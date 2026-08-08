@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = ["crates/*"]
 
@@ -17,3 +17,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 datafusion = "54"
 flate2 = "1"
 tempfile = "3"
+bytes = "1"
+

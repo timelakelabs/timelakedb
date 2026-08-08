@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 datafusion.workspace = true
 timelord-ingest = { path = "../ingest" }
+bytes.workspace = true

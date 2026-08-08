@@ -15,9 +15,12 @@ timelord-ingest = { path = "../ingest" }
 timelord-wal = { path = "../wal" }
 timelord-buffer = { path = "../buffer" }
 timelord-query = { path = "../query" }
+timelord-store = { path = "../store" }
+timelord-catalog = { path = "../catalog" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true
 flate2.workspace = true
+

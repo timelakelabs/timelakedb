@@ -58,12 +58,14 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M1 shipped** — parse → WAL → buffer → DataFusion works end to
-  end; AT-2 verified (smoke counts exact: 77,806; WAL survives container
-  restart). M1 limits: no Parquet flush/catalog yet (M2) — buffer memory
-  and WAL grow unbounded; no PK dedup yet (FR-5, M2); fsync per request
-  (group-commit windows are M4). Smoke gate command:
-  `python bench.py run --backend timelorddb --scale smoke --label X`.
+- Status: **M2 shipped** — full L0 cycle works: flush (PK sort + LWW
+  dedup, hour partitions, Parquet via Store, manifest catalog, WAL
+  generation reclaim), reads union buffer+files, 429 WAL backpressure.
+  Gate: smoke exact (77,806) through the flush cycle; SIGKILL recovery
+  0.8 s, zero loss. Limits: cross-file dedup arrives with compaction
+  (M3); no pruning; `docker kill` does NOT auto-restart (restart policies
+  ignore manual kills — use `docker restart -t 0` for crash drills).
+  Smoke gate: `python bench.py run --backend timelorddb --scale smoke`.
 
 ## Ground rules for work in this directory
 

@@ -10,7 +10,16 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn engine(dir: &std::path::Path) -> Arc<timelord_server::Engine> {
-    timelord_server::Engine::open(dir, 256 * 1024 * 1024).unwrap()
+    timelord_server::Engine::open(
+        dir,
+        timelord_server::EngineConfig {
+            query_mem_bytes: 256 * 1024 * 1024,
+            flush_rows: 1_000_000, // no auto-trigger; tests flush explicitly
+            flush_age_secs: u64::MAX,
+            wal_max_bytes: u64::MAX,
+        },
+    )
+    .unwrap()
 }
 
 fn now_ns() -> i64 {
@@ -208,6 +217,71 @@ async fn errors_are_400_with_line_context_and_never_wal_d() {
     };
     // db 'poc' never got a successful write, so it should not exist
     assert!(rows_after.is_null() || rows_after.get("error").is_some());
+}
+
+#[tokio::test]
+async fn flush_parquet_union_restart_and_dedup_m2() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+
+    // rows across two different hours -> two partitions; one duplicate PK
+    let h = 3_600_000_000_000i64;
+    let lp = format!(
+        "pipeline_events,product_id=p1,step=01-download,event=start value=1i {a}\n\
+         pipeline_events,product_id=p1,step=01-download,event=start value=9i {a}\n\
+         pipeline_events,product_id=p2,step=01-download,event=start value=1i {b}\n\
+         pipeline_events,product_id=p3,step=02-extract,event=start value=1i {c}",
+        a = t - 2 * h,
+        b = t - 2 * h + 1,
+        c = t - 1000,
+    );
+    assert_eq!(
+        write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // flush everything to Parquet
+    let files = eng.flush_all().unwrap();
+    assert!(files >= 2, "expected >=2 partition files, got {files}");
+
+    // buffer is empty now; reads come from Parquet: dup PK collapsed (FR-5)
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 3, "LWW dedup at flush");
+    let (_, rows) = sql(
+        &app,
+        "poc",
+        "SELECT value FROM pipeline_events WHERE product_id = 'p1'",
+    )
+    .await;
+    assert_eq!(rows[0]["value"], 9, "last write wins");
+
+    // new writes land in the buffer; queries union buffer + files
+    let lp2 = format!(
+        "pipeline_events,product_id=p4,step=03-validate,event=start value=1i {}",
+        t - 500
+    );
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp2.into_bytes(), false).await;
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(rows[0]["n"], 4, "union of parquet + buffer");
+
+    // restart: parquet via catalog + WAL replay of the unflushed row only
+    drop(app);
+    drop(eng);
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(rows[0]["n"], 4, "acknowledged rows survive restart, no dups");
+    // schema alignment across files with different column sets works:
+    let (code, _) = sql(
+        &app,
+        "poc",
+        "SELECT step, COUNT(DISTINCT product_id) FROM pipeline_events GROUP BY step",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
 }
 
 #[tokio::test]
