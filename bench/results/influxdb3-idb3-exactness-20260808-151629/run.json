@@ -1,0 +1,70 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "influxdb3-idb3-exactness-20260808-151629",
+  "backend": "influxdb3",
+  "backend_display": "InfluxDB 3 Core",
+  "backend_version": "3.11.0",
+  "target": {
+    "url": "http://localhost:8182",
+    "db": "poc",
+    "container": null,
+    "image": null
+  },
+  "started_at": "2026-08-08T15:16:29-0400",
+  "finished_at": "2026-08-08T15:18:15-0400",
+  "config": {
+    "scale": "laptop",
+    "label": "idb3-exactness",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 99.6,
+      "lines_per_s": 36714,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 993,
+      "batch_p95_ms": 1011,
+      "batch_max_ms": 1025
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 2957,
+        "value": 3656560,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 3,
+        "value": null,
+        "error": "HTTP 400: Error during planning: table 'public.iox.host_metrics' not found"
+      },
+      "disk_rows_6h": {
+        "ms": 42,
+        "value": null,
+        "error": "HTTP 400: Error during planning: table 'public.iox.disk_metrics' not found"
+      }
+    }
+  },
+  "notes": []
+}

@@ -16,7 +16,25 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M3 — compaction, retention, Flight SQL, Grafana
+## Status: M4 — full-scale gate passed (two carve-outs)
+
+The read path earned its full-scale numbers the hard way: five gate
+attempts, each failure measured and fixed — shared memory pool with
+admission control, decode-time row filters over entity-clustered
+row-group statistics, blocking-pool scans with deadlines, grace-period
+GC, a container memory cap, and native-volume I/O.
+
+Final gate (36.6M events, fresh after ingest, vs the InfluxDB 3
+baseline): ingest 365-671K lines/s 0 errors (5-9×); Shape A median
+**211 ms** (vs 520); Shape B **all complete** — funnel 1.7 s (vs 5.7),
+B4 0.68 s (vs 30.3); burst 100K in 0.12 s with concurrent query; COUNT(*)
+over 36.7M in 2.2 s; storage **0.50 GB/day** (vs 1.15); zero
+acknowledged-row loss proven by fixed-bound equality on identical data.
+Carve-outs → M5: Shape A p95 608 ms vs the 250 ms target, and intra-run
+ingest decline under maintenance contention (cross-run stable, so not
+cardinality decay) — both addressed by streaming/range-read execution.
+
+### Previous: M3 — compaction, retention, Flight SQL, Grafana
 
 Compaction merges L0 files per (table, hour) with cross-file
 last-write-wins dedup (FR-5 complete); per-table retention drops whole

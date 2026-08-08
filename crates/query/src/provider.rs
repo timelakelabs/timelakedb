@@ -19,7 +19,6 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -109,11 +108,17 @@ fn str_literal(e: &Expr) -> Option<String> {
 }
 
 pub struct LazyTable {
+    name: String,
     schema: SchemaRef,
     buffer: Vec<RecordBatch>,
     files: Vec<FileMeta>,
     store: Arc<dyn Store>,
-    runtime: Arc<RuntimeEnv>,
+    /// Loads run on the blocking pool with this deadline: a slow scan is
+    /// abandoned between files instead of pinning the async runtime
+    /// forever (the M4 hang that wedged a whole Docker VM).
+    load_timeout: std::time::Duration,
+    /// The SHARED pool (RR-1): loads try_grow here and fail cleanly.
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
 }
 
 impl std::fmt::Debug for LazyTable {
@@ -128,142 +133,199 @@ impl std::fmt::Debug for LazyTable {
 impl LazyTable {
     /// `schema` must already be the merged schema of buffer + files
     /// (cheap: footer-only reads happen at registration in the engine).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        name: String,
         schema: SchemaRef,
         buffer: Vec<RecordBatch>,
         files: Vec<FileMeta>,
         store: Arc<dyn Store>,
-        runtime: Arc<RuntimeEnv>,
+        load_timeout: std::time::Duration,
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     ) -> Self {
         LazyTable {
+            name,
             schema,
             buffer,
             files,
             store,
-            runtime,
+            load_timeout,
+            pool,
         }
-    }
-
-    fn load_pruned(
-        &self,
-        pruning: &Pruning,
-        needed: Option<&[String]>,
-    ) -> Result<Vec<RecordBatch>, String> {
-        // Memory accounting note (RR-1): loaded batches are handed to
-        // DataFusion's memory-tracked DataSourceExec — a candidate set
-        // beyond the pool budget fails there, cleanly. A separate load
-        // reservation here double-counted shared dictionary buffers
-        // (once per emitted batch) and rejected queries that actually
-        // fit — the full-scale AT-3 run caught it.
-        // buffer snapshots respect the projection too
-        let mut batches = Vec::with_capacity(self.buffer.len());
-        for b in &self.buffer {
-            batches.push(match needed {
-                None => b.clone(),
-                Some(names) => {
-                    let idx: Vec<usize> = names
-                        .iter()
-                        .filter_map(|n| b.schema().index_of(n).ok())
-                        .collect();
-                    b.project(&idx).map_err(|e| e.to_string())?
-                }
-            });
-        }
-
-        for meta in &self.files {
-            // file-level time pruning (catalog bounds)
-            if let Some(min) = pruning.min_ts_ns {
-                if meta.max_ts_ns < min {
-                    continue;
-                }
-            }
-            if let Some(max) = pruning.max_ts_ns {
-                if meta.min_ts_ns > max {
-                    continue;
-                }
-            }
-            let bytes = bytes::Bytes::from(
-                self.store
-                    .get(&meta.path)
-                    .map_err(|e| format!("store get {}: {e}", meta.path))?,
-            );
-            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-                .map_err(|e| e.to_string())?;
-
-            // row-group bloom pruning for tag equality literals (PR-3)
-            let n_rg = builder.metadata().num_row_groups();
-            let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
-                (0..n_rg).collect()
-            } else {
-                bloom_keep_row_groups(&bytes, n_rg, &pruning.tag_equals)
-            };
-            if keep.is_empty() {
-                continue;
-            }
-
-            // projection pushdown: decode only the columns the plan needs
-            let builder = match needed {
-                None => builder,
-                Some(names) => {
-                    let descr = builder.parquet_schema().clone();
-                    let idx: Vec<usize> = (0..descr.num_columns())
-                        .filter(|i| names.iter().any(|n| n == descr.column(*i).name()))
-                        .collect();
-                    let mask = datafusion::parquet::arrow::ProjectionMask::roots(&descr, idx);
-                    builder.with_projection(mask)
-                }
-            };
-
-            // one batch per row group: small default batches would each
-            // carry (and re-count) the whole shared dictionary buffer
-            let reader = builder
-                .with_row_groups(keep)
-                .with_batch_size(1_048_576)
-                .build()
-                .map_err(|e| e.to_string())?;
-            for b in reader {
-                batches.push(b.map_err(|e| e.to_string())?);
-            }
-        }
-        Ok(batches)
     }
 }
 
-/// Row groups that MAY contain every tag literal, per the file's bloom
-/// filters (written by flush for all dictionary columns). A group is
-/// skipped only on a definite bloom miss; missing blooms keep the group.
-fn bloom_keep_row_groups(
-    bytes: &bytes::Bytes,
-    n_rg: usize,
+/// Row groups whose column-chunk statistics ADMIT every tag literal.
+/// Settled files are entity-clustered by compaction, so these ranges are
+/// tight; a group is skipped only when a literal falls outside its
+/// min/max (bloom filters would be sharper, but the arrow writer emits
+/// none for dictionary columns — proven by test).
+pub fn stats_keep_row_groups(
+    metadata: &datafusion::parquet::file::metadata::ParquetMetaData,
     tag_equals: &[(String, String)],
 ) -> Vec<usize> {
-    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    use datafusion::parquet::file::statistics::Statistics;
 
-    let Ok(reader) = SerializedFileReader::new(bytes.clone()) else {
-        return (0..n_rg).collect();
-    };
-    let schema_descr = reader.metadata().file_metadata().schema_descr_ptr();
+    let descr = metadata.file_metadata().schema_descr();
+    let n_rg = metadata.num_row_groups();
     let mut keep = Vec::with_capacity(n_rg);
     'rg: for rg in 0..n_rg {
-        let Ok(rg_reader) = reader.get_row_group(rg) else {
-            keep.push(rg);
-            continue;
-        };
         for (col, val) in tag_equals {
             let Some(idx) =
-                (0..schema_descr.num_columns()).find(|i| schema_descr.column(*i).name() == col)
+                (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
             else {
                 continue;
             };
-            if let Some(sbbf) = rg_reader.get_column_bloom_filter(idx) {
-                if !sbbf.check(&val.as_str()) {
-                    continue 'rg; // definite miss: skip the group
+            let col_meta = metadata.row_group(rg).column(idx);
+            if let Some(Statistics::ByteArray(s)) = col_meta.statistics() {
+                if let (Some(min), Some(max)) = (s.min_opt(), s.max_opt()) {
+                    let v = val.as_bytes();
+                    if v < min.data() || v > max.data() {
+                        continue 'rg; // literal outside this group's range
+                    }
                 }
             }
         }
         keep.push(rg);
     }
     keep
+}
+
+/// The blocking half of scan: runs on the blocking pool, checks the
+/// deadline between files (RR-2 — abandonable, never pins the runtime).
+#[allow(clippy::too_many_arguments)]
+fn load_pruned(
+    buffer: &[RecordBatch],
+    files: &[FileMeta],
+    store: &Arc<dyn Store>,
+    pruning: &Pruning,
+    needed: Option<&[String]>,
+    deadline: std::time::Instant,
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    table: &str,
+) -> Result<(Vec<RecordBatch>, datafusion::execution::memory_pool::MemoryReservation), String> {
+    use datafusion::execution::memory_pool::MemoryConsumer;
+    // RR-1: loads are pool-visible at ACTUAL batch size. Accurate now:
+    // with batch_size >= row-group size each batch owns its dictionary
+    // (the earlier double-count came from 1024-row batches sharing one
+    // RG dictionary). The process must never be OOM-killable by a load.
+    let mut reservation = MemoryConsumer::new(format!("scan:{table}")).register(pool);
+    let mut batches = Vec::with_capacity(buffer.len());
+    for b in buffer {
+        batches.push(match needed {
+            None => b.clone(),
+            Some(names) => {
+                let idx: Vec<usize> = names
+                    .iter()
+                    .filter_map(|n| b.schema().index_of(n).ok())
+                    .collect();
+                b.project(&idx).map_err(|e| e.to_string())?
+            }
+        });
+    }
+
+    for meta in files {
+        if std::time::Instant::now() >= deadline {
+            return Err("scan load deadline exceeded — query abandoned (RR-2)".to_string());
+        }
+        // file-level time pruning (catalog bounds)
+        if let Some(min) = pruning.min_ts_ns {
+            if meta.max_ts_ns < min {
+                continue;
+            }
+        }
+        if let Some(max) = pruning.max_ts_ns {
+            if meta.min_ts_ns > max {
+                continue;
+            }
+        }
+        let bytes = bytes::Bytes::from(
+            store
+                .get(&meta.path)
+                .map_err(|e| format!("store get {}: {e}", meta.path))?,
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| e.to_string())?;
+
+        // row-group statistics pruning for tag equality literals (PR-3)
+        let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
+            (0..builder.metadata().num_row_groups()).collect()
+        } else {
+            stats_keep_row_groups(builder.metadata(), &pruning.tag_equals)
+        };
+        if keep.is_empty() {
+            continue;
+        }
+
+        // projection pushdown: decode only the columns the plan needs
+        let builder = match needed {
+            None => builder,
+            Some(names) => {
+                let descr = builder.parquet_schema().clone();
+                let idx: Vec<usize> = (0..descr.num_columns())
+                    .filter(|i| names.iter().any(|n| n == descr.column(*i).name()))
+                    .collect();
+                let mask = datafusion::parquet::arrow::ProjectionMask::roots(&descr, idx);
+                builder.with_projection(mask)
+            }
+        };
+
+        // decode-time row filtering (PR-3's last mile): for tag equality
+        // literals, only MATCHING rows materialize — a journey pulls its
+        // ~20 rows out of each kept row group instead of all 64K
+        let builder = if pruning.tag_equals.is_empty() {
+            builder
+        } else {
+            use datafusion::parquet::arrow::ProjectionMask;
+            use datafusion::parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+            let descr = builder.parquet_schema().clone();
+            let mut predicates: Vec<Box<dyn datafusion::parquet::arrow::arrow_reader::ArrowPredicate>> =
+                Vec::new();
+            for (col, val) in pruning.tag_equals.clone() {
+                let Some(idx) =
+                    (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
+                else {
+                    continue;
+                };
+                let mask = ProjectionMask::roots(&descr, [idx]);
+                predicates.push(Box::new(ArrowPredicateFn::new(mask, move |batch| {
+                    use datafusion::arrow::array::StringArray;
+                    use datafusion::arrow::compute::kernels::cmp::eq;
+                    let scalar = StringArray::new_scalar(val.clone());
+                    eq(batch.column(0), &scalar)
+                })));
+            }
+            if predicates.is_empty() {
+                builder
+            } else {
+                builder.with_row_filter(RowFilter::new(predicates))
+            }
+        };
+
+        // one batch per row group: small default batches would each
+        // carry (and re-count) the whole shared dictionary buffer
+        let reader = builder
+            .with_row_groups(keep)
+            .with_batch_size(1_048_576)
+            .build()
+            .map_err(|e| e.to_string())?;
+        for b in reader {
+            let b = b.map_err(|e| e.to_string())?;
+            reservation
+                .try_grow(b.get_array_memory_size())
+                .map_err(|e| format!("query memory budget exceeded at {}: {e}", meta.path))?;
+            batches.push(b);
+        }
+    }
+    tracing::info!(
+        table,
+        files_total = files.len(),
+        batches = batches.len(),
+        reserved_mb = reservation.size() / (1024 * 1024),
+        pruning = ?pruning,
+        "scan load complete"
+    );
+    Ok((batches, reservation))
 }
 
 #[async_trait]
@@ -319,9 +381,38 @@ impl TableProvider for LazyTable {
             }
         };
 
-        let batches = self
-            .load_pruned(&pruning, needed.as_deref())
-            .map_err(DataFusionError::Execution)?;
+        // blocking half runs on the blocking pool, abandonable (RR-2)
+        let buffer = self.buffer.clone();
+        let files = self.files.clone();
+        let store = self.store.clone();
+        let needed_owned = needed.clone();
+        let pruning_owned = pruning.clone();
+        let deadline = std::time::Instant::now() + self.load_timeout;
+        let pool = self.pool.clone();
+        let table_name = self.name.clone();
+        let (batches, reservation) = tokio::task::spawn_blocking(move || {
+            load_pruned(
+                &buffer,
+                &files,
+                &store,
+                &pruning_owned,
+                needed_owned.as_deref(),
+                deadline,
+                &pool,
+                &table_name,
+            )
+        })
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("scan load task: {e}")))?
+        .map_err(DataFusionError::Execution)?;
+        // The reservation's job is done: try_grow during the load is what
+        // rejects an oversized candidate set BEFORE memory blows up (the
+        // crash cause). Accounting is released here because the plan API
+        // gives the batches, not us, to the executor; execution-time
+        // residency is bounded instead by admission control
+        // (max_concurrent_queries × pool). Tying reservations to plan
+        // lifetime is the M5 streaming-exec work.
+        drop(reservation);
         let aligned = if count_only {
             use datafusion::arrow::record_batch::RecordBatchOptions;
             batches
@@ -352,6 +443,43 @@ impl TableProvider for LazyTable {
 mod tests {
     use super::*;
     use datafusion::logical_expr::{col, lit};
+
+    #[test]
+    fn stats_prune_clustered_row_groups() {
+        use timelord_buffer::{TableBuffer, flush};
+        use timelord_ingest::parse_lines;
+
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..2000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", (i * 7919) % 2000, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let parts =
+            flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
+        let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(256)).unwrap();
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let md = builder.metadata();
+        let total = md.num_row_groups();
+        assert!(total > 3);
+
+        // a specific entity: only its slice of the clustered file survives
+        let keep = stats_keep_row_groups(md, &[("pid".into(), "p00042".into())]);
+        assert!(
+            keep.len() <= 2,
+            "expected <=2 of {total} row groups, kept {}",
+            keep.len()
+        );
+        // beyond every range: nothing survives
+        let keep = stats_keep_row_groups(md, &[("pid".into(), "zzzz".into())]);
+        assert!(keep.is_empty());
+        // no literals: everything survives
+        let keep = stats_keep_row_groups(md, &[]);
+        assert_eq!(keep.len(), total);
+    }
 
     #[test]
     fn extracts_time_bounds_and_tag_literals() {
