@@ -41,6 +41,7 @@ async fn main() {
                 if retention {
                     e.enforce_retention()?;
                 }
+                e.run_gc();
                 Ok(())
             })
             .await;

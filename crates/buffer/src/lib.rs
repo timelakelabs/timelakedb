@@ -157,6 +157,35 @@ impl TableBuffer {
         Ok(())
     }
 
+    /// The buffer's schema without materializing any arrays (cheap —
+    /// used to keep the engine's schema registry current).
+    pub fn schema_only(&self) -> Arc<Schema> {
+        let mut fields: Vec<Field> = Vec::with_capacity(1 + self.tag_names.len() + self.field_names.len());
+        fields.push(Field::new(
+            "time",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(TZ.into())),
+            false,
+        ));
+        for name in &self.tag_names {
+            fields.push(Field::new(
+                name,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ));
+        }
+        for name in &self.field_names {
+            let dt = match &self.fields[name] {
+                FieldCol::F64(_) => DataType::Float64,
+                FieldCol::I64(_) => DataType::Int64,
+                FieldCol::U64(_) => DataType::UInt64,
+                FieldCol::Bool(_) => DataType::Boolean,
+                FieldCol::Str(_) => DataType::Utf8,
+            };
+            fields.push(Field::new(name, dt, true));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
     /// Immutable snapshot as one RecordBatch (time, tags..., fields...).
     pub fn snapshot(&self) -> Result<RecordBatch, String> {
         let mut fields: Vec<Field> = Vec::new();
@@ -297,9 +326,20 @@ pub mod flush {
     }
 
     pub fn to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, String> {
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
+        // bloom filters on every tag (dictionary) column: PR-3's
+        // row-group pruning for `tag = 'literal'` predicates
+        let mut props = WriterProperties::builder().set_compression(Compression::SNAPPY);
+        for f in batch.schema().fields() {
+            if matches!(f.data_type(), DataType::Dictionary(_, _)) {
+                props = props.set_column_bloom_filter_enabled(
+                    datafusion::parquet::schema::types::ColumnPath::new(vec![
+                        f.name().clone(),
+                    ]),
+                    true,
+                );
+            }
+        }
+        let props = props.build();
         let mut out = Vec::new();
         let mut w = ArrowWriter::try_new(&mut out, batch.schema(), Some(props))
             .map_err(|e| e.to_string())?;

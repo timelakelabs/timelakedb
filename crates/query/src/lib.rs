@@ -22,6 +22,131 @@ use serde_json::{Map, Number, Value, json};
 /// Re-export so downstream crates name batches without a direct
 /// datafusion dependency (version unification lives here).
 pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
+pub use datafusion::arrow::datatypes::SchemaRef as QuerySchema;
+pub use datafusion::datasource::TableProvider as DfTableProvider;
+
+pub mod provider;
+
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnv;
+
+/// Shared query environment (RR-1/RR-2 hardening, M4):
+/// ONE memory pool for every concurrent query (previously each query got
+/// its own full-size pool — concurrency multiplied memory, the exact
+/// disease this project exists to cure), a semaphore for admission
+/// control, and a server-side timeout so abandoned queries stop burning
+/// the pool.
+pub struct QueryEnv {
+    pub runtime: Arc<RuntimeEnv>,
+    admission: tokio::sync::Semaphore,
+    pub timeout: std::time::Duration,
+}
+
+impl QueryEnv {
+    pub fn new(total_mem_bytes: usize, max_concurrent: usize, timeout_secs: u64) -> Self {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(total_mem_bytes)))
+            .build_arc()
+            .expect("runtime env");
+        QueryEnv {
+            runtime,
+            admission: tokio::sync::Semaphore::new(max_concurrent.max(1)),
+            timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
+        }
+    }
+}
+
+/// Execute SQL over registered providers under the SHARED environment.
+pub async fn run_sql_env(
+    env: &QueryEnv,
+    session: &QuerySession,
+    tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    // admission control: excess queries queue here, bounded by RR-1
+    let _permit = env
+        .admission
+        .acquire()
+        .await
+        .map_err(|_| "query admission closed".to_string())?;
+
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), env.runtime.clone());
+    for (name, provider) in tables {
+        // SEC-2: the hook is on the path for every table, every query.
+        let _restriction = mandatory_predicate(session, &name);
+        ctx.register_table(&name, provider).map_err(|e| e.to_string())?;
+    }
+
+    let work = async {
+        let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+        df.collect().await.map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(env.timeout, work).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "query timed out after {}s (server-side cap, RR-2)",
+            env.timeout.as_secs()
+        )),
+    }
+}
+
+/// Union of two optional schemas (registry merge helper).
+pub fn schema_union(
+    a: Option<Arc<datafusion::arrow::datatypes::Schema>>,
+    b: Arc<datafusion::arrow::datatypes::Schema>,
+) -> Result<Arc<datafusion::arrow::datatypes::Schema>, String> {
+    use datafusion::arrow::datatypes::{Field, Schema};
+    let Some(a) = a else { return Ok(b) };
+    let mut names: Vec<String> = a.fields().iter().map(|f| f.name().clone()).collect();
+    let mut types: std::collections::HashMap<String, DataType> = a
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    for f in b.fields() {
+        match types.get(f.name()) {
+            None => {
+                names.push(f.name().clone());
+                types.insert(f.name().clone(), f.data_type().clone());
+            }
+            Some(t) if t == f.data_type() => {}
+            Some(t) => {
+                return Err(format!(
+                    "column '{}' has conflicting types {t:?} vs {:?}",
+                    f.name(),
+                    f.data_type()
+                ));
+            }
+        }
+    }
+    Ok(Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|n| Field::new(n, types[n].clone(), true))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+/// Align batches to a FIXED target schema (missing columns become null).
+pub fn align_to(
+    schema: Arc<datafusion::arrow::datatypes::Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, String> {
+    use datafusion::arrow::array::new_null_array;
+    let mut aligned = Vec::with_capacity(batches.len());
+    for b in batches {
+        let cols = schema
+            .fields()
+            .iter()
+            .map(|f| match b.column_by_name(f.name()) {
+                Some(c) => Ok(c.clone()),
+                None => Ok(new_null_array(f.data_type(), b.num_rows())),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        aligned.push(RecordBatch::try_new(schema.clone(), cols).map_err(|e| e.to_string())?);
+    }
+    Ok(aligned)
+}
 
 /// Per-session context the mandatory predicate sees (SEC-2).
 /// Grows Accumulo-style authorizations, tenant, and retention context.

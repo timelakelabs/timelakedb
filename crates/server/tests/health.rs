@@ -17,6 +17,9 @@ fn engine_cfg(retention: Vec<(String, u64)>) -> timelord_server::EngineConfig {
         wal_max_bytes: u64::MAX,
         compact_min_files: 2,
         retention,
+        max_concurrent_queries: 4,
+        query_timeout_secs: 120,
+        gc_grace_secs: 0, // tests exercise immediate GC via run_gc()
     }
 }
 
@@ -64,6 +67,9 @@ async fn sql(app: &axum::Router, db: &str, q: &str) -> (StatusCode, serde_json::
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        eprintln!("sql error [{status}] for {q}: {v}");
+    }
     (status, v)
 }
 
@@ -362,6 +368,41 @@ async fn retention_drops_expired_partitions_fr7() {
     // tables WITHOUT a policy keep everything (FR-7 is per-table)
     let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM kept").await;
     assert_eq!(rows[0]["n"], 1);
+}
+
+#[tokio::test]
+async fn memory_pool_rejects_cleanly_never_kills_rr1() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = engine_cfg(Vec::new());
+    cfg.query_mem_bytes = 2 * 1024 * 1024; // 2 MB pool: tiny on purpose
+    let eng = timelord_server::Engine::open(dir.path(), cfg).unwrap();
+    let app = timelord_server::app(eng.clone());
+
+    let t = now_ns();
+    let mut lp = String::new();
+    for i in 0..3000 {
+        lp.push_str(&format!(
+            "m,tag=t{i} v={}.5 {}\n",
+            i % 7,
+            t - 1000 - i as i64
+        ));
+    }
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await;
+
+    // a deliberately memory-hungry shape: wide cross-join aggregation
+    let (code, body) = sql(
+        &app,
+        "poc",
+        "SELECT COUNT(DISTINCT a.tag || b.tag || c.tag) AS n \
+         FROM m a CROSS JOIN m b CROSS JOIN m c",
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "hog must be rejected: {body}");
+
+    // ...and the server is entirely fine afterwards (the RR-1 contract)
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM m").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 3000);
 }
 
 #[tokio::test]
