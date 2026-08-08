@@ -33,12 +33,65 @@ pub fn mandatory_predicate(_session: &QuerySession, _table: &str) -> Option<Stri
     None
 }
 
-/// Execute `sql` over the given (table_name, snapshot) pairs, bounded by
-/// `mem_limit_bytes` (RR-1: a query that exceeds the pool gets a clean
+/// Merge batches with heterogeneous-but-compatible schemas (files written
+/// before a column existed union'd with newer ones): the merged schema is
+/// the first-seen-ordered union; missing columns become nulls. A name
+/// carried with two different types is an error (first-writer-wins is
+/// enforced at write time; a conflict here means corrupted state).
+pub fn align(
+    batches: Vec<RecordBatch>,
+) -> Result<(Arc<datafusion::arrow::datatypes::Schema>, Vec<RecordBatch>), String> {
+    use datafusion::arrow::array::new_null_array;
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    let mut names: Vec<String> = Vec::new();
+    let mut types: std::collections::HashMap<String, DataType> = std::collections::HashMap::new();
+    for b in &batches {
+        for f in b.schema().fields() {
+            match types.get(f.name()) {
+                None => {
+                    names.push(f.name().clone());
+                    types.insert(f.name().clone(), f.data_type().clone());
+                }
+                Some(t) if t == f.data_type() => {}
+                Some(t) => {
+                    return Err(format!(
+                        "column '{}' has conflicting types {t:?} vs {:?}",
+                        f.name(),
+                        f.data_type()
+                    ));
+                }
+            }
+        }
+    }
+    let schema = Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|n| Field::new(n, types[n].clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+
+    let mut aligned = Vec::with_capacity(batches.len());
+    for b in batches {
+        let cols = names
+            .iter()
+            .map(|n| match b.column_by_name(n) {
+                Some(c) => c.clone(),
+                None => new_null_array(&types[n], b.num_rows()),
+            })
+            .collect::<Vec<_>>();
+        aligned.push(RecordBatch::try_new(schema.clone(), cols).map_err(|e| e.to_string())?);
+    }
+    Ok((schema, aligned))
+}
+
+/// Execute `sql` over the given (table_name, batches) pairs — each table
+/// is the union of its buffer snapshot and its Parquet batches — bounded
+/// by `mem_limit_bytes` (RR-1: a query that exceeds the pool gets a clean
 /// error, never a dead process).
 pub async fn run_sql(
     session: &QuerySession,
-    tables: Vec<(String, RecordBatch)>,
+    tables: Vec<(String, Vec<RecordBatch>)>,
     sql: &str,
     mem_limit_bytes: usize,
 ) -> Result<Vec<RecordBatch>, String> {
@@ -48,12 +101,14 @@ pub async fn run_sql(
         .map_err(|e| e.to_string())?;
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
 
-    for (name, batch) in tables {
+    for (name, batches) in tables {
         // SEC-2: the hook is on the path for every table, every query.
         let _restriction = mandatory_predicate(session, &name);
-        debug_assert!(_restriction.is_none(), "M1 has no predicate sources");
-        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])
-            .map_err(|e| e.to_string())?;
+        debug_assert!(_restriction.is_none(), "M2 has no predicate sources");
+        let (schema, aligned) = align(batches)?;
+        // one partition per batch -> DataFusion scans them in parallel
+        let parts = aligned.into_iter().map(|b| vec![b]).collect();
+        let table = MemTable::try_new(schema, parts).map_err(|e| e.to_string())?;
         ctx.register_table(&name, Arc::new(table))
             .map_err(|e| e.to_string())?;
     }
@@ -143,7 +198,7 @@ mod tests {
         let session = QuerySession::default();
         let batches = run_sql(
             &session,
-            vec![("pipeline_events".into(), batch)],
+            vec![("pipeline_events".into(), vec![batch])],
             "SELECT step, COUNT(DISTINCT product_id) AS products \
              FROM pipeline_events \
              WHERE event = 'stop' AND time >= now() - INTERVAL '24 hours' \
@@ -167,7 +222,7 @@ mod tests {
         let batch = buffer_with("m f=1i 1");
         let err = run_sql(
             &QuerySession::default(),
-            vec![("m".into(), batch)],
+            vec![("m".into(), vec![batch])],
             "SELECT nope FROM missing",
             1024 * 1024,
         )

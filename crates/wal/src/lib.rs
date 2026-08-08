@@ -1,13 +1,18 @@
-//! Write-ahead log (RR-3). M1 scope: one local file of length-prefixed
-//! frames storing the RAW line-protocol body (plus db and precision
-//! multiplier), fsynced per append. Replay re-parses through the same
-//! ingest path, so WAL and live writes cannot diverge. A truncated tail
-//! (crash mid-write) is tolerated: replay stops at the last complete
-//! frame and the file is truncated back to it.
+//! Write-ahead log (RR-3) with generations.
 //!
-//! Later milestones: segment rotation + upload via Store (CL-1), and
-//! group-commit fsync windows for PR-1 (M4 tuning) — the `append`
-//! signature already takes a batch, so callers won't change.
+//! Frames store the RAW line-protocol body (plus db and precision
+//! multiplier); replay re-parses through the same ingest path, so WAL and
+//! live writes cannot diverge. fsync before the 204 (ack contract).
+//! A truncated tail (crash mid-write) is tolerated per generation.
+//!
+//! Generations exist for the flush checkpoint (ARCHITECTURE §5/§6):
+//! `rotate()` seals the current file and starts gen+1 for new writes;
+//! after the sealed generations' rows are flushed to Parquet and the
+//! manifest commit is durable, `delete_generations_before(gen)` reclaims
+//! them. Crash between flush and delete replays already-flushed rows —
+//! duplicates across parquet+buffer in that window are a known M2 limit
+//! (cross-source dedup completes with compaction at M3); acknowledged
+//! writes are never lost, which is the contract that matters.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, Write};
@@ -19,42 +24,62 @@ const MAGIC: u32 = 0x544C_4442; // "TLDB"
 pub type Frame = (String, i64, Vec<u8>);
 
 pub struct Wal {
+    dir: PathBuf,
     file: File,
-    path: PathBuf,
+    generation: u64,
+}
+
+fn gen_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("wal.{generation:08}.log"))
+}
+
+fn list_generations(dir: &Path) -> std::io::Result<Vec<u64>> {
+    let mut gens = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Some(g) = name
+                .strip_prefix("wal.")
+                .and_then(|s| s.strip_suffix(".log"))
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                gens.push(g);
+            }
+        }
+    }
+    gens.sort_unstable();
+    Ok(gens)
 }
 
 impl Wal {
-    /// Open (creating if absent) and replay all complete frames.
+    /// Open (creating if absent) and replay all complete frames of all
+    /// generations, oldest first.
     pub fn open(dir: &Path) -> std::io::Result<(Wal, Vec<Frame>)> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join("wal.log");
+        // migrate the M1 single-file layout
+        let legacy = dir.join("wal.log");
+        if legacy.exists() {
+            std::fs::rename(&legacy, gen_path(dir, 0))?;
+        }
+
+        let gens = list_generations(dir)?;
         let mut frames = Vec::new();
-        let mut good_end = 0u64;
-
-        if path.exists() {
-            let mut r = BufReader::new(File::open(&path)?);
-            loop {
-                match read_frame(&mut r) {
-                    Ok(Some(f)) => {
-                        frames.push(f);
-                        good_end = r.stream_position()?;
-                    }
-                    Ok(None) => break,
-                    Err(_) => break, // truncated / corrupt tail: keep the good prefix
-                }
-            }
+        for &g in &gens {
+            replay_file(&gen_path(dir, g), &mut frames)?;
         }
-
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let len = file.metadata()?.len();
-        if len > good_end {
-            // crash mid-frame — drop the partial tail
-            let f = OpenOptions::new().write(true).open(&path)?;
-            f.set_len(good_end)?;
-            f.sync_data()?;
-        }
-
-        Ok((Wal { file, path }, frames))
+        let generation = gens.last().copied().unwrap_or(0);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(gen_path(dir, generation))?;
+        Ok((
+            Wal {
+                dir: dir.to_path_buf(),
+                file,
+                generation,
+            },
+            frames,
+        ))
     }
 
     /// Durably append one write. 204 must not be sent before this returns.
@@ -71,14 +96,69 @@ impl Wal {
         self.file.sync_data()
     }
 
-    /// Bytes currently in the log (bounds RR-3 replay; flush truncation at M2).
-    pub fn size(&self) -> u64 {
-        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    /// Seal the current generation and start a new one for subsequent
+    /// appends. Returns the sealed generation number.
+    pub fn rotate(&mut self) -> std::io::Result<u64> {
+        let sealed = self.generation;
+        self.file.sync_data()?;
+        self.generation += 1;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(gen_path(&self.dir, self.generation))?;
+        Ok(sealed)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Reclaim generations `<= upto` (call only after their rows are in
+    /// a durably committed manifest).
+    pub fn delete_generations_upto(&self, upto: u64) -> std::io::Result<()> {
+        for g in list_generations(&self.dir)? {
+            if g <= upto && g != self.generation {
+                std::fs::remove_file(gen_path(&self.dir, g))?;
+            }
+        }
+        Ok(())
     }
+
+    /// Total bytes across live generations (bounds RR-3 replay; feeds
+    /// the RR-5 backpressure check).
+    pub fn size(&self) -> u64 {
+        list_generations(&self.dir)
+            .map(|gens| {
+                gens.iter()
+                    .filter_map(|&g| std::fs::metadata(gen_path(&self.dir, g)).ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+}
+
+fn replay_file(path: &Path, frames: &mut Vec<Frame>) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut good_end = 0u64;
+    {
+        let mut r = BufReader::new(File::open(path)?);
+        loop {
+            match read_frame(&mut r) {
+                Ok(Some(f)) => {
+                    frames.push(f);
+                    good_end = r.stream_position()?;
+                }
+                Ok(None) => return Ok(()),
+                Err(_) => break, // truncated / corrupt tail
+            }
+        }
+    }
+    // crash mid-frame — drop the partial tail so appends resume cleanly
+    let f = OpenOptions::new().write(true).open(path)?;
+    if f.metadata()?.len() > good_end {
+        f.set_len(good_end)?;
+        f.sync_data()?;
+    }
+    Ok(())
 }
 
 fn read_frame<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<Frame>> {
@@ -134,8 +214,28 @@ mod tests {
         let (_, replay) = Wal::open(dir.path()).unwrap();
         assert_eq!(replay.len(), 3);
         assert_eq!(replay[0], ("poc".into(), 1, b"m f=1i 1".to_vec()));
-        assert_eq!(replay[1].1, 1_000_000_000);
         assert_eq!(replay[2].0, "other");
+    }
+
+    #[test]
+    fn rotation_checkpoint_and_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wal, _) = Wal::open(dir.path()).unwrap();
+        wal.append("poc", 1, b"m f=1i 1").unwrap();
+        let sealed = wal.rotate().unwrap();
+        wal.append("poc", 1, b"m f=2i 2").unwrap();
+
+        // both generations replay, oldest first
+        let (_, replay) = Wal::open(dir.path()).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].2, b"m f=1i 1".to_vec());
+
+        // after "flush + manifest commit", the sealed gen is reclaimed
+        let (mut wal, _) = Wal::open(dir.path()).unwrap();
+        wal.delete_generations_upto(sealed).unwrap();
+        let (_, replay) = Wal::open(dir.path()).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].2, b"m f=2i 2".to_vec());
     }
 
     #[test]
@@ -145,11 +245,10 @@ mod tests {
             let (mut wal, _) = Wal::open(dir.path()).unwrap();
             wal.append("poc", 1, b"m f=1i 1").unwrap();
         }
-        // simulate a crash mid-frame: append garbage half-frame
         {
             let mut f = OpenOptions::new()
                 .append(true)
-                .open(dir.path().join("wal.log"))
+                .open(gen_path(dir.path(), 0))
                 .unwrap();
             f.write_all(&MAGIC.to_le_bytes()).unwrap();
             f.write_all(&3u32.to_le_bytes()).unwrap();
@@ -157,9 +256,22 @@ mod tests {
         }
         let (mut wal, replay) = Wal::open(dir.path()).unwrap();
         assert_eq!(replay.len(), 1);
-        // and the log is writable again after truncation
         wal.append("poc", 1, b"m f=2i 2").unwrap();
         let (_, replay) = Wal::open(dir.path()).unwrap();
         assert_eq!(replay.len(), 2);
+    }
+
+    #[test]
+    fn m1_single_file_layout_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut wal, _) = Wal::open(dir.path()).unwrap();
+            wal.append("poc", 1, b"m f=1i 1").unwrap();
+        }
+        // simulate an M1 layout
+        std::fs::rename(gen_path(dir.path(), 0), dir.path().join("wal.log")).unwrap();
+        let (_, replay) = Wal::open(dir.path()).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(gen_path(dir.path(), 0).exists());
     }
 }

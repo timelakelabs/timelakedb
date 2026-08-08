@@ -24,6 +24,9 @@ pub enum WriteError {
     /// 400 — the request is at fault (parse error, type conflict, bad
     /// precision); the message identifies the line/field (FR-9).
     BadRequest(String),
+    /// 429 + Retry-After — a named, visible limit (RR-5): the WAL is at
+    /// its cap and flush needs to catch up before more writes land.
+    Backpressure(String),
     /// 500 — the engine failed to make the write durable.
     Internal(String),
 }
@@ -140,6 +143,12 @@ async fn write_common<E: Engine>(
     match res {
         Ok(Ok(_lines)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(WriteError::BadRequest(msg))) => err_response(StatusCode::BAD_REQUEST, &msg),
+        Ok(Err(WriteError::Backpressure(msg))) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "1")],
+            Json(json!({ "error": msg })),
+        )
+            .into_response(),
         Ok(Err(WriteError::Internal(msg))) => {
             err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
         }

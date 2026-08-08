@@ -2869,6 +2869,7 @@ dependencies = [
 name = "timelord-buffer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "datafusion",
  "timelord-ingest",
 ]
@@ -2876,6 +2877,12 @@ dependencies = [
 [[package]]
 name = "timelord-catalog"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "timelord-store",
+]
 
 [[package]]
 name = "timelord-compact"
@@ -2919,8 +2926,10 @@ dependencies = [
  "tempfile",
  "timelord-api",
  "timelord-buffer",
+ "timelord-catalog",
  "timelord-ingest",
  "timelord-query",
+ "timelord-store",
  "timelord-wal",
  "tokio",
  "tower",
@@ -2931,6 +2940,9 @@ dependencies = [
 [[package]]
 name = "timelord-store"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "timelord-wal"

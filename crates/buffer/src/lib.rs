@@ -100,6 +100,14 @@ pub struct TableBuffer {
     tags: HashMap<String, TagCol>,
     field_names: Vec<String>,
     fields: HashMap<String, FieldCol>,
+    first_write: Option<std::time::Instant>,
+}
+
+impl TableBuffer {
+    /// Seconds since the first row landed (flush-age trigger).
+    pub fn age_secs(&self) -> u64 {
+        self.first_write.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
 }
 
 impl TableBuffer {
@@ -111,6 +119,7 @@ impl TableBuffer {
     /// request was already validated upstream; errors here are type
     /// conflicts, reported with the field name).
     pub fn append(&mut self, line: &ParsedLine) -> Result<(), String> {
+        self.first_write.get_or_insert_with(std::time::Instant::now);
         let n = self.times.len();
 
         for (k, v) in &line.tags {
@@ -192,6 +201,148 @@ impl TableBuffer {
     }
 }
 
+/// Flush preparation: PK sort + last-write-wins dedup (FR-5 within a
+/// flush), UTC-hour partition split (ARCHITECTURE §6), Parquet encoding.
+/// Compaction (M3) reuses these pieces for cross-file merges.
+pub mod flush {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Array, TimestampNanosecondArray, UInt32Array};
+    use datafusion::arrow::compute::take;
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::row::{RowConverter, SortField};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use datafusion::parquet::basic::Compression;
+    use datafusion::parquet::file::properties::WriterProperties;
+
+    /// Sort by primary key (time, tags...), keep the LAST write per PK,
+    /// and split into (hour_partition, batch) pieces.
+    pub fn prepare(batch: &RecordBatch) -> Result<Vec<(String, RecordBatch)>, String> {
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // PK columns: time (index 0 by construction) + every dictionary
+        // (tag) column
+        let mut pk_cols = vec![batch.column(0).clone()];
+        for (i, f) in batch.schema().fields().iter().enumerate().skip(1) {
+            if matches!(f.data_type(), DataType::Dictionary(_, _)) {
+                pk_cols.push(batch.column(i).clone());
+            }
+        }
+        let converter = RowConverter::new(
+            pk_cols
+                .iter()
+                .map(|c| SortField::new(c.data_type().clone()))
+                .collect(),
+        )
+        .map_err(|e| e.to_string())?;
+        let rows = converter.convert_columns(&pk_cols).map_err(|e| e.to_string())?;
+
+        let mut idx: Vec<usize> = (0..n).collect();
+        // stable: equal PKs stay in arrival order, so .last() is LWW
+        idx.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)).then(a.cmp(&b)));
+
+        let mut kept: Vec<usize> = Vec::with_capacity(n);
+        for &i in &idx {
+            if let Some(&prev) = kept.last() {
+                if rows.row(prev) == rows.row(i) {
+                    *kept.last_mut().unwrap() = i; // last write wins (FR-5)
+                    continue;
+                }
+            }
+            kept.push(i);
+        }
+
+        // split by UTC hour (kept is time-ordered already)
+        let times = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or("time column is not ns timestamps")?;
+        let mut parts: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for &i in &kept {
+            parts
+                .entry(hour_partition(times.value(i)))
+                .or_default()
+                .push(i as u32);
+        }
+
+        let mut out = Vec::with_capacity(parts.len());
+        for (hour, indices) in parts {
+            let indices = UInt32Array::from(indices);
+            let cols = batch
+                .columns()
+                .iter()
+                .map(|c| take(c.as_ref(), &indices, None).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push((
+                hour,
+                RecordBatch::try_new(batch.schema(), cols).map_err(|e| e.to_string())?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// (min_ts_ns, max_ts_ns) of a prepared (time-sorted) batch.
+    pub fn time_bounds(batch: &RecordBatch) -> (i64, i64) {
+        let times = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("time column");
+        (times.value(0), times.value(times.len() - 1))
+    }
+
+    pub fn to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, String> {
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, batch.schema(), Some(props))
+            .map_err(|e| e.to_string())?;
+        w.write(batch).map_err(|e| e.to_string())?;
+        w.close().map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    pub fn read_parquet_bytes(bytes: Vec<u8>) -> Result<Vec<RecordBatch>, String> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string())?;
+        reader
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    /// "YYYYMMDDHH" in UTC, no chrono dependency (Hinnant's civil algo).
+    pub fn hour_partition(ts_ns: i64) -> String {
+        let secs = ts_ns.div_euclid(1_000_000_000);
+        let days = secs.div_euclid(86_400);
+        let sod = secs.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}{m:02}{d:02}{:02}", sod / 3600)
+    }
+
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +378,54 @@ mod tests {
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .unwrap();
         assert_eq!(step.values().len(), 2);
+    }
+
+    #[test]
+    fn flush_prepare_dedups_lww_and_splits_hours() {
+        // same PK twice (later write wins), plus a second hour partition
+        let h0 = 1_754_600_000_000_000_000i64; // some fixed instant
+        let h1 = h0 + 3_600_000_000_000; // exactly one hour later
+        let lp = format!(
+            "m,tag=a v=1.0 {h0}\nm,tag=a v=2.0 {h0}\nm,tag=b v=3.0 {h0}\nm,tag=a v=4.0 {h1}"
+        );
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
+        assert_eq!(parts.len(), 2, "two hour partitions");
+        let (p0, b0) = &parts[0];
+        let (p1, b1) = &parts[1];
+        assert!(p0 < p1);
+        assert_eq!(b0.num_rows(), 2, "duplicate PK collapsed");
+        assert_eq!(b1.num_rows(), 1);
+        // LWW: the surviving (h0, tag=a) row carries v=4? no — v=2.0
+        let v = b0
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let tags = b0.column_by_name("tag").unwrap();
+        let tag0 = datafusion::arrow::util::display::array_value_to_string(tags, 0).unwrap();
+        let (a_idx, b_idx) = if tag0 == "a" { (0, 1) } else { (1, 0) };
+        assert_eq!(v.value(a_idx), 2.0, "last write wins");
+        assert_eq!(v.value(b_idx), 3.0);
+        let (min, max) = flush::time_bounds(b0);
+        assert_eq!((min, max), (h0, h0));
+
+        // parquet roundtrip preserves rows and schema
+        let bytes = flush::to_parquet_bytes(b0).unwrap();
+        let back = flush::read_parquet_bytes(bytes).unwrap();
+        assert_eq!(back.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(back[0].schema().field(0).name(), "time");
+    }
+
+    #[test]
+    fn hour_partition_format() {
+        // 2026-08-08T09:00:00Z == 1786179600
+        assert_eq!(flush::hour_partition(1_786_179_600_000_000_000), "2026080809");
+        assert_eq!(flush::hour_partition(0), "1970010100");
     }
 
     #[test]

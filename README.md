@@ -16,18 +16,19 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M1 — the ingest path is real
+## Status: M2 — a real storage engine
 
-Line-protocol parser → WAL (durable before the 204) → mutable Arrow
-buffer with dictionary-encoded tags → DataFusion SQL over buffer
-snapshots under a bounded memory pool (RR-1). v1/v2/v3 write endpoints
-with gzip + precision support; `/api/sql` returns JSON rows.
+Ingest: parser → WAL (durable before the 204, generation-rotated) →
+buffer. Flush (L0): PK-sort + last-write-wins dedup → (table, UTC hour)
+Parquet partitions through the Store chokepoint → manifest-log catalog →
+WAL reclaim. Reads union buffer snapshots with cataloged Parquet under
+the RR-1 memory pool; WAL cap answers 429 (RR-5).
 
-AT-2 gate: smoke-scale bench run with **context counts exact to the row**
-(77,806 = every event written), all five canonical Shape B queries
-completing, and acknowledged writes surviving container restart via WAL
-replay. Not yet: Parquet flush + catalog (M2), so memory and WAL grow
-unbounded — smoke scale only.
+M2 gate: smoke suite green with counts exact to the row (77,806) before
+*and after* the full flush cycle (buffer 0, WAL 0 bytes, 52 Parquet
+files); **SIGKILL → healthy in 0.8 s** with zero acknowledged-write loss
+(RR-3). Known limits: cross-file dedup completes with compaction (M3);
+no file pruning yet; fresh-vs-settled work is M3/M4.
 
 ## Quickstart (Docker — no local Rust needed)
 
