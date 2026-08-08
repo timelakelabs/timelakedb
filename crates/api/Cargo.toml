@@ -1,7 +1,12 @@
-[package]
+﻿[package]
 name = "timelord-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true

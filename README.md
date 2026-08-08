@@ -16,10 +16,18 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M0
+## Status: M1 — the ingest path is real
 
-Cargo workspace + server stub (`/health`, `/ping`; write/SQL endpoints
-answer 501 until M1), bench adapter, compose target, CI.
+Line-protocol parser → WAL (durable before the 204) → mutable Arrow
+buffer with dictionary-encoded tags → DataFusion SQL over buffer
+snapshots under a bounded memory pool (RR-1). v1/v2/v3 write endpoints
+with gzip + precision support; `/api/sql` returns JSON rows.
+
+AT-2 gate: smoke-scale bench run with **context counts exact to the row**
+(77,806 = every event written), all five canonical Shape B queries
+completing, and acknowledged writes surviving container restart via WAL
+replay. Not yet: Parquet flush + catalog (M2), so memory and WAL grow
+unbounded — smoke scale only.
 
 ## Quickstart (Docker — no local Rust needed)
 

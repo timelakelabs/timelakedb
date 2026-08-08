@@ -58,10 +58,12 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- M0 gate: `bench/backends/timelorddb.py` `healthy()` returns True
-  against the running container (AT-1). The adapter is also the API
-  contract M1 implements: `/api/v3/write_lp?db=` for line protocol,
-  `POST /api/sql {"db","sql"}` → JSON row array, DataFusion SQL dialect.
+- Status: **M1 shipped** — parse → WAL → buffer → DataFusion works end to
+  end; AT-2 verified (smoke counts exact: 77,806; WAL survives container
+  restart). M1 limits: no Parquet flush/catalog yet (M2) — buffer memory
+  and WAL grow unbounded; no PK dedup yet (FR-5, M2); fsync per request
+  (group-commit windows are M4). Smoke gate command:
+  `python bench.py run --backend timelorddb --scale smoke --label X`.
 
 ## Ground rules for work in this directory
 
