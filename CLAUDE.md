@@ -58,16 +58,33 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M3 shipped** — compaction (cross-file LWW dedup, FR-5
-  complete), per-table retention (FR-7), Flight SQL on :1964 serving the
-  stock Grafana datasource (FR-8; fixture dashboards render unchanged;
-  grafana profile in the compose file, port 3003). Laptop gate: 616K
-  lines/s ingest, 0 errors, Shape B ≤1.6 s, burst 100K/0.17 s. Open
-  items: (1) 8-row (2 ppm) dedup delta vs accepted lines — compare with
-  influxdb3 on identical fresh data at the M4 gate; (2) no file pruning
-  yet (Shape A 517 ms at laptop — M4's bloom/pruning work); (3) `docker
-  kill` suppresses restart policies — drills use `docker restart -t 0`.
-  Use the `/tldb-gate` skill for build/test/gate commands.
+- Status: **M4 IN PROGRESS — gate RED.** Landed & unit-green (28 tests):
+  shared FairSpillPool + admission semaphore + server-side timeout
+  (QueryEnv), pruning LazyTable provider (time-bound file skip, bloom
+  row-group skip, projection pushdown, COUNT(*) empty projection),
+  bloom write props on dict columns, GC grace (fixes a real
+  compaction-vs-query race AT-3 exposed), schema registry. Full-scale
+  ingest reproducible: 517-660K lines/s, 0 errors (3 runs).
+  **Gate blockers, in order:**
+  1. `LazyTable::scan` does BLOCKING store.get + parquet decode on the
+     async runtime → tokio timeout cannot preempt it → a slow scan hangs
+     forever (journey_14 hung >300 s, wedged the whole Docker VM). Fix:
+     spawn_blocking or yielding chunked loads. THIS FIRST.
+  2. Compose service has NO memory limit — a runaway container took down
+     the Docker VM (all host containers!). Add mem_limit ~6g to
+     bench/compose/timelorddb.yml before any further full-scale run.
+  3. Shape A ~4 s/lookup at full scale: bloom row-group pruning
+     apparently ineffective — VERIFY blooms are actually written for
+     Dictionary columns (SerializedFileReader on a real file); arrow
+     writer may skip blooms for dict columns → may need write-path
+     change (e.g., bloom on values) or a per-file pid min/max index.
+  4. Earlier fix, needs re-verification at full scale: dictionary
+     double-count removed (batch_size 1M, DataSourceExec accounting).
+  5. Still pending: Shape B full-scale pass, exactness cross-check vs
+     influxdb3 (8-row/2 ppm LWW delta), then AT-3 scorecard + commit.
+  Run logs: bench/results/tldb-m4-full{,2,3}.log. Gate via /tldb-gate.
+  Also: (3 ppm) `docker kill` suppresses restart policies — drills use
+  `docker restart -t 0`.
 
 ## Ground rules for work in this directory
 

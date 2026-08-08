@@ -26,7 +26,7 @@ use timelord_api::WriteError;
 use timelord_buffer::{TableBuffer, flush};
 use timelord_catalog::{Catalog, FileMeta};
 use timelord_ingest::{parse_lines, precision_multiplier};
-use timelord_query::{QuerySession, batches_to_json, run_sql};
+use timelord_query::{QuerySession, batches_to_json};
 use timelord_store::{LocalStore, Store};
 use timelord_wal::Wal;
 
@@ -41,6 +41,14 @@ pub struct EngineConfig {
     pub compact_min_files: usize,
     /// Per-table retention (table name → seconds); FR-7. Empty = keep all.
     pub retention: Vec<(String, u64)>,
+    /// Admission control: queries beyond this queue (RR-1).
+    pub max_concurrent_queries: usize,
+    /// Server-side query cap (RR-2): abandoned work stops burning pool.
+    pub query_timeout_secs: u64,
+    /// Files superseded by compaction/retention are physically deleted
+    /// only after this grace (must exceed query_timeout so an in-flight
+    /// query's catalog snapshot never dangles — the AT-3 race).
+    pub gc_grace_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -52,6 +60,9 @@ impl Default for EngineConfig {
             wal_max_bytes: 2 << 30,      // RR-3 replay bound / RR-5 backpressure
             compact_min_files: 4,
             retention: Vec::new(),
+            max_concurrent_queries: 6,
+            query_timeout_secs: 600,
+            gc_grace_secs: 900,
         }
     }
 }
@@ -84,11 +95,20 @@ pub struct Engine {
     store: Arc<LocalStore>,
     catalog: Catalog<Arc<LocalStore>>,
     cfg: EngineConfig,
+    /// Shared pool + admission + timeout (RR-1/RR-2) — ONE for all queries.
+    query_env: timelord_query::QueryEnv,
+    /// Full column set per (db, table): survives flushes and restarts so
+    /// providers can present a stable merged schema without re-reading
+    /// every footer per query.
+    schemas: RwLock<HashMap<(String, String), timelord_query::QuerySchema>>,
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
     retention_drops_total: AtomicU64,
     file_seq: AtomicU64,
+    /// Deferred deletions: (when superseded, path). Drained by run_gc
+    /// after gc_grace_secs so in-flight catalog snapshots never dangle.
+    pending_gc: Mutex<Vec<(std::time::Instant, String)>>,
 }
 
 impl Engine {
@@ -100,24 +120,61 @@ impl Engine {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let (wal, frames) = Wal::open(&data_dir.join("wal"))?;
 
+        let query_env = timelord_query::QueryEnv::new(
+            cfg.query_mem_bytes,
+            cfg.max_concurrent_queries,
+            cfg.query_timeout_secs,
+        );
         let engine = Engine {
             dbs: RwLock::new(HashMap::new()),
             ingest_gate: RwLock::new(()),
             wal: Mutex::new(wal),
             store,
             catalog,
+            query_env,
+            schemas: RwLock::new(HashMap::new()),
             cfg,
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
             retention_drops_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
+            pending_gc: Mutex::new(Vec::new()),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
             let body = String::from_utf8_lossy(&body);
             if let Err(e) = engine.apply(&db, &body, mult, 0) {
                 tracing::warn!(db, error = %e, "skipping unreplayable WAL frame");
+            }
+        }
+        // Rebuild the schema registry from the NEWEST file per table
+        // (fullest column set in practice; compaction folds old columns
+        // forward over time). Full-footer sweep is an S3-era refinement.
+        {
+            let mut newest: HashMap<(String, String), String> = HashMap::new();
+            for f in engine.catalog.all_files() {
+                let key = (f.db.clone(), f.table.clone());
+                let e = newest.entry(key).or_default();
+                if f.path > *e {
+                    *e = f.path;
+                }
+            }
+            for ((db, table), path) in newest {
+                match engine.store.get(&path).map_err(|e| e.to_string()).and_then(|b| {
+                    flush::read_parquet_bytes(b)
+                        .map(|bs| bs.first().map(|b| b.schema()))
+                }) {
+                    Ok(Some(schema)) => {
+                        engine
+                            .schemas
+                            .write()
+                            .expect("schemas lock")
+                            .insert((db, table), schema);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(path, error = %e, "schema bootstrap failed"),
+                }
             }
         }
         tracing::info!(
@@ -130,11 +187,43 @@ impl Engine {
 
     fn apply(&self, db: &str, body: &str, mult: i64, default_ts_ns: i64) -> Result<usize, String> {
         let rows = parse_lines(body, mult, default_ts_ns).map_err(|e| e.to_string())?;
-        let mut dbs = self.dbs.write().expect("dbs lock");
-        let tables = dbs.entry(db.to_string()).or_default();
         let n = rows.len();
-        for row in &rows {
-            tables.entry(row.table.clone()).or_default().append(row)?;
+        let touched: Vec<(String, usize)> = {
+            let mut dbs = self.dbs.write().expect("dbs lock");
+            let tables = dbs.entry(db.to_string()).or_default();
+            for row in &rows {
+                tables.entry(row.table.clone()).or_default().append(row)?;
+            }
+            let mut touched: Vec<String> = rows.iter().map(|r| r.table.clone()).collect();
+            touched.sort();
+            touched.dedup();
+            touched
+                .into_iter()
+                .map(|t| {
+                    let cols = tables[&t].schema_only().fields().len();
+                    (t, cols)
+                })
+                .collect()
+        };
+        // registry upkeep only when a table's column set could have grown
+        for (table, cols) in touched {
+            let key = (db.to_string(), table.clone());
+            let known = self
+                .schemas
+                .read()
+                .expect("schemas lock")
+                .get(&key)
+                .map(|s| s.fields().len())
+                .unwrap_or(0);
+            if cols > known {
+                let schema = {
+                    let dbs = self.dbs.read().expect("dbs lock");
+                    dbs[db][&table].schema_only()
+                };
+                let mut reg = self.schemas.write().expect("schemas lock");
+                let merged = timelord_query::schema_union(reg.get(&key).cloned(), schema)?;
+                reg.insert(key, merged);
+            }
         }
         self.lines_total.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
@@ -189,6 +278,15 @@ impl Engine {
         let mut metas = Vec::new();
         for (db, table, buf) in owned {
             let batch = buf.snapshot()?;
+            // keep the registry current: flushed columns must remain
+            // queryable after the buffer empties (and after restart)
+            {
+                let key = (db.clone(), table.clone());
+                let mut reg = self.schemas.write().expect("schemas lock");
+                let merged =
+                    timelord_query::schema_union(reg.get(&key).cloned(), batch.schema())?;
+                reg.insert(key, merged);
+            }
             for (partition, part) in flush::prepare(&batch)? {
                 let (min_ts, max_ts) = flush::time_bounds(&part);
                 let bytes = flush::to_parquet_bytes(&part)?;
@@ -288,12 +386,9 @@ impl Engine {
                     remove.clone(),
                 )
                 .map_err(|e| format!("catalog commit: {e}"))?;
-            // GC after the durable commit; failures only leak space
-            for p in remove {
-                if let Err(e) = self.store.delete(&p) {
-                    tracing::warn!(path = p, error = %e, "gc delete failed");
-                }
-            }
+            // deletion is DEFERRED (gc_grace): in-flight queries hold
+            // catalog snapshots referencing the old paths (AT-3 race)
+            self.defer_gc(remove);
             done += 1;
         }
         if done > 0 {
@@ -330,15 +425,36 @@ impl Engine {
             self.catalog
                 .commit(Vec::new(), remove.clone())
                 .map_err(|e| format!("catalog commit: {e}"))?;
-            for p in remove {
-                if let Err(e) = self.store.delete(&p) {
-                    tracing::warn!(path = p, error = %e, "gc delete failed");
-                }
-            }
+            self.defer_gc(remove);
             self.retention_drops_total.fetch_add(n as u64, Ordering::Relaxed);
             tracing::info!(files = n, "retention drop");
         }
         Ok(n)
+    }
+
+    fn defer_gc(&self, paths: Vec<String>) {
+        let now = std::time::Instant::now();
+        let mut q = self.pending_gc.lock().expect("gc lock");
+        q.extend(paths.into_iter().map(|p| (now, p)));
+    }
+
+    /// Physically delete superseded files older than the grace window.
+    pub fn run_gc(&self) -> usize {
+        let grace = std::time::Duration::from_secs(self.cfg.gc_grace_secs);
+        let due: Vec<String> = {
+            let mut q = self.pending_gc.lock().expect("gc lock");
+            let (ready, keep): (Vec<_>, Vec<_>) =
+                q.drain(..).partition(|(t, _)| t.elapsed() >= grace);
+            *q = keep;
+            ready.into_iter().map(|(_, p)| p).collect()
+        };
+        let n = due.len();
+        for p in due {
+            if let Err(e) = self.store.delete(&p) {
+                tracing::warn!(path = p, error = %e, "gc delete failed");
+            }
+        }
+        n
     }
 }
 
@@ -410,32 +526,41 @@ impl Engine {
             return Err(format!("database '{db}' does not exist (write to it first)"));
         }
 
-        let mut tables: Vec<(String, Vec<timelord_query::QueryBatch>)> =
+        let mut tables: Vec<(String, Arc<dyn timelord_query::DfTableProvider>)> =
             Vec::with_capacity(names.len());
         for name in names {
-            let mut batches = Vec::new();
-            {
+            let buffer: Vec<timelord_query::QueryBatch> = {
                 let dbs = self.dbs.read().expect("dbs lock");
-                if let Some(buf) = dbs.get(db).and_then(|t| t.get(&name)) {
-                    if buf.row_count() > 0 {
-                        batches.push(buf.snapshot()?);
-                    }
+                match dbs.get(db).and_then(|t| t.get(&name)) {
+                    Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
+                    _ => Vec::new(),
                 }
+            };
+            let files = self.catalog.files_for(db, &name);
+            if buffer.is_empty() && files.is_empty() {
+                continue;
             }
-            for meta in self.catalog.files_for(db, &name) {
-                let bytes = self
-                    .store
-                    .get(&meta.path)
-                    .map_err(|e| format!("store get {}: {e}", meta.path))?;
-                batches.extend(flush::read_parquet_bytes(bytes)?);
+            // merged schema: registry (covers files + past flushes) ∪ buffer
+            let key = (db.to_string(), name.clone());
+            let mut schema = self.schemas.read().expect("schemas lock").get(&key).cloned();
+            if let Some(b) = buffer.first() {
+                schema = Some(timelord_query::schema_union(schema, b.schema())?);
             }
-            if !batches.is_empty() {
-                tables.push((name, batches));
-            }
+            let Some(schema) = schema else { continue };
+
+            let store_dyn: Arc<dyn Store> = self.store.clone();
+            let provider = timelord_query::provider::LazyTable::new(
+                schema,
+                buffer,
+                files,
+                store_dyn,
+                self.query_env.runtime.clone(),
+            );
+            tables.push((name, Arc::new(provider)));
         }
 
         let session = QuerySession::default();
-        run_sql(&session, tables, query, self.cfg.query_mem_bytes).await
+        timelord_query::run_sql_env(&self.query_env, &session, tables, query).await
     }
 
     pub fn metrics_text_impl(&self) -> String {
@@ -505,6 +630,9 @@ pub fn config_from_env() -> EngineConfig {
         retention: std::env::var("TIMELORD_RETENTION")
             .map(|s| parse_retention(&s))
             .unwrap_or_default(),
+        max_concurrent_queries: env("TIMELORD_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
+        query_timeout_secs: env("TIMELORD_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
+        gc_grace_secs: env("TIMELORD_GC_GRACE_SECS", d.gc_grace_secs),
     }
 }
 

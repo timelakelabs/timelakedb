@@ -7,8 +7,12 @@ license.workspace = true
 [dependencies]
 datafusion.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+bytes.workspace = true
+timelord-store = { path = "../store" }
+timelord-catalog = { path = "../catalog" }
 
 [dev-dependencies]
-tokio.workspace = true
 timelord-buffer = { path = "../buffer" }
 timelord-ingest = { path = "../ingest" }

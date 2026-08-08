@@ -9,6 +9,10 @@ services:
     ports:
       - "1963:1963"   # HTTP: line-protocol writes + /api/sql
       - "1964:1964"   # Flight SQL (Grafana, FR-8)
+    environment:
+      # RR-1 pool at ~20% of the 16 GB VM — the same policy the InfluxDB 3
+      # baseline ran with, for a fair AT-3 comparison
+      TIMELORD_QUERY_MEM_BYTES: "3221225472"
     volumes:
       - ./data/timelord:/var/lib/timelord/data
     restart: unless-stopped

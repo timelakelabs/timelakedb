@@ -3030,10 +3030,14 @@ version = "0.1.0"
 name = "timelord-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "datafusion",
  "serde_json",
  "timelord-buffer",
+ "timelord-catalog",
  "timelord-ingest",
+ "timelord-store",
  "tokio",
 ]
 
