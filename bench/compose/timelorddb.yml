@@ -10,11 +10,19 @@ services:
       - "1963:1963"   # HTTP: line-protocol writes + /api/sql
       - "1964:1964"   # Flight SQL (Grafana, FR-8)
     environment:
-      # RR-1 pool at ~20% of the 16 GB VM — the same policy the InfluxDB 3
-      # baseline ran with, for a fair AT-3 comparison
-      TIMELORD_QUERY_MEM_BYTES: "3221225472"
+      # RR-1: one shared 3.5 GB pool; with 2 admitted queries worst-case
+      # tracked residency is 7 GB, inside the 8 GB cap below. (The
+      # influxdb3 baseline peaked at 9.2 GB unconstrained on this VM.)
+      TIMELORD_QUERY_MEM_BYTES: "3758096384"
+      TIMELORD_MAX_CONCURRENT_QUERIES: "2"
+    # A runaway engine must never take the host VM down with it (learned
+    # the hard way: an unkillable scan wedged Docker Desktop entirely)
+    mem_limit: 8g
     volumes:
-      - ./data/timelord:/var/lib/timelord/data
+      # named volume: native VM filesystem. A Windows bind mount here cost
+      # ~3 s/query in whole-file read overhead (measured); range reads
+      # over a real object store are the M5 refinement.
+      - timelord-data:/var/lib/timelord/data
     restart: unless-stopped
 
   # AT-6 read half: the UNCHANGED fixture dashboards over Flight SQL.
@@ -35,3 +43,6 @@ services:
     restart: unless-stopped
     depends_on:
       - timelorddb
+
+volumes:
+  timelord-data:

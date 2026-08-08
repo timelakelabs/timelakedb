@@ -247,17 +247,40 @@ pub mod flush {
     use datafusion::parquet::file::properties::WriterProperties;
 
     /// Sort by primary key (time, tags...), keep the LAST write per PK,
-    /// and split into (hour_partition, batch) pieces.
+    /// and split into (hour_partition, batch) pieces. L0 flush order:
+    /// time-first (file min/max time bounds do the pruning for fresh data).
     pub fn prepare(batch: &RecordBatch) -> Result<Vec<(String, RecordBatch)>, String> {
+        prepare_ordered(batch, None)
+    }
+
+    /// Like [`prepare`] but with `leading` (a tag column) as the primary
+    /// sort key — compaction uses this to CLUSTER settled files by their
+    /// hottest entity column, so row-group statistics on that column
+    /// become tight ranges and Shape-A pruning works without bloom
+    /// filters (which the arrow writer does not emit for dictionary
+    /// columns — proven by test, ARCHITECTURE §9 rung 3).
+    /// Dedup semantics are unchanged: the sort key SET is the same PK,
+    /// only the order differs, so equal PKs remain adjacent.
+    pub fn prepare_ordered(
+        batch: &RecordBatch,
+        leading: Option<&str>,
+    ) -> Result<Vec<(String, RecordBatch)>, String> {
         let n = batch.num_rows();
         if n == 0 {
             return Ok(Vec::new());
         }
-        // PK columns: time (index 0 by construction) + every dictionary
-        // (tag) column
-        let mut pk_cols = vec![batch.column(0).clone()];
+        let mut pk_cols = Vec::new();
+        if let Some(name) = leading {
+            if let Some(c) = batch.column_by_name(name) {
+                pk_cols.push(c.clone());
+            }
+        }
+        // time (index 0 by construction) + every dictionary (tag) column
+        pk_cols.push(batch.column(0).clone());
         for (i, f) in batch.schema().fields().iter().enumerate().skip(1) {
-            if matches!(f.data_type(), DataType::Dictionary(_, _)) {
+            if matches!(f.data_type(), DataType::Dictionary(_, _))
+                && leading != Some(f.name().as_str())
+            {
                 pk_cols.push(batch.column(i).clone());
             }
         }
@@ -315,29 +338,38 @@ pub mod flush {
         Ok(out)
     }
 
-    /// (min_ts_ns, max_ts_ns) of a prepared (time-sorted) batch.
+    /// (min_ts_ns, max_ts_ns) of a prepared batch (any sort order).
     pub fn time_bounds(batch: &RecordBatch) -> (i64, i64) {
         let times = batch
             .column(0)
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .expect("time column");
-        (times.value(0), times.value(times.len() - 1))
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for i in 0..times.len() {
+            let v = times.value(i);
+            min = min.min(v);
+            max = max.max(v);
+        }
+        (min, max)
     }
 
     pub fn to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, String> {
-        // bloom filters on every tag (dictionary) column: PR-3's
-        // row-group pruning for `tag = 'literal'` predicates
+        to_parquet_bytes_rg(batch, None)
+    }
+
+    /// `rg_rows` bounds row-group size: compaction writes SMALL groups
+    /// (64K) over entity-clustered data so per-group statistics become
+    /// tight, prunable ranges. (Bloom filters would be preferable but the
+    /// arrow writer does not emit them for dictionary columns.)
+    pub fn to_parquet_bytes_rg(
+        batch: &RecordBatch,
+        rg_rows: Option<usize>,
+    ) -> Result<Vec<u8>, String> {
         let mut props = WriterProperties::builder().set_compression(Compression::SNAPPY);
-        for f in batch.schema().fields() {
-            if matches!(f.data_type(), DataType::Dictionary(_, _)) {
-                props = props.set_column_bloom_filter_enabled(
-                    datafusion::parquet::schema::types::ColumnPath::new(vec![
-                        f.name().clone(),
-                    ]),
-                    true,
-                );
-            }
+        if let Some(rows) = rg_rows {
+            props = props.set_max_row_group_row_count(Some(rows));
         }
         let props = props.build();
         let mut out = Vec::new();
@@ -458,6 +490,57 @@ mod tests {
         let back = flush::read_parquet_bytes(bytes).unwrap();
         assert_eq!(back.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
         assert_eq!(back[0].schema().field(0).name(), "time");
+    }
+
+    #[test]
+    fn dict_columns_get_no_blooms_hence_entity_clustering() {
+        // Documented constraint (M4): the arrow writer emits NO bloom
+        // filters for dictionary columns — so compaction clusters by
+        // entity and pruning uses row-group statistics instead. This
+        // test pins the constraint (if blooms ever appear, revisit) and
+        // verifies the clustered write path.
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..2000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", (i * 7919) % 2000, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let snap = buf.snapshot().unwrap();
+
+        // clustered prepare: pid becomes the leading sort key
+        let parts = flush::prepare_ordered(&snap, Some("pid")).unwrap();
+        let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(256)).unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let md = reader.metadata();
+        assert!(md.num_row_groups() > 3, "small row groups requested");
+        let descr = md.file_metadata().schema_descr_ptr();
+        let pid_idx = (0..descr.num_columns())
+            .find(|i| descr.column(*i).name() == "pid")
+            .expect("pid column");
+        // the constraint: still no bloom
+        let rg0 = reader.get_row_group(0).unwrap();
+        assert!(rg0.get_column_bloom_filter(pid_idx).is_none());
+        // clustering: row-group pid ranges are disjoint & ordered
+        use datafusion::parquet::file::statistics::Statistics;
+        let mut prev_max: Option<Vec<u8>> = None;
+        for rg in 0..md.num_row_groups() {
+            if let Some(Statistics::ByteArray(s)) =
+                md.row_group(rg).column(pid_idx).statistics()
+            {
+                let (min, max) = (s.min_opt().unwrap(), s.max_opt().unwrap());
+                if let Some(prev) = &prev_max {
+                    assert!(
+                        min.data() >= prev.as_slice(),
+                        "row-group entity ranges must be ordered"
+                    );
+                }
+                prev_max = Some(max.data().to_vec());
+            }
+        }
     }
 
     #[test]

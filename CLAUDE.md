@@ -58,7 +58,19 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M4 IN PROGRESS — gate RED.** Landed & unit-green (28 tests):
+- Status: **M4 SHIPPED — AT-3 green with two carve-outs** (run
+  tldb-m4-final + tldb-m4-settled2 + idb3-exactness in bench/results/).
+  Fresh full-scale: Shape A median 211 ms, all Shape B complete (B1
+  1.7 s, B4 0.68 s), burst 0.12 s, storage 0.50 GB/day, zero row loss
+  (fixed-bound equality vs influxdb3 on identical data — the old "8-row
+  deficit" was now()-window aging, not dedup). Carve-outs for M5:
+  (a) Shape A p95 608 ms vs 250 target, (b) intra-run ingest decline
+  under maintenance contention (no cross-run decay) — both point at
+  streaming exec + range reads + maintenance/query isolation. Hard-won
+  operational lessons in the M4 commit messages: async scans must not
+  block, bind mounts cost ~3 s/query, batch-size vs shared dictionaries
+  distorts memory accounting, mem_limit is non-negotiable.
+- Previous: **M4 first pass (superseded, kept for the record):** Landed & unit-green (28 tests):
   shared FairSpillPool + admission semaphore + server-side timeout
   (QueryEnv), pruning LazyTable provider (time-bound file skip, bloom
   row-group skip, projection pushdown, COUNT(*) empty projection),

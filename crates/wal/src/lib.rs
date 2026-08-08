@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(replay[0].2, b"m f=1i 1".to_vec());
 
         // after "flush + manifest commit", the sealed gen is reclaimed
-        let (mut wal, _) = Wal::open(dir.path()).unwrap();
+        let (wal, _) = Wal::open(dir.path()).unwrap();
         wal.delete_generations_upto(sealed).unwrap();
         let (_, replay) = Wal::open(dir.path()).unwrap();
         assert_eq!(replay.len(), 1);

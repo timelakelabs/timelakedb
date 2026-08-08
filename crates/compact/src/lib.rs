@@ -30,7 +30,31 @@ pub fn merge_files(batch_sets: Vec<Vec<RecordBatch>>) -> Result<MergeResult, Str
     }
     let (schema, aligned) = align(batches)?;
     let combined = concat_batches(&schema, &aligned).map_err(|e| e.to_string())?;
-    let mut parts = flush::prepare(&combined)?;
+
+    // Cluster settled files by the highest-cardinality tag column so
+    // row-group statistics on it become tight, prunable ranges (Shape A
+    // without bloom filters — the arrow writer emits none for dictionary
+    // columns). Self-tuning: no per-workload config.
+    let cluster: Option<String> = {
+        use datafusion::arrow::array::DictionaryArray;
+        use datafusion::arrow::datatypes::{DataType, Int32Type};
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f.data_type(), DataType::Dictionary(_, _)))
+            .filter_map(|(i, f)| {
+                combined
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .map(|d| (d.values().len(), f.name().clone()))
+            })
+            .max()
+            .map(|(_, name)| name)
+    };
+
+    let mut parts = flush::prepare_ordered(&combined, cluster.as_deref())?;
     if parts.len() != 1 {
         return Err(format!(
             "merge crossed hour partitions ({} produced) — inputs must share one partition",
@@ -41,7 +65,8 @@ pub fn merge_files(batch_sets: Vec<Vec<RecordBatch>>) -> Result<MergeResult, Str
     let (min_ts_ns, max_ts_ns) = flush::time_bounds(&merged);
     Ok(MergeResult {
         rows: merged.num_rows() as u64,
-        bytes: flush::to_parquet_bytes(&merged)?,
+        // 64K-row groups: ~12 tight entity ranges per hour partition
+        bytes: flush::to_parquet_bytes_rg(&merged, Some(65_536))?,
         min_ts_ns,
         max_ts_ns,
     })

@@ -550,11 +550,13 @@ impl Engine {
 
             let store_dyn: Arc<dyn Store> = self.store.clone();
             let provider = timelord_query::provider::LazyTable::new(
+                name.clone(),
                 schema,
                 buffer,
                 files,
                 store_dyn,
-                self.query_env.runtime.clone(),
+                std::time::Duration::from_secs(self.cfg.query_timeout_secs),
+                self.query_env.runtime.memory_pool.clone(),
             );
             tables.push((name, Arc::new(provider)));
         }

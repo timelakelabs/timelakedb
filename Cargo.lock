@@ -3039,6 +3039,7 @@ dependencies = [
  "timelord-ingest",
  "timelord-store",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

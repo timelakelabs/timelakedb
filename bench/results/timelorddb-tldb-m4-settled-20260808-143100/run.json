@@ -1,0 +1,108 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-tldb-m4-settled-20260808-143100",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:1963",
+    "db": "poc",
+    "container": "timelorddb",
+    "image": "bench-timelorddb-timelorddb"
+  },
+  "started_at": "2026-08-08T14:31:00-0400",
+  "finished_at": "2026-08-08T14:33:26-0400",
+  "config": {
+    "scale": "full",
+    "label": "tldb-m4-settled",
+    "products_per_day": 1000000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 2500,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 8,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "query_a",
+      "query_b"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "query_shape_a": {
+      "n": 20,
+      "errors": 0,
+      "median_ms": 5008,
+      "p95_ms": 5761,
+      "max_ms": 5778
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 4386,
+          "warm_ms": 3838,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 8368,
+          "warm_ms": 10093,
+          "rows": 10,
+          "errors": 1
+        },
+        "B3_inflight_24h": {
+          "cold_ms": null,
+          "warm_ms": null,
+          "rows": null,
+          "errors": 3
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": null,
+          "warm_ms": null,
+          "rows": null,
+          "errors": 3
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": null,
+          "warm_ms": null,
+          "rows": null,
+          "errors": 3
+        }
+      },
+      "total_errors": 10,
+      "all_completed": false
+    },
+    "resources": {
+      "baseline_mem_mb": null,
+      "settled_mem_mb": 35.4,
+      "returned_to_baseline": null,
+      "phases": {
+        "query_a": {
+          "peak_mem_mb": 6442.5,
+          "peak_cpu_pct": 165.8,
+          "samples": 50
+        },
+        "query_b": {
+          "peak_mem_mb": 6442.5,
+          "peak_cpu_pct": 1063.8,
+          "samples": 17
+        },
+        "settle": {
+          "peak_mem_mb": 35.4,
+          "peak_cpu_pct": 0.0,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}
