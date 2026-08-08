@@ -1,0 +1,21 @@
+tsdb-bench run: timelorddb-tldb-m5-kill2-20260808-155546
+  backend   TimelordDB @ http://localhost:1963 (db=poc)
+  scale     laptop: 100,000 products/day x 2d, 300 hosts x 6.0h, burst 100,000
+  scenarios ingest
+  sampling baseline memory (6s)...
+[15:55:52] INGEST: 200,000 products over 2d (~4,000,000 events), 400 chunks, 4 workers
+[15:55:53]   40/400 chunks | 365,246 lines | 521,520 lines/s | 0 errors
+[15:55:54]   80/400 chunks | 729,922 lines | 551,542 lines/s | 0 errors
+[15:55:54]   120/400 chunks | 1,095,998 lines | 555,771 lines/s | 0 errors
+[15:55:55]   160/400 chunks | 1,462,400 lines | 566,461 lines/s | 0 errors
+[15:55:56]   200/400 chunks | 1,827,902 lines | 567,345 lines/s | 0 errors
+[15:55:56]   240/400 chunks | 2,192,932 lines | 564,188 lines/s | 0 errors
+[15:55:57]   280/400 chunks | 2,558,120 lines | 569,076 lines/s | 0 errors
+[15:55:58]   320/400 chunks | 2,924,280 lines | 566,227 lines/s | 0 errors
+[15:55:58]   360/400 chunks | 3,290,210 lines | 566,172 lines/s | 0 errors
+[15:56:05]   400/400 chunks | 3,656,634 lines | 287,044 lines/s | 0 errors
+[15:56:05] INGEST done: 3,656,634 lines in 12.7s (286,957 lines/s, 0 errors)
+
+Run complete in 22s
+  C:\project-time-lord-db\TimelordDB\bench\results\timelorddb-tldb-m5-kill2-20260808-155546\run.json
+  compare runs with: python bench.py compare C:\project-time-lord-db\TimelordDB\bench\results\*\run.json

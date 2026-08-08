@@ -107,12 +107,22 @@ fn str_literal(e: &Expr) -> Option<String> {
     }
 }
 
+/// Engine-lifetime cache of parquet footers, keyed by object path.
+/// Sound because data files are IMMUTABLE (CL-1): a path's metadata
+/// never changes; superseded paths simply stop being referenced.
+/// Lets warm queries prune row groups WITHOUT fetching file bytes —
+/// only files that survive pruning get read at all.
+pub type MetaCache = std::sync::Mutex<
+    std::collections::HashMap<String, Arc<datafusion::parquet::file::metadata::ParquetMetaData>>,
+>;
+
 pub struct LazyTable {
     name: String,
     schema: SchemaRef,
     buffer: Vec<RecordBatch>,
     files: Vec<FileMeta>,
     store: Arc<dyn Store>,
+    meta_cache: Arc<MetaCache>,
     /// Loads run on the blocking pool with this deadline: a slow scan is
     /// abandoned between files instead of pinning the async runtime
     /// forever (the M4 hang that wedged a whole Docker VM).
@@ -142,6 +152,7 @@ impl LazyTable {
         store: Arc<dyn Store>,
         load_timeout: std::time::Duration,
         pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        meta_cache: Arc<MetaCache>,
     ) -> Self {
         LazyTable {
             name,
@@ -151,6 +162,7 @@ impl LazyTable {
             store,
             load_timeout,
             pool,
+            meta_cache,
         }
     }
 }
@@ -203,6 +215,7 @@ fn load_pruned(
     deadline: std::time::Instant,
     pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     table: &str,
+    meta_cache: &Arc<MetaCache>,
 ) -> Result<(Vec<RecordBatch>, datafusion::execution::memory_pool::MemoryReservation), String> {
     use datafusion::execution::memory_pool::MemoryConsumer;
     // RR-1: loads are pool-visible at ACTUAL batch size. Accurate now:
@@ -239,23 +252,60 @@ fn load_pruned(
                 continue;
             }
         }
-        let bytes = bytes::Bytes::from(
-            store
-                .get(&meta.path)
-                .map_err(|e| format!("store get {}: {e}", meta.path))?,
-        );
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| e.to_string())?;
 
-        // row-group statistics pruning for tag equality literals (PR-3)
-        let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
-            (0..builder.metadata().num_row_groups()).collect()
-        } else {
-            stats_keep_row_groups(builder.metadata(), &pruning.tag_equals)
+        // metadata-cache fast path: on a warm footer, decide row-group
+        // pruning WITHOUT fetching the file — only survivors get read
+        let cached_md = meta_cache
+            .lock()
+            .expect("meta cache lock")
+            .get(&meta.path)
+            .cloned();
+        let (keep, mut bytes_opt): (Vec<usize>, Option<bytes::Bytes>) = match cached_md {
+            Some(md) => {
+                let keep = if pruning.tag_equals.is_empty() {
+                    (0..md.num_row_groups()).collect()
+                } else {
+                    stats_keep_row_groups(&md, &pruning.tag_equals)
+                };
+                (keep, None)
+            }
+            None => {
+                let bytes = bytes::Bytes::from(
+                    store
+                        .get(&meta.path)
+                        .map_err(|e| format!("store get {}: {e}", meta.path))?,
+                );
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                    .map_err(|e| e.to_string())?;
+                let md: Arc<_> = Arc::new(builder.metadata().as_ref().clone());
+                {
+                    let mut cache = meta_cache.lock().expect("meta cache lock");
+                    if cache.len() > 4096 {
+                        cache.clear(); // crude bound; files are few post-compaction
+                    }
+                    cache.insert(meta.path.clone(), md.clone());
+                }
+                let keep = if pruning.tag_equals.is_empty() {
+                    (0..md.num_row_groups()).collect()
+                } else {
+                    stats_keep_row_groups(&md, &pruning.tag_equals)
+                };
+                (keep, Some(bytes))
+            }
         };
         if keep.is_empty() {
             continue;
         }
+        let bytes = match bytes_opt.take() {
+            Some(b) => b,
+            None => bytes::Bytes::from(
+                store
+                    .get(&meta.path)
+                    .map_err(|e| format!("store get {}: {e}", meta.path))?,
+            ),
+        };
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| e.to_string())?;
 
         // projection pushdown: decode only the columns the plan needs
         let builder = match needed {
@@ -390,6 +440,7 @@ impl TableProvider for LazyTable {
         let deadline = std::time::Instant::now() + self.load_timeout;
         let pool = self.pool.clone();
         let table_name = self.name.clone();
+        let meta_cache = self.meta_cache.clone();
         let (batches, reservation) = tokio::task::spawn_blocking(move || {
             load_pruned(
                 &buffer,
@@ -400,6 +451,7 @@ impl TableProvider for LazyTable {
                 deadline,
                 &pool,
                 &table_name,
+                &meta_cache,
             )
         })
         .await

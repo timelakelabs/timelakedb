@@ -44,5 +44,17 @@ services:
     depends_on:
       - timelorddb
 
+  # AT-6 write half: stock Telegraf feeding TimelordDB.
+  #   docker compose -f compose/timelorddb.yml --profile telegraf up -d
+  telegraf:
+    image: telegraf:latest
+    container_name: timelord-telegraf
+    profiles: ["telegraf"]
+    volumes:
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    restart: unless-stopped
+    depends_on:
+      - timelorddb
+
 volumes:
   timelord-data:

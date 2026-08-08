@@ -16,7 +16,25 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M4 — full-scale gate passed (two carve-outs)
+## Status: M5 — acceptance drills complete
+
+- **AT-6:** stock Telegraf (`influxdb_v2` output, gzip default) writes
+  with only a URL; the fixture Grafana dashboards render over Flight SQL.
+- **AT-5:** backup 34 s / restore-from-destroyed-volume 13 s with all
+  36.68M rows exact (vs 10–15 min on the 1.x incumbent); SIGKILL
+  mid-ingest → healthy in 4.7 s, zero acknowledged-write loss (count
+  exact at 40.34M); ten consecutive 100K bursts absorbed ≤0.13 s each,
+  0 errors, concurrent queries stable.
+- **AT-4:** repeat full-scale run within tolerance (ingest ±3.5%,
+  funnels ±6%, storage ±9%, 0 errors both runs).
+- **Metadata cache:** warm journey lookups **0–6 ms** (immutable footers
+  prune without fetching; only surviving files are read) — the M4 p95
+  carve-out closed; cold ≈300 ms.
+
+Remaining before v1: SEC-3 TLS + cert rotation (AT-7), streaming/range-
+read execution (ingest-contention carve-out), CI on a remote.
+
+### Previous: M4 — full-scale gate passed (two carve-outs)
 
 The read path earned its full-scale numbers the hard way: five gate
 attempts, each failure measured and fixed — shared memory pool with

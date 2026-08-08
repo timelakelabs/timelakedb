@@ -1,0 +1,76 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-tldb-m5-burst4-20260808-154921",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:1963",
+    "db": "poc",
+    "container": "timelorddb",
+    "image": "bench-timelorddb-timelorddb"
+  },
+  "started_at": "2026-08-08T15:49:27-0400",
+  "finished_at": "2026-08-08T15:49:39-0400",
+  "config": {
+    "scale": "full",
+    "label": "tldb-m5-burst4",
+    "products_per_day": 1000000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 2500,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 8,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "burst"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "burst": {
+      "events": 100000,
+      "wall_s": 0.08,
+      "events_per_s": 1204885,
+      "errors": 0,
+      "batch_p50_ms": 44,
+      "batch_p95_ms": 62,
+      "batch_max_ms": 67,
+      "concurrent_query_ms": 2867,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "resources": {
+      "baseline_mem_mb": 2455.6,
+      "settled_mem_mb": 2965.7,
+      "returned_to_baseline": true,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 2456.7,
+          "peak_cpu_pct": 5.0,
+          "samples": 3
+        },
+        "burst": {
+          "peak_mem_mb": 2778.8,
+          "peak_cpu_pct": 99.7,
+          "samples": 1
+        },
+        "settle": {
+          "peak_mem_mb": 2967.8,
+          "peak_cpu_pct": 1033.1,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}
