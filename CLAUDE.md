@@ -58,7 +58,15 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M4 SHIPPED — AT-3 green with two carve-outs** (run
+- Status: **M5 SHIPPED — AT-4/5/6 complete.** Metadata cache (immutable
+  footers) → warm Shape A 0–6 ms, cold ~300 ms. Backup 34 s / restore
+  13 s exact; SIGKILL mid-ingest recovery 4.7 s, zero loss (40,340,794
+  exact); 10× 100K bursts clean; repeat run within tolerance; stock
+  Telegraf writing (compose profile "telegraf"). Backup note: live
+  snapshots are safe by objects-before-manifest ordering; quiesce only
+  eliminates a tiny manifest-tear window. Next: SEC-3 TLS + AT-7 drill;
+  streaming/range reads for the ingest-contention carve-out.
+- Previous: **M4 — AT-3 green with two carve-outs** (run
   tldb-m4-final + tldb-m4-settled2 + idb3-exactness in bench/results/).
   Fresh full-scale: Shape A median 211 ms, all Shape B complete (B1
   1.7 s, B4 0.68 s), burst 0.12 s, storage 0.50 GB/day, zero row loss

@@ -109,6 +109,8 @@ pub struct Engine {
     /// Deferred deletions: (when superseded, path). Drained by run_gc
     /// after gc_grace_secs so in-flight catalog snapshots never dangle.
     pending_gc: Mutex<Vec<(std::time::Instant, String)>>,
+    /// Immutable-footer cache: warm queries prune without fetching files.
+    meta_cache: Arc<timelord_query::provider::MetaCache>,
 }
 
 impl Engine {
@@ -140,6 +142,7 @@ impl Engine {
             retention_drops_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
             pending_gc: Mutex::new(Vec::new()),
+            meta_cache: Arc::new(Default::default()),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -557,6 +560,7 @@ impl Engine {
                 store_dyn,
                 std::time::Duration::from_secs(self.cfg.query_timeout_secs),
                 self.query_env.runtime.memory_pool.clone(),
+                self.meta_cache.clone(),
             );
             tables.push((name, Arc::new(provider)));
         }
