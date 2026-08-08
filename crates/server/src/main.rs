@@ -59,14 +59,84 @@ async fn main() {
         .parse()
         .expect("TIMELORD_FLIGHT_ADDR must be host:port");
     let flight_backend: Arc<dyn timelord_flight::SqlBackend> = engine.clone();
-    tokio::spawn(async move {
-        if let Err(e) = timelord_flight::serve(flight_backend, flight_addr).await {
-            tracing::error!(error = %e, "flight sql server exited");
-        }
-    });
 
-    let listener = TcpListener::bind(&addr).await.expect("bind listen address");
-    axum::serve(listener, timelord_server::app(engine))
-        .await
-        .expect("server error");
+    // SEC-3: TLS on BOTH listeners when cert+key are configured; the
+    // fixtures and bench stay plaintext by simply not setting these.
+    let tls_cert = std::env::var("TIMELORD_TLS_CERT").ok();
+    let tls_key = std::env::var("TIMELORD_TLS_KEY").ok();
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let rot = timelord_tls::RotatingCert::load(cert.as_ref(), key.as_ref())
+                .expect("initial TLS cert load must succeed (no last-good yet)");
+            engine.set_tls(Arc::clone(&rot));
+            // Floor is TLS 1.3; TIMELORD_TLS_MIN=1.2 lowers it (SEC-3).
+            let allow_tls12 = std::env::var("TIMELORD_TLS_MIN").as_deref() == Ok("1.2");
+            tracing::info!(
+                expires_in_secs = rot.expires_in_secs(),
+                min_version = if allow_tls12 { "1.2" } else { "1.3" },
+                "TLS enabled on HTTP and Flight SQL listeners"
+            );
+
+            // File watcher: certbot-style renewals just overwrite the
+            // files; poll mtimes (2 s), debounce, reload. A failed reload
+            // alarms and keeps last-good — it must NOT stop the watcher.
+            let watcher = Arc::clone(&rot);
+            tokio::spawn(async move {
+                let mut last = watcher.mtimes();
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let now = watcher.mtimes();
+                    if now.is_some() && now != last {
+                        // Debounce: cert and key are two files; let the
+                        // writer finish both before validating the pair.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let settled = watcher.mtimes();
+                        let w = Arc::clone(&watcher);
+                        let _ = tokio::task::spawn_blocking(move || w.reload()).await;
+                        last = settled;
+                    } else {
+                        last = now;
+                    }
+                }
+            });
+
+            // Flight SQL over TLS (gRPC wants ALPN h2).
+            let flight_tls = rot.server_config(allow_tls12, &[b"h2".as_slice()]);
+            tokio::spawn(async move {
+                if let Err(e) =
+                    timelord_flight::serve_tls(flight_backend, flight_addr, flight_tls).await
+                {
+                    tracing::error!(error = %e, "flight sql (TLS) server exited");
+                }
+            });
+
+            // HTTP over TLS. axum-server drives hyper over our rustls
+            // config; the resolver inside it is the rotation point.
+            let http_tls = rot.server_config(allow_tls12, &[b"h2".as_slice(), b"http/1.1"]);
+            let sock_addr: std::net::SocketAddr =
+                addr.parse().expect("TIMELORD_ADDR must be host:port under TLS");
+            let app = timelord_server::app_with_tls_admin(engine, rot);
+            axum_server::bind_rustls(
+                sock_addr,
+                axum_server::tls_rustls::RustlsConfig::from_config(http_tls),
+            )
+            .serve(app.into_make_service())
+            .await
+            .expect("server error (TLS)");
+        }
+        (None, None) => {
+            tokio::spawn(async move {
+                if let Err(e) = timelord_flight::serve(flight_backend, flight_addr).await {
+                    tracing::error!(error = %e, "flight sql server exited");
+                }
+            });
+            let listener = TcpListener::bind(&addr).await.expect("bind listen address");
+            axum::serve(listener, timelord_server::app(engine))
+                .await
+                .expect("server error");
+        }
+        _ => panic!("TIMELORD_TLS_CERT and TIMELORD_TLS_KEY must be set together"),
+    }
 }

@@ -1,0 +1,45 @@
+#!/bin/sh
+# AT-7 drill certs: a throwaway CA plus a short-TTL (24 h) server cert —
+# the daily-renewal shape SEC-3 is designed for. Usage:
+#   ./gen-certs.sh initial   # CA + server.crt/key (the pair the server boots with)
+#   ./gen-certs.sh renewal   # renewal.crt/key: fresh 24 h pair from the same CA
+# SANs cover host-side clients (localhost/127.0.0.1) and the in-compose
+# hostname Telegraf dials (timelorddb-tls).
+set -e
+cd "$(dirname "$0")"
+# Git-Bash on Windows rewrites "/CN=..." into a filesystem path without this
+export MSYS_NO_PATHCONV=1
+mkdir -p certs
+SAN="subjectAltName=DNS:localhost,DNS:timelorddb-tls,IP:127.0.0.1"
+
+if [ "$1" = "initial" ]; then
+  openssl ecparam -name prime256v1 -genkey -noout -out certs/ca.key
+  # keyUsage/basicConstraints explicit: OpenSSL 3.x clients (Python ssl)
+  # reject a CA whose keyUsage extension is absent
+  openssl req -new -x509 -key certs/ca.key -out certs/ca.crt -days 10 \
+    -subj "/CN=timelord-drill-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
+  openssl ecparam -name prime256v1 -genkey -noout -out certs/server.key
+  openssl req -new -key certs/server.key -out certs/server.csr \
+    -subj "/CN=timelorddb" -addext "$SAN" \
+    -addext "keyUsage=critical,digitalSignature" \
+    -addext "extendedKeyUsage=serverAuth"
+  openssl x509 -req -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key \
+    -CAcreateserial -out certs/server.crt -days 1 -copy_extensions copy
+  rm -f certs/server.csr
+  echo "initial: $(openssl x509 -in certs/server.crt -noout -serial -enddate)"
+elif [ "$1" = "renewal" ]; then
+  openssl ecparam -name prime256v1 -genkey -noout -out certs/renewal.key
+  openssl req -new -key certs/renewal.key -out certs/renewal.csr \
+    -subj "/CN=timelorddb" -addext "$SAN" \
+    -addext "keyUsage=critical,digitalSignature" \
+    -addext "extendedKeyUsage=serverAuth"
+  openssl x509 -req -in certs/renewal.csr -CA certs/ca.crt -CAkey certs/ca.key \
+    -CAcreateserial -out certs/renewal.crt -days 1 -copy_extensions copy
+  rm -f certs/renewal.csr
+  echo "renewal: $(openssl x509 -in certs/renewal.crt -noout -serial -enddate)"
+else
+  echo "usage: $0 initial|renewal" >&2
+  exit 2
+fi

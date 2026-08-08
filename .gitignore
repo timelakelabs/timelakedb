@@ -7,3 +7,6 @@ bench/compose/data/
 # Python
 __pycache__/
 *.pyc
+
+# AT-7 drill certs are throwaway, minted per run by gen-certs.sh
+bench/compose/tls-drill/certs/

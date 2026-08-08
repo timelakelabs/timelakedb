@@ -5,7 +5,9 @@ COPY Cargo.toml rust-toolchain.toml ./
 COPY crates ./crates
 RUN cargo build --release -p timelord-server
 
-FROM debian:bookworm-slim
+# trixie matches the glibc of the rust:1-slim builder (a bookworm runtime
+# broke with `GLIBC_2.38 not found` when the builder image moved forward)
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

@@ -140,3 +140,45 @@ pub async fn serve(
         .serve(addr)
         .await
 }
+
+/// Serve Flight SQL over TLS (SEC-3). The `ServerConfig` comes from
+/// `timelord_tls::RotatingCert::server_config` — its cert resolver is
+/// consulted per handshake, so cert rotation needs no listener restart
+/// and never touches established gRPC streams.
+pub async fn serve_tls(
+    backend: Arc<dyn SqlBackend>,
+    addr: std::net::SocketAddr,
+    tls: Arc<rustls::ServerConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    tracing::info!(%addr, "flight sql listening (TLS)");
+
+    // Handshakes run inline on the accept loop: rustls handshakes are
+    // sub-millisecond of CPU and Grafana holds connections open, so
+    // serialization here is not a bottleneck at this milestone. A failed
+    // handshake (scanner, plaintext probe) is logged and skipped — it
+    // must never take the listener down.
+    let incoming = futures::stream::unfold((listener, acceptor), |(listener, acceptor)| async {
+        loop {
+            match listener.accept().await {
+                Ok((tcp, peer)) => match acceptor.accept(tcp).await {
+                    Ok(tls_stream) => {
+                        return Some((Ok::<_, std::io::Error>(tls_stream), (listener, acceptor)));
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "flight TLS handshake failed");
+                        continue;
+                    }
+                },
+                Err(e) => return Some((Err(e), (listener, acceptor))),
+            }
+        }
+    });
+
+    tonic::transport::Server::builder()
+        .add_service(FlightServiceServer::new(TimelordFlight::new(backend)))
+        .serve_with_incoming(incoming)
+        .await?;
+    Ok(())
+}

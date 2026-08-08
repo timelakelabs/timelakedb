@@ -16,7 +16,30 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M5 — acceptance drills complete
+## Status: SEC-3 — TLS 1.3 with hot cert rotation, AT-7 passed
+
+- **TLS 1.3 (rustls) on both listeners** — HTTPS (writes, /api/sql) and
+  Flight SQL — from one shared `ArcSwap<CertifiedKey>` resolver
+  consulted only at handshake, so rotation never touches established
+  connections. Configurable 1.2 floor (`TIMELORD_TLS_MIN=1.2`);
+  plaintext remains the default when `TIMELORD_TLS_CERT`/`_KEY` are
+  unset. Renewals validate (PEM, expiry, key↔cert match) *before* an
+  atomic swap; triggers are a 2 s file watcher and POST
+  `/admin/tls/reload`; `/metrics` exports
+  `timelord_tls_cert_expiry_seconds` and `timelord_tls_last_reload_ok`.
+- **AT-7 drill 19/19** (`bench/results/at7-drill.log`): under stock
+  Telegraf-over-HTTPS plus sustained writes, rotating to a fresh 24 h
+  cert landed mid-flight in a 20 s Flight SQL query (219B-combo SUM,
+  result exact) — zero write errors, zero dropped connections, both
+  listeners presenting the new cert to the next connection via the file
+  watcher alone. A deliberately corrupt renewal was rejected 422 with
+  the named `SEC3_CERT_RENEWAL_FAILED` alarm while the last-good pair
+  kept serving; the next good renewal restored health.
+
+Remaining before v1: streaming/range-read execution (ingest-contention
+carve-out), CI on a remote.
+
+### Previous: M5 — acceptance drills complete
 
 - **AT-6:** stock Telegraf (`influxdb_v2` output, gzip default) writes
   with only a URL; the fixture Grafana dashboards render over Flight SQL.
@@ -30,9 +53,6 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 - **Metadata cache:** warm journey lookups **0–6 ms** (immutable footers
   prune without fetching; only surviving files are read) — the M4 p95
   carve-out closed; cold ≈300 ms.
-
-Remaining before v1: SEC-3 TLS + cert rotation (AT-7), streaming/range-
-read execution (ingest-contention carve-out), CI on a remote.
 
 ### Previous: M4 — full-scale gate passed (two carve-outs)
 

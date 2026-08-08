@@ -1,0 +1,45 @@
+AT-7 certificate rotation drill — 2026-08-08, SEC-3 implementation
+Stack: compose/timelorddb-tls.yml (TLS on both listeners, ports 2963/2964)
+       + stock Telegraf over HTTPS (tls_ca), 1 s flush.
+Certs:  gen-certs.sh — throwaway CA, 24 h ECDSA P-256 server certs.
+Driver: compose/tls-drill/at7_drill.py
+
+== preflight ==
+  PASS  health over TLS  (pass)
+  PASS  TLS 1.3 negotiated (default floor)  (TLSv1.3)
+  PASS  expiry gauge ~24h  (86329s)
+  PASS  reload-ok gauge starts 1
+  PASS  both listeners serve the same cert  (413FADCE99FA5A8EDF6697ACABEA0FE90336FA7F)
+== seed + calibrate long query ==
+  calibration: 3.38B combos in 0.38s -> 4th leg m=65 (~219B combos, target ~25s)
+== leg 1: rotate under load ==
+  PASS  new HTTPS connections present the renewed cert [file watcher]  (413FADCE99FA5A8EDF6697ACABEA0FE90336FA7F -> 413FADCE99FA5A8EDF6697ACABEA0FE90336FA80)
+  PASS  Flight listener rotated in lockstep
+  PASS  in-flight Flight SQL query completed correctly across rotation  (500284687500000 in 20.3s)
+  PASS  rotation landed while the query was in flight  (query 20.3s, rotated at T+5.1s)
+  PASS  zero write errors across rotation (139 writes)
+  PASS  every acknowledged write is queryable  (139 == 139)
+  PASS  Telegraf (TLS) logged zero output errors
+  PASS  reload-ok gauge still 1 after rotation
+== leg 2: corrupt renewal ==
+  PASS  admin reload rejects corrupt pair with named alarm  (HTTP 422 {'alarm': 'SEC3_CERT_RENEWAL_FAILED', 'error': 'no certificate found in PEM', 'serving': 'last-good certificate'})
+  PASS  still serving last-good cert
+  PASS  reload-ok gauge dropped to 0
+  PASS  SEC3_CERT_RENEWAL_FAILED alarm in server logs
+  PASS  writes kept flowing on last-good (49 writes)
+  PASS  good renewal after the bad one restores health
+
+== AT-7 verdict ==
+19/19 checks passed
+AT-7: PASS
+
+Notes:
+- Rotation was picked up by the FILE WATCHER (2 s mtime poll + debounce)
+  through a Windows bind mount — the admin-endpoint fallback in the drill
+  was not needed; the admin path was exercised (422 + alarm) in leg 2.
+- The long query is SUM(a.v+b.v+c.v+d.v) over a 4-leg cross join with an
+  exactly computable expected value; COUNT(*) and 3-leg SUM variants were
+  answered too fast to span the rotation (measured ~9-11B combos/s).
+- Workspace unit tests cover the validation gate directly: corrupt PEM,
+  expired leaf, cert/key mismatch all rejected; last-good retained after
+  a bad reload; recovery on the next good pair (crates/tls, 7 tests).
