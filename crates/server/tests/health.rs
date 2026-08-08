@@ -9,17 +9,19 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+fn engine_cfg(retention: Vec<(String, u64)>) -> timelord_server::EngineConfig {
+    timelord_server::EngineConfig {
+        query_mem_bytes: 256 * 1024 * 1024,
+        flush_rows: 1_000_000, // no auto-trigger; tests flush explicitly
+        flush_age_secs: u64::MAX,
+        wal_max_bytes: u64::MAX,
+        compact_min_files: 2,
+        retention,
+    }
+}
+
 fn engine(dir: &std::path::Path) -> Arc<timelord_server::Engine> {
-    timelord_server::Engine::open(
-        dir,
-        timelord_server::EngineConfig {
-            query_mem_bytes: 256 * 1024 * 1024,
-            flush_rows: 1_000_000, // no auto-trigger; tests flush explicitly
-            flush_age_secs: u64::MAX,
-            wal_max_bytes: u64::MAX,
-        },
-    )
-    .unwrap()
+    timelord_server::Engine::open(dir, engine_cfg(Vec::new())).unwrap()
 }
 
 fn now_ns() -> i64 {
@@ -282,6 +284,84 @@ async fn flush_parquet_union_restart_and_dedup_m2() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn compaction_merges_files_and_completes_fr5_m3() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+
+    // write + flush, then RETRY the same PK with a new value + flush again:
+    // the duplicate now lives across two files
+    let lp1 = format!(
+        "pipeline_events,product_id=p1,step=01-download,event=start value=1i {t}"
+    );
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp1.into_bytes(), false).await;
+    eng.flush_all().unwrap();
+    let lp2 = format!(
+        "pipeline_events,product_id=p1,step=01-download,event=start value=42i {t}\n\
+         pipeline_events,product_id=p2,step=01-download,event=start value=1i {}",
+        t + 1
+    );
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp2.into_bytes(), false).await;
+    eng.flush_all().unwrap();
+
+    // before compaction: cross-file duplicate is visible (M2 limit)
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(rows[0]["n"], 3, "cross-file dup exists pre-compaction");
+
+    let compacted = eng.compact_once().unwrap();
+    assert!(compacted >= 1, "partition with 2 files must compact");
+
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(rows[0]["n"], 2, "compaction collapsed the cross-file dup");
+    let (_, rows) = sql(
+        &app,
+        "poc",
+        "SELECT value FROM pipeline_events WHERE product_id = 'p1'",
+    )
+    .await;
+    assert_eq!(rows[0]["value"], 42, "newest file won (FR-5 complete)");
+
+    // survives restart via the manifest log (removes + adds replayed)
+    drop(app);
+    drop(eng);
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
+    assert_eq!(rows[0]["n"], 2);
+}
+
+#[tokio::test]
+async fn retention_drops_expired_partitions_fr7() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let day = 86_400_000_000_000i64;
+    let eng = timelord_server::Engine::open(
+        dir.path(),
+        engine_cfg(vec![("short_lived".into(), 86_400)]), // keep 1 day
+    )
+    .unwrap();
+    let app = timelord_server::app(eng.clone());
+
+    let lp = format!(
+        "short_lived,k=a v=1.0 {old}\nshort_lived,k=b v=2.0 {new}\nkept,k=a v=3.0 {old}",
+        old = t - 3 * day,
+        new = t - 1000,
+    );
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await;
+    eng.flush_all().unwrap();
+
+    let dropped = eng.enforce_retention().unwrap();
+    assert!(dropped >= 1, "expired partition must drop");
+
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM short_lived").await;
+    assert_eq!(rows[0]["n"], 1, "only the in-window row survives");
+    // tables WITHOUT a policy keep everything (FR-7 is per-table)
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM kept").await;
+    assert_eq!(rows[0]["n"], 1);
 }
 
 #[tokio::test]

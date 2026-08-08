@@ -30,12 +30,17 @@ use timelord_query::{QuerySession, batches_to_json, run_sql};
 use timelord_store::{LocalStore, Store};
 use timelord_wal::Wal;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub query_mem_bytes: usize,
     pub flush_rows: usize,
     pub flush_age_secs: u64,
     pub wal_max_bytes: u64,
+    /// Compact a (table, hour) partition once it accumulates this many
+    /// L0 files (PR-6 lever).
+    pub compact_min_files: usize,
+    /// Per-table retention (table name → seconds); FR-7. Empty = keep all.
+    pub retention: Vec<(String, u64)>,
 }
 
 impl Default for EngineConfig {
@@ -45,8 +50,28 @@ impl Default for EngineConfig {
             flush_rows: 50_000,          // L0 trigger
             flush_age_secs: 60,
             wal_max_bytes: 2 << 30,      // RR-3 replay bound / RR-5 backpressure
+            compact_min_files: 4,
+            retention: Vec::new(),
         }
     }
+}
+
+/// Parse "pipeline_events=365d,host_metrics=90d,disk_metrics=72h" (FR-7).
+pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
+    spec.split(',')
+        .filter_map(|part| {
+            let (table, dur) = part.trim().split_once('=')?;
+            let dur = dur.trim();
+            let (num, unit_secs) = if let Some(d) = dur.strip_suffix('d') {
+                (d, 86_400)
+            } else if let Some(h) = dur.strip_suffix('h') {
+                (h, 3_600)
+            } else {
+                (dur, 1)
+            };
+            Some((table.trim().to_string(), num.parse::<u64>().ok()? * unit_secs))
+        })
+        .collect()
 }
 
 pub struct Engine {
@@ -61,6 +86,8 @@ pub struct Engine {
     cfg: EngineConfig,
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
+    compactions_total: AtomicU64,
+    retention_drops_total: AtomicU64,
     file_seq: AtomicU64,
 }
 
@@ -82,6 +109,8 @@ impl Engine {
             cfg,
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
+            compactions_total: AtomicU64::new(0),
+            retention_drops_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
         };
         let n = frames.len();
@@ -198,6 +227,119 @@ impl Engine {
         tracing::info!(files = n, "flush complete");
         Ok(n)
     }
+
+    /// L0→L1: merge every (db, table, hour) group holding at least
+    /// `compact_min_files` files into one (PR-6; completes FR-5 across
+    /// files). Bounded work per call; returns partitions compacted.
+    pub fn compact_once(&self) -> Result<usize, String> {
+        const MAX_GROUPS_PER_TICK: usize = 8;
+
+        let mut groups: HashMap<(String, String, String), Vec<FileMeta>> = HashMap::new();
+        for f in self.catalog.all_files() {
+            groups
+                .entry((f.db.clone(), f.table.clone(), f.partition.clone()))
+                .or_default()
+                .push(f);
+        }
+        let mut todo: Vec<_> = groups
+            .into_values()
+            .filter(|v| v.len() >= self.cfg.compact_min_files)
+            .collect();
+        // biggest wins first: most files = most read amplification saved
+        todo.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        todo.truncate(MAX_GROUPS_PER_TICK);
+
+        let mut done = 0;
+        for mut files in todo {
+            // oldest first so merge's last-write-wins favors newer files;
+            // file names embed max_ts+seq, so path order is write order
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut batch_sets = Vec::with_capacity(files.len());
+            for f in &files {
+                let bytes = self
+                    .store
+                    .get(&f.path)
+                    .map_err(|e| format!("store get {}: {e}", f.path))?;
+                batch_sets.push(flush::read_parquet_bytes(bytes)?);
+            }
+            let merged = timelord_compact::merge_files(batch_sets)?;
+            let f0 = &files[0];
+            let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
+            let path = format!(
+                "{}/{}/data/{}/c{:020}-{seq:06}.parquet",
+                f0.db, f0.table, f0.partition, merged.max_ts_ns
+            );
+            self.store
+                .put(&path, &merged.bytes)
+                .map_err(|e| format!("store put {path}: {e}"))?;
+            let remove: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+            self.catalog
+                .commit(
+                    vec![FileMeta {
+                        db: f0.db.clone(),
+                        table: f0.table.clone(),
+                        partition: f0.partition.clone(),
+                        path,
+                        rows: merged.rows,
+                        size_bytes: merged.bytes.len() as u64,
+                        min_ts_ns: merged.min_ts_ns,
+                        max_ts_ns: merged.max_ts_ns,
+                    }],
+                    remove.clone(),
+                )
+                .map_err(|e| format!("catalog commit: {e}"))?;
+            // GC after the durable commit; failures only leak space
+            for p in remove {
+                if let Err(e) = self.store.delete(&p) {
+                    tracing::warn!(path = p, error = %e, "gc delete failed");
+                }
+            }
+            done += 1;
+        }
+        if done > 0 {
+            self.compactions_total.fetch_add(done as u64, Ordering::Relaxed);
+            tracing::info!(partitions = done, "compaction pass");
+        }
+        Ok(done)
+    }
+
+    /// FR-7: drop whole partitions past their table's retention window.
+    pub fn enforce_retention(&self) -> Result<usize, String> {
+        if self.cfg.retention.is_empty() {
+            return Ok(0);
+        }
+        let now = Self::now_ns();
+        let mut remove: Vec<String> = Vec::new();
+        for f in self.catalog.all_files() {
+            if let Some((_, secs)) = self
+                .cfg
+                .retention
+                .iter()
+                .find(|(table, _)| *table == f.table)
+            {
+                let cutoff = flush::hour_partition(now - (*secs as i64) * 1_000_000_000);
+                // partition strings sort chronologically; a partition
+                // strictly before the cutoff hour is wholly expired
+                if f.partition.as_str() < cutoff.as_str() {
+                    remove.push(f.path.clone());
+                }
+            }
+        }
+        let n = remove.len();
+        if n > 0 {
+            self.catalog
+                .commit(Vec::new(), remove.clone())
+                .map_err(|e| format!("catalog commit: {e}"))?;
+            for p in remove {
+                if let Err(e) = self.store.delete(&p) {
+                    tracing::warn!(path = p, error = %e, "gc delete failed");
+                }
+            }
+            self.retention_drops_total.fetch_add(n as u64, Ordering::Relaxed);
+            tracing::info!(files = n, "retention drop");
+        }
+        Ok(n)
+    }
 }
 
 impl timelord_api::Engine for Engine {
@@ -237,12 +379,29 @@ impl timelord_api::Engine for Engine {
     }
 
     async fn sql(&self, db: String, query: String) -> Result<Value, String> {
+        let batches = self.sql_batches(&db, &query).await?;
+        Ok(batches_to_json(&batches))
+    }
+
+    fn metrics_text(&self) -> String {
+        self.metrics_text_impl()
+    }
+}
+
+impl Engine {
+    /// Shared query path: /api/sql renders JSON from these batches and
+    /// Flight SQL streams them natively (FR-8).
+    pub async fn sql_batches(
+        &self,
+        db: &str,
+        query: &str,
+    ) -> Result<Vec<timelord_query::QueryBatch>, String> {
         // gather table names from buffer AND catalog
         let mut names: Vec<String> = {
             let dbs = self.dbs.read().expect("dbs lock");
-            dbs.get(&db).map(|t| t.keys().cloned().collect()).unwrap_or_default()
+            dbs.get(db).map(|t| t.keys().cloned().collect()).unwrap_or_default()
         };
-        for t in self.catalog.tables_for(&db) {
+        for t in self.catalog.tables_for(db) {
             if !names.contains(&t) {
                 names.push(t);
             }
@@ -251,18 +410,19 @@ impl timelord_api::Engine for Engine {
             return Err(format!("database '{db}' does not exist (write to it first)"));
         }
 
-        let mut tables: Vec<(String, Vec<_>)> = Vec::with_capacity(names.len());
+        let mut tables: Vec<(String, Vec<timelord_query::QueryBatch>)> =
+            Vec::with_capacity(names.len());
         for name in names {
             let mut batches = Vec::new();
             {
                 let dbs = self.dbs.read().expect("dbs lock");
-                if let Some(buf) = dbs.get(&db).and_then(|t| t.get(&name)) {
+                if let Some(buf) = dbs.get(db).and_then(|t| t.get(&name)) {
                     if buf.row_count() > 0 {
                         batches.push(buf.snapshot()?);
                     }
                 }
             }
-            for meta in self.catalog.files_for(&db, &name) {
+            for meta in self.catalog.files_for(db, &name) {
                 let bytes = self
                     .store
                     .get(&meta.path)
@@ -275,11 +435,10 @@ impl timelord_api::Engine for Engine {
         }
 
         let session = QuerySession::default();
-        let batches = run_sql(&session, tables, &query, self.cfg.query_mem_bytes).await?;
-        Ok(batches_to_json(&batches))
+        run_sql(&session, tables, query, self.cfg.query_mem_bytes).await
     }
 
-    fn metrics_text(&self) -> String {
+    pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
             let tables: usize = dbs.values().map(|t| t.len()).sum();
@@ -299,7 +458,9 @@ impl timelord_api::Engine for Engine {
              # TYPE timelord_databases gauge\ntimelord_databases {}\n\
              # TYPE timelord_tables gauge\ntimelord_tables {}\n\
              # TYPE timelord_buffer_rows gauge\ntimelord_buffer_rows {}\n\
-             # TYPE timelord_wal_bytes gauge\ntimelord_wal_bytes {}\n",
+             # TYPE timelord_wal_bytes gauge\ntimelord_wal_bytes {}\n\
+             # TYPE timelord_compactions_total counter\ntimelord_compactions_total {}\n\
+             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -307,15 +468,21 @@ impl timelord_api::Engine for Engine {
             n_tables,
             n_rows,
             wal_bytes,
+            self.compactions_total.load(Ordering::Relaxed),
+            self.retention_drops_total.load(Ordering::Relaxed),
         )
     }
 }
 
-pub struct EnginePaths;
-
 impl Engine {
     pub fn config(&self) -> EngineConfig {
-        self.cfg
+        self.cfg.clone()
+    }
+}
+
+impl timelord_flight::SqlBackend for Engine {
+    fn query_batches<'a>(&'a self, db: String, sql: String) -> timelord_flight::SqlFuture<'a> {
+        Box::pin(async move { self.sql_batches(&db, &sql).await })
     }
 }
 
@@ -334,6 +501,10 @@ pub fn config_from_env() -> EngineConfig {
         flush_rows: env("TIMELORD_FLUSH_ROWS", d.flush_rows),
         flush_age_secs: env("TIMELORD_FLUSH_AGE_SECS", d.flush_age_secs),
         wal_max_bytes: env("TIMELORD_WAL_MAX_BYTES", d.wal_max_bytes),
+        compact_min_files: env("TIMELORD_COMPACT_MIN_FILES", d.compact_min_files),
+        retention: std::env::var("TIMELORD_RETENTION")
+            .map(|s| parse_retention(&s))
+            .unwrap_or_default(),
     }
 }
 

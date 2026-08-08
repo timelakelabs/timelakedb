@@ -12,7 +12,7 @@ RUN apt-get update \
 COPY --from=build /src/target/release/timelord-server /usr/local/bin/timelord-server
 ENV TIMELORD_ADDR=0.0.0.0:1963
 ENV TIMELORD_DATA_DIR=/var/lib/timelord/data
-EXPOSE 1963
+EXPOSE 1963 1964
 HEALTHCHECK --interval=10s --timeout=5s --retries=12 \
     CMD curl -sf http://localhost:1963/health || exit 1
 ENTRYPOINT ["timelord-server"]

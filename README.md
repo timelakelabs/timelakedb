@@ -16,7 +16,20 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 
-## Status: M2 — a real storage engine
+## Status: M3 — compaction, retention, Flight SQL, Grafana
+
+Compaction merges L0 files per (table, hour) with cross-file
+last-write-wins dedup (FR-5 complete); per-table retention drops whole
+partitions (FR-7); Flight SQL serves Grafana's stock datasource on :1964
+(FR-8) — the unchanged fixture dashboards render against TimelordDB.
+
+M3 gate: laptop scale (3.66M events) — ingest 616K lines/s, 0 errors,
+all Shape B ≤1.6 s, burst 100K in 0.17 s with concurrent query, Grafana
+datasource health OK and the funnel panel returning all ten steps
+through Flight SQL. Open item: 8-row (2 ppm) LWW dedup delta vs accepted
+lines — verify against an influxdb3 run on identical fresh data at M4.
+
+### Previous: M2 — a real storage engine
 
 Ingest: parser → WAL (durable before the 204, generation-rotated) →
 buffer. Flush (L0): PK-sort + last-write-wins dedup → (table, UTC hour)
