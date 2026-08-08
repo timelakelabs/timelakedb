@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "timelord-server"
 version.workspace = true
 edition.workspace = true
@@ -7,11 +7,17 @@ license.workspace = true
 [dependencies]
 tokio.workspace = true
 axum.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+timelord-api = { path = "../api" }
+timelord-ingest = { path = "../ingest" }
+timelord-wal = { path = "../wal" }
+timelord-buffer = { path = "../buffer" }
+timelord-query = { path = "../query" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile.workspace = true
+flate2.workspace = true
