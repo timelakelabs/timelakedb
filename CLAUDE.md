@@ -48,6 +48,21 @@ This project is inspired by the following projects.
   Consul v2 (CL-5); discovery may never carry correctness — that stays in
   catalog CAS.
 
+## Build & verify
+
+- **This machine has Docker but no Rust toolchain** (no MSVC either) —
+  build and test via Docker:
+  `docker compose -f bench/compose/timelorddb.yml up -d --build`
+  then `curl http://localhost:1963/health`.
+- CI (`.github/workflows/ci.yml`) runs fmt + clippy -D warnings + tests.
+- With a local toolchain: `cargo test --workspace`,
+  `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
+  default 0.0.0.0:1963).
+- M0 gate: `bench/backends/timelorddb.py` `healthy()` returns True
+  against the running container (AT-1). The adapter is also the API
+  contract M1 implements: `/api/v3/write_lp?db=` for line protocol,
+  `POST /api/sql {"db","sql"}` → JSON row array, DataFusion SQL dialect.
+
 ## Ground rules for work in this directory
 
 - The acceptance test is `bench/` — do not invent a new harness.
