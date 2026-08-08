@@ -1,0 +1,13 @@
+# TimelordDB target for tsdb-bench — the system under test.
+#   docker compose -f compose/timelorddb.yml up -d --build
+#   python bench.py run --backend timelorddb --scale smoke --label tldb-smoke
+name: bench-timelorddb
+services:
+  timelorddb:
+    build: ../..
+    container_name: timelorddb
+    ports:
+      - "1963:1963"
+    volumes:
+      - ./data/timelord:/var/lib/timelord/data
+    restart: unless-stopped
