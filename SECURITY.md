@@ -1,0 +1,118 @@
+# Security Policy
+
+## Supported versions
+
+TimelordDB is **pre-v1**. Only `main` is supported; there are no released
+versions and no backports. The workspace version is `0.1.0`.
+
+| Version | Supported |
+|---|---|
+| `main` | Yes — fixes land here |
+| anything else | No |
+
+## Reporting a vulnerability
+
+Report privately through GitHub's **Security → Report a vulnerability**
+(private vulnerability reporting) on this repository. Please do not open a
+public issue for a suspected vulnerability, and do not attack a deployment
+you do not own.
+
+A useful report includes the version or commit, the configuration
+(`TIMELORD_*` variables, whether TLS is on), the exposure model (what a
+reachable attacker can do), and a reproduction. Expect an acknowledgement
+within a week; this is a single-maintainer project with no on-call rotation,
+so please size your disclosure timeline accordingly.
+
+## Current security posture — read this before deploying
+
+**TimelordDB has no authentication and no authorization.** Any client that
+can open a TCP connection to port 1963 or 1964 has full read and write
+access to every database on the node. This is a deliberate pre-v1 state
+(REQUIREMENTS.md §12 scopes token auth for v1; it is not implemented yet),
+not an oversight — but it means the *only* access control today is network
+reachability.
+
+Treat a TimelordDB port as equivalent to an unauthenticated shell into the
+data. Bind it to localhost or a private network segment, and put an
+authenticating proxy in front of it if anything other than your own agents
+needs access.
+
+| Control | Status |
+|---|---|
+| Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELORD_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
+| Client certificate / mTLS | Not implemented — server-side TLS only. Mutual TLS is v2 (SEC-3 intra-cluster). |
+| Authentication | **Not implemented.** Write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything and returns an empty token. |
+| Authorization | **Not implemented.** No users, roles, or per-database/table permissions. |
+| Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
+| Encryption at rest | Not implemented. SEC-1 is a v1 *design constraint* (all object I/O flows through one narrow layer) and a v2 feature. |
+| Row visibility labels | Not implemented. SEC-2 is a v1 design constraint — one mandatory-predicate injection point in the query path. |
+| Audit logging | Not implemented. Writes and queries are not attributed to a principal, because there is no principal. |
+| Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
+
+## Known exposures
+
+These are verified properties of the current build, not hypotheticals. They
+follow from "no authentication" and are listed so you can design around them.
+
+1. **Unauthenticated ingest and query** on `:1963` (line protocol, `/api/sql`)
+   and `:1964` (Flight SQL). Anyone reachable can write arbitrary data, read
+   all data, and enumerate the schema.
+
+2. **`POST /api/sql` executes arbitrary DataFusion SQL, including `COPY … TO`,
+   which writes files as the server process.** Verified: a single unauthenticated
+   request wrote a Parquet file outside the data directory. Arbitrary file
+   *reads* are not reachable today — no `read_parquet`/`read_csv`-style table
+   functions are registered, and `CREATE EXTERNAL TABLE` does not survive the
+   request because each query gets a fresh session — but do not rely on that as
+   a boundary. **Treat SQL access as filesystem-write access to the container.**
+
+3. **`POST /admin/tls/reload` is unauthenticated** when TLS is enabled. Impact
+   is limited by design — it only re-reads the already-configured cert and key
+   paths, validates before swapping, and keeps the last-good pair on failure —
+   so the realistic worst case is forced log/alarm noise rather than a
+   downgrade. It is still an unauthenticated administrative endpoint.
+
+4. **The container runs as root.** The image has no `USER` directive, so the
+   server process and every file it writes are root-owned. Combined with (2),
+   a reachable attacker can write root-owned files anywhere the container's
+   filesystem permits.
+
+5. **Query errors are returned verbatim**, including DataFusion planning errors
+   that disclose table and column names.
+
+6. **No rate limiting per client.** The memory pool and admission semaphore
+   keep a query from killing the server, but nothing stops one client from
+   consuming the whole admission budget.
+
+## Deploying it safely today
+
+- **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
+  (`TIMELORD_ADDR=127.0.0.1:1963`) or to a private Docker/Kubernetes network,
+  and publish nothing.
+- **Front it with something that authenticates** if remote access is needed — a
+  reverse proxy doing mTLS or token checks, or a VPN/overlay network. Note that
+  Flight SQL is gRPC over HTTP/2, so any proxy in front of `:1964` must speak
+  HTTP/2.
+- **Enable TLS** (`TIMELORD_TLS_CERT`/`_KEY`) even on a private network; it is
+  the one security control that is finished and drilled.
+- **Set a container memory limit.** `mem_limit` is not optional in practice —
+  an unbounded engine took down an entire Docker VM during development.
+- **Run it on a dedicated volume** with nothing else of value on the filesystem,
+  given exposure (2) and (4).
+- **Alert on certificate health**: `timelord_tls_last_reload_ok == 0` and
+  `timelord_tls_cert_expiry_seconds` below two renewal periods. A failed
+  renewal keeps serving on the last-good pair, which is exactly why it can go
+  unnoticed until expiry.
+
+## Roadmap
+
+| Item | Requirement | State |
+|---|---|---|
+| TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
+| Token authentication | §12 (v1 scope) | Not started |
+| Mutual TLS, intra-cluster | SEC-3 (v2) | Not started |
+| Encryption at rest | SEC-1 (design constraint v1, feature v2) | Design constraint honoured — one narrow object I/O layer |
+| Row visibility labels | SEC-2 (design constraint v1) | Design constraint honoured — one predicate injection point |
+
+`REQUIREMENTS.md` §8 is the full security specification and explains why
+SEC-1 and SEC-2 are constrained now and implemented later.

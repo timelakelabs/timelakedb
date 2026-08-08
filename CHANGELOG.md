@@ -1,0 +1,114 @@
+# Changelog
+
+All notable changes to TimelordDB are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
+will follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from
+its first release.
+
+Nothing has been released yet. Everything below is pre-v1 work on `main`,
+organised by the milestone that gated it. Every performance or robustness
+entry traces to a recorded run in `bench/results/` — the harness is the
+specification, so an entry without a measurement behind it does not belong
+here.
+
+## [Unreleased]
+
+### Added — documentation and project files (2026-08-08)
+
+- `LICENSE` (Apache-2.0), `SECURITY.md`, `CONTRIBUTING.md`,
+  `CODE_OF_CONDUCT.md` and this changelog.
+- `SECURITY.md` states the real pre-v1 posture: no authentication and no
+  authorization on either listener, and the exposures that follow from it.
+- `docs/BACKUP_RESTORE.md` and `ops/tldb-backup.sh` — the AT-5 procedure as a
+  runnable script rather than a measured result with no method.
+- Project website in `site/` (landing + documentation), published by
+  `.github/workflows/pages.yml`.
+
+### Added — SEC-3: TLS 1.3 with hot certificate rotation (2026-08-08)
+
+- New `timelord-tls` crate: validate-before-swap certificate loading (PEM
+  structure, leaf expiry, key↔certificate match) behind an `ArcSwap`
+  resolver that is consulted only during a handshake.
+- TLS on both listeners when `TIMELORD_TLS_CERT` and `TIMELORD_TLS_KEY` are
+  set — HTTP via `axum-server`, Flight SQL via a `tokio-rustls` accept loop.
+  Plaintext remains the default. `TIMELORD_TLS_MIN=1.2` lowers the floor.
+- Rotation triggers: a 2 s file-modification watcher and
+  `POST /admin/tls/reload`.
+- A rejected renewal keeps the last-good pair serving and raises the named
+  alarm `SEC3_CERT_RENEWAL_FAILED`.
+- Metrics: `timelord_tls_cert_expiry_seconds`, `timelord_tls_last_reload_ok`.
+- **AT-7 drill: 19/19** (`bench/results/at7-drill.log`). Under stock
+  Telegraf-over-HTTPS plus sustained writes, a rotation landed mid-flight in a
+  20 s Flight SQL query with an exact result, zero write errors and zero
+  dropped connections.
+
+### Fixed
+
+- Runtime image moved to `debian:trixie-slim` to match the builder's glibc;
+  a bookworm runtime failed at startup with `GLIBC_2.38 not found` after
+  `rust:1-slim` moved forward.
+
+### Added — M5: acceptance drills and the metadata cache (2026-08-08)
+
+- Metadata cache over immutable Parquet footers: warm point lookups
+  **0–6 ms** against roughly 300 ms cold, closing the M4 p95 carve-out.
+- **AT-6:** stock Telegraf writes with only a URL configured; the unchanged
+  fixture Grafana dashboards render over Flight SQL.
+- **AT-5:** backup 34 s, restore from a destroyed volume 13 s, all 36.68M
+  rows exact; SIGKILL mid-ingest recovered healthy in 4.7 s with zero
+  acknowledged-write loss (40,340,794 rows exact); ten consecutive 100K
+  bursts absorbed in ≤0.13 s each.
+- **AT-4:** a repeat full-scale run within tolerance — ingest ±3.5%, funnels
+  ±6%, storage ±9%, zero errors in both runs.
+
+### Added — M4: the full-scale gate (2026-08-08)
+
+- Shared `FairSpillPool` with an admission semaphore and a server-side query
+  deadline (RR-1); scans moved to the blocking pool so a slow scan can always
+  be preempted.
+- Pruning table provider: time-bound file skipping, row-group statistics
+  pruning, projection pushdown, decode-time row filters.
+- Entity-clustered compaction, grace-period GC (`TIMELORD_GC_GRACE_SECS`),
+  and a schema registry.
+- **AT-3 gate green with two carve-outs** at 36.6M events against the
+  InfluxDB 3 baseline: ingest 365–671K lines/s with zero errors, Shape A
+  median **211 ms** (vs 520), all Shape B complete — funnel 1.7 s (vs 5.7),
+  B4 0.68 s (vs 30.3) — storage **0.50 GB/day** (vs 1.15), and zero
+  acknowledged-row loss proven by fixed-bound equality on identical data.
+- Carve-outs carried forward: Shape A p95 608 ms against a 250 ms target, and
+  intra-run ingest decline under maintenance contention (stable across runs,
+  so not cardinality decay).
+
+### Added — M3: compaction, retention, Flight SQL (2026-08-08)
+
+- Compaction merges L0 files per `(table, hour)` with cross-file
+  last-write-wins de-duplication (FR-5).
+- Per-table retention drops whole partitions as a catalog operation (FR-7).
+- Flight SQL on port 1964 serving Grafana's stock datasource (FR-8).
+
+### Added — M2: the storage engine (2026-08-08)
+
+- Write path: parser → WAL (fsynced before the 204, generation-rotated) →
+  in-memory buffer.
+- Flush: primary-key sort and last-write-wins de-duplication into
+  `(table, UTC hour)` Parquet partitions through the single store chokepoint,
+  committed to a manifest-log catalog, then WAL reclaim.
+- Reads union live buffer snapshots with catalogued Parquet under the RR-1
+  memory pool. A WAL cap answers 429 with `Retry-After` (RR-5).
+- **SIGKILL → healthy in 0.8 s** with zero acknowledged-write loss (RR-3).
+
+### Added — M0/M1: workspace and ingest path (2026-08-08)
+
+- Cargo workspace, server binary, Docker image, compose target, CI gate
+  (fmt, clippy `-D warnings`, tests, 80% line coverage).
+- Line-protocol parser with the full escape set, Arrow buffer with
+  `Dictionary<Int32, Utf8>` tag columns, DataFusion SQL over the buffer, and
+  the InfluxDB-compatible write endpoints (`/write`, `/api/v2/write`,
+  `/api/v3/write_lp`).
+- `timelorddb` backend adapter for the tsdb-bench harness.
+
+### Added — the evidence base (2026-08-08)
+
+- `REQUIREMENTS.md` and `ARCHITECTURE.md` derived from the five-engine
+  evaluation, with the tsdb-bench harness, benchmark record and Grafana
+  fixtures vendored so the repository is self-contained.

@@ -67,6 +67,14 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
+- Repo files: `LICENSE` (Apache-2.0), `SECURITY.md`, `CONTRIBUTING.md`,
+  `CODE_OF_CONDUCT.md`, `CHANGELOG.md`. `ops/tldb-backup.sh` +
+  `docs/BACKUP_RESTORE.md` make AT-5 runnable (helper-container tar, no
+  host bind mount; `--recreate` for the destroyed-volume case; drops
+  `*.tmp-write` on restore). **No authn/authz exists** — SECURITY.md
+  states the posture, including that `/api/sql` can `COPY … TO` files as
+  the (root) server process. Known engine hardening: manifest replay
+  should skip non-`.json` files.
 - Status: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
   `bench/results/at7-drill.log`). New `timelord-tls` crate:
   validate-before-swap cert loading (PEM, expiry via x509-parser,

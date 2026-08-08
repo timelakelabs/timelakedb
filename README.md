@@ -13,9 +13,19 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 |---|---|
 | `REQUIREMENTS.md` | Evidence-traced requirements (FR/PR/RR/SR/CL/SEC + acceptance tests) |
 | `ARCHITECTURE.md` | Components, seams, milestones M0–M5 |
+| `SECURITY.md` | Security posture, exposures, and how to report a vulnerability |
+| `CONTRIBUTING.md` | Development environment, the crate map, what CI enforces |
+| `CHANGELOG.md` | What landed, milestone by milestone |
+| `docs/BACKUP_RESTORE.md` | The AT-5 procedure, runnable (`ops/tldb-backup.sh`) |
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 | `site/` | Project website (landing + docs), published to GitHub Pages |
+
+> **Security:** TimelordDB has **no authentication and no authorization**. Any
+> client that can reach port 1963 or 1964 can read and write everything on the
+> node — network isolation is the only access control it has today. TLS 1.3 is
+> implemented and drilled; token auth is scoped for v1 and not written yet.
+> Read `SECURITY.md` before deploying anything.
 
 ## Website
 
@@ -125,8 +135,25 @@ cargo test --workspace
 cargo run -p timelord-server
 ```
 
+## Backup
+
+```bash
+./ops/tldb-backup.sh backup                 # live, no downtime
+./ops/tldb-backup.sh verify  -f <archive>
+./ops/tldb-backup.sh restore -f <archive> --recreate
+```
+
+Measured on a 1.19 GB volume while ingesting: backup 25 s, restore 66 s,
+healthy in under a second, and a fixed-bound `COUNT(*)` identical on the
+source and the restored copy (40,327,616). Runbook: `docs/BACKUP_RESTORE.md`.
+
 ## The rule
 
 The benchmark harness is the specification. Every milestone gates on a
 `bench.py run --backend timelorddb` result, compared against the recorded
 InfluxDB 3 baselines in `bench/results/`.
+
+## License
+
+Apache-2.0 — see `LICENSE`. Contributions are governed by `CONTRIBUTING.md`
+and `CODE_OF_CONDUCT.md`.

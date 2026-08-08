@@ -43,6 +43,12 @@
       <li><a href="#retention">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg>
         Retention</a></li>
+      <li><a href="#security">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 5 6.5v5c0 4.3 2.9 7.6 7 9 4.1-1.4 7-4.7 7-9v-5Z"/><path d="m9 12 2 2 4-4"/></svg>
+        Security</a></li>
+      <li><a href="#operations">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7" ry="2.5"/><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13"/><path d="m9.5 13.5 2 2 4-4"/></svg>
+        Backup &amp; Restore</a></li>
       <li><a href="#scaling">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 18 9 12l4 3.5L20 7"/><path d="M15 7h5v5"/></svg>
         Scaling</a></li>
@@ -71,6 +77,14 @@
           hot certificate rotation — but replication and query high
           availability are v2 work. Read <a href="#scaling">Scaling</a> before
           planning a deployment.
+        </p>
+      </div>
+      <div class="note warn">
+        <p>
+          <strong>There is no authentication.</strong> Any client that can reach
+          port 1963 or 1964 can read and write everything on the node. Network
+          reachability is the only access control TimelordDB has today — see
+          <a href="#security">Security</a> before exposing it anywhere.
         </p>
       </div>
 
@@ -272,6 +286,141 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
     </section>
 
+    <section id="security">
+      <h2>Security</h2>
+      <p>
+        The honest version: one security control is finished and drilled — TLS
+        1.3 with hot certificate rotation — and everything else is network
+        isolation. Plan the deployment around that rather than around what a
+        database of this shape usually offers.
+      </p>
+
+      <div class="note warn">
+        <p>
+          <strong>No authentication, no authorization.</strong> Write endpoints
+          accept any token and ignore it; the Flight SQL handshake accepts
+          anything and returns an empty token. There are no users, roles or
+          per-table permissions, and databases are namespaces rather than
+          security boundaries. Treat an open TimelordDB port as equivalent to
+          an unauthenticated shell into the data.
+        </p>
+      </div>
+
+      <h3>What exists today</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Control</th><th>State</th></tr></thead>
+          <tbody>
+            <tr><td>Transport encryption</td><td><strong>Implemented, opt-in</strong> — TLS 1.3 on both listeners with hot rotation</td></tr>
+            <tr><td>Client certificates / mTLS</td><td>Not implemented — server-side TLS only; mutual TLS is v2</td></tr>
+            <tr><td>Authentication</td><td>Not implemented — token auth is scoped for v1</td></tr>
+            <tr><td>Authorization</td><td>Not implemented</td></tr>
+            <tr><td>Encryption at rest</td><td>Not implemented — a v1 design constraint (one narrow object-I/O layer), a v2 feature</td></tr>
+            <tr><td>Row visibility labels</td><td>Not implemented — a v1 design constraint (one predicate injection point)</td></tr>
+            <tr><td>Audit logging</td><td>Not implemented — there is no principal to attribute a write to</td></tr>
+            <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Those guardrails bound resource exhaustion; they are not access control.
+        No query can kill the server, but any client can run one.
+      </p>
+
+      <h3>Exposures that follow</h3>
+      <ul>
+        <li><code>POST /api/sql</code> executes arbitrary DataFusion SQL, and
+            <code>COPY … TO</code> <strong>writes files as the server process</strong>.
+            Arbitrary reads are not reachable — no file-reading table functions
+            are registered and DDL does not survive a request — but treat SQL
+            access as filesystem-write access to the container.</li>
+        <li>The container runs as root; the image sets no <code>USER</code>.</li>
+        <li><code>POST /admin/tls/reload</code> is unauthenticated. Impact is
+            bounded by design — it re-reads only the configured paths, validates
+            before swapping, and keeps the last-good pair — but it is an open
+            administrative endpoint.</li>
+        <li>Query errors are returned verbatim, disclosing table and column names.</li>
+        <li>There is no per-client rate limit; one client can consume the whole
+            admission budget.</li>
+      </ul>
+
+      <h3>Deploying it safely</h3>
+      <ul>
+        <li>Bind to localhost or a private network — <code>TIMELORD_ADDR=127.0.0.1:1963</code>
+            — and publish nothing to an untrusted network.</li>
+        <li>If remote access is needed, front it with something that
+            authenticates. Flight SQL is gRPC over HTTP/2, so a proxy in front of
+            port 1964 must speak HTTP/2.</li>
+        <li>Enable TLS even on a private network. It is the one control that is
+            finished, and rotation costs no downtime.</li>
+        <li>Give it a dedicated volume and a container memory limit.</li>
+      </ul>
+      <p>
+        <code>SECURITY.md</code> in the repository carries the full posture,
+        the vulnerability reporting process and the roadmap;
+        <code>REQUIREMENTS.md</code> §8 is the specification behind it.
+      </p>
+    </section>
+
+    <section id="operations">
+      <h2>Backup &amp; Restore</h2>
+      <p>
+        The whole database is one directory — <code>TIMELORD_DATA_DIR</code>,
+        holding the write-ahead log, the Parquet objects and the manifest-log
+        catalog. Copying it is the backup. <code>ops/tldb-backup.sh</code> does
+        that through a throwaway helper container, so Docker is the only
+        prerequisite.
+      </p>
+
+      <div class="code">
+        <header>Back up, verify, restore <button class="copy" type="button">Copy</button></header>
+<pre>./ops/tldb-backup.sh backup                     <span class="c"># live, no downtime</span>
+./ops/tldb-backup.sh verify  -f timelord-backup-20260808-214500.tgz
+./ops/tldb-backup.sh restore -f timelord-backup-20260808-214500.tgz --recreate</pre>
+      </div>
+
+      <h3>Why a live backup is safe</h3>
+      <ul>
+        <li>Objects are written <em>before</em> the manifest that references
+            them, so a snapshot may contain an object no manifest mentions —
+            invisible, harmless — but never the reverse.</li>
+        <li>Every object is written temp, fsync, rename: a manifest entry is
+            durable or absent, never torn.</li>
+        <li>A truncated WAL tail is tolerated per generation, so capturing a
+            segment mid-append costs at most the frame being written — which was
+            never acknowledged to a client.</li>
+        <li>A file removed from the catalog is deleted only after
+            <code>TIMELORD_GC_GRACE_SECS</code>, so the archive is internally
+            consistent as long as the backup finishes inside the grace period.
+            A 25 s backup against a 900 s default has 36× of headroom.</li>
+      </ul>
+      <p>
+        Quiescing writes (<code>--stop &lt;container&gt;</code>) removes even that
+        window. It is not required.
+      </p>
+
+      <h3>Measured</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Step</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>AT-5 full scale: backup / restore</td><td>34 s / 13 s, 36.68M rows exact — against 10–15 min on the 1.x incumbent</td></tr>
+            <tr><td>1.19 GB volume, uncompressed</td><td>backup 25 s with zero downtime; restore 66 s</td></tr>
+            <tr><td>Gzip on the same data</td><td>15% smaller, 2.5× slower — Parquet is already compressed</td></tr>
+            <tr><td>Healthy after restore</td><td>under a second: recovery is a log replay, not an index rebuild</td></tr>
+            <tr><td>Fixed-bound <code>COUNT(*)</code>, source vs restored</td><td>40,327,616 = 40,327,616</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Validate a restore with a <em>fixed upper time bound</em> on both sides —
+        a plain <code>COUNT(*)</code> against a node that is still ingesting will
+        never match. There is no incremental mode and no point-in-time recovery;
+        the full runbook, including scheduling and non-Docker installations, is
+        <code>docs/BACKUP_RESTORE.md</code>.
+      </p>
+    </section>
+
     <section id="scaling">
       <h2>Scaling</h2>
       <h3>Today: one node, honestly</h3>
@@ -400,12 +549,23 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         unnoticed until expiry.
       </p>
 
-      <h3>Back up while running</h3>
+      <h3>Back up while running, and restore before you need to</h3>
       <p>
         Objects are written before the manifest that references them, so a live
         snapshot is internally consistent — a backup taken under load restored
-        with every row exact in 13 seconds. Quiescing writes only removes a very
-        small manifest-tear window.
+        with every row exact in 13 seconds. Run
+        <code>ops/tldb-backup.sh</code> from cron, and rehearse the restore into
+        a scratch volume at least once: a backup nobody has restored is a
+        hypothesis. See <a href="#operations">Backup &amp; Restore</a>.
+      </p>
+
+      <h3>Assume the port is the perimeter</h3>
+      <p>
+        Until token authentication lands, whoever can reach 1963 or 1964 owns the
+        data. Bind to a private interface, keep TimelordDB off any network you do
+        not control, and read <a href="#security">Security</a> in full before a
+        deployment — particularly the note that <code>/api/sql</code> can write
+        files as the server process.
       </p>
 
       <h3>Prove changes with the harness</h3>
