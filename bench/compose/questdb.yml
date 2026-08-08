@@ -1,0 +1,13 @@
+# QuestDB target for tsdb-bench.
+#   docker compose -f compose/questdb.yml up -d
+#   python bench.py run --backend questdb --scale smoke --label qdb-smoke
+name: bench-questdb
+services:
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    ports:
+      - "9000:9000"     # REST /exec + ILP-over-HTTP /write
+    volumes:
+      - ./data/questdb:/var/lib/questdb
+    restart: unless-stopped

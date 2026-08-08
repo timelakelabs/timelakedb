@@ -1,0 +1,379 @@
+{
+  "uid": "host-detail",
+  "title": "Host Detail (single host)",
+  "description": "Telegraf-style single-host drilldown: pick a host in the dropdown. Queries use fixed now()-relative windows (see README).",
+  "tags": ["influxdb3-poc"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "host",
+        "type": "query",
+        "datasource": { "type": "influxdb", "uid": "influxdb3" },
+        "query": "SELECT DISTINCT host FROM host_metrics ORDER BY host",
+        "definition": "SELECT DISTINCT host FROM host_metrics ORDER BY host",
+        "refresh": 1,
+        "sort": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "host0000", "value": "host0000" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "CPU %",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 70 },
+            { "color": "red", "value": 90 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT cpu_pct FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Memory %",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 70 },
+            { "color": "red", "value": 90 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT mem_pct FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Disk %",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 80 },
+            { "color": "red", "value": 90 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT disk_pct FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Net RX",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "bps", "decimals": 1 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT net_rx_bps FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Net TX",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "bps", "decimals": 1 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT net_tx_bps FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "gauge",
+      "title": "Memory Free",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "yellow", "value": 20 },
+            { "color": "green", "value": 40 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "values": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT 100 - mem_pct AS mem_free FROM host_metrics WHERE host = '$host' ORDER BY time DESC LIMIT 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "CPU % (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": { "legend": { "showLegend": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(cpu_pct) AS cpu_pct FROM host_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Memory % (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": { "legend": { "showLegend": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(mem_pct) AS mem_pct FROM host_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Disk % (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": { "legend": { "showLegend": false } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(disk_pct) AS disk_pct FROM host_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Network RX / TX (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "bps", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(net_rx_bps) AS rx_bps, AVG(net_tx_bps) AS tx_bps FROM host_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "bargauge",
+      "title": "Disk used % by device",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 80 },
+            { "color": "red", "value": 90 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": { "values": true, "calcs": [] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT device, AVG(used_pct) AS used_pct FROM disk_metrics WHERE host = '$host' AND time >= now() - INTERVAL '15 minutes' GROUP BY device ORDER BY device",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Disk devices (15m averages)",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 23 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": {
+        "defaults": { "decimals": 1 },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "capacity_gb" },
+            "properties": [ { "id": "unit", "value": "decgbytes" }, { "id": "decimals", "value": 0 } ] },
+          { "matcher": { "id": "byName", "options": "used_gb" },
+            "properties": [ { "id": "unit", "value": "decgbytes" } ] },
+          { "matcher": { "id": "byName", "options": "used_pct" },
+            "properties": [ { "id": "unit", "value": "percent" } ] },
+          { "matcher": { "id": "byName", "options": "read_bps" },
+            "properties": [ { "id": "unit", "value": "Bps" } ] },
+          { "matcher": { "id": "byName", "options": "write_bps" },
+            "properties": [ { "id": "unit", "value": "Bps" } ] }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT device, MAX(capacity_gb) AS capacity_gb, AVG(used_gb) AS used_gb, AVG(used_pct) AS used_pct, AVG(read_bps) AS read_bps, AVG(write_bps) AS write_bps FROM disk_metrics WHERE host = '$host' AND time >= now() - INTERVAL '15 minutes' GROUP BY device ORDER BY device",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Disk read by device (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 31 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+      "transformations": [
+        { "id": "partitionByValues", "options": { "fields": ["device"] } }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, device, AVG(read_bps) AS read_bps FROM disk_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1, device ORDER BY 1, device",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Disk write by device (6h)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 31 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+      "transformations": [
+        { "id": "partitionByValues", "options": { "fields": ["device"] } }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, device, AVG(write_bps) AS write_bps FROM disk_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1, device ORDER BY 1, device",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "This host vs fleet average CPU % (6h)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 40 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(cpu_pct) AS this_host FROM host_metrics WHERE host = '$host' AND time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(cpu_pct) AS fleet_avg FROM host_metrics WHERE time >= now() - INTERVAL '6 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

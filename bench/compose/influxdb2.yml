@@ -1,0 +1,26 @@
+# InfluxDB 2.x target for tsdb-bench (the generation between the 1.x
+# incumbent and InfluxDB 3 — same TSM/TSI storage family as 1.x).
+#   docker compose -f compose/influxdb2.yml up -d
+#   python bench.py run --backend influxdb2 --scale smoke --label idb2-smoke
+#
+# No memory cap: it shares the same Docker VM as the influxdb3 target, so
+# both engines see identical hardware. Expect the series index to be the
+# bottleneck at this workload's cardinality — that is the point.
+name: bench-influxdb2
+services:
+  influxdb2:
+    image: influxdb:2.7
+    container_name: influxdb2
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminadmin
+      DOCKER_INFLUXDB_INIT_ORG: poc
+      DOCKER_INFLUXDB_INIT_BUCKET: poc
+      DOCKER_INFLUXDB_INIT_RETENTION: "0"
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: bench-token
+    volumes:
+      - ./data/influxdb2:/var/lib/influxdb2
+    restart: unless-stopped

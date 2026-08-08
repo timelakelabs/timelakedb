@@ -99,7 +99,7 @@ timelord/
     discovery/   Discovery trait; static backend (v1), Consul (v2)  ← CL-5
   tests/
     at/          AT-1..AT-6 harness glue (tsdb-bench adapter lives in
-                 ../benchmark/backends/timelorddb.py, not here)
+                 bench/backends/timelorddb.py, not here)
 ```
 
 Consolidating crates later is cheap; splitting a tangle is not. Start

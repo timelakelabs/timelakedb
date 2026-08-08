@@ -1,0 +1,26 @@
+# InfluxDB 1.x target for tsdb-bench (the incumbent, for baseline numbers).
+#   docker compose -f compose/influxdb1.yml up -d
+#   python bench.py run --backend influxdb1 --scale smoke --label idb1-smoke
+#
+# tsi1 (disk-based index) is the fairest 1.x configuration for the
+# 1M-products/day cardinality; the default inmem index would be worse.
+# The series/tag-value caps are lifted on purpose: the defaults (1M series
+# per db, 100K values per tag) would reject this workload's writes at a
+# config guardrail instead of letting the engine genuinely attempt it —
+# hitting a wall in the ENGINE is the finding we're collecting.
+name: bench-influxdb1
+services:
+  influxdb1:
+    image: influxdb:1.8
+    container_name: influxdb1
+    ports:
+      - "8086:8086"    # stop the influxdb2 target first (same port)
+    environment:
+      INFLUXDB_DB: poc
+      INFLUXDB_DATA_INDEX_VERSION: tsi1
+      INFLUXDB_HTTP_MAX_BODY_SIZE: "0"
+      INFLUXDB_DATA_MAX_SERIES_PER_DATABASE: "0"
+      INFLUXDB_DATA_MAX_VALUES_PER_TAG: "0"
+    volumes:
+      - ./data/influxdb1:/var/lib/influxdb
+    restart: unless-stopped

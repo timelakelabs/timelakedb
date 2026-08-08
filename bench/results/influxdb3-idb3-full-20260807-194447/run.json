@@ -1,0 +1,187 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "influxdb3-idb3-full-20260807-194447",
+  "backend": "influxdb3",
+  "backend_display": "InfluxDB 3 Core",
+  "backend_version": "3.11.0",
+  "target": {
+    "url": "http://localhost:8181",
+    "db": "poc",
+    "container": "influxdb3",
+    "image": "influxdb:3-core"
+  },
+  "started_at": "2026-08-07T19:44:53-0400",
+  "finished_at": "2026-08-07T19:57:16-0400",
+  "config": {
+    "scale": "full",
+    "label": "idb3-full",
+    "products_per_day": 1000000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 2500,
+    "host_hours": 6.0,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 8,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts",
+      "query_a",
+      "query_b",
+      "burst",
+      "storage",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322285568
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 36578224,
+      "wall_s": 499.5,
+      "lines_per_s": 73227,
+      "mb_sent": 3838.2,
+      "errors": 0,
+      "batch_p50_ms": 994,
+      "batch_p95_ms": 1028,
+      "batch_max_ms": 1081
+    },
+    "host_ingest": {
+      "lines": 900000,
+      "wall_s": 11.9,
+      "lines_per_s": 75359,
+      "errors": 0
+    },
+    "query_shape_a": {
+      "n": 20,
+      "errors": 0,
+      "median_ms": 505,
+      "p95_ms": 630,
+      "max_ms": 1190
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 4603,
+          "warm_ms": 4719,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 13231,
+          "warm_ms": 12679,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 8021,
+          "warm_ms": 7930,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 22763,
+          "warm_ms": 22538,
+          "rows": 495,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 5073,
+          "warm_ms": 4789,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "burst": {
+      "events": 100000,
+      "wall_s": 1.23,
+      "events_per_s": 81152,
+      "errors": 0,
+      "batch_p50_ms": 284,
+      "batch_p95_ms": 944,
+      "batch_max_ms": 946,
+      "concurrent_query_ms": 4724,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "storage": {
+      "bytes": 1982353481,
+      "gb_total": 1.982,
+      "days_of_data": 2,
+      "gb_per_day": 0.991,
+      "projected_gb_90d": 89.2,
+      "projected_gb_365d": 361.8
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 22995,
+        "value": 36813965,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 60,
+        "value": 896000,
+        "error": null
+      }
+    },
+    "resources": {
+      "baseline_mem_mb": 371.9,
+      "settled_mem_mb": 4401.3,
+      "returned_to_baseline": false,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 372.7,
+          "peak_cpu_pct": 1.8,
+          "samples": 3
+        },
+        "ingest": {
+          "peak_mem_mb": 2946.3,
+          "peak_cpu_pct": 22.8,
+          "samples": 247
+        },
+        "hosts": {
+          "peak_mem_mb": 3026.9,
+          "peak_cpu_pct": 17.8,
+          "samples": 6
+        },
+        "query_a": {
+          "peak_mem_mb": 7485.1,
+          "peak_cpu_pct": 267.7,
+          "samples": 5
+        },
+        "query_b": {
+          "peak_mem_mb": 7529.1,
+          "peak_cpu_pct": 1310.9,
+          "samples": 79
+        },
+        "burst": {
+          "peak_mem_mb": 5440.6,
+          "peak_cpu_pct": 280.0,
+          "samples": 3
+        },
+        "storage": {
+          "peak_mem_mb": 6769.9,
+          "peak_cpu_pct": 285.6,
+          "samples": 23
+        },
+        "settle": {
+          "peak_mem_mb": 4401.3,
+          "peak_cpu_pct": 2.9,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": [
+    "storage: measured immediately after ingest; WAL may not be fully compacted to Parquet yet. Re-run later with --scenarios storage for a settled number."
+  ]
+}
