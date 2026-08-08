@@ -111,6 +111,9 @@ pub struct Engine {
     pending_gc: Mutex<Vec<(std::time::Instant, String)>>,
     /// Immutable-footer cache: warm queries prune without fetching files.
     meta_cache: Arc<timelord_query::provider::MetaCache>,
+    /// SEC-3: set when the listeners run TLS; feeds the expiry gauge and
+    /// renewal-health metric so a failing rotation is visible (RR-5).
+    tls: RwLock<Option<Arc<timelord_tls::RotatingCert>>>,
 }
 
 impl Engine {
@@ -143,6 +146,7 @@ impl Engine {
             file_seq: AtomicU64::new(0),
             pending_gc: Mutex::new(Vec::new()),
             meta_cache: Arc::new(Default::default()),
+            tls: RwLock::new(None),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -569,6 +573,11 @@ impl Engine {
         timelord_query::run_sql_env(&self.query_env, &session, tables, query).await
     }
 
+    /// Attach the TLS rotator so /metrics exports cert health (SEC-3).
+    pub fn set_tls(&self, rot: Arc<timelord_tls::RotatingCert>) {
+        *self.tls.write().expect("tls lock") = Some(rot);
+    }
+
     pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
@@ -581,6 +590,17 @@ impl Engine {
             (dbs.len(), tables, rows)
         };
         let wal_bytes = self.wal.lock().expect("wal lock").size();
+        let tls_lines = match self.tls.read().expect("tls lock").as_ref() {
+            Some(t) => format!(
+                "# TYPE timelord_tls_cert_expiry_seconds gauge\n\
+                 timelord_tls_cert_expiry_seconds {}\n\
+                 # TYPE timelord_tls_last_reload_ok gauge\n\
+                 timelord_tls_last_reload_ok {}\n",
+                t.expires_in_secs(),
+                if t.last_reload_ok() { 1 } else { 0 },
+            ),
+            None => String::new(),
+        };
         format!(
             "# TYPE timelord_lines_written_total counter\n\
              timelord_lines_written_total {}\n\
@@ -591,7 +611,7 @@ impl Engine {
              # TYPE timelord_buffer_rows gauge\ntimelord_buffer_rows {}\n\
              # TYPE timelord_wal_bytes gauge\ntimelord_wal_bytes {}\n\
              # TYPE timelord_compactions_total counter\ntimelord_compactions_total {}\n\
-             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n",
+             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -601,6 +621,7 @@ impl Engine {
             wal_bytes,
             self.compactions_total.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
+            tls_lines,
         )
     }
 }
@@ -619,6 +640,50 @@ impl timelord_flight::SqlBackend for Engine {
 
 pub fn app(engine: Arc<Engine>) -> axum::Router {
     timelord_api::app(engine)
+}
+
+/// The TLS-enabled router: the api surface plus the explicit rotation
+/// trigger (SEC-3 mandates BOTH a file watcher and an admin endpoint;
+/// reload-by-restart is forbidden). No auth at this milestone,
+/// consistent with the rest of the PoC surface.
+pub fn app_with_tls_admin(
+    engine: Arc<Engine>,
+    rot: Arc<timelord_tls::RotatingCert>,
+) -> axum::Router {
+    use axum::response::IntoResponse;
+    let reload = move || {
+        let rot = Arc::clone(&rot);
+        async move {
+            let res = tokio::task::spawn_blocking(move || rot.reload().map(|_| rot.expires_in_secs()))
+                .await;
+            match res {
+                Ok(Ok(expires_in)) => (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "status": "rotated",
+                        "expires_in_seconds": expires_in,
+                    })),
+                )
+                    .into_response(),
+                Ok(Err(e)) => (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    axum::Json(serde_json::json!({
+                        "error": e.to_string(),
+                        "alarm": timelord_tls::RENEWAL_ALARM,
+                        "serving": "last-good certificate",
+                    })),
+                )
+                    .into_response(),
+                Err(join) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": join.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
+    };
+    timelord_api::app(engine)
+        .merge(axum::Router::new().route("/admin/tls/reload", axum::routing::post(reload)))
 }
 
 /// Parse engine config from environment (main + integration use).

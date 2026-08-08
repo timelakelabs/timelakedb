@@ -18,5 +18,12 @@ datafusion = "54"
 flate2 = "1"
 tempfile = "3"
 bytes = "1"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+arc-swap = "1"
+x509-parser = "0.17"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
 
 

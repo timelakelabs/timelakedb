@@ -58,14 +58,30 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M5 SHIPPED — AT-4/5/6 complete.** Metadata cache (immutable
+- Status: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
+  `bench/results/at7-drill.log`). New `timelord-tls` crate:
+  validate-before-swap cert loading (PEM, expiry via x509-parser,
+  key↔cert match via `CertifiedKey::from_der`), `ArcSwap` resolver
+  consulted only at handshake, last-good + named
+  `SEC3_CERT_RENEWAL_FAILED` alarm on a bad renewal. Both listeners TLS
+  when `TIMELORD_TLS_CERT`/`_KEY` set (HTTP via axum-server, Flight via
+  tokio-rustls accept loop into `serve_with_incoming`); plaintext stays
+  the default (bench/fixtures unchanged). Triggers: 2 s mtime watcher
+  (works through a Windows bind mount) + POST /admin/tls/reload.
+  Gauges: timelord_tls_cert_expiry_seconds, timelord_tls_last_reload_ok.
+  Drill stack: `compose/timelorddb-tls.yml` (ports 2963/2964) +
+  `tls-drill/` (gen-certs.sh, at7_drill.py). Gotcha: rust:1-slim moved
+  to trixie — runtime stage must be trixie-slim or the binary dies with
+  `GLIBC_2.38 not found`. Post-TLS smoke gate green (0 errors, Shape A
+  49 ms median). Next: streaming/range reads for the ingest-contention
+  carve-out; CI on a remote.
+- Previous: **M5 — AT-4/5/6 complete.** Metadata cache (immutable
   footers) → warm Shape A 0–6 ms, cold ~300 ms. Backup 34 s / restore
   13 s exact; SIGKILL mid-ingest recovery 4.7 s, zero loss (40,340,794
   exact); 10× 100K bursts clean; repeat run within tolerance; stock
   Telegraf writing (compose profile "telegraf"). Backup note: live
   snapshots are safe by objects-before-manifest ordering; quiesce only
-  eliminates a tiny manifest-tear window. Next: SEC-3 TLS + AT-7 drill;
-  streaming/range reads for the ingest-contention carve-out.
+  eliminates a tiny manifest-tear window.
 - Previous: **M4 — AT-3 green with two carve-outs** (run
   tldb-m4-final + tldb-m4-settled2 + idb3-exactness in bench/results/).
   Fresh full-scale: Shape A median 211 ms, all Shape B complete (B1

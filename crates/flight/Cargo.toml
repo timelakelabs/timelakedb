@@ -7,8 +7,11 @@ license.workspace = true
 [dependencies]
 arrow = "58"
 arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 prost = "0.14"
 futures = "0.3"
 serde_json.workspace = true
 tracing.workspace = true
+tokio = { workspace = true }
+rustls.workspace = true
+tokio-rustls.workspace = true

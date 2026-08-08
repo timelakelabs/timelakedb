@@ -1,0 +1,17 @@
+﻿[package]
+name = "timelord-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustls.workspace = true
+rustls-pemfile.workspace = true
+arc-swap.workspace = true
+x509-parser.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+time = "0.3"
+tempfile.workspace = true

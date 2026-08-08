@@ -19,6 +19,8 @@ timelord-store = { path = "../store" }
 timelord-catalog = { path = "../catalog" }
 timelord-compact = { path = "../compact" }
 timelord-flight = { path = "../flight" }
+timelord-tls = { path = "../tls" }
+axum-server.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

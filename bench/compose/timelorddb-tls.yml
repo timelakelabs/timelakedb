@@ -1,0 +1,44 @@
+# AT-7 drill stack: TimelordDB with TLS 1.3 on both listeners (SEC-3),
+# plus stock Telegraf writing over HTTPS. Separate ports and volume so
+# the plaintext bench fixture can keep running untouched.
+#
+#   cd bench/compose/tls-drill && sh gen-certs.sh initial && cd ..
+#   docker compose -f compose/timelorddb-tls.yml --profile telegraf up -d --build
+#   python compose/tls-drill/at7_drill.py
+name: bench-timelorddb-tls
+services:
+  timelorddb-tls:
+    build: ../..
+    container_name: timelorddb-tls
+    ports:
+      - "2963:1963"   # HTTPS: line-protocol writes + /api/sql + /admin/tls/reload
+      - "2964:1964"   # Flight SQL over TLS
+    environment:
+      TIMELORD_TLS_CERT: /certs/server.crt
+      TIMELORD_TLS_KEY: /certs/server.key
+    volumes:
+      - timelord-tls-data:/var/lib/timelord/data
+      # bind mount, read-only: the drill rotates certs by overwriting
+      # these files from the host, exactly like a certbot renewal would.
+      - ./tls-drill/certs:/certs:ro
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:1963/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  telegraf:
+    image: telegraf:latest
+    container_name: timelord-telegraf-tls
+    profiles: ["telegraf"]
+    volumes:
+      - ./telegraf-tls.conf:/etc/telegraf/telegraf.conf:ro
+      - ./tls-drill/certs:/certs:ro
+    restart: unless-stopped
+    depends_on:
+      - timelorddb-tls
+
+volumes:
+  timelord-tls-data:
