@@ -1,7 +1,13 @@
-[package]
+﻿[package]
 name = "timelord-compact"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+datafusion.workspace = true
+timelord-buffer = { path = "../buffer" }
+timelord-query = { path = "../query" }
+
+[dev-dependencies]
+timelord-ingest = { path = "../ingest" }

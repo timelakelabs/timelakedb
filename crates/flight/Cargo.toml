@@ -1,7 +1,14 @@
-[package]
+﻿[package]
 name = "timelord-flight"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow = "58"
+arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+tonic = "0.14"
+prost = "0.14"
+futures = "0.3"
+serde_json.workspace = true
+tracing.workspace = true

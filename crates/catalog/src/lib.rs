@@ -32,6 +32,10 @@ pub struct FileMeta {
 struct ManifestEntry {
     seq: u64,
     add_files: Vec<FileMeta>,
+    /// Object paths superseded by this commit (compaction merges,
+    /// retention drops). Removals apply before adds on replay.
+    #[serde(default)]
+    remove_paths: Vec<String>,
 }
 
 pub struct Catalog<S: Store> {
@@ -54,6 +58,11 @@ impl<S: Store> Catalog<S> {
                 )
             })?;
             seq = seq.max(entry.seq);
+            if !entry.remove_paths.is_empty() {
+                for list in files.values_mut() {
+                    list.retain(|f| !entry.remove_paths.contains(&f.path));
+                }
+            }
             for f in entry.add_files {
                 files
                     .entry((f.db.clone(), f.table.clone()))
@@ -70,15 +79,31 @@ impl<S: Store> Catalog<S> {
 
     /// Durably commit newly flushed files, then apply in memory.
     pub fn commit_add(&self, add_files: Vec<FileMeta>) -> std::io::Result<u64> {
+        self.commit(add_files, Vec::new())
+    }
+
+    /// Durably commit a replacement (compaction) or drop (retention):
+    /// removals apply before adds, atomically from readers' perspective.
+    pub fn commit(
+        &self,
+        add_files: Vec<FileMeta>,
+        remove_paths: Vec<String>,
+    ) -> std::io::Result<u64> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let entry = ManifestEntry {
             seq,
             add_files: add_files.clone(),
+            remove_paths: remove_paths.clone(),
         };
         let path = format!("catalog/manifest/{seq:012}.json");
         self.store
             .put(&path, &serde_json::to_vec(&entry).expect("manifest json"))?;
         let mut files = self.files.lock().expect("catalog lock");
+        if !remove_paths.is_empty() {
+            for list in files.values_mut() {
+                list.retain(|f| !remove_paths.contains(&f.path));
+            }
+        }
         for f in add_files {
             files
                 .entry((f.db.clone(), f.table.clone()))
@@ -86,6 +111,17 @@ impl<S: Store> Catalog<S> {
                 .push(f);
         }
         Ok(seq)
+    }
+
+    /// All files, for compaction/retention planning.
+    pub fn all_files(&self) -> Vec<FileMeta> {
+        self.files
+            .lock()
+            .expect("catalog lock")
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     pub fn files_for(&self, db: &str, table: &str) -> Vec<FileMeta> {

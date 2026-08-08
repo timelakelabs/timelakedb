@@ -1,0 +1,18 @@
+# Grafana datasource provisioning for the TimelordDB fixture check
+# (AT-6 read half). Deliberately keeps uid "influxdb3" — the fixture
+# dashboards reference that uid, and FR-8's bar is that they render with
+# no change beyond the datasource URL.
+apiVersion: 1
+
+datasources:
+  - name: TimelordDB-SQL
+    uid: influxdb3
+    type: influxdb
+    access: proxy
+    url: http://timelorddb:1964
+    isDefault: true
+    jsonData:
+      version: SQL
+      dbName: poc
+      httpMode: POST
+      insecureGrpc: true

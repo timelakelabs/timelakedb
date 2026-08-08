@@ -69,7 +69,7 @@ async fn health() -> Json<Value> {
         "status": "pass",
         "name": "timelorddb",
         "version": env!("CARGO_PKG_VERSION"),
-        "milestone": "M1",
+        "milestone": "M3",
     }))
 }
 

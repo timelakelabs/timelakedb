@@ -206,7 +206,6 @@ impl TableBuffer {
 /// Compaction (M3) reuses these pieces for cross-file merges.
 pub mod flush {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     use datafusion::arrow::array::{Array, TimestampNanosecondArray, UInt32Array};
     use datafusion::arrow::compute::take;

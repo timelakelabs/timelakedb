@@ -16,24 +16,51 @@ async fn main() {
     let data_dir = timelord_server::data_dir_from_env();
     let cfg = timelord_server::config_from_env();
 
+    tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelorddb M3 starting");
     let engine =
         timelord_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
-    tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelorddb M2 listening");
 
-    // L0 flush tick (ARCHITECTURE §7)
-    let flusher = Arc::clone(&engine);
+    // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
+    // every 30 s, retention every 60 s — sequential on one blocking task
+    // so background work never stacks up on itself.
+    let maint = Arc::clone(&engine);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
-            let e = Arc::clone(&flusher);
-            let res = tokio::task::spawn_blocking(move || e.flush_if_needed()).await;
+            n += 1;
+            let e = Arc::clone(&maint);
+            let compact = n % 3 == 0;
+            let retention = n % 6 == 0;
+            let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                e.flush_if_needed()?;
+                if compact {
+                    e.compact_once()?;
+                }
+                if retention {
+                    e.enforce_retention()?;
+                }
+                Ok(())
+            })
+            .await;
             match res {
-                Ok(Ok(0)) => {}
-                Ok(Ok(files)) => tracing::info!(files, "flush tick"),
-                Ok(Err(err)) => tracing::error!(%err, "flush failed"),
-                Err(join) => tracing::error!(%join, "flush task panicked"),
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::error!(%err, "maintenance tick failed"),
+                Err(join) => tracing::error!(%join, "maintenance task panicked"),
             }
+        }
+    });
+
+    // Flight SQL (FR-8) on its own gRPC port
+    let flight_addr: std::net::SocketAddr = std::env::var("TIMELORD_FLIGHT_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:1964".to_string())
+        .parse()
+        .expect("TIMELORD_FLIGHT_ADDR must be host:port");
+    let flight_backend: Arc<dyn timelord_flight::SqlBackend> = engine.clone();
+    tokio::spawn(async move {
+        if let Err(e) = timelord_flight::serve(flight_backend, flight_addr).await {
+            tracing::error!(error = %e, "flight sql server exited");
         }
     });
 

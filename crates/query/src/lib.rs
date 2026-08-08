@@ -19,6 +19,10 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use serde_json::{Map, Number, Value, json};
 
+/// Re-export so downstream crates name batches without a direct
+/// datafusion dependency (version unification lives here).
+pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
+
 /// Per-session context the mandatory predicate sees (SEC-2).
 /// Grows Accumulo-style authorizations, tenant, and retention context.
 #[derive(Debug, Default, Clone)]

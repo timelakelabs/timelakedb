@@ -58,14 +58,16 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
-- Status: **M2 shipped** — full L0 cycle works: flush (PK sort + LWW
-  dedup, hour partitions, Parquet via Store, manifest catalog, WAL
-  generation reclaim), reads union buffer+files, 429 WAL backpressure.
-  Gate: smoke exact (77,806) through the flush cycle; SIGKILL recovery
-  0.8 s, zero loss. Limits: cross-file dedup arrives with compaction
-  (M3); no pruning; `docker kill` does NOT auto-restart (restart policies
-  ignore manual kills — use `docker restart -t 0` for crash drills).
-  Smoke gate: `python bench.py run --backend timelorddb --scale smoke`.
+- Status: **M3 shipped** — compaction (cross-file LWW dedup, FR-5
+  complete), per-table retention (FR-7), Flight SQL on :1964 serving the
+  stock Grafana datasource (FR-8; fixture dashboards render unchanged;
+  grafana profile in the compose file, port 3003). Laptop gate: 616K
+  lines/s ingest, 0 errors, Shape B ≤1.6 s, burst 100K/0.17 s. Open
+  items: (1) 8-row (2 ppm) dedup delta vs accepted lines — compare with
+  influxdb3 on identical fresh data at the M4 gate; (2) no file pruning
+  yet (Shape A 517 ms at laptop — M4's bloom/pruning work); (3) `docker
+  kill` suppresses restart policies — drills use `docker restart -t 0`.
+  Use the `/tldb-gate` skill for build/test/gate commands.
 
 ## Ground rules for work in this directory
 

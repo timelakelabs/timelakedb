@@ -7,7 +7,27 @@ services:
     build: ../..
     container_name: timelorddb
     ports:
-      - "1963:1963"
+      - "1963:1963"   # HTTP: line-protocol writes + /api/sql
+      - "1964:1964"   # Flight SQL (Grafana, FR-8)
     volumes:
       - ./data/timelord:/var/lib/timelord/data
     restart: unless-stopped
+
+  # AT-6 read half: the UNCHANGED fixture dashboards over Flight SQL.
+  #   docker compose -f compose/timelorddb.yml --profile grafana up -d
+  grafana:
+    image: grafana/grafana:latest
+    container_name: timelord-grafana
+    profiles: ["grafana"]
+    ports:
+      - "3003:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana-datasource:/etc/grafana/provisioning/datasources:ro
+      - ../../fixtures/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../../fixtures/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    depends_on:
+      - timelorddb
