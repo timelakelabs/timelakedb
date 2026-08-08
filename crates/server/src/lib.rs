@@ -281,40 +281,18 @@ impl Engine {
             (owned, sealed)
         };
 
-        // 2. encode + upload through the Store chokepoint
+        // 2. encode + upload through the Store chokepoint. One table's
+        // failure must not discard the others' rows, so each is encoded
+        // independently and a failure is recorded rather than propagated.
         let mut metas = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         for (db, table, buf) in owned {
-            let batch = buf.snapshot()?;
-            // keep the registry current: flushed columns must remain
-            // queryable after the buffer empties (and after restart)
-            {
-                let key = (db.clone(), table.clone());
-                let mut reg = self.schemas.write().expect("schemas lock");
-                let merged =
-                    timelord_query::schema_union(reg.get(&key).cloned(), batch.schema())?;
-                reg.insert(key, merged);
-            }
-            for (partition, part) in flush::prepare(&batch)? {
-                let (min_ts, max_ts) = flush::time_bounds(&part);
-                let bytes = flush::to_parquet_bytes(&part)?;
-                let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
-                let path = format!(
-                    "{db}/{table}/data/{partition}/{:020}-{seq:06}.parquet",
-                    max_ts
-                );
-                self.store
-                    .put(&path, &bytes)
-                    .map_err(|e| format!("store put {path}: {e}"))?;
-                metas.push(FileMeta {
-                    db: db.clone(),
-                    table: table.clone(),
-                    partition,
-                    path,
-                    rows: part.num_rows() as u64,
-                    size_bytes: bytes.len() as u64,
-                    min_ts_ns: min_ts,
-                    max_ts_ns: max_ts,
-                });
+            match self.flush_one(&db, &table, buf) {
+                Ok(mut m) => metas.append(&mut m),
+                Err(err) => {
+                    tracing::error!(%db, %table, %err, "flush failed for this table; others continue");
+                    failed.push(format!("{db}.{table}"));
+                }
             }
         }
 
@@ -323,14 +301,66 @@ impl Engine {
         self.catalog
             .commit_add(metas)
             .map_err(|e| format!("catalog commit: {e}"))?;
-        self.wal
-            .lock()
-            .expect("wal lock")
-            .delete_generations_upto(sealed_gen)
-            .map_err(|e| format!("wal reclaim: {e}"))?;
+        if failed.is_empty() {
+            self.wal
+                .lock()
+                .expect("wal lock")
+                .delete_generations_upto(sealed_gen)
+                .map_err(|e| format!("wal reclaim: {e}"))?;
+        } else {
+            // The failed tables' rows are still in the sealed generation.
+            // Keeping it means a restart replays them — safe, because
+            // replaying already-flushed rows dedups last-write-wins.
+            tracing::warn!(
+                tables = ?failed,
+                "WAL generations retained: some tables did not flush"
+            );
+        }
         self.flushes_total.fetch_add(1, Ordering::Relaxed);
         tracing::info!(files = n, "flush complete");
-        Ok(n)
+        if failed.is_empty() {
+            Ok(n)
+        } else {
+            Err(format!("flush incomplete for {}", failed.join(", ")))
+        }
+    }
+
+    /// Encode and upload one table's buffer. Split out of [`Self::flush_all`]
+    /// so a single bad buffer is contained.
+    fn flush_one(&self, db: &str, table: &str, buf: TableBuffer) -> Result<Vec<FileMeta>, String> {
+        let batch = buf.snapshot()?;
+        // keep the registry current: flushed columns must remain
+        // queryable after the buffer empties (and after restart)
+        {
+            let key = (db.to_string(), table.to_string());
+            let mut reg = self.schemas.write().expect("schemas lock");
+            let merged = timelord_query::schema_union(reg.get(&key).cloned(), batch.schema())?;
+            reg.insert(key, merged);
+        }
+        let mut metas = Vec::new();
+        for (partition, part) in flush::prepare(&batch)? {
+            let (min_ts, max_ts) = flush::time_bounds(&part);
+            let bytes = flush::to_parquet_bytes(&part)?;
+            let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
+            let path = format!(
+                "{db}/{table}/data/{partition}/{:020}-{seq:06}.parquet",
+                max_ts
+            );
+            self.store
+                .put(&path, &bytes)
+                .map_err(|e| format!("store put {path}: {e}"))?;
+            metas.push(FileMeta {
+                db: db.to_string(),
+                table: table.to_string(),
+                partition,
+                path,
+                rows: part.num_rows() as u64,
+                size_bytes: bytes.len() as u64,
+                min_ts_ns: min_ts,
+                max_ts_ns: max_ts,
+            });
+        }
+        Ok(metas)
     }
 
     /// L0→L1: merge every (db, table, hour) group holding at least

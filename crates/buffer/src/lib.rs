@@ -32,6 +32,10 @@ struct TagCol {
 }
 
 impl TagCol {
+    fn pad_to(&mut self, n: usize) {
+        self.keys.resize(n, None);
+    }
+
     fn push(&mut self, v: &str) {
         let next = self.values.len() as i32;
         let key = *self.intern.entry(v.to_string()).or_insert_with(|| {
@@ -71,6 +75,21 @@ impl FieldCol {
         }
     }
 
+    /// Would `push` accept this value? Lets a whole line be validated
+    /// before any column is touched — see [`TableBuffer::append`].
+    fn accepts(&self, v: &FieldValue) -> bool {
+        matches!(
+            (self, v),
+            (
+                FieldCol::F64(_),
+                FieldValue::Float(_) | FieldValue::Int(_) | FieldValue::UInt(_)
+            ) | (FieldCol::I64(_), FieldValue::Int(_))
+                | (FieldCol::U64(_), FieldValue::UInt(_))
+                | (FieldCol::Bool(_), FieldValue::Bool(_))
+                | (FieldCol::Str(_), FieldValue::Str(_))
+        )
+    }
+
     fn push(&mut self, v: &FieldValue, col: &str) -> Result<(), String> {
         match (self, v) {
             (FieldCol::F64(c), FieldValue::Float(x)) => c.push(Some(*x)),
@@ -81,15 +100,17 @@ impl FieldCol {
             (FieldCol::U64(c), FieldValue::UInt(x)) => c.push(Some(*x)),
             (FieldCol::Bool(c), FieldValue::Bool(x)) => c.push(Some(*x)),
             (FieldCol::Str(c), FieldValue::Str(x)) => c.push(Some(x.clone())),
-            (_, other) => {
-                return Err(format!(
-                    "field '{col}' type conflict: column was created with a \
-                     different type than {other:?}"
-                ));
-            }
+            (_, other) => return Err(type_conflict(col, other)),
         }
         Ok(())
     }
+}
+
+fn type_conflict(col: &str, v: &FieldValue) -> String {
+    format!(
+        "field '{col}' type conflict: column was created with a \
+         different type than {v:?}"
+    )
 }
 
 /// One table's mutable buffer.
@@ -118,7 +139,36 @@ impl TableBuffer {
     /// Append one parsed line. On error the row is NOT applied (the whole
     /// request was already validated upstream; errors here are type
     /// conflicts, reported with the field name).
+    /// Append one row.
+    ///
+    /// **Atomic**: a rejected line leaves the buffer exactly as it was. It
+    /// has to be. Pushing tag values first and discovering a field type
+    /// conflict afterwards left the tag columns one longer than `times`,
+    /// and from then on every `snapshot()` failed with "all columns in a
+    /// record batch must have the same length" — which took out reads on
+    /// the table, the flush that would have drained it, and (because
+    /// maintenance was one sequential task) compaction and retention for
+    /// every other table on the node. One 400 poisoned the whole engine,
+    /// and the WAL replayed it at boot, so a restart did not clear it.
     pub fn append(&mut self, line: &ParsedLine) -> Result<(), String> {
+        // Validate every field — against the column it would land in, and
+        // against any column this same line is about to create — BEFORE
+        // touching anything.
+        let mut pending: Vec<(&String, FieldCol)> = Vec::new();
+        for (k, v) in &line.fields {
+            if let Some(col) = self.fields.get(k) {
+                if !col.accepts(v) {
+                    return Err(type_conflict(k, v));
+                }
+            } else if let Some((_, col)) = pending.iter().find(|(name, _)| *name == k) {
+                if !col.accepts(v) {
+                    return Err(type_conflict(k, v));
+                }
+            } else {
+                pending.push((k, FieldCol::new(v)));
+            }
+        }
+
         self.first_write.get_or_insert_with(std::time::Instant::now);
         let n = self.times.len();
 
@@ -129,6 +179,9 @@ impl TableBuffer {
                 c.keys.resize(n, None); // backfill rows written before this tag existed
                 c
             });
+            // A key repeated inside one line overwrites rather than appends:
+            // two pushes would leave this column longer than `times`.
+            col.pad_to(n);
             col.push(v);
         }
         for (k, v) in &line.fields {
@@ -138,7 +191,8 @@ impl TableBuffer {
                 c.pad_to(n);
                 c
             });
-            col.push(v, k)?;
+            col.pad_to(n); // same rule for a repeated field key: last wins
+            col.push(v, k)?; // cannot fail — validated above
         }
 
         // pad columns this row didn't mention
@@ -449,6 +503,76 @@ mod tests {
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .unwrap();
         assert_eq!(step.values().len(), 2);
+    }
+
+    #[test]
+    fn rejected_line_leaves_the_buffer_usable() {
+        // The regression: the conflicting line had already pushed its tag
+        // value when the field push failed, leaving `h` one longer than
+        // `time`. Every later snapshot then failed with "all columns in a
+        // record batch must have the same length" — killing reads of the
+        // table, the flush that would have drained it, and the whole
+        // maintenance tick behind it.
+        let mut buf = TableBuffer::default();
+        for line in parse_lines("tt,h=a v=1 100", 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+
+        let bad = parse_lines("tt,h=a v=\"oops\" 200", 1, 0).unwrap();
+        let err = buf.append(&bad[0]).unwrap_err();
+        assert!(err.contains("type conflict"), "unexpected error: {err}");
+
+        assert_eq!(buf.row_count(), 1, "rejected row must not be counted");
+        assert_eq!(buf.snapshot().unwrap().num_rows(), 1);
+
+        // and the buffer still accepts good writes afterwards
+        for line in parse_lines("tt,h=a v=2 300", 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        assert_eq!(buf.snapshot().unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn repeated_key_in_one_line_stays_aligned_and_last_wins() {
+        // A duplicate tag key was accepted (204) and pushed twice into the
+        // same column — same ragged-column corruption, from a *successful*
+        // write.
+        let mut buf = TableBuffer::default();
+        for line in parse_lines("dt,h=a,h=b v=1,v=2 100", 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let batch = buf.snapshot().expect("snapshot must survive repeated keys");
+        assert_eq!(batch.num_rows(), 1);
+
+        let h = batch
+            .column_by_name("h")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let vals = h.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(vals.value(h.keys().value(0) as usize), "b");
+
+        let v = batch
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(v.value(0), 2.0);
+    }
+
+    #[test]
+    fn conflicting_repeat_within_one_line_is_rejected_cleanly() {
+        let mut buf = TableBuffer::default();
+        for line in parse_lines("ct,h=a v=1 100", 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        // second `w` conflicts with the column the first `w` would create
+        let bad = parse_lines("ct,h=a w=1,w=\"two\" 200", 1, 0).unwrap();
+        assert!(buf.append(&bad[0]).is_err());
+        assert_eq!(buf.row_count(), 1);
+        assert_eq!(buf.snapshot().unwrap().num_rows(), 1);
     }
 
     #[test]
