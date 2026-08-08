@@ -1,0 +1,91 @@
+{
+  "uid": "host-metrics",
+  "title": "Host Metrics (fleet)",
+  "description": "Simulated CPU/mem/disk from the host fleet. Queries use fixed now()-relative windows (see README).",
+  "tags": ["influxdb3-poc"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Hosts reporting (last 5m)",
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT COUNT(DISTINCT host) AS hosts FROM host_metrics WHERE time >= now() - INTERVAL '5 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Fleet avg CPU % (5m)",
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT AVG(cpu_pct) AS cpu FROM host_metrics WHERE time >= now() - INTERVAL '5 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Fleet avg memory % (5m)",
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT AVG(mem_pct) AS mem FROM host_metrics WHERE time >= now() - INTERVAL '5 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Fleet avg CPU / memory %, 1-min bins (3h)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 5 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, AVG(cpu_pct) AS avg_cpu, AVG(mem_pct) AS avg_mem FROM host_metrics WHERE time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Top 10 hosts by CPU (5m) - granular per-host drilldown",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "influxdb3" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb3" },
+          "rawSql": "SELECT host, AVG(cpu_pct) AS cpu_pct, AVG(mem_pct) AS mem_pct, MAX(disk_pct) AS disk_pct FROM host_metrics WHERE time >= now() - INTERVAL '5 minutes' GROUP BY host ORDER BY cpu_pct DESC LIMIT 10",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Rust build output (future)
+target/
+
+# Benchmark targets' data volumes — never in git
+bench/compose/data/
+
+# Python
+__pycache__/
+*.pyc

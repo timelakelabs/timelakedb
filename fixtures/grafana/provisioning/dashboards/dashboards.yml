@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: influxdb3-poc
+    type: file
+    folder: InfluxDB 3 PoC
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

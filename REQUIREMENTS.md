@@ -2,8 +2,8 @@
 
 **Status:** Draft v1 · 2026-08-08
 **Evidence base:** Every requirement below traces to a measured result from
-the tsdb-bench evaluation (`../BENCHMARK_RESULTS.md`, raw records in
-`../benchmark/results/`), in which five engines ran the identical workload:
+the tsdb-bench evaluation (`docs/evidence/BENCHMARK_RESULTS.md`, raw records in
+`bench/results/`), in which five engines ran the identical workload:
 InfluxDB 1.8 (OOM-killed by a query), InfluxDB 2.7 (funnel never completed),
 QuestDB and VictoriaMetrics (prior trials, OOM on the same query shape), and
 InfluxDB 3 Core (passed everything). TimelordDB must beat the survivor and
@@ -112,7 +112,7 @@ tables genuinely need different lifetimes.*
 datasource — no custom plugin — connects, passes its health check, and
 queries. Primary path: Flight SQL (the InfluxDB datasource's SQL mode);
 PostgreSQL wire is an acceptable alternative. Concrete bar: the four
-provisioned dashboards in `../influxdb3-poc/grafana/` (pipeline funnel,
+provisioned dashboards in `fixtures/grafana/` (pipeline funnel,
 host fleet, host detail, product journey) render against TimelordDB with
 no change beyond the datasource URL. *Evidence: those dashboards are plain
 SQL over Flight SQL and served as the evaluation's entire read path.*
@@ -329,7 +329,7 @@ floor is allowed for legacy clients, nothing older.)
 
 ## 10. Acceptance testing — the benchmark is the specification
 
-The existing harness (`../benchmark/`) is the executable acceptance test.
+The existing harness (`bench/`) is the executable acceptance test.
 
 - **AT-1 (MUST):** Implement a `timelorddb` tsdb-bench adapter (~100 lines:
   write endpoint, five canonical Shape B queries in SQL, Shape A, health,
@@ -346,7 +346,7 @@ The existing harness (`../benchmark/`) is the executable acceptance test.
   ≤ 1 min), and the sustained-repeated-burst variant.
 - **AT-6 (MUST):** Ecosystem end-to-end: a stock Telegraf agent
   (`influxdb_v2` output, gzip enabled) writes host metrics to TimelordDB
-  while the evaluation's Grafana provisioning (`../influxdb3-poc/grafana/`)
+  while the evaluation's Grafana provisioning (`fixtures/grafana/`)
   points at it — datasource health check passes and all four dashboards
   render and refresh. This reruns the plan's T5 + T8 against TimelordDB.
   **Runs twice: plaintext and TLS 1.3 end-to-end** (Telegraf `tls_*`

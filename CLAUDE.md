@@ -1,7 +1,7 @@
 # TimelordDB
 
 A new time-series database, specified from evidence: five engines ran the
-identical high-cardinality workload under `../benchmark/` (tsdb-bench), and
+identical high-cardinality workload under `bench/` (tsdb-bench), and
 their measured successes and failures define what this one must do.
 
 ## Inspired
@@ -25,10 +25,10 @@ This project is inspired by the following projects.
   workspace, write/read paths, manifest-log catalog, compaction levels,
   memory budgets, the SEC seams, clustering evolution, and the M0–M5
   milestones (each gated by a tsdb-bench run).
-- `../BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
+- `docs/evidence/BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
   query), 2.7 (funnel never completed, 12× ingest decay), 3 Core (passed
   everything — the bar to beat), plus prior QuestDB/VictoriaMetrics OOMs.
-- `../EVALUATION_PLAN.md` — the original workload definition and pass
+- `docs/evidence/EVALUATION_PLAN.md` — the original workload definition and pass
   criteria the benchmarks implement.
 
 ## Decided
@@ -50,20 +50,20 @@ This project is inspired by the following projects.
 
 ## Ground rules for work in this directory
 
-- The acceptance test is `../benchmark/` — do not invent a new harness.
+- The acceptance test is `bench/` — do not invent a new harness.
   A `timelorddb` backend adapter + compose target makes any prototype
   measurable with `python bench.py run --backend timelorddb` and
   comparable via `bench.py compare` against the recorded baselines in
-  `../benchmark/results/`.
+  `bench/results/`.
 - The hard invariant is RR-1: no query may kill the server. Designs that
   can't uphold it are out, regardless of speed.
 - High-cardinality tags must cost what a compressed column costs (FR-2).
   Anything whose memory or write cost grows with distinct-tag-combination
   count repeats the failure this project exists to avoid.
 - Keep query semantics identical to the canonical five Shape B queries and
-  Shape A in `../benchmark/backends/influxdb3.py` — those are the
+  Shape A in `bench/backends/influxdb3.py` — those are the
   reference meanings, validated by matching row counts across engines.
 - Telegraf (unmodified `influxdb`/`influxdb_v2` output plugins) and Grafana
   (stock datasource over Flight SQL) are first-class integrations — FR-8 /
-  FR-9 / AT-6. The provisioned dashboards in `../influxdb3-poc/grafana/`
+  FR-9 / AT-6. The provisioned dashboards in `fixtures/grafana/`
   are the Grafana compatibility fixture; don't fork them.
