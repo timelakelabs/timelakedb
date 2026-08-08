@@ -15,6 +15,15 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `ARCHITECTURE.md` | Components, seams, milestones M0–M5 |
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
+| `site/` | Project website (landing + docs), published to GitHub Pages |
+
+## Website
+
+`site/` is plain HTML, CSS and SVG — no build step, no dependencies. Open
+`site/index.html` in a browser to preview it. `.github/workflows/pages.yml`
+publishes the directory on every push that touches it; enable it once per
+repository under **Settings → Pages → Source: GitHub Actions**. Every figure
+on the site traces to a run under `bench/results/`.
 
 ## Status: SEC-3 — TLS 1.3 with hot cert rotation, AT-7 passed
 

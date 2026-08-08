@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation — TimelordDB</title>
+<meta name="description" content="TimelordDB documentation: ingestion over line protocol, SQL and Flight SQL querying, per-table retention, scaling, API reference and operational practice.">
+<meta name="theme-color" content="#0b1320">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="shell">
+    <a class="brand" href="../index.html">
+      <img class="mark" src="../assets/logo.svg" alt="">
+      <span>Timelord<span class="db">DB</span></span>
+    </a>
+    <span class="tagline">Time-Series Database Documentation</span>
+    <nav>
+      <a href="../index.html">Home</a>
+      <a href="../index.html#evidence">Benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell docs">
+  <aside class="docs-nav" aria-label="Documentation sections">
+    <ol>
+      <li><a class="active" href="#overview">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1Z"/></svg>
+        Overview</a></li>
+      <li><a href="#quick-start">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M5 15c-1 2-1 4-1 4s2 0 4-1"/><path d="M9 18c5-2 11-8 11-14C14 4 8 10 6 15Z"/><circle cx="14" cy="10" r="1.6"/></svg>
+        Quick Start</a></li>
+      <li><a href="#ingestion">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>
+        Ingestion</a></li>
+      <li><a href="#querying">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+        Querying</a></li>
+      <li><a href="#retention">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg>
+        Retention</a></li>
+      <li><a href="#scaling">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 18 9 12l4 3.5L20 7"/><path d="M15 7h5v5"/></svg>
+        Scaling</a></li>
+      <li><a href="#api">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 8-5 4 5 4M15 8l5 4-5 4"/></svg>
+        API Reference</a></li>
+      <li><a href="#practices">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
+        Best Practices</a></li>
+    </ol>
+  </aside>
+
+  <main class="docs-body">
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>
+        TimelordDB is a time-series database for high-cardinality event
+        analytics: millions of distinct entities per day, queried across
+        their whole journey rather than one series at a time. It is written
+        in Rust on Apache DataFusion, Arrow, Parquet and <code>object_store</code>.
+      </p>
+      <div class="note">
+        <p>
+          <strong>Status: pre-v1.</strong> A single node is production-shaped —
+          durable writes, compaction, retention, backup and restore, TLS with
+          hot certificate rotation — but replication and query high
+          availability are v2 work. Read <a href="#scaling">Scaling</a> before
+          planning a deployment.
+        </p>
+      </div>
+
+      <h3>Why it exists</h3>
+      <p>
+        Five engines were given one identical workload — roughly 1–2 million
+        products a day moving through ten pipeline steps, then aggregated with
+        <code>COUNT(DISTINCT product_id)</code>. InfluxDB 1.8 was OOM-killed by
+        that query; InfluxDB 2.7 never finished it; QuestDB and VictoriaMetrics
+        had run out of memory on it in earlier trials. Those failures became
+        this database's requirements, and its benchmark harness is the
+        acceptance test rather than a marketing exercise.
+      </p>
+
+      <h3>How a write becomes a queryable row</h3>
+      <ul>
+        <li>Line protocol is parsed and appended to a write-ahead log, which is
+            <strong>fsynced before the 204 returns</strong> — an acknowledged write
+            survives a kill.</li>
+        <li>Rows land in a per-table in-memory buffer where tags are Arrow
+            <code>Dictionary&lt;Int32, Utf8&gt;</code> columns. High-cardinality tags
+            cost what a compressed column costs; nothing is keyed per series.</li>
+        <li>Flushes sort by primary key, apply last-write-wins de-duplication and
+            write Snappy Parquet partitioned by <code>(table, UTC hour)</code>.</li>
+        <li>A manifest-log catalog records file additions and removals; it is
+            replayed at boot, so recovery is a log replay, not an index rebuild.</li>
+        <li>Compaction merges small files per partition, clustering rows by the
+            highest-cardinality dictionary column so later queries can skip most
+            row groups on statistics alone.</li>
+      </ul>
+
+      <h3>How a query stays inside its budget</h3>
+      <p>
+        Reads union the live buffer with catalogued Parquet through DataFusion.
+        Files are pruned by time bounds, then by row-group statistics, then by
+        decode-time row filters; immutable footers are cached so a warm lookup
+        prunes without fetching anything. Every query runs against one shared
+        memory pool, behind an admission semaphore and a server-side deadline —
+        the hard invariant is that <strong>no query may kill the server</strong>.
+      </p>
+    </section>
+
+    <section id="quick-start">
+      <h2>Quick Start</h2>
+      <p>Docker is the only prerequisite; no Rust toolchain is needed to run it.</p>
+
+      <div class="code">
+        <header>Start the server <button class="copy" type="button">Copy</button></header>
+<pre><span class="k">cd</span> TimelordDB/bench
+docker compose -f compose/timelorddb.yml up -d --build
+curl http://localhost:<span class="n">1963</span>/health
+<span class="c"># {"status":"pass","name":"timelorddb",...}</span></pre>
+      </div>
+
+      <div class="code">
+        <header>Write and read back <button class="copy" type="button">Copy</button></header>
+<pre>curl -X POST <span class="s">'http://localhost:1963/api/v2/write?bucket=poc'</span> \
+  --data-binary <span class="s">'pipeline_events,product_id=p-1042,step=01-download,worker_ip=172.16.1.7 event="start" 1754600000000000000'</span>
+
+curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
+  -H <span class="s">'content-type: application/json'</span> \
+  -d <span class="s">'{"db":"poc","sql":"SELECT COUNT(*) AS n FROM pipeline_events"}'</span></pre>
+      </div>
+
+      <h3>Telegraf</h3>
+      <p>A stock agent needs a URL and nothing else — the token, organization and gzip defaults are all accepted.</p>
+      <div class="code">
+        <header>telegraf.conf <button class="copy" type="button">Copy</button></header>
+<pre>[[outputs.influxdb_v2]]
+  urls = [<span class="s">"http://timelorddb:1963"</span>]
+  token = <span class="s">"anything-auth-is-off"</span>
+  organization = <span class="s">"poc"</span>
+  bucket = <span class="s">"poc"</span></pre>
+      </div>
+
+      <h3>Grafana</h3>
+      <p>
+        Add the stock InfluxDB datasource, choose <strong>SQL</strong> as the query
+        language, and point it at <code>http://timelorddb:1964</code> — Grafana's
+        Flight SQL client connects unmodified. The provisioned dashboards under
+        <code>fixtures/grafana/</code> are the compatibility fixture and render as-is.
+      </p>
+    </section>
+
+    <section id="ingestion">
+      <h2>Ingestion</h2>
+      <p>
+        All three InfluxDB write endpoints are accepted so existing agents and
+        scripts need no changes. The database (or bucket) named in the query
+        string is created on first write.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Selector</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /write</code></td><td><code>?db=</code></td><td>v1-style</td></tr>
+            <tr><td><code>POST /api/v2/write</code></td><td><code>?bucket=</code></td><td>v2-style; <code>org</code> accepted and ignored (single tenant)</td></tr>
+            <tr><td><code>POST /api/v3/write_lp</code></td><td><code>?db=</code></td><td>v3-style</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Request handling</h3>
+      <ul>
+        <li><code>Content-Encoding: gzip</code> is decompressed automatically — the
+            Telegraf <code>influxdb_v2</code> default.</li>
+        <li><code>precision</code> may be <code>s</code>, <code>ms</code>, <code>us</code>
+            or <code>ns</code> (default). Points without a timestamp take server time.</li>
+        <li><strong>204 No Content</strong> means the batch is durable in the WAL, not merely buffered.</li>
+        <li><strong>400</strong> identifies the offending line and field rather than failing the batch silently.</li>
+        <li><strong>429</strong> with <code>Retry-After</code> is backpressure: the WAL has reached
+            <code>TIMELORD_WAL_MAX_BYTES</code> and flushing needs to catch up. It is a
+            named, visible limit — writes are never dropped quietly.</li>
+      </ul>
+
+      <h3>Schema rules</h3>
+      <p>
+        Tags become dictionary-encoded string columns and fields become typed
+        columns; new columns may appear at any time. Rows sharing a primary key
+        (tag set plus timestamp) are de-duplicated last-write-wins at flush, and
+        again across files during compaction.
+      </p>
+    </section>
+
+    <section id="querying">
+      <h2>Querying</h2>
+      <p>Two interfaces, one engine and one memory budget behind them.</p>
+
+      <h3>SQL over HTTP</h3>
+      <div class="code">
+        <header>POST /api/sql <button class="copy" type="button">Copy</button></header>
+<pre>curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
+  -H <span class="s">'content-type: application/json'</span> \
+  -d <span class="s">'{"db":"poc","sql":"SELECT step, COUNT(DISTINCT product_id) AS products
+                     FROM pipeline_events
+                     WHERE time &gt;= now() - INTERVAL '\''24 hours'\''
+                     GROUP BY step ORDER BY step"}'</span></pre>
+      </div>
+      <p>The response is a JSON array of row objects. SQL is DataFusion's dialect.</p>
+
+      <h3>Flight SQL</h3>
+      <p>
+        Port 1964 serves Arrow Flight SQL for Grafana and any Flight SQL client.
+        The database is read from request metadata — <code>database</code>,
+        <code>bucket-name</code>, <code>bucket</code> or <code>db</code>, in that order —
+        and defaults to <code>poc</code>.
+      </p>
+
+      <h3>What makes it fast</h3>
+      <ul>
+        <li><strong>Time pruning:</strong> partition bounds eliminate whole files before any I/O.</li>
+        <li><strong>Statistics pruning:</strong> entity-clustered compaction means a single
+            product's rows sit in a handful of row groups, and min/max statistics
+            skip the rest. (Bloom filters are deliberately not relied upon —
+            the Parquet writer does not emit them for dictionary columns, which a
+            unit test pins.)</li>
+        <li><strong>Row filters and projection pushdown:</strong> predicates are applied during
+            decode, and only referenced columns are materialised.</li>
+        <li><strong>Metadata cache:</strong> Parquet footers are immutable, so a repeat lookup
+            prunes from cache and reads only surviving files — 0–6 ms warm against
+            roughly 300 ms cold.</li>
+      </ul>
+
+      <h3>Guardrails</h3>
+      <p>
+        Queries share one <code>FairSpillPool</code>, queue behind an admission
+        semaphore, and are cancelled at a server-side deadline; loads run on the
+        blocking pool so a slow scan can always be preempted. Size the pool below
+        the container memory limit divided by the admission count.
+      </p>
+    </section>
+
+    <section id="retention">
+      <h2>Retention</h2>
+      <p>
+        Retention is configured <strong>per table</strong>, not globally — metrics that
+        matter for a year and debug streams that matter for three days live in the
+        same database without compromise.
+      </p>
+      <div class="code">
+        <header>Per-table retention <button class="copy" type="button">Copy</button></header>
+<pre>TIMELORD_RETENTION=<span class="s">"pipeline_events=365d,host_metrics=90d,disk_metrics=72h"</span></pre>
+      </div>
+      <ul>
+        <li>Durations take <code>d</code> (days), <code>h</code> (hours), or a bare number of seconds.</li>
+        <li>Tables absent from the specification are kept indefinitely; an empty
+            value keeps everything.</li>
+        <li>Enforcement drops whole <code>(table, hour)</code> partitions on the maintenance
+            tick — it is a catalog operation, not a row-by-row delete.</li>
+        <li>Removed files are deleted only after <code>TIMELORD_GC_GRACE_SECS</code>
+            (default 900 s) so a long-running query's catalog snapshot can never
+            dangle. Keep the grace longer than <code>TIMELORD_QUERY_TIMEOUT_SECS</code>.</li>
+      </ul>
+      <p>
+        Background maintenance runs on one sequential task: flush checks every
+        10 s, compaction every 30 s, retention every 60 s, so housekeeping can
+        never stack up on itself.
+      </p>
+    </section>
+
+    <section id="scaling">
+      <h2>Scaling</h2>
+      <h3>Today: one node, honestly</h3>
+      <p>
+        A single node absorbed 36.6M events per benchmark day at 365–671K
+        lines/s with every query completing, and bursts of 100K events landed in
+        0.12 s while queries ran concurrently. Vertical levers are the memory
+        pool, the admission count, flush size and the compaction trigger.
+      </p>
+
+      <h3>Built to become a cluster</h3>
+      <ul>
+        <li>The catalog is an append-only manifest log designed to take
+            compare-and-swap commits — the seam a second writer needs.</li>
+        <li>All object I/O passes through one narrow store interface, so remote
+            object storage (and, later, Parquet modular encryption) is one
+            implementation rather than a rewrite.</li>
+        <li>Node discovery is a trait: a static backend now, Consul as a supported
+            option later. Discovery may never carry correctness — that stays in the
+            catalog.</li>
+        <li>Replication and query high availability are explicitly v2, and are not
+            claimed here until a drill measures them.</li>
+      </ul>
+
+      <h3>Sizing guidance</h3>
+      <p>
+        Set a container memory limit and keep
+        <code>TIMELORD_QUERY_MEM_BYTES × TIMELORD_MAX_CONCURRENT_QUERIES</code>
+        inside it. The reference benchmark configuration used a 3.5 GB pool with
+        2 admitted queries under an 8 GB cap.
+      </p>
+    </section>
+
+    <section id="api">
+      <h2>API Reference</h2>
+
+      <h3>HTTP endpoints (port 1963)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method &amp; path</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /health</code></td><td>Liveness and version</td></tr>
+            <tr><td><code>GET|HEAD /ping</code></td><td>204 with a version header (InfluxDB client compatibility)</td></tr>
+            <tr><td><code>GET /metrics</code></td><td>Prometheus exposition</td></tr>
+            <tr><td><code>POST /write</code>, <code>/api/v2/write</code>, <code>/api/v3/write_lp</code></td><td>Line-protocol ingest</td></tr>
+            <tr><td><code>POST /api/sql</code></td><td>SQL returning JSON rows</td></tr>
+            <tr><td><code>POST /admin/tls/reload</code></td><td>Re-read and validate the certificate pair (TLS mode only)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Configuration</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>TIMELORD_ADDR</code></td><td><code>0.0.0.0:1963</code></td><td>HTTP listener</td></tr>
+            <tr><td><code>TIMELORD_FLIGHT_ADDR</code></td><td><code>0.0.0.0:1964</code></td><td>Flight SQL listener</td></tr>
+            <tr><td><code>TIMELORD_DATA_DIR</code></td><td><code>/var/lib/timelord/data</code></td><td>WAL, objects and catalog</td></tr>
+            <tr><td><code>TIMELORD_QUERY_MEM_BYTES</code></td><td>1 GiB</td><td>Shared query memory pool</td></tr>
+            <tr><td><code>TIMELORD_MAX_CONCURRENT_QUERIES</code></td><td>6</td><td>Admission limit; the rest queue</td></tr>
+            <tr><td><code>TIMELORD_QUERY_TIMEOUT_SECS</code></td><td>600</td><td>Server-side query deadline</td></tr>
+            <tr><td><code>TIMELORD_FLUSH_ROWS</code></td><td>50000</td><td>Rows in a table buffer before flushing</td></tr>
+            <tr><td><code>TIMELORD_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
+            <tr><td><code>TIMELORD_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>
+            <tr><td><code>TIMELORD_COMPACT_MIN_FILES</code></td><td>4</td><td>Files in a partition before compaction</td></tr>
+            <tr><td><code>TIMELORD_RETENTION</code></td><td>empty</td><td>Per-table retention specification</td></tr>
+            <tr><td><code>TIMELORD_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
+            <tr><td><code>TIMELORD_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths)</td></tr>
+            <tr><td><code>TIMELORD_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Metrics</h3>
+      <p>
+        <code>timelord_lines_written_total</code>, <code>timelord_flushes_total</code>,
+        <code>timelord_compactions_total</code>, <code>timelord_retention_drops_total</code>,
+        <code>timelord_parquet_files</code>, <code>timelord_buffer_rows</code>,
+        <code>timelord_wal_bytes</code>, <code>timelord_databases</code>,
+        <code>timelord_tables</code>. With TLS enabled,
+        <code>timelord_tls_cert_expiry_seconds</code> and
+        <code>timelord_tls_last_reload_ok</code> are added.
+      </p>
+
+      <h3>TLS and certificate rotation</h3>
+      <p>
+        Setting <code>TIMELORD_TLS_CERT</code> and <code>TIMELORD_TLS_KEY</code> puts TLS 1.3
+        on both listeners. Certificates are designed to be short-lived: overwrite
+        the files (a certbot deploy hook, a sidecar, anything) and a watcher picks
+        the change up within seconds, or call <code>POST /admin/tls/reload</code>.
+        A replacement is parsed and validated — PEM structure, expiry, and that
+        the key matches the certificate — <em>before</em> an atomic swap, and the
+        resolver is consulted only during a handshake, so rotation never disturbs
+        established connections or in-flight queries. A bad renewal keeps the
+        last-good pair serving and logs the named alarm
+        <code>SEC3_CERT_RENEWAL_FAILED</code> while
+        <code>timelord_tls_last_reload_ok</code> drops to 0.
+      </p>
+    </section>
+
+    <section id="practices">
+      <h2>Best Practices</h2>
+
+      <h3>Give the container a memory limit</h3>
+      <p>
+        Always set <code>mem_limit</code> (or the Kubernetes equivalent) and keep the
+        pool times admission inside it. This is not defensive paperwork: during
+        development an unbounded runaway scan took down an entire Docker VM and
+        every container on it.
+      </p>
+
+      <h3>Use real volumes, not host bind mounts</h3>
+      <p>
+        On Windows and macOS, a bind-mounted data directory cost roughly three
+        seconds per query in file-read overhead alone. Use a named volume or
+        native storage.
+      </p>
+
+      <h3>Alert on certificate health, not on the calendar</h3>
+      <p>
+        Page on <code>timelord_tls_last_reload_ok == 0</code> and on
+        <code>timelord_tls_cert_expiry_seconds</code> falling below roughly two
+        renewal periods. The server will keep serving on the last-good
+        certificate, which is exactly why a silent failure would otherwise go
+        unnoticed until expiry.
+      </p>
+
+      <h3>Back up while running</h3>
+      <p>
+        Objects are written before the manifest that references them, so a live
+        snapshot is internally consistent — a backup taken under load restored
+        with every row exact in 13 seconds. Quiescing writes only removes a very
+        small manifest-tear window.
+      </p>
+
+      <h3>Prove changes with the harness</h3>
+      <p>
+        <code>bench/</code> is the executable specification. Run
+        <code>python bench.py run --backend timelorddb --scale laptop</code> and compare
+        against the recorded baselines in <code>bench/results/</code> rather than
+        inventing a new measurement each time; that is how every claim on this
+        site was produced.
+      </p>
+    </section>
+  </main>
+</div>
+
+<footer class="site">
+  <div class="shell">
+    <div>
+      <div class="kicker">Time. Stored. Forever.</div>
+      <div>TimelordDB — Rust · DataFusion · Arrow · Parquet</div>
+    </div>
+    <div style="margin-left:auto">
+      <a href="../index.html">Home</a> ·
+      <a href="../index.html#evidence">Benchmarks</a>
+    </div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TimelordDB — High-Performance Time-Series Database</title>
+<meta name="description" content="TimelordDB is a Rust time-series database for high-cardinality event analytics, specified from a five-engine benchmark: 36M events/day, every cross-product query completes, 0.50 GB/day on disk.">
+<meta name="theme-color" content="#0b1320">
+<meta property="og:title" content="TimelordDB — Time. Stored. Forever.">
+<meta property="og:description" content="A time-series database specified from evidence: the query that OOM-killed InfluxDB 1.8 returns here in 0.68 s.">
+<meta property="og:type" content="website">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="shell">
+    <a class="brand" href="index.html">
+      <img class="mark" src="assets/logo.svg" alt="">
+      <span>Timelord<span class="db">DB</span></span>
+    </a>
+    <nav>
+      <a href="docs/index.html">Docs</a>
+      <a href="#evidence">Benchmarks</a>
+      <a href="#quickstart">Quick Start</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="shell">
+    <div>
+      <div class="hero-mark">
+        <img class="mark" src="assets/logo.svg" alt="TimelordDB logo">
+        <div>
+          <h1 class="wordmark">Timelord<span class="db">DB</span></h1>
+          <p class="kicker">Time. Stored. Forever.</p>
+        </div>
+      </div>
+      <div class="rule"></div>
+      <p class="lede">High-Performance Time-Series Database</p>
+      <p class="sub">
+        Built in Rust on Apache DataFusion, Arrow and Parquet for
+        high-cardinality event analytics — the workload that made four
+        other engines run out of memory.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#quickstart">Quick Start</a>
+        <a class="btn btn-ghost" href="docs/index.html">Read the docs</a>
+      </div>
+    </div>
+
+    <!-- The line of time: 24 hours of events sweeping into the graphic. -->
+    <svg class="hero-graphic" viewBox="0 0 820 340" role="img"
+         aria-label="A day of time-series data rising to a peak and settling, plotted from 00:00 to 24:00">
+      <defs>
+        <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#2563eb"/>
+          <stop offset="55%" stop-color="#5b9bff"/>
+          <stop offset="100%" stop-color="#8fc2ff"/>
+        </linearGradient>
+        <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#2563eb" stop-opacity=".38"/>
+          <stop offset="100%" stop-color="#2563eb" stop-opacity="0"/>
+        </linearGradient>
+        <filter id="glow" x="-25%" y="-45%" width="150%" height="190%">
+          <feGaussianBlur stdDeviation="6" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+      </defs>
+
+      <!-- radar arcs behind the plot -->
+      <g fill="none" stroke="#5b9bff" opacity=".16">
+        <circle cx="600" cy="150" r="105"/>
+        <circle cx="600" cy="150" r="150"/>
+        <circle cx="600" cy="150" r="196"/>
+        <circle cx="600" cy="150" r="242"/>
+      </g>
+
+      <!-- hour gridlines -->
+      <g stroke="#31456b" stroke-width="1" opacity=".55">
+        <path d="M40 40V290M227 40V290M414 40V290M601 40V290M788 40V290"/>
+      </g>
+
+      <path class="spark-fill" fill="url(#area)"
+            d="M40 255 72 243 104 228 136 248 168 214 200 226 232 190 264 200 296 164 328 178 360 144 392 154 424 124 456 136 488 100 520 112 552 78 584 62 616 92 648 76 680 112 712 98 744 128 776 140 776 290 40 290Z"/>
+
+      <polyline class="spark-line" fill="none" stroke="url(#stroke)" stroke-width="3"
+                stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"
+                points="40,255 72,243 104,228 136,248 168,214 200,226 232,190 264,200 296,164 328,178 360,144 392,154 424,124 456,136 488,100 520,112 552,78 584,62 616,92 648,76 680,112 712,98 744,128 776,140"/>
+
+      <g class="spark-dots" fill="#dceaff" filter="url(#glow)">
+        <circle cx="136" cy="248" r="3.4"/>
+        <circle cx="296" cy="164" r="3.4"/>
+        <circle cx="424" cy="124" r="3.4"/>
+        <circle cx="584" cy="62" r="4.6"/>
+        <circle cx="680" cy="112" r="3.4"/>
+        <circle cx="776" cy="140" r="3.4"/>
+      </g>
+
+      <!-- time axis -->
+      <path d="M40 290H788" stroke="#5b9bff" stroke-width="1.5" opacity=".8"/>
+      <g fill="#93a7c4" font-family="system-ui, sans-serif" font-size="16" text-anchor="middle">
+        <text x="40" y="318">00:00</text>
+        <text x="227" y="318">06:00</text>
+        <text x="414" y="318">12:00</text>
+        <text x="601" y="318">18:00</text>
+        <text x="788" y="318">24:00</text>
+      </g>
+    </svg>
+  </div>
+</div>
+
+<div class="strip">
+  <div class="shell">
+    <span class="pill">Pre-v1</span>
+    <span>Single-node today, cluster-ready by design</span>
+    <span>·</span>
+    <span>Telegraf-compatible ingest</span>
+    <span>·</span>
+    <span>Grafana over Flight SQL</span>
+    <span>·</span>
+    <span>TLS 1.3 with hot certificate rotation</span>
+  </div>
+</div>
+
+<section>
+  <div class="shell">
+    <div class="section-head">
+      <h2>What it does, measured</h2>
+      <p>
+        Every number below comes from the same 36.6-million-event day run
+        through the benchmark harness in this repository — the same dataset
+        every other engine was given.
+      </p>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+             stroke-linecap="round" aria-hidden="true">
+          <path d="M12 20a8 8 0 1 1 8-8"/><path d="M12 12l5-3"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+        </svg>
+        <h3>Blazing fast</h3>
+        <span class="stat">211 ms → 0 ms</span>
+        <p>
+          Median product lookup across 36.6M events, cold. Once footers are
+          cached the same lookups return in 0–6 ms, because immutable Parquet
+          metadata prunes files without fetching them.
+        </p>
+      </div>
+      <div class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+             stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3l9 4.5-9 4.5-9-4.5L12 3Z"/><path d="M3 12l9 4.5 9-4.5"/><path d="M3 16.5 12 21l9-4.5"/>
+        </svg>
+        <h3>Efficient storage</h3>
+        <span class="stat">0.50 GB / day</span>
+        <p>
+          Columnar Parquet with entity-clustered compaction: less than half
+          the InfluxDB 3 footprint for the same data, and roughly a sixteenth
+          of what the 1.x and 2.x TSM engines wrote.
+        </p>
+      </div>
+      <div class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/>
+          <rect x="9" y="9" width="6" height="6" rx="1.4"/>
+        </svg>
+        <h3>Never killed by a query</h3>
+        <span class="stat">0.68 s</span>
+        <p>
+          The cross-product aggregation that OOM-killed InfluxDB 1.8 returns
+          here in under a second. One shared memory pool, admission control
+          and server-side deadlines make that a structural property, not luck.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="evidence">
+  <div class="shell">
+    <div class="section-head">
+      <h2>Specified from evidence</h2>
+      <p>
+        This database exists because five engines ran one identical workload —
+        ~1–2M products a day moving through ten pipeline steps, queried with
+        <code>COUNT(DISTINCT product_id)</code> — and their failures defined the
+        requirements.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><b>36.6M</b><span>events per benchmark day</span></div>
+      <div class="metric"><b>365–671K</b><span>lines/s ingest, zero errors</span></div>
+      <div class="metric"><b>4.7 s</b><span>SIGKILL recovery, zero acknowledged-write loss</span></div>
+      <div class="metric"><b>34 s / 13 s</b><span>backup / restore, all rows exact</span></div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Engine</th>
+            <th>Ingest</th>
+            <th>Product lookup</th>
+            <th>Cross-product funnels</th>
+            <th>Storage / day</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>TimelordDB</strong></td>
+            <td>365–671K lines/s</td>
+            <td>211 ms median</td>
+            <td class="good">all complete, 0.68–1.7 s</td>
+            <td><strong>0.50 GB</strong></td>
+          </tr>
+          <tr>
+            <td>InfluxDB 3 Core</td>
+            <td>73K lines/s</td>
+            <td>520 ms median</td>
+            <td class="good">all complete, 5.7–30.3 s</td>
+            <td>1.15 GB</td>
+          </tr>
+          <tr>
+            <td>InfluxDB 2.7</td>
+            <td>33K lines/s avg (decayed 123K → 10K)</td>
+            <td>134 ms</td>
+            <td class="bad">did not finish (3 × 300 s timeout)</td>
+            <td>8.13 GB</td>
+          </tr>
+          <tr>
+            <td>InfluxDB 1.8</td>
+            <td>58.7K lines/s</td>
+            <td>18 ms</td>
+            <td class="bad">OOM-killed the server at 14.4 GB</td>
+            <td>8.15 GB</td>
+          </tr>
+          <tr>
+            <td>QuestDB · VictoriaMetrics</td>
+            <td colspan="3" class="bad">out of memory on the same query shape (prior trials)</td>
+            <td>—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">
+      Same seeded dataset, same query semantics, same machine. Full record and
+      raw run files live in <code>docs/evidence/</code> and <code>bench/results/</code>.
+    </p>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="shell">
+    <div class="section-head">
+      <h2>Quick start</h2>
+      <p>Docker is the only prerequisite. The server speaks InfluxDB line protocol on 1963 and Flight SQL on 1964.</p>
+    </div>
+
+    <div class="code">
+      <header>Run it <button class="copy" type="button">Copy</button></header>
+<pre><span class="c"># from a clone of the repository</span>
+<span class="k">cd</span> TimelordDB/bench
+docker compose -f compose/timelorddb.yml up -d --build
+curl http://localhost:<span class="n">1963</span>/health</pre>
+    </div>
+
+    <div class="code">
+      <header>Write a point <button class="copy" type="button">Copy</button></header>
+<pre>curl -i -X POST <span class="s">'http://localhost:1963/api/v2/write?bucket=poc'</span> \
+  --data-binary <span class="s">'pipeline_events,product_id=p-1042,step=01-download,worker_ip=172.16.1.7 event="start" 1754600000000000000'</span>
+<span class="c"># HTTP/1.1 204 No Content  — durable in the WAL before it returns</span></pre>
+    </div>
+
+    <div class="code">
+      <header>Query it <button class="copy" type="button">Copy</button></header>
+<pre>curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
+  -H <span class="s">'content-type: application/json'</span> \
+  -d <span class="s">'{"db":"poc","sql":"SELECT step, COUNT(DISTINCT product_id) AS products FROM pipeline_events GROUP BY step ORDER BY step"}'</span></pre>
+    </div>
+
+    <p>
+      Point a stock Telegraf <code>influxdb_v2</code> output at the same URL, or add
+      Grafana's InfluxDB datasource in SQL mode against port 1964 —
+      both work unmodified. The <a href="docs/index.html">documentation</a>
+      covers ingestion, querying, retention and operations in detail.
+    </p>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="shell">
+    <div>
+      <div class="kicker">Time. Stored. Forever.</div>
+      <div>TimelordDB — Rust · DataFusion · Arrow · Parquet</div>
+    </div>
+    <div style="margin-left:auto">
+      <a href="docs/index.html">Documentation</a> ·
+      <a href="#evidence">Benchmarks</a>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
