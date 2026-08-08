@@ -21,6 +21,10 @@ This project is inspired by the following projects.
 - `REQUIREMENTS.md` — the requirements document. Every FR/PR/RR/SR traces
   to a measured benchmark result; the anti-requirements list is the four
   ways real engines failed.
+- `ARCHITECTURE.md` — how the requirements become components: crate
+  workspace, write/read paths, manifest-log catalog, compaction levels,
+  memory budgets, the SEC seams, clustering evolution, and the M0–M5
+  milestones (each gated by a tsdb-bench run).
 - `../BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
   query), 2.7 (funnel never completed, 12× ingest decay), 3 Core (passed
   everything — the bar to beat), plus prior QuestDB/VictoriaMetrics OOMs.
@@ -36,6 +40,13 @@ This project is inspired by the following projects.
 - Retention is per-table (FR-7). Encryption (SEC-1) and Accumulo-style
   row visibility labels (SEC-2) are v1 *design constraints* — one narrow
   object-I/O layer, one mandatory-predicate injection point.
+- TLS 1.3 (rustls) on every listener in v1, mTLS intra-cluster in v2
+  (SEC-3 — "TLS 3.0" in conversation means TLS 1.3). Certs are short-TTL
+  (~24 h) and hot-rotated: file-watch + ArcSwap resolver, validate-before-
+  swap, last-good on bad renewal, established connections never dropped
+  (AT-7 drills this under load). Discovery is a trait: static backend v1,
+  Consul v2 (CL-5); discovery may never carry correctness — that stays in
+  catalog CAS.
 
 ## Ground rules for work in this directory
 

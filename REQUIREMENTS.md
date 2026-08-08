@@ -233,6 +233,16 @@ near-linearly to 4 read nodes.
 replaceable without write downtime; a replacement reaches serving state in
 ≤ 5 min, bounded by cache warmup — never by state copy.
 
+**CL-5 · Pluggable membership & discovery, Consul supported (MUST, v2).**
+Cluster topology (which nodes exist, their roles, their health) comes from
+a `Discovery` trait with named backends: **static config** (v1/dev) and
+**HashiCorp Consul** (service registration, health checks, and sessions/
+leases for role election such as the per-shard compactor singleton).
+Design guard: no *correctness* property may depend on the discovery
+backend — writes and catalog commits stay safe under a wrong or stale
+membership view (correctness lives in catalog CAS, CL-1); discovery
+affects availability and routing only. Backend choice is config, not code.
+
 ## 8. Security & data governance (design constraints now, implementation phased)
 
 v1 ships token auth and optional TLS only (§12) — but the following are
@@ -271,6 +281,39 @@ The honest assessment requested:
   injection point (also the future hook for multi-tenancy and
   retention-boundary filtering).
 
+**SEC-3 · TLS 1.3 on every wire (MUST, v1 external · v2 intra-cluster).**
+(Specified as TLS 1.3 — there is no "TLS 3.0"; a configurable TLS 1.2
+floor is allowed for legacy clients, nothing older.)
+- **v1:** every listener — the HTTP write API (FR-1/FR-9) and Flight SQL
+  (FR-8) — serves TLS 1.3 via rustls; certificates hot-reload without
+  restart. Verified with real clients: Telegraf's `tls_ca`/`tls_cert`
+  output options and Grafana's secure-connection datasource settings
+  (the evaluation ran Grafana with "insecure gRPC" only because the PoC
+  had no TLS — the fixture must pass both ways).
+- **v2:** intra-cluster traffic (WAL replication CL-2, router↔node,
+  catalog) uses **mutual TLS** with the same rustls stack.
+- **Short-TTL certificates with hot rotation (MUST, v1).** The system is
+  designed for certificates with a validity of ~24 h, refreshed daily
+  (Vault agent / step-ca / cert-manager / ACME-style issuers that
+  materialize files):
+  - Reload is triggered by watching the cert/key files (the universal
+    integration) and by an explicit admin endpoint; **never by process
+    restart**.
+  - Rotation affects **new handshakes only** — established connections
+    and in-flight streams (long-lived Flight SQL queries, Telegraf keep-
+    alive sessions) continue uninterrupted; no draining, no forced close.
+  - Cert+key pairs load **atomically and validate before adoption**
+    (expiry, key match); a bad renewal keeps the last-good pair serving
+    and raises a loud, named alarm (RR-5) — degraded-but-serving beats
+    correct-but-down.
+  - Days-to-expiry is an exported metric with an alert threshold below
+    the renewal interval, so a stalled rotation is caught while the old
+    cert still works.
+  - mTLS trust anchors (v2) rotate the same way, with **dual-CA overlap**
+    supported so client and server bundles can roll independently.
+- Operational note carried from the evaluation: Flight SQL is gRPC over
+  HTTP/2 — any proxy in front must speak HTTP/2.
+
 ## 9. Anti-requirements — designs the evidence forbids
 
 1. **No inverted series index over the full tag space** (2.x decay curve,
@@ -306,6 +349,14 @@ The existing harness (`../benchmark/`) is the executable acceptance test.
   while the evaluation's Grafana provisioning (`../influxdb3-poc/grafana/`)
   points at it — datasource health check passes and all four dashboards
   render and refresh. This reruns the plan's T5 + T8 against TimelordDB.
+  **Runs twice: plaintext and TLS 1.3 end-to-end** (Telegraf `tls_*`
+  options, Grafana secure connection — SEC-3).
+- **AT-7 (MUST):** Certificate rotation drill: under sustained Telegraf
+  writes and a long-running Flight SQL query, rotate to a fresh 24 h cert.
+  Pass: zero dropped connections, zero write errors, the in-flight query
+  completes, and the next new connection presents the new certificate.
+  Repeat with a deliberately corrupt renewal: server keeps serving on the
+  last-good cert and raises the SEC-3 alarm.
 
 ## 11. Technology direction (decided 2026-08-08)
 
@@ -332,8 +383,9 @@ foundation** — libraries, not a fork.
 ## 12. Out of scope for v1
 
 Multi-node operation (phased per §7 — v1 is single-node but cluster-ready
-by CL-1), authn/z hardening and TLS termination (SEC constrains design
-only), encryption *implementation* (SEC-1 is a v1 design constraint,
+by CL-1; Consul discovery arrives with it, CL-5), authn/z hardening beyond
+token auth (SEC constrains design only — note TLS is **in** scope for v1
+per SEC-3), encryption *implementation* (SEC-1 is a v1 design constraint,
 v2 feature), InfluxQL/Flux query compatibility layers (write-API compat is
 in scope via FR-9), cross-datacenter replication, and a bespoke dashboard
 UI (Grafana is the read path).
