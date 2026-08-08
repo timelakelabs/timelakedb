@@ -33,22 +33,24 @@ async fn main() {
             let e = Arc::clone(&maint);
             let compact = n % 3 == 0;
             let retention = n % 6 == 0;
-            let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                e.flush_if_needed()?;
-                if compact {
-                    e.compact_once()?;
+            // Each stage is independent. A failing flush used to abort the
+            // rest of the tick, so one unflushable table stopped compaction
+            // and retention for every table on the node.
+            let res = tokio::task::spawn_blocking(move || {
+                if let Err(err) = e.flush_if_needed() {
+                    tracing::error!(%err, stage = "flush", "maintenance stage failed");
                 }
-                if retention {
-                    e.enforce_retention()?;
+                if compact && let Err(err) = e.compact_once() {
+                    tracing::error!(%err, stage = "compact", "maintenance stage failed");
+                }
+                if retention && let Err(err) = e.enforce_retention() {
+                    tracing::error!(%err, stage = "retention", "maintenance stage failed");
                 }
                 e.run_gc();
-                Ok(())
             })
             .await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::error!(%err, "maintenance tick failed"),
-                Err(join) => tracing::error!(%join, "maintenance task panicked"),
+            if let Err(join) = res {
+                tracing::error!(%join, "maintenance task panicked");
             }
         }
     });

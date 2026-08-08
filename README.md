@@ -19,7 +19,7 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `docs/BACKUP_RESTORE.md` | The AT-5 procedure, runnable (`ops/tldb-backup.sh`) |
 | `docs/evidence/` | The benchmark record this project is built on |
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
-| `site/` | Project website (landing + docs), published to GitHub Pages |
+| `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
 > **Security:** TimelordDB has **no authentication and no authorization**. Any
 > client that can reach port 1963 or 1964 can read and write everything on the

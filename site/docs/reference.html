@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — TimelordDB</title>
+<meta name="description" content="TimelordDB reference: line protocol grammar and types, SQL dialect, HTTP and Flight SQL surfaces, InfluxDB compatibility matrix, metrics and glossary.">
+<meta name="theme-color" content="#0b1320">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="shell">
+    <a class="brand" href="../index.html">
+      <img class="mark" src="../assets/logo.svg" alt="">
+      <span>Timelord<span class="db">DB</span></span>
+    </a>
+    <span class="tagline">Reference</span>
+    <nav>
+      <a href="../index.html">Home</a>
+      <a href="index.html">Docs</a>
+      <a href="../index.html#evidence">Benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell docs">
+  <aside class="docs-nav" aria-label="Reference sections">
+    <ol>
+      <li><a class="active" href="#line-protocol">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h13"/></svg>
+        Line Protocol</a></li>
+      <li><a href="#sql">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 8-5 4 5 4M15 8l5 4-5 4"/></svg>
+        SQL Dialect</a></li>
+      <li><a href="#http">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c4 4.5 4 12.5 0 17M12 3.5c-4 4.5-4 12.5 0 17"/></svg>
+        HTTP API</a></li>
+      <li><a href="#flight">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M3 12.5 21 5l-4.5 15-4-6.5Z"/><path d="m12.5 13.5-2.5 5 2-3.5"/></svg>
+        Flight SQL</a></li>
+      <li><a href="#compatibility">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.3l2.6-2.6a4 4 0 0 0-5.7-5.7L11 7.2"/><path d="M14 10.5a4 4 0 0 0-5.7-.3l-2.6 2.6a4 4 0 0 0 5.7 5.7L13 16.8"/></svg>
+        Compatibility</a></li>
+      <li><a href="#metrics">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V5"/><path d="M8 19v-6M12 19V8M16 19v-9M20 19v-4"/></svg>
+        Metrics</a></li>
+      <li><a href="#glossary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M5 4.5h9a3 3 0 0 1 3 3V21a2.5 2.5 0 0 0-2.5-2H5Z"/><path d="M17 7.5h2V21a2.5 2.5 0 0 0-2.5-2"/></svg>
+        Glossary</a></li>
+    </ol>
+  </aside>
+
+  <main class="docs-body">
+    <section id="line-protocol">
+      <h2>Line Protocol</h2>
+      <p>
+        The write format is InfluxDB line protocol, one record per line. Every
+        rule below is what the parser in <code>crates/ingest</code> actually
+        does, not what the format specifies in general.
+      </p>
+
+      <div class="code">
+        <header>Grammar <button class="copy" type="button">Copy</button></header>
+<pre>measurement[,tag_key=tag_value...] field_key=field_value[,field_key=field_value...] [timestamp]
+<span class="c"># └ table         └ dictionary columns   └ typed columns              └ integer, precision-scaled</span></pre>
+      </div>
+
+      <h3>Parsing</h3>
+      <ul>
+        <li>Records are separated by <code>\n</code>; a trailing <code>\r</code> is
+            stripped, so CRLF bodies are accepted.</li>
+        <li>Blank lines are skipped, and <strong>a line beginning with <code>#</code> is a
+            comment</strong>.</li>
+        <li>A measurement with no field set is an error — tags alone are not a record.</li>
+        <li>The batch is atomic: if any line fails to parse the whole request is
+            rejected with 400 and nothing in it is written.</li>
+      </ul>
+
+      <h3>Escaping</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Position</th><th>Escapes honoured</th></tr></thead>
+          <tbody>
+            <tr><td>Measurement, tag key, tag value, field key</td><td><code>\,</code> &nbsp; <code>\=</code> &nbsp; <code>\\</code> &nbsp; and a backslash before a space</td></tr>
+            <tr><td>Quoted string field value</td><td><code>\"</code> <code>\\</code> — a backslash takes the next character literally</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        A backslash before anything else is kept as a literal backslash.
+        <code>esc,path=a\,b\ c v=1</code> stores the tag value <code>a,b c</code>.
+      </p>
+
+      <h3>Field types</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Written as</th><th>Type</th><th>Column</th></tr></thead>
+          <tbody>
+            <tr><td><code>1.5</code>, <code>-1.5e3</code>, <code>2E-2</code></td><td>float</td><td><code>Float64</code></td></tr>
+            <tr><td><code>42i</code></td><td>signed integer</td><td><code>Int64</code></td></tr>
+            <tr><td><code>42u</code></td><td>unsigned integer</td><td><code>UInt64</code></td></tr>
+            <tr><td><code>t T true True TRUE</code> / <code>f F false False FALSE</code></td><td>boolean</td><td><code>Boolean</code></td></tr>
+            <tr><td><code>"quoted text"</code></td><td>string</td><td><code>Utf8</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Tags are always strings and always become
+        <code>Dictionary&lt;Int32, Utf8&gt;</code> columns — that is the whole
+        high-cardinality argument: a tag costs what a compressed column costs.
+        Full-width values round-trip exactly, including
+        <code>9223372036854775807i</code> and <code>18446744073709551615u</code>.
+      </p>
+
+      <h3>Timestamps</h3>
+      <ul>
+        <li>An integer in the unit given by the <code>precision</code> parameter:
+            <code>ns</code> (or <code>n</code>, the default), <code>us</code> (or
+            <code>u</code>), <code>ms</code>, <code>s</code>. Any other value is a 400.</li>
+        <li>Omit it and the server's clock is used — which is what Telegraf does
+            by default.</li>
+        <li>The column is <code>Timestamp(Nanosecond, "+00:00")</code>, never null.
+            Timestamps slightly in the future are legitimate and are stored as given.</li>
+      </ul>
+
+      <h3>Schema rules</h3>
+      <ul>
+        <li>The first write of a field name fixes its type. Integers and unsigned
+            integers are accepted into an existing float column (widening); nothing
+            else is coerced.</li>
+        <li>A conflicting type is a 400 naming the field, and the whole request is
+            rejected: <code>field 'v' type conflict: column was created with a
+            different type than Str("oops")</code>.</li>
+        <li>New tags and fields may appear at any time; earlier rows read back as
+            <code>null</code> for them.</li>
+        <li>A key repeated inside one line takes its <strong>last</strong> value, for
+            both tags and fields.</li>
+        <li>An empty tag value (<code>h=</code>) is stored as an empty string. InfluxDB
+            drops such a tag instead — one of the few places the behaviour differs.</li>
+        <li>The primary key is the tag set plus the timestamp. Duplicates are
+            de-duplicated last-write-wins at flush, and again across files during
+            compaction.</li>
+      </ul>
+
+      <div class="note warn">
+        <p>
+          <strong>Known defect: non-ASCII text is mangled.</strong> The parser decodes
+          each byte as a character, so a UTF-8 tag value like <code>München</code>
+          reads back as <code>MÃ¼nchen</code>. It affects measurement names, tag keys
+          and values, field keys and string field values. ASCII is unaffected.
+          Until it is fixed, keep identifiers and string fields ASCII.
+        </p>
+      </div>
+
+      <h3>Write errors</h3>
+      <p>Errors are JSON, and the message identifies the offending line by its
+        1-based position in the request body:</p>
+      <div class="code">
+        <header>400 responses <button class="copy" type="button">Copy</button></header>
+<pre>{"error":"line 2: bad float \"notanumber\" in \"probe,h=a v=notanumber\""}
+{"error":"line 1: no field set in \"probe,h=a\""}
+{"error":"line 1: tag 'h' has no value in \"probe,h v=1\""}
+{"error":"line 1: bad timestamp \"abc\" in \"probe,h=a v=1 abc\""}
+{"error":"bad precision \"bogus\""}
+{"error":"missing 'db' parameter"}</pre>
+      </div>
+    </section>
+
+    <section id="sql">
+      <h2>SQL Dialect</h2>
+      <p>
+        Queries run on Apache DataFusion — its dialect, its function library, its
+        error messages. Each query gets a fresh session containing the tables of
+        exactly one database, so nothing a query defines outlives it.
+      </p>
+
+      <h3>Schema seen by a query</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Column</th><th>Type</th><th>Null</th></tr></thead>
+          <tbody>
+            <tr><td><code>time</code></td><td><code>Timestamp(Nanosecond, "+00:00")</code></td><td>never</td></tr>
+            <tr><td>each tag</td><td><code>Dictionary(Int32, Utf8)</code></td><td>yes — null where the tag was absent</td></tr>
+            <tr><td>each field</td><td><code>Float64</code> / <code>Int64</code> / <code>UInt64</code> / <code>Boolean</code> / <code>Utf8</code></td><td>yes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>One table per measurement. <code>DESCRIBE &lt;table&gt;</code> works and is the
+        reliable way to inspect a schema.</p>
+
+      <h3>What works</h3>
+      <p>
+        Verified against a running server: joins, common table expressions, window
+        functions, <code>COUNT(DISTINCT …)</code>, <code>date_trunc</code>,
+        <code>date_bin</code>, <code>now()</code>, <code>INTERVAL</code> arithmetic,
+        <code>AT TIME ZONE</code>, <code>EXPLAIN</code> and <code>DESCRIBE</code>.
+      </p>
+
+      <h3>What does not</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Statement</th><th>Behaviour</th></tr></thead>
+          <tbody>
+            <tr><td><code>INSERT</code></td><td><code>This feature is not implemented: Insert into not implemented for this table</code> — write with line protocol</td></tr>
+            <tr><td><code>UPDATE</code>, <code>DELETE</code></td><td>Not implemented for these tables. Data leaves only by retention (FR-7)</td></tr>
+            <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Unavailable</strong> — the session does not enable it, so schema-browsing clients find nothing</td></tr>
+            <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td>Parse and return <code>[]</code>, but have <strong>no effect</strong> — the session is discarded with the query. A <code>DROP TABLE</code> that appears to succeed does not delete anything</td></tr>
+            <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td>Works, and writes a file as the server process — see <a href="index.html#security">Security</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>JSON encoding of results</h3>
+      <p><code>/api/sql</code> returns an array of row objects:</p>
+      <div class="code">
+        <header>Types on the wire <button class="copy" type="button">Copy</button></header>
+<pre>[{"b":true,"f":1.5,"host":"alpha","i":42,"s":"hi there",
+  "time":"2025-08-07T20:53:20Z","u":7}]</pre>
+      </div>
+      <ul>
+        <li><code>Int64</code>, <code>UInt64</code> and <code>Float64</code> are JSON
+            numbers — full 64-bit range, not stringified.</li>
+        <li><code>Boolean</code> is <code>true</code>/<code>false</code>.</li>
+        <li>Timestamps are RFC 3339 strings in UTC; dictionary (tag) values and
+            strings are strings.</li>
+        <li>SQL <code>NULL</code> is JSON <code>null</code>.</li>
+      </ul>
+
+      <h3>Query errors</h3>
+      <div class="code">
+        <header>400 responses <button class="copy" type="button">Copy</button></header>
+<pre>{"error":"Error during planning: table 'datafusion.public.nope' not found"}
+{"error":"database 'nosuch' does not exist (write to it first)"}
+{"error":"query timed out after 600s (server-side cap, RR-2)"}</pre>
+      </div>
+      <p>
+        A database exists once something has been written to it; querying an unknown
+        one is an error rather than an empty result. Planning errors are returned
+        verbatim, which discloses table and column names to any caller.
+      </p>
+    </section>
+
+    <section id="http">
+      <h2>HTTP API</h2>
+      <p>Port 1963. No authentication — see <a href="index.html#security">Security</a>.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Required</th><th>Optional</th><th>Success</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /write</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
+            <tr><td><code>POST /api/v2/write</code></td><td><code>bucket</code></td><td><code>precision</code>, <code>org</code> (ignored)</td><td>204</td></tr>
+            <tr><td><code>POST /api/v3/write_lp</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
+            <tr><td><code>POST /api/sql</code></td><td>body <code>sql</code></td><td>body <code>db</code> (default <code>poc</code>)</td><td>200 + JSON rows</td></tr>
+            <tr><td><code>GET /health</code></td><td>—</td><td>—</td><td>200 + <code>{"status":"pass","name":"timelorddb","version":…}</code></td></tr>
+            <tr><td><code>GET|HEAD /ping</code></td><td>—</td><td>—</td><td>204 + <code>x-timelorddb-version</code></td></tr>
+            <tr><td><code>GET /metrics</code></td><td>—</td><td>—</td><td>200 + Prometheus text</td></tr>
+            <tr><td><code>POST /admin/tls/reload</code></td><td>—</td><td>—</td><td>200 (TLS mode only)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Status codes</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Code</th><th>Means</th></tr></thead>
+          <tbody>
+            <tr><td><strong>204</strong></td><td>The batch is durable in the WAL — fsynced before the response, not merely buffered</td></tr>
+            <tr><td><strong>400</strong></td><td>Parse error, type conflict, bad precision, missing selector, or a failed query</td></tr>
+            <tr><td><strong>422</strong></td><td>TLS reload rejected: the new pair failed validation, the last-good pair keeps serving</td></tr>
+            <tr><td><strong>429</strong></td><td>Backpressure with <code>Retry-After: 1</code> — the WAL is at <code>TIMELORD_WAL_MAX_BYTES</code>. A named, visible limit; writes are never dropped silently</td></tr>
+            <tr><td><strong>500</strong></td><td>The engine could not make the write durable</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <code>Content-Encoding: gzip</code> is decompressed automatically on every
+        write endpoint — the Telegraf <code>influxdb_v2</code> default. Bodies must be
+        UTF-8.
+      </p>
+    </section>
+
+    <section id="flight">
+      <h2>Flight SQL</h2>
+      <p>
+        Port 1964, Arrow Flight SQL over gRPC (HTTP/2). The database comes from
+        request metadata, checked in this order: <code>database</code>,
+        <code>bucket-name</code>, <code>bucket</code>, <code>db</code> — defaulting to
+        <code>poc</code>.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Call</th><th>State</th></tr></thead>
+          <tbody>
+            <tr><td><code>Handshake</code></td><td>Accepts anything and returns an empty token — there is no authentication</td></tr>
+            <tr><td><code>GetFlightInfo(CommandStatementQuery)</code></td><td>Implemented</td></tr>
+            <tr><td><code>DoGet(ticket)</code></td><td>Implemented — streams Arrow batches natively</td></tr>
+            <tr><td><code>CommandGetTables</code>, <code>GetCatalogs</code>, <code>GetDbSchemas</code>, <code>GetSqlInfo</code></td><td><strong>Unimplemented</strong> — clients that browse metadata get an error</td></tr>
+            <tr><td>Prepared statements, <code>DoPut</code>, <code>ListFlights</code></td><td>Unimplemented</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Grafana's stock datasource works because its SQL mode sends statements
+        directly. A tool that starts by enumerating catalogs and tables will not,
+        and there is no schema browsing over SQL either — see
+        <a href="#sql">SQL Dialect</a>.
+      </p>
+    </section>
+
+    <section id="compatibility">
+      <h2>InfluxDB Compatibility</h2>
+      <p>
+        Existing agents write to TimelordDB unmodified. The read side is
+        deliberately not InfluxDB-shaped: SQL and Flight SQL replace InfluxQL and
+        Flux (REQUIREMENTS.md §12).
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>InfluxDB surface</th><th>TimelordDB</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /write</code> (v1)</td><td><strong>Implemented</strong></td></tr>
+            <tr><td><code>POST /api/v2/write</code> (v2)</td><td><strong>Implemented</strong>; <code>org</code> accepted and ignored, single tenant</td></tr>
+            <tr><td><code>POST /api/v3/write_lp</code> (v3)</td><td><strong>Implemented</strong></td></tr>
+            <tr><td>Authorization tokens</td><td>Accepted and ignored — any value works, including none</td></tr>
+            <tr><td>Buckets / databases</td><td>Created implicitly on first write; no management API</td></tr>
+            <tr><td><code>GET /ping</code></td><td>204, but the version header is <code>x-timelorddb-version</code>, <em>not</em> <code>X-Influxdb-Version</code> — clients that gate on that header will not recognise the server</td></tr>
+            <tr><td><code>GET /query</code> (InfluxQL)</td><td>404 — not implemented</td></tr>
+            <tr><td><code>POST /api/v2/query</code> (Flux)</td><td>404 — not implemented</td></tr>
+            <tr><td><code>/api/v2/buckets</code>, <code>/api/v2/orgs</code>, <code>/api/v2/setup</code></td><td>404 — no management API</td></tr>
+            <tr><td><code>POST /api/v2/delete</code></td><td>404 — data leaves only by retention</td></tr>
+            <tr><td><code>/api/v3/query_sql</code></td><td>404 — use <code>POST /api/sql</code> or Flight SQL</td></tr>
+            <tr><td><code>/debug/vars</code></td><td>404 — use <code>/metrics</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Verified integrations</h3>
+      <ul>
+        <li><strong>Telegraf</strong>, unmodified <code>influxdb</code> and
+            <code>influxdb_v2</code> output plugins, gzip on, token and organisation
+            set to anything — the AT-6 fixture.</li>
+        <li><strong>Grafana</strong>, stock InfluxDB datasource in SQL mode over Flight
+            SQL on 1964; the provisioned dashboards in <code>fixtures/grafana/</code>
+            render unchanged.</li>
+      </ul>
+      <p>
+        Client libraries that only write line protocol over the endpoints above will
+        work. Anything that calls a management, query or metadata API will not.
+      </p>
+    </section>
+
+    <section id="metrics">
+      <h2>Metrics</h2>
+      <p>
+        <code>GET /metrics</code> returns Prometheus exposition text. The series carry
+        <strong>no labels</strong> — one node, one value each.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Metric</th><th>Type</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>timelord_lines_written_total</code></td><td>counter</td><td>Line-protocol records accepted since start</td></tr>
+            <tr><td><code>timelord_flushes_total</code></td><td>counter</td><td>Completed flush cycles (buffer → Parquet → manifest)</td></tr>
+            <tr><td><code>timelord_compactions_total</code></td><td>counter</td><td>Partitions merged L0 → L1</td></tr>
+            <tr><td><code>timelord_retention_drops_total</code></td><td>counter</td><td>Files dropped by per-table retention</td></tr>
+            <tr><td><code>timelord_parquet_files</code></td><td>gauge</td><td>Files currently in the catalog</td></tr>
+            <tr><td><code>timelord_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
+            <tr><td><code>timelord_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELORD_WAL_MAX_BYTES</code></td></tr>
+            <tr><td><code>timelord_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>
+            <tr><td><code>timelord_tables</code></td><td>gauge</td><td>Tables with a live buffer</td></tr>
+            <tr><td><code>timelord_tls_cert_expiry_seconds</code></td><td>gauge</td><td>Seconds until the serving certificate expires (TLS mode only)</td></tr>
+            <tr><td><code>timelord_tls_last_reload_ok</code></td><td>gauge</td><td>1 if the last certificate reload validated, 0 if it was rejected (TLS mode only)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>What to alert on</h3>
+      <ul>
+        <li><code>rate(timelord_flushes_total[15m]) == 0</code> while
+            <code>timelord_buffer_rows</code> is high — maintenance is not draining the
+            buffer, and the WAL will grow into backpressure.</li>
+        <li><code>timelord_wal_bytes</code> approaching
+            <code>TIMELORD_WAL_MAX_BYTES</code> — writes are about to get 429s.</li>
+        <li><code>timelord_tls_last_reload_ok == 0</code> — a renewal was rejected and
+            the node is serving on the last-good certificate.</li>
+        <li><code>timelord_tls_cert_expiry_seconds</code> below two renewal periods.</li>
+        <li><code>timelord_parquet_files</code> climbing without compaction — check for
+            <code>maintenance stage failed</code> in the logs.</li>
+      </ul>
+      <p>
+        Logging is <code>tracing</code> to stdout, controlled by <code>RUST_LOG</code>
+        (default <code>info</code>).
+      </p>
+    </section>
+
+    <section id="glossary">
+      <h2>Glossary</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+          <tbody>
+            <tr><td>Buffer</td><td>A table's mutable in-memory rows, snapshotted as immutable Arrow batches for readers</td></tr>
+            <tr><td>WAL generation</td><td>One write-ahead log segment. Flush seals the current one and reclaims sealed ones; a truncated tail is tolerated</td></tr>
+            <tr><td>Flush (L0)</td><td>Sorting a buffer by primary key, de-duplicating last-write-wins and writing Parquet</td></tr>
+            <tr><td>Partition</td><td>A <code>(table, UTC hour)</code> group of files — the unit of time pruning and of retention drops</td></tr>
+            <tr><td>Manifest log</td><td>The append-only catalog: each entry adds or removes files, replayed in order at boot</td></tr>
+            <tr><td>Compaction (L0→L1)</td><td>Merging a partition's small files into one settled file, de-duplicating across them</td></tr>
+            <tr><td>Entity clustering</td><td>Ordering rows during compaction by the highest-cardinality tag, so one entity's rows sit in few row groups and statistics can skip the rest</td></tr>
+            <tr><td>Row group</td><td>Parquet's internal block; the granularity at which min/max statistics prune reads</td></tr>
+            <tr><td>Metadata cache</td><td>Cached Parquet footers — immutable, so a warm lookup prunes without fetching</td></tr>
+            <tr><td>Admission</td><td>The semaphore limiting concurrently executing queries; the rest queue</td></tr>
+            <tr><td>Memory pool</td><td>One shared <code>FairSpillPool</code> every query allocates from, so no query can exhaust the node (RR-1)</td></tr>
+            <tr><td>GC grace</td><td>The delay before a file removed from the catalog is deleted, so a long query's snapshot cannot dangle</td></tr>
+            <tr><td>Backpressure</td><td>The 429 raised when the WAL hits its cap — a named limit rather than a silent drop (RR-5)</td></tr>
+            <tr><td>Primary key</td><td>Tag set plus timestamp; the basis of last-write-wins de-duplication</td></tr>
+            <tr><td>Shape A / Shape B</td><td>The benchmark's two query shapes: a single-entity journey lookup, and the funnel aggregations across all entities</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="site">
+  <div class="shell">
+    <div>
+      <div class="kicker">Time. Stored. Forever.</div>
+      <div>TimelordDB — Rust · DataFusion · Arrow · Parquet</div>
+    </div>
+    <div style="margin-left:auto">
+      <a href="../index.html">Home</a> ·
+      <a href="index.html">Docs</a> ·
+      <a href="../index.html#evidence">Benchmarks</a>
+    </div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>

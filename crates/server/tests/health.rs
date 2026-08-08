@@ -423,3 +423,84 @@ async fn wal_replay_survives_restart_rr3() {
     assert_eq!(code, StatusCode::OK);
     assert_eq!(rows[0]["n"], 1, "a 204'd write must survive restart");
 }
+
+#[tokio::test]
+async fn a_rejected_write_cannot_poison_the_table_or_the_engine() {
+    // One type-conflicting line used to leave the buffer with ragged
+    // columns: reads of the table failed from then on, the flush that
+    // would have drained it failed, and the maintenance tick took
+    // compaction and retention for every other table down with it. The
+    // WAL replayed the same line at boot, so a restart did not clear it.
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let engine_ref = engine(dir.path());
+    let app = timelord_server::app(Arc::clone(&engine_ref));
+
+    assert_eq!(
+        write_lp(
+            &app,
+            "/api/v3/write_lp?db=poc",
+            format!("tt,h=a v=1 {t}").into_bytes(),
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    // a second table, to prove the blast radius stays at zero tables
+    assert_eq!(
+        write_lp(
+            &app,
+            "/api/v3/write_lp?db=poc",
+            format!("other,h=z v=1 {t}").into_bytes(),
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let code = write_lp(
+        &app,
+        "/api/v3/write_lp?db=poc",
+        format!("tt,h=a v=\"oops\" {}", t + 1).into_bytes(),
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "type conflict is a 400");
+
+    // reads still work, on this table and the other one
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "the rejected line must not break reads"
+    );
+    assert_eq!(rows[0]["n"], 1);
+    let (code, _) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM other").await;
+    assert_eq!(code, StatusCode::OK);
+
+    // a duplicate tag key is accepted, and must not corrupt anything either
+    assert_eq!(
+        write_lp(
+            &app,
+            "/api/v3/write_lp?db=poc",
+            format!("tt,h=a,h=b v=2 {}", t + 2).into_bytes(),
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    // maintenance still works: the buffers flush and the WAL is reclaimed
+    engine_ref.flush_all().expect("flush must succeed");
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 2);
+
+    // and the poison does not come back from the WAL after a restart
+    drop(app);
+    drop(engine_ref);
+    let app = timelord_server::app(engine(dir.path()));
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
+    assert_eq!(code, StatusCode::OK, "restart must not replay the poison");
+    assert_eq!(rows[0]["n"], 2);
+}

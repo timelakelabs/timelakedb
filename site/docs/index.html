@@ -20,6 +20,7 @@
     <span class="tagline">Time-Series Database Documentation</span>
     <nav>
       <a href="../index.html">Home</a>
+      <a href="reference.html">Reference</a>
       <a href="../index.html#evidence">Benchmarks</a>
     </nav>
   </div>
@@ -208,6 +209,11 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         (tag set plus timestamp) are de-duplicated last-write-wins at flush, and
         again across files during compaction.
       </p>
+      <p>
+        The exact grammar, escape set, field-type syntax, timestamp precisions and
+        error messages are in the
+        <a href="reference.html#line-protocol">line protocol reference</a>.
+      </p>
     </section>
 
     <section id="querying">
@@ -224,7 +230,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
                      WHERE time &gt;= now() - INTERVAL '\''24 hours'\''
                      GROUP BY step ORDER BY step"}'</span></pre>
       </div>
-      <p>The response is a JSON array of row objects. SQL is DataFusion's dialect.</p>
+      <p>
+        The response is a JSON array of row objects. SQL is DataFusion's dialect —
+        the <a href="reference.html#sql">SQL reference</a> lists what is supported,
+        what is not (no <code>INSERT</code>/<code>DELETE</code>, no
+        <code>SHOW TABLES</code>), and how each type is encoded on the wire.
+      </p>
 
       <h3>Flight SQL</h3>
       <p>
@@ -456,6 +467,11 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
     <section id="api">
       <h2>API Reference</h2>
+      <p>
+        A summary. The <a href="reference.html">full reference</a> carries the
+        line protocol grammar, the SQL dialect, the Flight SQL command surface, the
+        InfluxDB compatibility matrix, every metric and a glossary.
+      </p>
 
       <h3>HTTP endpoints (port 1963)</h3>
       <div class="table-wrap">
@@ -497,6 +513,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>Metrics</h3>
       <p>
+        Types, meanings and suggested alerts are in the
+        <a href="reference.html#metrics">metrics reference</a>. The series are:
         <code>timelord_lines_written_total</code>, <code>timelord_flushes_total</code>,
         <code>timelord_compactions_total</code>, <code>timelord_retention_drops_total</code>,
         <code>timelord_parquet_files</code>, <code>timelord_buffer_rows</code>,
@@ -588,6 +606,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
     </div>
     <div style="margin-left:auto">
       <a href="../index.html">Home</a> ·
+      <a href="reference.html">Reference</a> ·
       <a href="../index.html#evidence">Benchmarks</a>
     </div>
   </div>

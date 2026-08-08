@@ -67,6 +67,18 @@ This project is inspired by the following projects.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).
+- Reference docs: `site/docs/reference.html` (line protocol, SQL dialect,
+  HTTP + Flight SQL surface, InfluxDB compatibility matrix, metrics,
+  glossary) — verified against a running server, keep it true.
+  Known gaps it records: non-ASCII is mangled (the LP parser does
+  `b as char`, so UTF-8 becomes mojibake); `SHOW TABLES` and
+  `information_schema` are off (`SessionConfig::new()` without
+  `.with_information_schema(true)`); `CREATE`/`DROP TABLE` return `[]`
+  but do nothing (session per query); Flight SQL implements only
+  handshake + statement query (GetTables/GetCatalogs/GetDbSchemas are
+  Unimplemented). Fixed here: a type-conflicting or duplicate-tag-key
+  line used to leave `TableBuffer` columns ragged, breaking reads AND
+  the node-wide maintenance tick, durably (WAL replayed it).
 - Repo files: `LICENSE` (Apache-2.0), `SECURITY.md`, `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md`, `CHANGELOG.md`. `ops/tldb-backup.sh` +
   `docs/BACKUP_RESTORE.md` make AT-5 runnable (helper-container tar, no

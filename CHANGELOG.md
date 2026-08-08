@@ -13,7 +13,37 @@ here.
 
 ## [Unreleased]
 
+### Fixed — a rejected write could wedge the whole engine (2026-08-08)
+
+- `TableBuffer::append` is now atomic. It pushed a row's tag values before
+  validating its field types, so a type conflict returned an error with the
+  tag columns already one longer than `time`. Every later snapshot of that
+  table then failed with *"all columns in a record batch must have the same
+  length"* — which killed reads of the table, the flush that would have
+  drained it, and, because the maintenance tick ran the stages with `?`,
+  compaction and retention for **every table on the node**. The WAL replayed
+  the poisoned line at boot, so a restart did not clear it.
+- A **duplicate tag key in one line** (`m,h=a,h=b v=1`) caused the same
+  corruption from a *successful* write: the column was pushed twice for one
+  row. A repeated key now takes its last value, for tags and fields alike.
+- Field types are validated against the existing column — and against a
+  column the same line is about to create — before anything is mutated.
+- `flush_all` encodes each table through `flush_one`, so one bad buffer no
+  longer discards the other tables' rows; WAL generations are retained when
+  any table fails to flush, and the maintenance tick runs flush, compaction
+  and retention independently rather than aborting on the first error.
+- Regression tests: three in `timelord-buffer`, plus
+  `a_rejected_write_cannot_poison_the_table_or_the_engine` covering the whole
+  cascade end to end — reject, read, second table, duplicate key, flush,
+  restart.
+
 ### Added — documentation and project files (2026-08-08)
+
+- `site/docs/reference.html`: line protocol grammar, escapes and field types;
+  the SQL dialect with what is and is not supported; the HTTP and Flight SQL
+  surfaces; an InfluxDB compatibility matrix; every metric with its type and
+  suggested alerts; and a glossary. Written from the code and verified against
+  a running server.
 
 - `LICENSE` (Apache-2.0), `SECURITY.md`, `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md` and this changelog.
