@@ -394,6 +394,13 @@ code:not(pre code) {
 }
 .note p:last-child { margin-bottom: 0; }
 
+/* A warning is a note that has earned a louder colour: reserved for things
+   that change how you may safely deploy, not for emphasis. */
+.note.warn {
+  border-left-color: #b42318;
+  background: #fef3f2;
+}
+
 /* ---------- footer ---------- */
 
 footer.site {
