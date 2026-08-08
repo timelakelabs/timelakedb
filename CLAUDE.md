@@ -55,6 +55,15 @@ This project is inspired by the following projects.
   `docker compose -f bench/compose/timelorddb.yml up -d --build`
   then `curl http://localhost:1963/health`.
 - CI (`.github/workflows/ci.yml`) runs fmt + clippy -D warnings + tests.
+- The website is `site/` — hand-written HTML/CSS/SVG, no build step, all
+  paths relative so it works at a project-page subpath or a domain root.
+  `.github/workflows/pages.yml` publishes it (needs Settings → Pages →
+  Source: GitHub Actions, once). Brand palette: navy 0B1320, blue
+  2563EB, gold D4AF37, mist E6E8EC, gray 6B7280 — the canonical copy of
+  each value lives in `site/assets/style.css` as CSS custom properties,
+  and `site/assets/logo.svg` is the mark. (The original brand sheet is a
+  local design asset, deliberately untracked.) Site claims must trace to
+  `bench/results/` — no marketing numbers.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
   default 0.0.0.0:1963).

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img"
+     aria-label="TimelordDB mark: an hourglass inside a compass clock">
+  <defs>
+    <!-- the lower bulb fills with data, so the blue lines are clipped to it -->
+    <clipPath id="bulb">
+      <path d="M45 88C45 71 58 64 60 60c2 4 15 11 15 28Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- compass points -->
+  <g fill="#d4af37">
+    <path d="M60 1 66 14 60 20 54 14Z"/>
+    <path d="M60 119 54 106 60 100 66 106Z"/>
+    <path d="M1 60 14 54 20 60 14 66Z" opacity=".7"/>
+    <path d="M119 60 106 66 100 60 106 54Z" opacity=".7"/>
+  </g>
+
+  <!-- rings -->
+  <circle cx="60" cy="60" r="53" fill="none" stroke="#d4af37" stroke-width="2"/>
+  <circle cx="60" cy="60" r="45" fill="none" stroke="#e6e8ec" stroke-width="3.5"/>
+
+  <!-- hour ticks -->
+  <g stroke="#e6e8ec" stroke-width="1.5" opacity=".8">
+    <path d="M60 17v5M60 98v5M17 60h5M98 60h5"/>
+    <path d="M81.5 22.7l-2.5 4.3M41 93l-2.5 4.3M93 81.5l-4.3-2.5M27 41l-4.3-2.5"/>
+    <path d="M97.3 41l-4.3 2.5M22.7 79l4.3 2.5M79 97.3l-2.5-4.3M43.5 26.5 41 22.2"/>
+  </g>
+
+  <!-- hourglass -->
+  <g fill="#0b1320" fill-opacity=".55" stroke="#e6e8ec" stroke-width="3"
+     stroke-linejoin="round" stroke-linecap="round">
+    <path d="M45 32c0 17 13 24 15 28-2 4-15 11-15 28"/>
+    <path d="M75 32c0 17-13 24-15 28 2 4 15 11 15 28"/>
+  </g>
+  <g clip-path="url(#bulb)" stroke="#2563eb" stroke-width="4" stroke-linecap="round">
+    <path d="M44 85h32"/>
+    <path d="M46 78h28" opacity=".8"/>
+    <path d="M50 71h20" opacity=".55"/>
+  </g>
+  <!-- falling grain -->
+  <circle cx="60" cy="66" r="1.6" fill="#5b9bff"/>
+
+  <!-- plates and clock hands -->
+  <g stroke="#d4af37" stroke-width="3.4" stroke-linecap="round">
+    <path d="M42 31h36M42 89h36"/>
+  </g>
+  <path d="M60 60 60 45" stroke="#d4af37" stroke-width="2.2" stroke-linecap="round" opacity=".95"/>
+  <path d="M60 60 71 66" stroke="#d4af37" stroke-width="2.2" stroke-linecap="round" opacity=".95"/>
+  <circle cx="60" cy="60" r="2.4" fill="#d4af37"/>
+</svg>
