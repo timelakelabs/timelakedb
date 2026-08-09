@@ -99,6 +99,13 @@ timelord/
     compact/     L0→L1→L2 planner + executor (PR-6)
     retention/   per-table policy enforcement (FR-7)
     discovery/   Discovery trait; static backend (v1), Consul (v2)  ← CL-5
+    tls/         validate-before-swap cert loading, rotation  ← SEC-3
+    store-s3/    S3Store + AwsKms behind the Store/Kms traits  ← CL-1, C0
+    config/      layered resolver (default < property < override),
+                 provenance, validation, hot-swap holder      ← §17, U0
+    auth/        principals, sessions, tokens, roles          ← SEC-4, U0
+    audit/       chained append-only sink, system.audit       ← SR-6, U1
+    admin/       admin listener: console REST API + embedded UI ← SR-5, U0
   tests/
     at/          AT-1..AT-6 harness glue (tsdb-bench adapter lives in
                  bench/backends/timelorddb.py, not here)
@@ -528,6 +535,15 @@ compaction lag, pool usage, admission queue depth, per-query peak memory),
 stats, and `system.*` virtual tables (files, partitions, retention state)
 so the harness never has to shell into a container again.
 
+Shipped so far: lines written, buffer rows, WAL bytes, Parquet files,
+flushes, compactions, retention drops, databases/tables, encryption,
+visibility filtering, KMS, S3 and TLS. The query-side series above
+(latency histogram, admission depth, per-query peak memory, pruning
+counters, storage bytes, flush/compaction lag, uptime) are still missing
+and land with the console's performance views — §17, U2, which tables
+them individually. They are worth adding for Grafana and the harness
+regardless of the console.
+
 ## 14. Milestones — each one measurable by the harness
 
 | M | Deliverable | Gate (tsdb-bench) |
@@ -548,6 +564,16 @@ M0–M5 are complete. The cluster phases (§12 design):
 | C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Flight), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild |
 | C3 | Consul discovery, intra-cluster mTLS, full scale | AT-3-style gate against the cluster; latency re-baselined off LocalStack |
 
+The console phases (§17 design, `docs/CONSOLE.md`). U0–U2 are independent
+of the C track; U3 needs the C2 role split:
+
+| U | Deliverable | Gate (tsdb-bench + drill) |
+|---|---|---|
+| U0 | Admin listener (1965, TLS, private by default), SEC-4 auth (bootstrap, roles, sessions, tokens), `timelord-config` layered resolver with provenance/revert/pinning, retention rebuilt on it, `/admin/*` off 1963 | full scale green with every tunable set through the console, not the environment; restart with a stale property keeps overrides **and** logs the divergence; unauthenticated admin call = 401 + audit record; `gc_grace_secs ≤ query_timeout_secs` rejected by name |
+| U1 | App-log ring + SSE tail; `timelord-audit` hash-chained sink, `system.audit`, verifier | audit drill: every mutating route emits exactly one record (denials included), chain verifies, a hand-edited record is caught at the right sequence, sink survives SIGKILL, mutations fail closed when the sink is down |
+| U2 | Missing metrics (§13), 6 h sample ring, Overview/Ingest/Storage/Query/Security views | console numbers match `/metrics` and a run's `run.json` within tolerance; RR-4 idle footprint unchanged with ring + log buffer full; the Query view shows the fresh-vs-settled effect without running the harness |
+| U3 | Cluster view over `Discovery`, drill-in, config convergence, degraded-mode banners | node kill visible ≤ 10 s with role and health; a node held at an old revision is flagged; a stale membership view changes nothing about write/catalog correctness (CL-5 guard, drilled) |
+
 The rule from `CLAUDE.md` stands: the harness is the spec. No milestone
 is "done" on unit tests alone.
 
@@ -562,6 +588,9 @@ is "done" on unit tests alone.
 | Shape A | Pruning + bounded locator experiment | Full inverted entity index | AR-1 — 1.8 showed both the 18 ms ceiling and the price we refuse |
 | WAL | Custom segmented records (bincode/rkyv) | Reusing Parquet as WAL | WAL wants append+fsync semantics, not columnar layout; segments upload as-is for CL-1 |
 | Ack | WAL-durable (v1) | Buffer-only ack | 0-errors-under-burst (PR-7) is meaningless if ack precedes durability |
+| Config authority | Layered: default < system property < stored override, with provenance and revert | GUI-wins-after-boot; property-always-locks | Both facts stay true and visible (RR-5); per-key pinning recovers the locking model where a deployment needs it (§17) |
+| Admin surface | Its own listener, private by default | Paths on the data port | The most destructive endpoints must not inherit the data plane's exposure (SECURITY exposure 3a) |
+| Audit trail | Chained append-only segments outside the tables | A regular table in the DB | The retention UI must not be able to delete the record of its own use, and the sink must work when the engine is unhealthy |
 
 ## 16. Risks (each with its falsification test)
 
@@ -592,3 +621,68 @@ is "done" on unit tests alone.
 9. **WAL replication cost vs PR-1 ingest floor** — one intra-pair RTT
    per ack. *Measure at C2; the degraded-mode policy (§12.4) is the
    pressure valve and must stay loud (RR-5).*
+10. **The console destabilises the data plane** — SSE log tails, metric
+    polling and audit fsyncs compete with ingest and queries for the same
+    box. *Test at U2: a full-scale run with ten console sessions attached
+    and every view polling; ingest and Shape A/B must hold the unattached
+    baseline. Related: hot config swaps racing the maintenance tick —
+    falsified at U0 by flipping tunables every 200 ms through a full-scale
+    ingest and re-running the exactness check.*
+
+## 17. Console — the operator plane (SR-5/SR-6/SEC-4) — design
+
+**Status: designed 2026-08-09; build phased U0–U3 (§14). Full design:
+`docs/CONSOLE.md`.** One authenticated surface for changing what the
+server does, seeing what it did, and watching what it is doing. It adds
+four crates (§3) and one listener; it adds no new place to keep state.
+
+The retention slice shipped on 2026-08-09 (`/admin/retention` +
+`/admin/ui`, policies persisted to `catalog/config/retention.json`) is the
+prototype and the reason for this design: it proved the shape and exposed
+three defects — an unauthenticated deletion control on the data port
+(SECURITY exposure 3a), a stored config that silently outranks the
+environment (RR-5 says guardrails are never silent), and a `DELETE` whose
+meaning is ambiguous the moment a system property is also in play.
+
+**Configuration.** Three layers resolve — `EngineConfig::default()` <
+`TIMELORD_*` system property < stored override — and the API returns the
+whole stack, not just the winner. An override records the property value
+as it stood when written, so a later deployment change is *detectable*:
+banner, `WARN` line, and `timelord_config_divergent_settings`. Overrides
+are three-state (absent = inherit, value, explicit-none = off regardless
+of the property), which is what makes "revert to the system property" and
+"keep everything anyway" distinguishable. `TIMELORD_CONFIG_PINNED` locks
+named keys to the property layer for configuration-as-code deployments.
+Cluster-scope settings live at `catalog/config/settings.json` through the
+`Store` (encrypted by SEC-1, shared on S3, revision-stamped; C1's
+`put_if_absent` upgrades the write to CAS with a 409 diff); node-scope
+settings stay local. Validation runs over the whole proposed config
+because the rules are cross-field — `gc_grace_secs > query_timeout_secs`
+is the AT-3 race expressed as an invariant. Hot application reuses the
+`ArcSwap` snapshot pattern from `timelord-tls`: readers stay lock-free and
+in-flight queries keep the pool and deadline they were admitted with.
+
+**Identity.** SEC-4 introduces authentication and roles (viewer /
+operator / admin) on the admin plane only — data-plane auth breaks every
+client and Telegraf/Grafana fixture and deserves its own migration. The
+operator/admin split follows the data: growing a retention window is an
+operator action, shrinking one is an admin action. The principal store is
+also where SEC-2 authorizations stop being unauthenticated claims, once
+the data plane requires a session.
+
+**Audit.** Every mutation and every denial produces exactly one
+hash-chained record (`prev_hash` → `hash`) in append-only segments that
+upload to the object store, exposed read-only as `system.audit` — outside
+the tables, so the retention UI cannot delete the record of its own use,
+and available when the engine is unhealthy. The sink fails *closed*: an
+administrative change that leaves no record is worse than one that did not
+happen. Audit retention has a property-pinned floor.
+
+**Observation.** App logs go to a bounded ring plus SSE tail (never
+ingested into TimelordDB — self-ingestion amplifies writes exactly when
+the server is sick, RR-4). Metrics get the missing query-side series
+(§13) and a 6-hour in-memory sample ring, enough to triage a node with
+nothing else installed. Grafana is not replaced (FR-8): the console
+explains the node, Grafana explores the data. U3 aggregates nodes through
+the `Discovery` trait, under CL-5's standing guard — the membership view
+is advisory and may never carry correctness.

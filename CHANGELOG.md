@@ -13,6 +13,40 @@ here.
 
 ## [Unreleased]
 
+### Added — SEC-4: authentication on the admin surface (2026-08-09)
+
+- New `timelord-auth` crate: principals with `viewer`/`operator`/`admin`
+  roles, Argon2id credentials, server-side sessions (cookie or bearer)
+  with 30-minute idle and 12-hour absolute expiry, per-principal
+  exponential backoff on failed logins. Principals persist through the
+  `Store`, so they are envelope-encrypted with everything else (SEC-1).
+- **Every `/admin/*` route now authenticates**, which closes SECURITY.md
+  exposure 3a — the unauthenticated deletion control. Mutations from a
+  cookie session additionally require a double-submit CSRF token and an
+  Origin check. The `/admin/tls/reload` endpoint moved behind the same
+  guard and now requires `admin`.
+- **First run seeds `admin`/`admin`, quarantined**: it authenticates, and
+  then the only route that answers is `POST /admin/password` — everything
+  else returns `403 password_change_required`. Rotation invalidates every
+  session for that principal, including the one that performed it. The
+  replacement cannot be shorter than 8 characters, the username, or
+  `admin`. `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` provisions a real password
+  instead so no well-known default ever exists. This reverses the
+  bootstrap-token design; the cost is recorded in docs/CONSOLE.md §4.2.
+- Retention authorization follows the data, not the verb: **growing** a
+  window needs `operator`; **shrinking, introducing, or removing** one
+  needs `admin`.
+- The console at `/admin/ui` became a three-state page — sign in, forced
+  password change, then management — still one self-contained file with
+  no build step. It ships no data; every value it shows is fetched
+  through an authenticated call.
+- Metrics: `timelord_admin_default_credential_active` (alert on this),
+  `timelord_admin_logins_total`, `timelord_admin_login_failures_total`.
+- **The data plane is deliberately untouched**: `/write`, `/api/sql` and
+  Flight SQL still require no credentials, so Telegraf, Grafana and the
+  harness keep working. That migration is its own milestone (SEC-4
+  "phased").
+
 ### Added — runtime retention management + GUI (2026-08-09)
 
 - Retention (FR-7) is now a runtime control, not a boot-time setting:

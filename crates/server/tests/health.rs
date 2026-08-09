@@ -785,13 +785,75 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     assert_eq!(rows[0]["n"], 500);
 }
 
+/// An authenticated admin session: the cookie plus its CSRF token.
+#[derive(Clone, Default)]
+struct AdminSession {
+    cookie: String,
+    csrf: String,
+}
+
+/// Log in and capture the session cookie + CSRF token.
+async fn login(app: &axum::Router, user: &str, pass: &str) -> (StatusCode, AdminSession) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/session")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"username": user, "password": pass}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let cookie = res
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .unwrap_or("")
+        .to_string();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let csrf = v["csrf"].as_str().unwrap_or("").to_string();
+    (status, AdminSession { cookie, csrf })
+}
+
+/// Log in as the seeded admin and complete the forced rotation — what
+/// every test that just wants a working console needs.
+async fn admin_ready(app: &axum::Router) -> AdminSession {
+    let (code, seeded) = login(app, "admin", "admin").await;
+    assert_eq!(code, StatusCode::OK, "seeded credential must sign in");
+    let (code, _) = admin_json(
+        app,
+        "POST",
+        "/admin/password",
+        Some(serde_json::json!({
+            "current_password": "admin",
+            "new_password": "test console password"
+        })),
+        &seeded,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "forced rotation must succeed");
+    let (code, session) = login(app, "admin", "test console password").await;
+    assert_eq!(code, StatusCode::OK);
+    session
+}
+
 async fn admin_json(
     app: &axum::Router,
     method: &str,
     path: &str,
     body: Option<serde_json::Value>,
+    session: &AdminSession,
 ) -> (StatusCode, serde_json::Value) {
     let mut req = Request::builder().method(method).uri(path);
+    if !session.cookie.is_empty() {
+        req = req.header("cookie", &session.cookie);
+        req = req.header("x-timelord-csrf", &session.csrf);
+    }
     let b = match body {
         Some(v) => {
             req = req.header("content-type", "application/json");
@@ -818,8 +880,9 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     let day = 86_400_000_000_000i64;
     let eng = engine(dir.path()); // NO env seed — everything via the API
     let app = timelord_server::app(eng.clone());
+    let session = admin_ready(&app).await;
 
-    let (code, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    let (code, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(v["policies"].as_array().map(Vec::len), Some(0));
 
@@ -837,6 +900,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
         "PUT",
         "/admin/retention",
         Some(serde_json::json!({"table": "gui_ret", "duration": "soon"})),
+        &session,
     )
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -847,6 +911,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
         "PUT",
         "/admin/retention",
         Some(serde_json::json!({"table": "gui_ret", "duration": "1d"})),
+        &session,
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{v}");
@@ -857,26 +922,188 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM gui_ret").await;
     assert_eq!(rows[0]["n"], 1, "only the in-window row survives");
 
-    // restart: the policy came from the STORE, not the environment
+    // restart: the policy came from the STORE, not the environment —
+    // and so did the (already rotated) credential
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
     let app = timelord_server::app(eng.clone());
-    let (_, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    let (code, session) = login(&app, "admin", "test console password").await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "the rotated password survives restart"
+    );
+    let (_, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
     assert_eq!(v["policies"][0]["table"], "gui_ret");
     assert_eq!(v["policies"][0]["seconds"], 86_400);
 
     // remove it; the removal persists too
-    let (code, _) = admin_json(&app, "DELETE", "/admin/retention/gui_ret", None).await;
+    let (code, _) = admin_json(&app, "DELETE", "/admin/retention/gui_ret", None, &session).await;
     assert_eq!(code, StatusCode::OK);
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
     let app = timelord_server::app(eng);
-    let (_, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    let (_, session) = login(&app, "admin", "test console password").await;
+    let (_, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
     assert_eq!(v["policies"].as_array().map(Vec::len), Some(0));
+}
 
-    // and the management page itself serves
+/// The full SEC-4 first-run story: admin/admin gets in, can do NOTHING
+/// but change its password, and the console opens up once it has.
+#[tokio::test]
+async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+    let anon = AdminSession::default();
+
+    // 1. unauthenticated: the deletion control is closed (exposure 3a)
+    for (method, path, body) in [
+        ("GET", "/admin/retention", None),
+        (
+            "PUT",
+            "/admin/retention",
+            Some(serde_json::json!({"table":"t","duration":"1s"})),
+        ),
+        ("DELETE", "/admin/retention/t", None),
+    ] {
+        let (code, v) = admin_json(&app, method, path, body, &anon).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{method} {path} -> {v}");
+        assert_eq!(v["code"], "unauthenticated");
+    }
+
+    // 2. a wrong password, and a missing user, are both refused
+    assert_eq!(
+        login(&app, "admin", "nope").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(&app, "ghost", "admin").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 3. the seeded credential works but is quarantined to ONE action
+    let (code, seeded) = login(&app, "admin", "admin").await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, v) = admin_json(&app, "GET", "/admin/retention", None, &seeded).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(v["code"], "password_change_required");
+    let (code, _) = admin_json(
+        &app,
+        "PUT",
+        "/admin/retention",
+        Some(serde_json::json!({"table":"t","duration":"1s"})),
+        &seeded,
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "the default credential must not be able to destroy data"
+    );
+
+    // 4. the password policy is enforced
+    for bad in ["short", "admin", "ADMIN"] {
+        let (code, _) = admin_json(
+            &app,
+            "POST",
+            "/admin/password",
+            Some(serde_json::json!({"current_password":"admin","new_password": bad})),
+            &seeded,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad} must be refused");
+    }
+
+    // 5. a valid rotation opens the console — and kills the session that
+    // performed it, so a stolen default-era cookie cannot outlive it
+    let (code, _) = admin_json(
+        &app,
+        "POST",
+        "/admin/password",
+        Some(serde_json::json!({
+            "current_password": "admin",
+            "new_password": "a much better password"
+        })),
+        &seeded,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = admin_json(&app, "GET", "/admin/retention", None, &seeded).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+    // 6. the new credential is a working admin; the old one is dead
+    assert_eq!(
+        login(&app, "admin", "admin").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (code, session) = login(&app, "admin", "a much better password").await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(v["role"], "admin");
+
+    // 7. CSRF: a valid cookie without the matching token cannot mutate
+    let no_csrf = AdminSession {
+        cookie: session.cookie.clone(),
+        csrf: "wrong".into(),
+    };
+    let (code, v) = admin_json(
+        &app,
+        "PUT",
+        "/admin/retention",
+        Some(serde_json::json!({"table":"t","duration":"7d"})),
+        &no_csrf,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(v["code"], "csrf");
+
+    // 8. it survives a restart and does NOT re-seed the default
+    drop(app);
+    drop(eng);
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+    assert_eq!(
+        login(&app, "admin", "admin").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(&app, "admin", "a much better password").await.0,
+        StatusCode::OK
+    );
+    assert!(
+        eng.metrics_text_impl()
+            .contains("timelord_admin_default_credential_active 0"),
+        "the default-credential alarm must clear once rotated"
+    );
+
+    // 9. the DATA plane stayed open — Telegraf, Grafana and the harness
+    // must not need credentials (SEC-4 is phased)
+    assert_eq!(
+        write_lp(
+            &app,
+            "/api/v3/write_lp?db=poc",
+            format!("open,k=a v=1i {}", now_ns()).into_bytes(),
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (code, _) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM open").await;
+    assert_eq!(code, StatusCode::OK);
+}
+
+/// The console page is public — it carries no data, it asks for it — and
+/// a node still holding the seeded password says so in /metrics.
+#[tokio::test]
+async fn console_page_is_public_and_the_default_credential_is_alarmable() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+
     let res = app
         .oneshot(Request::get("/admin/ui").body(Body::empty()).unwrap())
         .await
@@ -884,7 +1111,14 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     assert_eq!(res.status(), StatusCode::OK);
     let html =
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(html.contains("Sign in"));
     assert!(html.contains("Retention"));
+
+    assert!(
+        eng.metrics_text_impl()
+            .contains("timelord_admin_default_credential_active 1"),
+        "a fresh node must raise the default-credential alarm"
+    );
 }
 
 /// The C0 S3 drill caught acked rows going UNQUERYABLE during a table's

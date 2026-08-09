@@ -202,6 +202,37 @@ version endpoint, per-query memory/telemetry, and a way to measure on-disk
 size scoped per database — everything the harness had to shell into
 containers to learn.
 
+**SR-5 · Operator console for configuration and observation (MUST, v1).**
+A first-party, authenticated management surface: every runtime tunable
+readable and editable with its **provenance** (built-in default, system
+property, or stored override) and revertible to the layer beneath it;
+per-table retention (FR-7) managed with an impact preview before anything
+destructive; application logs, the audit trail, live metrics and the
+performance views; and, once roles split, a cluster view. A setting
+declared by a system property *and* edited in the console must leave both
+facts true and visible — a stored value that silently shadows the
+deployment's own configuration is the guardrail RR-5 forbids. The console
+never replaces Grafana (FR-8): it explains the node, Grafana explores the
+data. *Evidence: every tunable in the evaluation was a compose-file edit
+and a restart; the 5–26× fresh-vs-settled effect — the largest single
+performance lever measured — was invisible until someone ran the harness
+by hand; and the retention control shipped 2026-08-09 is one click from
+permanent deletion.* Design: `docs/CONSOLE.md`; phased U0–U3.
+
+**SR-6 · Tamper-evident audit trail of administrative mutations (MUST,
+v1).** Every configuration change, retention change, principal/token
+change, authentication event and denial produces exactly one record
+carrying actor, source, action, target, before→after (with the resolved
+layer, not just the value), outcome and time. Records are append-only,
+hash-chained so an edit is detectable, stored outside the ordinary tables
+so the retention surface cannot delete the record of its own use, and
+readable as `system.audit`. The sink fails **closed**: a mutation that
+cannot be recorded is refused. *Evidence: SECURITY.md exposure 3a — the
+retention endpoint is a durable deletion control; without an
+actor-attributed record, a dropped table is indistinguishable from a bug,
+and the OOM-and-recovery incidents in the evaluation were reconstructable
+only because one person had done everything themselves.*
+
 ## 7. Clustering & availability
 
 Clustering is a **requirement, not an aspiration** — the evaluation plan's
@@ -318,6 +349,36 @@ floor is allowed for legacy clients, nothing older.)
 - Operational note carried from the evaluation: Flight SQL is gRPC over
   HTTP/2 — any proxy in front must speak HTTP/2.
 
+**SEC-4 · Authentication and role-based authorization on the
+administrative surface (MUST, v1 · data plane phased).**
+- **v1 (with SR-5):** the admin surface authenticates every request.
+  Principals hold one of three roles — `viewer` (read everything, change
+  nothing), `operator` (non-destructive tunables, growing a retention
+  window, triggering maintenance), `admin` (destructive and
+  resource-governing settings, principal management). *Amended
+  2026-08-09: the first-run credential is a seeded `admin`/`admin` that
+  can do nothing but change its own password, rather than the originally
+  specified one-time bootstrap token — a deliberate product call whose
+  cost and mitigations are recorded in docs/CONSOLE.md §4.2.
+  `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` preserves the no-well-known-default
+  posture for provisioning.* Browser sessions are cookie-based with idle and absolute
+  expiry plus CSRF and origin checks; automation uses revocable
+  role-scoped tokens stored as password hashes. The admin listener binds
+  privately by default and refuses plaintext unless explicitly and loudly
+  overridden.
+- **Phased:** the same principal store gives SEC-2 authorizations an
+  owner. Today `X-Timelord-Authorizations` is an unauthenticated claim;
+  once the data plane requires a session, the scan-time predicate can
+  trust the intersection of *claimed* and *granted* labels. That change
+  breaks every existing client, so it is a deliberate migration of its
+  own — not a side effect of shipping the console.
+- *Evidence: SECURITY.md exposures 1–4 — unauthenticated writes and
+  reads, `/api/sql` able to `COPY … TO` files as a root process, and
+  exposure 3a's unauthenticated deletion control. A management GUI over
+  that surface is a remote data-destruction button; authentication is the
+  precondition for shipping one, and it is what makes SR-6's audit
+  records name a person instead of an address.*
+
 ## 9. Anti-requirements — designs the evidence forbids
 
 1. **No inverted series index over the full tag space** (2.x decay curve,
@@ -392,7 +453,9 @@ token auth (SEC constrains design only — note TLS is **in** scope for v1
 per SEC-3), encryption *implementation* (SEC-1 is a v1 design constraint,
 v2 feature), InfluxQL/Flux query compatibility layers (write-API compat is
 in scope via FR-9), cross-datacenter replication, and a bespoke dashboard
-UI (Grafana is the read path).
+UI for exploring data (Grafana is the read path — SR-5's operator console
+administers the *server* and is in scope; it does not build dashboards or
+browse measurements).
 
 ## 13. Open questions
 
