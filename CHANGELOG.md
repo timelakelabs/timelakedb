@@ -13,6 +13,37 @@ here.
 
 ## [Unreleased]
 
+### Added — schema discovery (2026-08-08)
+
+- `information_schema` is enabled on the query session, so `SHOW TABLES`,
+  `DESCRIBE` and `information_schema.tables` work over `/api/sql`.
+- The default catalog is named after the database being queried, so the
+  three-part names BI tools generate — `poc.public.events` — resolve, and
+  agree with what Flight SQL reports as a catalog. Planner errors now read
+  `table 'poc.public.nope' not found`.
+- Flight SQL answers `CommandGetCatalogs`, `CommandGetDbSchemas`,
+  `CommandGetTables` (including `include_schema`), `CommandGetTableTypes` and
+  `CommandGetSqlInfo`, all of which previously returned `Unimplemented` —
+  which locked out every ADBC or JDBC client that enumerates a schema before
+  it will show anything. A database is a catalog, every table sits in
+  `public`, and `GetSqlInfo` reports the server as read-only because writes
+  arrive as line protocol and there is no DDL.
+- New `SqlBackend::databases`/`tables`/`table_schema`, backed by
+  `Engine::databases`/`table_names`/`table_schema` extracted from
+  `sql_batches` so the query and metadata paths cannot drift.
+
+### Fixed — non-ASCII text was mangled (2026-08-08)
+
+- The line-protocol parser decoded each byte as a character — a Latin-1
+  decode — so every multi-byte character became mojibake: a tag value of
+  `München` was stored and returned as `MÃ¼nchen`. It affected measurement
+  names, tag keys and values, field keys and string field values. Bytes are
+  now collected and decoded once as UTF-8.
+- Unchanged, and now covered by a test: a body that is not valid UTF-8 is
+  refused whole with `{"error":"body is not utf-8"}` before the parser and
+  before the WAL. Line protocol has no byte escape, so such data has to be
+  transcoded or base64-encoded by the client.
+
 ### Fixed — a rejected write could wedge the whole engine (2026-08-08)
 
 - `TableBuffer::append` is now atomic. It pushed a row's tag values before

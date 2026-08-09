@@ -145,15 +145,22 @@
             compaction.</li>
       </ul>
 
-      <div class="note warn">
-        <p>
-          <strong>Known defect: non-ASCII text is mangled.</strong> The parser decodes
-          each byte as a character, so a UTF-8 tag value like <code>München</code>
-          reads back as <code>MÃ¼nchen</code>. It affects measurement names, tag keys
-          and values, field keys and string field values. ASCII is unaffected.
-          Until it is fixed, keep identifiers and string fields ASCII.
-        </p>
-      </div>
+      <h3>Text encoding</h3>
+      <ul>
+        <li><strong>Bodies must be UTF-8.</strong> Measurement names, tag keys and
+            values, field keys and string field values all round-trip exactly —
+            <code>München</code> reads back as <code>München</code>.</li>
+        <li>There is no byte or code-point escape in line protocol, so a
+            non-UTF-8 byte cannot be expressed. A body containing one is refused
+            whole with <code>{"error":"body is not utf-8"}</code>, before the parser
+            and before the WAL — nothing partial is written. A client holding
+            Latin-1 or binary data must transcode it, or carry it base64-encoded in
+            a string field.</li>
+        <li>Valid UTF-8 that is merely unusual — tabs, NUL, combining marks,
+            bidirectional overrides — is stored verbatim and returned verbatim. The
+            only characters the format itself reserves are the delimiters, and those
+            are what the escapes above are for.</li>
+      </ul>
 
       <h3>Write errors</h3>
       <p>Errors are JSON, and the message identifies the offending line by its
@@ -206,7 +213,7 @@
           <tbody>
             <tr><td><code>INSERT</code></td><td><code>This feature is not implemented: Insert into not implemented for this table</code> — write with line protocol</td></tr>
             <tr><td><code>UPDATE</code>, <code>DELETE</code></td><td>Not implemented for these tables. Data leaves only by retention (FR-7)</td></tr>
-            <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Unavailable</strong> — the session does not enable it, so schema-browsing clients find nothing</td></tr>
+            <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Supported.</strong> The default catalog is named after the database, so <code>poc.public.events</code> resolves and matches what Flight SQL reports</td></tr>
             <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td>Parse and return <code>[]</code>, but have <strong>no effect</strong> — the session is discarded with the query. A <code>DROP TABLE</code> that appears to succeed does not delete anything</td></tr>
             <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td>Works, and writes a file as the server process — see <a href="index.html#security">Security</a></td></tr>
           </tbody>
@@ -232,7 +239,7 @@
       <h3>Query errors</h3>
       <div class="code">
         <header>400 responses <button class="copy" type="button">Copy</button></header>
-<pre>{"error":"Error during planning: table 'datafusion.public.nope' not found"}
+<pre>{"error":"Error during planning: table 'poc.public.nope' not found"}
 {"error":"database 'nosuch' does not exist (write to it first)"}
 {"error":"query timed out after 600s (server-side cap, RR-2)"}</pre>
       </div>
@@ -298,16 +305,35 @@
             <tr><td><code>Handshake</code></td><td>Accepts anything and returns an empty token — there is no authentication</td></tr>
             <tr><td><code>GetFlightInfo(CommandStatementQuery)</code></td><td>Implemented</td></tr>
             <tr><td><code>DoGet(ticket)</code></td><td>Implemented — streams Arrow batches natively</td></tr>
-            <tr><td><code>CommandGetTables</code>, <code>GetCatalogs</code>, <code>GetDbSchemas</code>, <code>GetSqlInfo</code></td><td><strong>Unimplemented</strong> — clients that browse metadata get an error</td></tr>
-            <tr><td>Prepared statements, <code>DoPut</code>, <code>ListFlights</code></td><td>Unimplemented</td></tr>
+            <tr><td><code>CommandGetCatalogs</code></td><td>Implemented — one row per database</td></tr>
+            <tr><td><code>CommandGetDbSchemas</code></td><td>Implemented — <code>public</code> under each catalog</td></tr>
+            <tr><td><code>CommandGetTables</code></td><td>Implemented, including <code>include_schema</code> (the Arrow schema, IPC-encoded)</td></tr>
+            <tr><td><code>CommandGetTableTypes</code></td><td>Implemented — a single <code>BASE TABLE</code></td></tr>
+            <tr><td><code>CommandGetSqlInfo</code></td><td>Implemented — server name, version, Arrow version, read-only, no DDL</td></tr>
+            <tr><td>Prepared statements, <code>DoPut</code>, <code>ListFlights</code>, keys and type info</td><td>Unimplemented</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>How the namespace maps</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Flight SQL</th><th>TimelordDB</th></tr></thead>
+          <tbody>
+            <tr><td>catalog</td><td>a database</td></tr>
+            <tr><td>db_schema</td><td>always <code>public</code></td></tr>
+            <tr><td>table_type</td><td>always <code>BASE TABLE</code></td></tr>
           </tbody>
         </table>
       </div>
       <p>
-        Grafana's stock datasource works because its SQL mode sends statements
-        directly. A tool that starts by enumerating catalogs and tables will not,
-        and there is no schema browsing over SQL either — see
-        <a href="#sql">SQL Dialect</a>.
+        <code>GetCatalogs</code> lists every database on the node.
+        <code>GetTables</code> answers for the catalog named in the request, or for
+        the database this connection is bound to when the request names none — a
+        query on a connection can only reach the database in its metadata, so
+        listing every database's tables would advertise what you cannot select
+        from. The same three-part name works over SQL:
+        <code>SELECT … FROM poc.public.events</code>.
       </p>
     </section>
 

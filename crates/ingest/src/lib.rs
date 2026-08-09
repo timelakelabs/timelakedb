@@ -148,14 +148,20 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
 
 /// Read until an unescaped stop byte or space (exclusive); unescapes
 /// `\,` `\ ` `\=` `\\`.
+///
+/// Bytes are collected and decoded once at the end. Pushing each byte as a
+/// `char` is a Latin-1 decode, which turned every multi-byte character into
+/// mojibake — `München` was stored and returned as `MÃ¼nchen`. Scanning
+/// byte-wise is still correct: every stop byte is ASCII, and UTF-8
+/// continuation bytes are all >= 0x80, so no character can be split.
 fn take_escaped(bytes: &[u8], pos: &mut usize, stops: &[u8]) -> Result<String, String> {
-    let mut s = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     while *pos < bytes.len() {
         let b = bytes[*pos];
         if b == b'\\' && *pos + 1 < bytes.len() {
             let n = bytes[*pos + 1];
             if n == b',' || n == b' ' || n == b'=' || n == b'\\' {
-                s.push(n as char);
+                buf.push(n);
                 *pos += 2;
                 continue;
             }
@@ -163,29 +169,32 @@ fn take_escaped(bytes: &[u8], pos: &mut usize, stops: &[u8]) -> Result<String, S
         if stops.contains(&b) || b == b' ' {
             break;
         }
-        s.push(b as char);
+        buf.push(b);
         *pos += 1;
     }
-    Ok(s)
+    String::from_utf8(buf).map_err(|_| "invalid utf-8".to_string())
 }
 
 fn take_field_value(bytes: &[u8], pos: &mut usize) -> Result<FieldValue, String> {
     if *pos < bytes.len() && bytes[*pos] == b'"' {
-        // quoted string with \" and \\ escapes
+        // quoted string with \" and \\ escapes; bytes in, decoded once out
+        // (see take_escaped for why pushing chars was wrong)
         *pos += 1;
-        let mut s = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         while *pos < bytes.len() {
             match bytes[*pos] {
                 b'\\' if *pos + 1 < bytes.len() => {
-                    s.push(bytes[*pos + 1] as char);
+                    buf.push(bytes[*pos + 1]);
                     *pos += 2;
                 }
                 b'"' => {
                     *pos += 1;
+                    let s = String::from_utf8(buf)
+                        .map_err(|_| "invalid utf-8 in string field".to_string())?;
                     return Ok(FieldValue::Str(s));
                 }
                 b => {
-                    s.push(b as char);
+                    buf.push(b);
                     *pos += 1;
                 }
             }
@@ -257,6 +266,39 @@ mod tests {
         // missing timestamp -> default
         let rows = parse_lines("m f=1.5", 1, 42).unwrap();
         assert_eq!(rows[0].timestamp_ns, 42);
+    }
+
+    #[test]
+    fn non_ascii_round_trips_everywhere() {
+        // The regression: bytes were pushed as chars (a Latin-1 decode), so
+        // every multi-byte character came back as mojibake — the tag value
+        // "München" read back as "MÃ¼nchen".
+        let lp = "café,ville=München,clé=valeur température=21.5,note=\"jusqu'à —30 °C\" 100";
+        let rows = parse_lines(lp, 1, 0).unwrap();
+        assert_eq!(rows[0].table, "café");
+        assert_eq!(
+            rows[0].tags,
+            vec![
+                ("ville".to_string(), "München".to_string()),
+                ("clé".to_string(), "valeur".to_string()),
+            ]
+        );
+        assert_eq!(rows[0].fields[0].0, "température");
+        assert_eq!(
+            rows[0].fields[1].1,
+            FieldValue::Str("jusqu'à —30 °C".into())
+        );
+    }
+
+    #[test]
+    fn escapes_survive_next_to_multibyte_characters() {
+        let lp = "m,city=Köln\\,\\ Deutschland s=\"ü\\\"ü\" 100";
+        let rows = parse_lines(lp, 1, 0).unwrap();
+        assert_eq!(
+            rows[0].tags,
+            vec![("city".to_string(), "Köln, Deutschland".to_string())]
+        );
+        assert_eq!(rows[0].fields[0].1, FieldValue::Str("ü\"ü".into()));
     }
 
     #[test]

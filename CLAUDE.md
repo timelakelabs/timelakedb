@@ -70,13 +70,16 @@ This project is inspired by the following projects.
 - Reference docs: `site/docs/reference.html` (line protocol, SQL dialect,
   HTTP + Flight SQL surface, InfluxDB compatibility matrix, metrics,
   glossary) — verified against a running server, keep it true.
-  Known gaps it records: non-ASCII is mangled (the LP parser does
-  `b as char`, so UTF-8 becomes mojibake); `SHOW TABLES` and
-  `information_schema` are off (`SessionConfig::new()` without
-  `.with_information_schema(true)`); `CREATE`/`DROP TABLE` return `[]`
-  but do nothing (session per query); Flight SQL implements only
-  handshake + statement query (GetTables/GetCatalogs/GetDbSchemas are
-  Unimplemented). Fixed here: a type-conflicting or duplicate-tag-key
+  Known gaps it records: `CREATE`/`DROP TABLE` return `[]` but do
+  nothing (fresh session per query); no prepared statements or DoPut
+  over Flight. Schema discovery works both ways now —
+  `with_information_schema(true)` plus a default catalog named after the
+  db (so `poc.public.t` resolves and planner errors say `poc.public.…`),
+  and Flight SQL answers GetCatalogs/GetDbSchemas/GetTables/
+  GetTableTypes/GetSqlInfo (catalog = database, schema = `public`,
+  type = `BASE TABLE`). Text is UTF-8 end to end; a non-UTF-8 body is
+  400 `body is not utf-8` before the WAL — there is no byte escape in
+  line protocol. Also fixed: a type-conflicting or duplicate-tag-key
   line used to leave `TableBuffer` columns ragged, breaking reads AND
   the node-wide maintenance tick, durably (WAL replayed it).
 - Repo files: `LICENSE` (Apache-2.0), `SECURITY.md`, `CONTRIBUTING.md`,

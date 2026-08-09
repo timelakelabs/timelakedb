@@ -211,6 +211,17 @@ async fn errors_are_400_with_line_context_and_never_wal_d() {
 
     let code = write_lp(&app, "/api/v3/write_lp?db=poc", b"good f=1i\nbroken".to_vec(), false).await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
+    // Line protocol has no byte escape, so a non-UTF-8 body cannot be
+    // expressed at all: it is refused whole, before the parser and before
+    // the WAL. Clients holding Latin-1 or binary must transcode.
+    let code = write_lp(
+        &app,
+        "/api/v3/write_lp?db=poc",
+        b"m,host=\xffZ v=1".to_vec(),
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
     // missing db
     let code = write_lp(&app, "/api/v3/write_lp", b"m f=1i".to_vec(), false).await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -422,6 +433,58 @@ async fn wal_replay_survives_restart_rr3() {
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(rows[0]["n"], 1, "a 204'd write must survive restart");
+}
+
+#[tokio::test]
+async fn schema_is_discoverable_over_sql() {
+    // Without information_schema, SHOW TABLES failed outright and every
+    // BI tool that starts by enumerating a schema was locked out.
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelord_server::app(engine(dir.path()));
+    let t = now_ns();
+    for lp in [
+        format!("pipeline_events,product_id=p1,step=01 value=1i {t}"),
+        format!("disk_metrics,host=h1 used_gb=1.5 {t}"),
+    ] {
+        assert_eq!(
+            write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let (code, rows) = sql(&app, "poc", "SHOW TABLES").await;
+    assert_eq!(code, StatusCode::OK);
+    let listed: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["table_name"].as_str())
+        .collect();
+    assert!(listed.contains(&"pipeline_events"), "got {listed:?}");
+    assert!(listed.contains(&"disk_metrics"), "got {listed:?}");
+
+    // the same answer through information_schema, and the catalog is named
+    // after the database so Flight SQL's catalog list agrees with SQL
+    let (code, rows) = sql(
+        &app,
+        "poc",
+        "SELECT table_catalog, table_schema FROM information_schema.tables \
+         WHERE table_name = 'disk_metrics'",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["table_catalog"], "poc");
+    assert_eq!(rows[0]["table_schema"], "public");
+
+    // which is what makes the three-part names BI tools generate resolve
+    let (code, rows) = sql(
+        &app,
+        "poc",
+        "SELECT COUNT(*) AS n FROM poc.public.pipeline_events",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "three-part name must resolve");
+    assert_eq!(rows[0]["n"], 1);
 }
 
 #[tokio::test]

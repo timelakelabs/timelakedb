@@ -146,6 +146,15 @@ impl<S: Store> Catalog<S> {
         out
     }
 
+    /// Databases known to the catalog (buffer may know more).
+    pub fn databases(&self) -> Vec<String> {
+        let files = self.files.lock().expect("catalog lock");
+        let mut out: Vec<String> = files.keys().map(|(d, _)| d.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn file_count(&self) -> usize {
         self.files.lock().expect("catalog lock").values().map(Vec::len).sum()
     }
