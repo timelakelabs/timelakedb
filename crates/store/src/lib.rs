@@ -1,10 +1,11 @@
 //! Store — the single chokepoint for ALL object I/O (SEC-1 seam).
 //!
 //! Every byte that reaches durable object storage passes through the
-//! [`Store`] trait. Encryption ships later as a decorator
-//! (`EncryptingStore(inner, kms)`) implementing this same trait — the
-//! engine never knows (SEC-1). An S3 backend adopts the `object_store`
-//! crate behind this same seam (CL-1) without touching callers.
+//! [`Store`] trait. Encryption ships as a decorator —
+//! [`EncryptingStore`]`(inner, kms)` implementing this same trait — and
+//! the engine never knows (SEC-1). An S3 backend adopts the
+//! `object_store` crate behind this same seam (CL-1) without touching
+//! callers.
 //!
 //! M2 backend: the local filesystem. Writes are atomic (temp file +
 //! rename) and fsynced — a manifest committed through this layer is
@@ -12,6 +13,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+pub mod encrypt;
+pub use encrypt::{EncryptingStore, Kms, LocalKek, key_from_hex};
 
 pub trait Store: Send + Sync + 'static {
     fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()>;
@@ -55,6 +59,29 @@ impl<S: Store> Store for std::sync::Arc<S> {
     }
 }
 
+/// The engine holds its store as `Arc<dyn Store>` so the encrypting
+/// decorator (SEC-1) slots in by configuration, invisible to every caller.
+impl Store for std::sync::Arc<dyn Store> {
+    fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        (**self).put(path, bytes)
+    }
+    fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        (**self).get(path)
+    }
+    fn delete(&self, path: &str) -> std::io::Result<()> {
+        (**self).delete(path)
+    }
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        (**self).list(prefix)
+    }
+    fn size(&self, path: &str) -> std::io::Result<u64> {
+        (**self).size(path)
+    }
+    fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        (**self).get_range(path, offset, len)
+    }
+}
+
 pub struct LocalStore {
     root: PathBuf,
 }
@@ -62,7 +89,9 @@ pub struct LocalStore {
 impl LocalStore {
     pub fn new(root: &Path) -> std::io::Result<LocalStore> {
         std::fs::create_dir_all(root)?;
-        Ok(LocalStore { root: root.to_path_buf() })
+        Ok(LocalStore {
+            root: root.to_path_buf(),
+        })
     }
 
     fn abs(&self, path: &str) -> PathBuf {
@@ -168,11 +197,17 @@ mod tests {
     fn roundtrip_list_delete() {
         let dir = tempfile::tempdir().unwrap();
         let s = LocalStore::new(dir.path()).unwrap();
-        s.put("poc/pipeline_events/data/2026080800/a.parquet", b"AAA").unwrap();
-        s.put("poc/pipeline_events/data/2026080801/b.parquet", b"BBB").unwrap();
+        s.put("poc/pipeline_events/data/2026080800/a.parquet", b"AAA")
+            .unwrap();
+        s.put("poc/pipeline_events/data/2026080801/b.parquet", b"BBB")
+            .unwrap();
         s.put("catalog/manifest/000001.json", b"{}").unwrap();
 
-        assert_eq!(s.get("poc/pipeline_events/data/2026080800/a.parquet").unwrap(), b"AAA");
+        assert_eq!(
+            s.get("poc/pipeline_events/data/2026080800/a.parquet")
+                .unwrap(),
+            b"AAA"
+        );
         let files = s.list("poc/pipeline_events").unwrap();
         assert_eq!(files.len(), 2);
         assert!(files[0] < files[1], "list must be sorted");

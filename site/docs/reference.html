@@ -261,7 +261,7 @@
             <tr><td><code>POST /write</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
             <tr><td><code>POST /api/v2/write</code></td><td><code>bucket</code></td><td><code>precision</code>, <code>org</code> (ignored)</td><td>204</td></tr>
             <tr><td><code>POST /api/v3/write_lp</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
-            <tr><td><code>POST /api/sql</code></td><td>body <code>sql</code></td><td>body <code>db</code> (default <code>poc</code>)</td><td>200 + JSON rows</td></tr>
+            <tr><td><code>POST /api/sql</code></td><td>body <code>sql</code></td><td>body <code>db</code> (default <code>poc</code>), body <code>authorizations</code> / header <code>X-Timelord-Authorizations</code> (SEC-2, comma-separated)</td><td>200 + JSON rows</td></tr>
             <tr><td><code>GET /health</code></td><td>—</td><td>—</td><td>200 + <code>{"status":"pass","name":"timelorddb","version":…}</code></td></tr>
             <tr><td><code>GET|HEAD /ping</code></td><td>—</td><td>—</td><td>204 + <code>x-timelorddb-version</code></td></tr>
             <tr><td><code>GET /metrics</code></td><td>—</td><td>—</td><td>200 + Prometheus text</td></tr>
@@ -288,6 +288,38 @@
         write endpoint — the Telegraf <code>influxdb_v2</code> default. Bodies must be
         UTF-8.
       </p>
+
+      <h3>Row visibility labels (SEC-2)</h3>
+      <p>
+        A tag named <code>_visibility</code> holds an Accumulo-style label
+        expression per row — <code>admin</code>, <code>ops&amp;audit</code>,
+        <code>(ops&amp;audit)|admin</code>, quoted tokens
+        (<code>"needs quoting"</code>) — written as an ordinary tag, no special
+        endpoint. Queries see only rows whose expression their session's
+        authorizations satisfy, supplied via the
+        <code>X-Timelord-Authorizations</code> header (comma-separated), the
+        <code>/api/sql</code> body field <code>authorizations</code>, or
+        <code>x-timelord-authorizations</code> gRPC metadata on Flight SQL.
+        Rows without a label are visible to everyone; a malformed expression is
+        visible to <em>no one</em> (fail closed); <code>&amp;</code> and
+        <code>|</code> may not mix without parentheses. Enforcement happens
+        inside the scan, so aggregates cannot count hidden rows.
+        <strong>Until token authentication exists, authorizations are claims,
+        not credentials</strong> — see SECURITY.md.
+      </p>
+
+      <h3>Encryption at rest (SEC-1)</h3>
+      <p>
+        Set <code>TIMELORD_ENCRYPTION_KEY</code> (64 hex characters) or
+        <code>TIMELORD_ENCRYPTION_KEY_FILE</code> and every object written to
+        the store — Parquet data, catalog manifests, checkpoints — is
+        envelope-encrypted: a fresh AES-256-GCM data key per object, wrapped by
+        your key, in 64&nbsp;KiB authenticated chunks so range reads (bloom
+        probes, footer loads) stay cheap. A malformed key refuses to start.
+        Objects written before the key was configured remain readable; the
+        local WAL is not encrypted. Wrong key or tampered object is a clean
+        named error, never silent data.
+      </p>
     </section>
 
     <section id="flight">
@@ -296,7 +328,9 @@
         Port 1964, Arrow Flight SQL over gRPC (HTTP/2). The database comes from
         request metadata, checked in this order: <code>database</code>,
         <code>bucket-name</code>, <code>bucket</code>, <code>db</code> — defaulting to
-        <code>poc</code>.
+        <code>poc</code>. Visibility authorizations (SEC-2) ride the same way:
+        <code>x-timelord-authorizations</code> metadata, comma-separated, captured
+        into the statement ticket at <code>GetFlightInfo</code> time.
       </p>
       <div class="table-wrap">
         <table>
@@ -399,6 +433,8 @@
             <tr><td><code>timelord_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELORD_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelord_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>
             <tr><td><code>timelord_tables</code></td><td>gauge</td><td>Tables with a live buffer</td></tr>
+            <tr><td><code>timelord_encryption_enabled</code></td><td>gauge</td><td>1 when the object store is envelope-encrypted (SEC-1), else 0</td></tr>
+            <tr><td><code>timelord_visibility_rows_filtered_total</code></td><td>counter</td><td>Rows hidden by visibility-label enforcement (SEC-2) since start</td></tr>
             <tr><td><code>timelord_tls_cert_expiry_seconds</code></td><td>gauge</td><td>Seconds until the serving certificate expires (TLS mode only)</td></tr>
             <tr><td><code>timelord_tls_last_reload_ok</code></td><td>gauge</td><td>1 if the last certificate reload validated, 0 if it was rejected (TLS mode only)</td></tr>
           </tbody>

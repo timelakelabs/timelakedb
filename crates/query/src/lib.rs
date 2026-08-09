@@ -2,10 +2,12 @@
 //! bounded memory pool (RR-1 from the first line of query code), tables
 //! registered from buffer snapshots, JSON row output for /api/sql.
 //!
-//! The SEC-2 hook is called unconditionally for every registered table —
-//! at M1 it returns None (no restriction) and its call is the seam where
-//! visibility labels, retention boundaries, and tenant scoping arrive
-//! (M2 turns the return into a DataFusion Expr composed under the scan).
+//! The SEC-2 hook [`mandatory_predicate`] is called unconditionally for
+//! every table scan, inside the provider — below any user predicate and
+//! before any aggregation, so an aggregate can never count a row the
+//! caller cannot see. v1 restriction: Accumulo-style visibility labels
+//! (see [`visibility`]); retention boundaries and tenant scoping arrive
+//! as new [`Restriction`] variants through this same hook.
 
 use std::sync::Arc;
 
@@ -19,13 +21,14 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use serde_json::{Map, Number, Value, json};
 
+pub use datafusion::arrow::datatypes::SchemaRef as QuerySchema;
 /// Re-export so downstream crates name batches without a direct
 /// datafusion dependency (version unification lives here).
 pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
-pub use datafusion::arrow::datatypes::SchemaRef as QuerySchema;
 pub use datafusion::datasource::TableProvider as DfTableProvider;
 
 pub mod provider;
+pub mod visibility;
 
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -59,7 +62,7 @@ impl QueryEnv {
 /// Execute SQL over registered providers under the SHARED environment.
 pub async fn run_sql_env(
     env: &QueryEnv,
-    session: &QuerySession,
+    _session: &QuerySession,
     db: &str,
     tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     sql: &str,
@@ -80,10 +83,12 @@ pub async fn run_sql_env(
         .with_information_schema(true)
         .with_default_catalog_and_schema(db, "public");
     let ctx = SessionContext::new_with_config_rt(config, env.runtime.clone());
+    // SEC-2 note: enforcement is NOT here. The providers carry the session
+    // and call mandatory_predicate inside scan() — the filter is part of
+    // the scan itself, so no plan shape can aggregate around it.
     for (name, provider) in tables {
-        // SEC-2: the hook is on the path for every table, every query.
-        let _restriction = mandatory_predicate(session, &name);
-        ctx.register_table(&name, provider).map_err(|e| e.to_string())?;
+        ctx.register_table(&name, provider)
+            .map_err(|e| e.to_string())?;
     }
 
     let work = async {
@@ -158,17 +163,129 @@ pub fn align_to(
 }
 
 /// Per-session context the mandatory predicate sees (SEC-2).
-/// Grows Accumulo-style authorizations, tenant, and retention context.
+/// Grows tenant and retention context alongside the authorizations.
 #[derive(Debug, Default, Clone)]
 pub struct QuerySession {
     pub authorizations: Vec<String>,
 }
 
-/// THE injection point (SEC-2). v1 returns `None` (no restriction).
-/// At M2 the return type becomes a DataFusion `Expr` composed with AND
-/// below any user predicate — inside the scan, not the API layer.
-pub fn mandatory_predicate(_session: &QuerySession, _table: &str) -> Option<String> {
-    None
+impl QuerySession {
+    pub fn with_authorizations(authorizations: Vec<String>) -> QuerySession {
+        QuerySession { authorizations }
+    }
+}
+
+/// The label column: a dictionary-encoded tag holding an Accumulo-style
+/// expression per row. Low-cardinality in practice, so FR-2's column
+/// economics apply — a label costs what a tag costs.
+pub const VISIBILITY_COLUMN: &str = "_visibility";
+
+/// What [`mandatory_predicate`] can require of a scan. One variant today;
+/// tenant scoping and retention boundaries arrive as more variants, each
+/// enforced at the same place in the provider.
+#[derive(Debug, Clone)]
+pub enum Restriction {
+    /// Drop rows whose visibility expression the session's authorizations
+    /// do not satisfy.
+    Visibility {
+        column: String,
+        authorizations: Vec<String>,
+    },
+}
+
+/// THE injection point (SEC-2). Called unconditionally for every table
+/// scan by the provider; the returned restriction composes below any
+/// user predicate and before aggregation. Tables without a label column
+/// carry no restriction — the bench workload is untouched.
+pub fn mandatory_predicate(
+    session: &QuerySession,
+    _table: &str,
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> Option<Restriction> {
+    if schema.field_with_name(VISIBILITY_COLUMN).is_err() {
+        return None;
+    }
+    Some(Restriction::Visibility {
+        column: VISIBILITY_COLUMN.to_string(),
+        authorizations: session.authorizations.clone(),
+    })
+}
+
+/// Enforce one restriction on one batch. Rows fail closed: a label the
+/// session's authorizations do not satisfy — or one that does not parse —
+/// drops its row here, before DataFusion ever sees it.
+pub fn apply_restriction(r: &Restriction, batch: &RecordBatch) -> Result<RecordBatch, String> {
+    use datafusion::arrow::array::{BooleanArray, DictionaryArray, StringArray};
+    use datafusion::arrow::compute::filter_record_batch;
+    use datafusion::arrow::datatypes::Int32Type;
+
+    let Restriction::Visibility {
+        column,
+        authorizations,
+    } = r;
+    // A batch without the column (a file written before labels existed)
+    // holds unlabeled rows, and unlabeled rows are visible to everyone.
+    let Some(col) = batch.column_by_name(column) else {
+        return Ok(batch.clone());
+    };
+    let auths: std::collections::HashSet<&str> =
+        authorizations.iter().map(|s| s.as_str()).collect();
+
+    let mask: BooleanArray = match col.data_type() {
+        // the expected shape: tags are dictionary columns (FR-2), so each
+        // distinct label is evaluated once per batch, not once per row
+        DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8 => {
+            let dict = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .expect("checked dictionary type");
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("checked utf8 values");
+            let visible: Vec<bool> = (0..values.len())
+                .map(|i| values.is_null(i) || visibility::is_visible(values.value(i), &auths))
+                .collect();
+            let keys = dict.keys();
+            (0..dict.len())
+                .map(|i| {
+                    if dict.is_null(i) {
+                        true // NULL label = unlabeled = public
+                    } else {
+                        visible[keys.value(i) as usize]
+                    }
+                })
+                .collect()
+        }
+        DataType::Utf8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("checked utf8");
+            let mut memo: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        true
+                    } else {
+                        let s = arr.value(i);
+                        *memo
+                            .entry(s)
+                            .or_insert_with(|| visibility::is_visible(s, &auths))
+                    }
+                })
+                .collect()
+        }
+        other => {
+            // a _visibility FIELD (e.g. a float) cannot be evaluated;
+            // failing the query loudly beats silently hiding every row
+            return Err(format!(
+                "{column} must be a string column to carry visibility labels, got {other:?}"
+            ));
+        }
+    };
+    filter_record_batch(batch, &mask).map_err(|e| e.to_string())
 }
 
 /// Merge batches with heterogeneous-but-compatible schemas (files written
@@ -243,10 +360,16 @@ pub async fn run_sql(
     );
 
     for (name, batches) in tables {
-        // SEC-2: the hook is on the path for every table, every query.
-        let _restriction = mandatory_predicate(session, &name);
-        debug_assert!(_restriction.is_none(), "M2 has no predicate sources");
         let (schema, aligned) = align(batches)?;
+        // SEC-2: the hook is on the path for every table, every query —
+        // this in-memory path enforces at registration, before DataFusion.
+        let aligned = match mandatory_predicate(session, &name, &schema) {
+            None => aligned,
+            Some(r) => aligned
+                .iter()
+                .map(|b| apply_restriction(&r, b))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         // one partition per batch -> DataFusion scans them in parallel
         let parts = aligned.into_iter().map(|b| vec![b]).collect();
         let table = MemTable::try_new(schema, parts).map_err(|e| e.to_string())?;
@@ -356,6 +479,46 @@ mod tests {
         assert_eq!(rows[0]["products"], 2);
         assert_eq!(rows[1]["step"], "02-extract");
         assert_eq!(rows[1]["products"], 1);
+    }
+
+    #[tokio::test]
+    async fn visibility_labels_gate_rows_and_aggregates() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        // one row visible to admin, one to ops&audit holders, one public
+        let lp = format!(
+            "pipeline_events,product_id=p1,_visibility=admin duration_s=1.0 {t1}\n\
+             pipeline_events,product_id=p2,_visibility=ops&audit duration_s=2.0 {t2}\n\
+             pipeline_events,product_id=p3 duration_s=3.0 {t3}",
+            t1 = now - 1_000,
+            t2 = now - 2_000,
+            t3 = now - 3_000,
+        );
+        let batch = buffer_with(&lp);
+
+        for (auths, expect) in [
+            (vec![], 1i64), // no auths: public rows only
+            (vec!["admin"], 2),
+            (vec!["ops"], 1), // ops alone does not satisfy ops&audit
+            (vec!["ops", "audit"], 2),
+            (vec!["admin", "ops", "audit"], 3),
+        ] {
+            let session =
+                QuerySession::with_authorizations(auths.iter().map(|s| s.to_string()).collect());
+            // the aggregate is the leak test: a hidden row must not COUNT
+            let rows = run_sql(
+                &session,
+                vec![("pipeline_events".into(), vec![batch.clone()])],
+                "SELECT COUNT(*) AS n FROM pipeline_events",
+                64 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+            let rows = batches_to_json(&rows);
+            assert_eq!(rows[0]["n"], expect, "auths {auths:?}");
+        }
     }
 
     #[tokio::test]

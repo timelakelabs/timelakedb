@@ -27,7 +27,7 @@ use timelord_buffer::{TableBuffer, flush};
 use timelord_catalog::{Catalog, FileMeta};
 use timelord_ingest::{parse_lines, precision_multiplier};
 use timelord_query::{QuerySession, batches_to_json};
-use timelord_store::{LocalStore, Store};
+use timelord_store::{EncryptingStore, LocalKek, LocalStore, Store};
 use timelord_wal::Wal;
 
 #[derive(Clone, Debug)]
@@ -54,10 +54,10 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
-            query_mem_bytes: 1 << 30,    // 1 GiB RR-1 pool
-            flush_rows: 50_000,          // L0 trigger
+            query_mem_bytes: 1 << 30, // 1 GiB RR-1 pool
+            flush_rows: 50_000,       // L0 trigger
             flush_age_secs: 60,
-            wal_max_bytes: 2 << 30,      // RR-3 replay bound / RR-5 backpressure
+            wal_max_bytes: 2 << 30, // RR-3 replay bound / RR-5 backpressure
             compact_min_files: 4,
             retention: Vec::new(),
             max_concurrent_queries: 6,
@@ -65,6 +65,22 @@ impl Default for EngineConfig {
             gc_grace_secs: 900,
         }
     }
+}
+
+/// SEC-1 key config: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
+/// `TIMELORD_ENCRYPTION_KEY_FILE` (a file holding them). Key material
+/// stays out of [`EngineConfig`] so a `?cfg` log line can never leak it.
+fn encryption_key_from_env() -> std::io::Result<Option<[u8; 32]>> {
+    let hex = match std::env::var("TIMELORD_ENCRYPTION_KEY") {
+        Ok(k) => k,
+        Err(_) => match std::env::var("TIMELORD_ENCRYPTION_KEY_FILE") {
+            Ok(path) => std::fs::read_to_string(&path).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("encryption key file {path}: {e}"))
+            })?,
+            Err(_) => return Ok(None),
+        },
+    };
+    timelord_store::key_from_hex(&hex).map(Some)
 }
 
 /// Parse "pipeline_events=365d,host_metrics=90d,disk_metrics=72h" (FR-7).
@@ -80,7 +96,10 @@ pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
             } else {
                 (dur, 1)
             };
-            Some((table.trim().to_string(), num.parse::<u64>().ok()? * unit_secs))
+            Some((
+                table.trim().to_string(),
+                num.parse::<u64>().ok()? * unit_secs,
+            ))
         })
         .collect()
 }
@@ -92,8 +111,11 @@ pub struct Engine {
     /// sealed WAL generation but miss the swapped buffers.
     ingest_gate: RwLock<()>,
     wal: Mutex<Wal>,
-    store: Arc<LocalStore>,
-    catalog: Catalog<Arc<LocalStore>>,
+    store: Arc<dyn Store>,
+    catalog: Catalog<Arc<dyn Store>>,
+    /// SEC-1: true when the store is the encrypting decorator (drives the
+    /// timelord_encryption_enabled gauge; the engine itself cannot tell).
+    store_encrypted: bool,
     cfg: EngineConfig,
     /// Shared pool + admission + timeout (RR-1/RR-2) — ONE for all queries.
     query_env: timelord_query::QueryEnv,
@@ -111,6 +133,8 @@ pub struct Engine {
     pending_gc: Mutex<Vec<(std::time::Instant, String)>>,
     /// Immutable-footer cache: warm queries prune without fetching files.
     meta_cache: Arc<timelord_query::provider::MetaCache>,
+    /// SEC-2: rows the mandatory predicate dropped, across all queries.
+    visibility_filtered: Arc<AtomicU64>,
     /// SEC-3: set when the listeners run TLS; feeds the expiry gauge and
     /// renewal-health metric so a failing rotation is visible (RR-5).
     tls: RwLock<Option<Arc<timelord_tls::RotatingCert>>>,
@@ -119,8 +143,38 @@ pub struct Engine {
 impl Engine {
     /// Open the engine: catalog load + WAL replay happen BEFORE serving
     /// (RR-3 — writes are accepted as soon as this returns).
+    ///
+    /// SEC-1 is decided here and only here: with an encryption key in the
+    /// environment the object store is wrapped in [`EncryptingStore`] and
+    /// nothing downstream can tell. A malformed key refuses to start —
+    /// silently running plaintext would be the worst possible reading of
+    /// "encryption enabled".
     pub fn open(data_dir: &Path, cfg: EngineConfig) -> std::io::Result<Arc<Engine>> {
-        let store = Arc::new(LocalStore::new(&data_dir.join("objects"))?);
+        let local = LocalStore::new(&data_dir.join("objects"))?;
+        match encryption_key_from_env()? {
+            Some(kek) => {
+                tracing::info!(
+                    "SEC-1: object-store encryption enabled (per-object DEK, AES-256-GCM)"
+                );
+                Self::open_with_store(
+                    data_dir,
+                    cfg,
+                    Arc::new(EncryptingStore::new(local, Arc::new(LocalKek::new(kek)))),
+                    true,
+                )
+            }
+            None => Self::open_with_store(data_dir, cfg, Arc::new(local), false),
+        }
+    }
+
+    /// Open over an explicit store (tests wire the encrypting decorator
+    /// directly; `open` is the env-driven front door).
+    pub fn open_with_store(
+        data_dir: &Path,
+        cfg: EngineConfig,
+        store: Arc<dyn Store>,
+        store_encrypted: bool,
+    ) -> std::io::Result<Arc<Engine>> {
         let catalog = Catalog::load(store.clone())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let (wal, frames) = Wal::open(&data_dir.join("wal"))?;
@@ -136,6 +190,7 @@ impl Engine {
             wal: Mutex::new(wal),
             store,
             catalog,
+            store_encrypted,
             query_env,
             schemas: RwLock::new(HashMap::new()),
             cfg,
@@ -146,6 +201,7 @@ impl Engine {
             file_seq: AtomicU64::new(0),
             pending_gc: Mutex::new(Vec::new()),
             meta_cache: Arc::new(Default::default()),
+            visibility_filtered: Arc::new(AtomicU64::new(0)),
             tls: RwLock::new(None),
         };
         let n = frames.len();
@@ -168,10 +224,13 @@ impl Engine {
                 }
             }
             for ((db, table), path) in newest {
-                match engine.store.get(&path).map_err(|e| e.to_string()).and_then(|b| {
-                    flush::read_parquet_bytes(b)
-                        .map(|bs| bs.first().map(|b| b.schema()))
-                }) {
+                match engine
+                    .store
+                    .get(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| {
+                        flush::read_parquet_bytes(b).map(|bs| bs.first().map(|b| b.schema()))
+                    }) {
                     Ok(Some(schema)) => {
                         engine
                             .schemas
@@ -429,7 +488,8 @@ impl Engine {
             done += 1;
         }
         if done > 0 {
-            self.compactions_total.fetch_add(done as u64, Ordering::Relaxed);
+            self.compactions_total
+                .fetch_add(done as u64, Ordering::Relaxed);
             tracing::info!(partitions = done, "compaction pass");
         }
         Ok(done)
@@ -463,7 +523,8 @@ impl Engine {
                 .commit(Vec::new(), remove.clone())
                 .map_err(|e| format!("catalog commit: {e}"))?;
             self.defer_gc(remove);
-            self.retention_drops_total.fetch_add(n as u64, Ordering::Relaxed);
+            self.retention_drops_total
+                .fetch_add(n as u64, Ordering::Relaxed);
             tracing::info!(files = n, "retention drop");
         }
         Ok(n)
@@ -531,8 +592,13 @@ impl timelord_api::Engine for Engine {
             .map_err(WriteError::BadRequest)
     }
 
-    async fn sql(&self, db: String, query: String) -> Result<Value, String> {
-        let batches = self.sql_batches(&db, &query).await?;
+    async fn sql(
+        &self,
+        db: String,
+        query: String,
+        authorizations: Vec<String>,
+    ) -> Result<Value, String> {
+        let batches = self.sql_batches(&db, &query, authorizations).await?;
         Ok(batches_to_json(&batches))
     }
 
@@ -543,17 +609,23 @@ impl timelord_api::Engine for Engine {
 
 impl Engine {
     /// Shared query path: /api/sql renders JSON from these batches and
-    /// Flight SQL streams them natively (FR-8).
+    /// Flight SQL streams them natively (FR-8). `authorizations` are the
+    /// session's visibility authorizations (SEC-2) — claims, not
+    /// credentials, until authn exists (see SECURITY.md).
     pub async fn sql_batches(
         &self,
         db: &str,
         query: &str,
+        authorizations: Vec<String>,
     ) -> Result<Vec<timelord_query::QueryBatch>, String> {
         let names = self.table_names(db);
         if names.is_empty() {
-            return Err(format!("database '{db}' does not exist (write to it first)"));
+            return Err(format!(
+                "database '{db}' does not exist (write to it first)"
+            ));
         }
 
+        let session = QuerySession::with_authorizations(authorizations);
         let mut tables: Vec<(String, Arc<dyn timelord_query::DfTableProvider>)> =
             Vec::with_capacity(names.len());
         for name in names {
@@ -575,21 +647,21 @@ impl Engine {
             }
             let Some(schema) = schema else { continue };
 
-            let store_dyn: Arc<dyn Store> = self.store.clone();
             let provider = timelord_query::provider::LazyTable::new(
                 name.clone(),
                 schema,
                 buffer,
                 files,
-                store_dyn,
+                self.store.clone(),
                 std::time::Duration::from_secs(self.cfg.query_timeout_secs),
                 self.query_env.runtime.memory_pool.clone(),
                 self.meta_cache.clone(),
+                session.clone(),
+                self.visibility_filtered.clone(),
             );
             tables.push((name, Arc::new(provider)));
         }
 
-        let session = QuerySession::default();
         timelord_query::run_sql_env(&self.query_env, &session, db, tables, query).await
     }
 
@@ -689,7 +761,10 @@ impl Engine {
              # TYPE timelord_buffer_rows gauge\ntimelord_buffer_rows {}\n\
              # TYPE timelord_wal_bytes gauge\ntimelord_wal_bytes {}\n\
              # TYPE timelord_compactions_total counter\ntimelord_compactions_total {}\n\
-             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n{}",
+             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n\
+             # TYPE timelord_encryption_enabled gauge\ntimelord_encryption_enabled {}\n\
+             # TYPE timelord_visibility_rows_filtered_total counter\n\
+             timelord_visibility_rows_filtered_total {}\n{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -699,6 +774,8 @@ impl Engine {
             wal_bytes,
             self.compactions_total.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
+            if self.store_encrypted { 1 } else { 0 },
+            self.visibility_filtered.load(Ordering::Relaxed),
             tls_lines,
         )
     }
@@ -711,8 +788,13 @@ impl Engine {
 }
 
 impl timelord_flight::SqlBackend for Engine {
-    fn query_batches<'a>(&'a self, db: String, sql: String) -> timelord_flight::SqlFuture<'a> {
-        Box::pin(async move { self.sql_batches(&db, &sql).await })
+    fn query_batches<'a>(
+        &'a self,
+        db: String,
+        sql: String,
+        authorizations: Vec<String>,
+    ) -> timelord_flight::SqlFuture<'a> {
+        Box::pin(async move { self.sql_batches(&db, &sql, authorizations).await })
     }
 
     fn databases(&self) -> Vec<String> {
@@ -744,8 +826,9 @@ pub fn app_with_tls_admin(
     let reload = move || {
         let rot = Arc::clone(&rot);
         async move {
-            let res = tokio::task::spawn_blocking(move || rot.reload().map(|_| rot.expires_in_secs()))
-                .await;
+            let res =
+                tokio::task::spawn_blocking(move || rot.reload().map(|_| rot.expires_in_secs()))
+                    .await;
             match res {
                 Ok(Ok(expires_in)) => (
                     axum::http::StatusCode::OK,
@@ -779,7 +862,10 @@ pub fn app_with_tls_admin(
 /// Parse engine config from environment (main + integration use).
 pub fn config_from_env() -> EngineConfig {
     fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     }
     let d = EngineConfig::default();
     EngineConfig {

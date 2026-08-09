@@ -9,8 +9,10 @@
 //! candidate set is too large for the pool budget fails cleanly at load
 //! time instead of OOMing the process.
 //!
-//! This provider is also SEC-2's future push-down home: the mandatory
-//! predicate composes here, below any user filter.
+//! This provider is also SEC-2's enforcement point: scan() calls the
+//! mandatory-predicate hook unconditionally and applies the returned
+//! restriction to every batch — buffer and file alike — before the
+//! execution plan is built, below any user filter and any aggregation.
 
 use std::sync::Arc;
 
@@ -18,9 +20,9 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
@@ -237,17 +239,17 @@ fn walk(e: &Expr, p: &mut Pruning) {
                 walk(&b.right, p);
             }
             Operator::GtEq | Operator::Gt => {
-                if let (Some(col), Some(ts)) = (col_name(&b.left), ts_literal(&b.right)) {
-                    if col == "time" {
-                        p.min_ts_ns = Some(p.min_ts_ns.map_or(ts, |c| c.max(ts)));
-                    }
+                if let (Some(col), Some(ts)) = (col_name(&b.left), ts_literal(&b.right))
+                    && col == "time"
+                {
+                    p.min_ts_ns = Some(p.min_ts_ns.map_or(ts, |c| c.max(ts)));
                 }
             }
             Operator::LtEq | Operator::Lt => {
-                if let (Some(col), Some(ts)) = (col_name(&b.left), ts_literal(&b.right)) {
-                    if col == "time" {
-                        p.max_ts_ns = Some(p.max_ts_ns.map_or(ts, |c| c.min(ts)));
-                    }
+                if let (Some(col), Some(ts)) = (col_name(&b.left), ts_literal(&b.right))
+                    && col == "time"
+                {
+                    p.max_ts_ns = Some(p.max_ts_ns.map_or(ts, |c| c.min(ts)));
                 }
             }
             Operator::Eq => {
@@ -312,6 +314,12 @@ pub struct LazyTable {
     load_timeout: std::time::Duration,
     /// The SHARED pool (RR-1): loads try_grow here and fail cleanly.
     pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    /// Who is asking (SEC-2): scan() hands this to the mandatory
+    /// predicate; providers are built per query, so this is per session.
+    session: crate::QuerySession,
+    /// Rows the mandatory predicate dropped, engine-wide (observability:
+    /// enforcement that leaves no trace is indistinguishable from a bug).
+    filtered_rows: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for LazyTable {
@@ -336,6 +344,8 @@ impl LazyTable {
         load_timeout: std::time::Duration,
         pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
         meta_cache: Arc<MetaCache>,
+        session: crate::QuerySession,
+        filtered_rows: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         LazyTable {
             name,
@@ -346,6 +356,8 @@ impl LazyTable {
             load_timeout,
             pool,
             meta_cache,
+            session,
+            filtered_rows,
         }
     }
 }
@@ -414,18 +426,17 @@ pub fn stats_keep_row_groups(
     let mut keep = Vec::with_capacity(n_rg);
     'rg: for rg in 0..n_rg {
         for (col, val) in tag_equals {
-            let Some(idx) =
-                (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
+            let Some(idx) = (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
             else {
                 continue;
             };
             let col_meta = metadata.row_group(rg).column(idx);
-            if let Some(Statistics::ByteArray(s)) = col_meta.statistics() {
-                if let (Some(min), Some(max)) = (s.min_opt(), s.max_opt()) {
-                    let v = val.as_bytes();
-                    if v < min.data() || v > max.data() {
-                        continue 'rg; // literal outside this group's range
-                    }
+            if let Some(Statistics::ByteArray(s)) = col_meta.statistics()
+                && let (Some(min), Some(max)) = (s.min_opt(), s.max_opt())
+            {
+                let v = val.as_bytes();
+                if v < min.data() || v > max.data() {
+                    continue 'rg; // literal outside this group's range
                 }
             }
         }
@@ -447,13 +458,19 @@ fn load_pruned(
     pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     table: &str,
     meta_cache: &Arc<MetaCache>,
-) -> Result<(Vec<RecordBatch>, datafusion::execution::memory_pool::MemoryReservation), String> {
+) -> Result<
+    (
+        Vec<RecordBatch>,
+        datafusion::execution::memory_pool::MemoryReservation,
+    ),
+    String,
+> {
     use datafusion::execution::memory_pool::MemoryConsumer;
     // RR-1: loads are pool-visible at ACTUAL batch size. Accurate now:
     // with batch_size >= row-group size each batch owns its dictionary
     // (the earlier double-count came from 1024-row batches sharing one
     // RG dictionary). The process must never be OOM-killable by a load.
-    let mut reservation = MemoryConsumer::new(format!("scan:{table}")).register(pool);
+    let reservation = MemoryConsumer::new(format!("scan:{table}")).register(pool);
     let mut batches = Vec::with_capacity(buffer.len());
     for b in buffer {
         batches.push(match needed {
@@ -473,15 +490,15 @@ fn load_pruned(
             return Err("scan load deadline exceeded — query abandoned (RR-2)".to_string());
         }
         // file-level time pruning (catalog bounds)
-        if let Some(min) = pruning.min_ts_ns {
-            if meta.max_ts_ns < min {
-                continue;
-            }
+        if let Some(min) = pruning.min_ts_ns
+            && meta.max_ts_ns < min
+        {
+            continue;
         }
-        if let Some(max) = pruning.max_ts_ns {
-            if meta.min_ts_ns > max {
-                continue;
-            }
+        if let Some(max) = pruning.max_ts_ns
+            && meta.min_ts_ns > max
+        {
+            continue;
         }
 
         // metadata-cache fast path: on a warm footer, decide row-group
@@ -554,11 +571,11 @@ fn load_pruned(
             use datafusion::parquet::arrow::ProjectionMask;
             use datafusion::parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
             let descr = builder.parquet_schema().clone();
-            let mut predicates: Vec<Box<dyn datafusion::parquet::arrow::arrow_reader::ArrowPredicate>> =
-                Vec::new();
+            let mut predicates: Vec<
+                Box<dyn datafusion::parquet::arrow::arrow_reader::ArrowPredicate>,
+            > = Vec::new();
             for (col, val) in pruning.tag_equals.clone() {
-                let Some(idx) =
-                    (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
+                let Some(idx) = (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
                 else {
                     continue;
                 };
@@ -630,16 +647,30 @@ impl TableProvider for LazyTable {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let pruning = extract_pruning(filters);
 
+        // SEC-2: THE mandatory-predicate call — unconditional, per scan.
+        // Whatever it returns is applied to every batch below, before the
+        // plan exists, so no query shape can aggregate around it.
+        let restriction = crate::mandatory_predicate(&self.session, &self.name, &self.schema);
+
         // projection pushdown: read only needed columns. An EMPTY
         // projection (COUNT(*)) wants zero-column batches that still
         // carry row counts — we read the cheapest column to count rows.
+        // Under a restriction the label column rides along even when the
+        // query never mentions it (COUNT(*) must not count hidden rows);
+        // align_to / the count path drop it again before results form.
         let count_only = projection.is_some_and(|p| p.is_empty());
         let (target_schema, needed): (SchemaRef, Option<Vec<String>>) = match projection {
             None => (self.schema.clone(), None),
-            Some(_) if count_only => (
-                Arc::new(datafusion::arrow::datatypes::Schema::empty()),
-                Some(vec!["time".to_string()]),
-            ),
+            Some(_) if count_only => {
+                let mut cols = vec!["time".to_string()];
+                if restriction.is_some() {
+                    cols.push(crate::VISIBILITY_COLUMN.to_string());
+                }
+                (
+                    Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+                    Some(cols),
+                )
+            }
             Some(idx) => {
                 let names: Vec<String> = idx
                     .iter()
@@ -649,9 +680,15 @@ impl TableProvider for LazyTable {
                     .iter()
                     .map(|n| self.schema.field_with_name(n).unwrap().clone())
                     .collect();
+                let mut read_names = names.clone();
+                if restriction.is_some()
+                    && !read_names.iter().any(|n| n == crate::VISIBILITY_COLUMN)
+                {
+                    read_names.push(crate::VISIBILITY_COLUMN.to_string());
+                }
                 (
                     Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
-                    Some(names),
+                    Some(read_names),
                 )
             }
         };
@@ -682,6 +719,24 @@ impl TableProvider for LazyTable {
         .await
         .map_err(|e| DataFusionError::Execution(format!("scan load task: {e}")))?
         .map_err(DataFusionError::Execution)?;
+        // SEC-2 enforcement: every batch — buffer snapshot and file alike —
+        // passes the restriction before the plan is built.
+        let batches = match &restriction {
+            None => batches,
+            Some(r) => {
+                let mut kept = Vec::with_capacity(batches.len());
+                let mut dropped: u64 = 0;
+                for b in batches {
+                    let before = b.num_rows();
+                    let f = crate::apply_restriction(r, &b).map_err(DataFusionError::Execution)?;
+                    dropped += (before - f.num_rows()) as u64;
+                    kept.push(f);
+                }
+                self.filtered_rows
+                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                kept
+            }
+        };
         // The reservation's job is done: try_grow during the load is what
         // rejects an oversized candidate set BEFORE memory blows up (the
         // crash cause). Accounting is released here because the plan API
@@ -706,8 +761,7 @@ impl TableProvider for LazyTable {
                 .map_err(DataFusionError::Execution)?
         } else {
             // align to the (projected) schema: files may lack newer columns
-            crate::align_to(target_schema.clone(), batches)
-                .map_err(DataFusionError::Execution)?
+            crate::align_to(target_schema.clone(), batches).map_err(DataFusionError::Execution)?
         };
         // One partition per batch — but never ZERO partitions. A scan that
         // prunes everything away used to build a source with no partitions
@@ -744,11 +798,9 @@ mod tests {
         for line in parse_lines(&lp, 1, 0).unwrap() {
             buf.append(&line).unwrap();
         }
-        let parts =
-            flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
+        let parts = flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
         let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(256)).unwrap();
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
         let md = builder.metadata();
         let total = md.num_row_groups();
         assert!(total > 3);
@@ -971,6 +1023,108 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
+    /// The SEC-2 acceptance shape: labels written through the normal
+    /// ingest path, flushed to Parquet, scanned by a real DataFusion
+    /// session — and COUNT(*) (the empty-projection fast path that never
+    /// asks for the label column) still cannot count a hidden row.
+    #[tokio::test]
+    async fn scan_enforces_visibility_even_for_count_star() {
+        use datafusion::prelude::SessionContext;
+        use timelord_buffer::{TableBuffer, flush};
+        use timelord_ingest::parse_lines;
+
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..100)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("m,pid=p{i:03},_visibility=secret v=1.0 {}\n", t + i)
+                } else {
+                    format!("m,pid=p{i:03} v=1.0 {}\n", t + i)
+                }
+            })
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let snapshot = buf.snapshot().unwrap();
+        let parts = flush::prepare(&snapshot).unwrap();
+        let bytes = flush::to_parquet_bytes(&parts[0].1).unwrap();
+        let file_len = bytes.len() as u64;
+        let path = "poc/m/data/2026080809/f.parquet";
+        let store = CountingStore::with(path, bytes);
+        let meta = FileMeta {
+            db: "poc".into(),
+            table: "m".into(),
+            partition: "2026080809".into(),
+            path: path.into(),
+            rows: 100,
+            size_bytes: file_len,
+            min_ts_ns: t,
+            max_ts_ns: t + 100,
+        };
+
+        let run = |auths: Vec<&str>, sql: &'static str| {
+            let store_dyn: Arc<dyn Store> = store.clone();
+            let meta = meta.clone();
+            let schema = snapshot.schema();
+            let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let session = crate::QuerySession::with_authorizations(
+                auths.iter().map(|s| s.to_string()).collect(),
+            );
+            let c = counter.clone();
+            async move {
+                let table = LazyTable::new(
+                    "m".into(),
+                    schema,
+                    Vec::new(),
+                    vec![meta],
+                    store_dyn,
+                    std::time::Duration::from_secs(60),
+                    Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+                    Arc::new(MetaCache::default()),
+                    session,
+                    c,
+                );
+                let ctx = SessionContext::new();
+                ctx.register_table("m", Arc::new(table)).unwrap();
+                let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                (batches, counter.load(std::sync::atomic::Ordering::Relaxed))
+            }
+        };
+
+        // COUNT(*): the empty projection must still see (and obey) labels
+        let (batches, dropped) = run(vec![], "SELECT COUNT(*) AS n FROM m").await;
+        let n = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 50, "unauthorized COUNT(*) must not count hidden rows");
+        assert_eq!(dropped, 50, "the filtered-rows counter records enforcement");
+
+        let (batches, _) = run(vec!["secret"], "SELECT COUNT(*) AS n FROM m").await;
+        let n = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 100, "authorized session sees everything");
+
+        // a projection that never mentions the label column: rows are
+        // filtered, and the rode-along column does not leak into results
+        let (batches, _) = run(vec![], "SELECT pid FROM m ORDER BY pid").await;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 50);
+        for b in &batches {
+            assert!(b.column_by_name("_visibility").is_none());
+        }
+    }
+
     #[test]
     fn extracts_time_bounds_and_tag_literals() {
         let filters = vec![
@@ -981,6 +1135,9 @@ mod tests {
         let p = extract_pruning(&filters);
         assert_eq!(p.min_ts_ns, Some(100));
         assert_eq!(p.max_ts_ns, Some(900));
-        assert_eq!(p.tag_equals, vec![("product_id".to_string(), "p1".to_string())]);
+        assert_eq!(
+            p.tag_equals,
+            vec![("product_id".to_string(), "p1".to_string())]
+        );
     }
 }

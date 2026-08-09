@@ -47,7 +47,14 @@ const TABLE_TYPE: &str = "BASE TABLE";
 
 /// The seam to the engine (implemented by `timelord_server::Engine`).
 pub trait SqlBackend: Send + Sync + 'static {
-    fn query_batches<'a>(&'a self, db: String, sql: String) -> SqlFuture<'a>;
+    /// `authorizations` are the session's visibility authorizations
+    /// (SEC-2), from `x-timelord-authorizations` request metadata.
+    fn query_batches<'a>(
+        &'a self,
+        db: String,
+        sql: String,
+        authorizations: Vec<String>,
+    ) -> SqlFuture<'a>;
 
     /// Databases holding data — one catalog each, for `CommandGetCatalogs`.
     fn databases(&self) -> Vec<String>;
@@ -72,13 +79,30 @@ impl TimelordFlight {
 
 fn db_from_metadata(md: &tonic::metadata::MetadataMap) -> String {
     for key in ["database", "bucket-name", "bucket", "db"] {
-        if let Some(v) = md.get(key).and_then(|v| v.to_str().ok()) {
-            if !v.is_empty() {
-                return v.to_string();
-            }
+        if let Some(v) = md.get(key).and_then(|v| v.to_str().ok())
+            && !v.is_empty()
+        {
+            return v.to_string();
         }
     }
     "poc".to_string()
+}
+
+/// Visibility authorizations (SEC-2) ride gRPC metadata the same way the
+/// database does, comma-separated. Like the db, they are captured at
+/// GetFlightInfo time into the ticket, because some clients DoGet on a
+/// fresh connection that no longer carries the metadata.
+fn auths_from_metadata(md: &tonic::metadata::MetadataMap) -> Vec<String> {
+    md.get("x-timelord-authorizations")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Every metadata command answers GetFlightInfo the same way: a ticket that
@@ -156,7 +180,9 @@ impl FlightSqlService for TimelordFlight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let db = db_from_metadata(request.metadata());
-        let handle = serde_json::json!({ "db": db, "sql": query.query }).to_string();
+        let auths = auths_from_metadata(request.metadata());
+        let handle =
+            serde_json::json!({ "db": db, "sql": query.query, "auths": auths }).to_string();
         let ticket = TicketStatementQuery {
             statement_handle: handle.into_bytes().into(),
         };
@@ -171,7 +197,7 @@ impl FlightSqlService for TimelordFlight {
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
         let handle = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("ticket is not utf-8"))?;
@@ -182,10 +208,27 @@ impl FlightSqlService for TimelordFlight {
             .as_str()
             .ok_or_else(|| Status::invalid_argument("ticket missing sql"))?
             .to_string();
+        // ticket auths first (captured at planning), unioned with any on
+        // this DoGet call — a client cannot LOSE authorizations between
+        // the two, and gaining some only widens what was already theirs.
+        let mut auths: Vec<String> = parsed["auths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for a in auths_from_metadata(request.metadata()) {
+            if !auths.contains(&a) {
+                auths.push(a);
+            }
+        }
 
         let batches = self
             .backend
-            .query_batches(db, sql)
+            .query_batches(db, sql, auths)
             .await
             .map_err(Status::internal)?;
         let schema = match batches.first() {
@@ -393,7 +436,12 @@ mod tests {
     struct StubBackend;
 
     impl SqlBackend for StubBackend {
-        fn query_batches<'a>(&'a self, _db: String, _sql: String) -> SqlFuture<'a> {
+        fn query_batches<'a>(
+            &'a self,
+            _db: String,
+            _sql: String,
+            _authorizations: Vec<String>,
+        ) -> SqlFuture<'a> {
             Box::pin(async { Ok(Vec::new()) })
         }
         fn databases(&self) -> Vec<String> {

@@ -1,0 +1,60 @@
+SEC-1 + SEC-2 drill — 2026-08-09, image bench-timelorddb-timelorddb e0995d8ba8eb
+================================================================================
+
+Instance: fresh container, TIMELORD_ENCRYPTION_KEY set (64 hex),
+TIMELORD_FLUSH_AGE_SECS=2, ports 2966 (HTTP) / 2967 (Flight SQL).
+Startup log confirms: "SEC-1: object-store encryption enabled (per-object
+DEK, AES-256-GCM)".
+
+Data: three rows in table `audit` via /api/v3/write_lp (204):
+  actor=amy  _visibility=admin
+  actor=bob  _visibility=(ops&audit)|admin
+  actor=cat  (no label)
+
+SEC-2 over HTTP (/api/sql), buffer path (pre-flush):
+  no auths                       -> COUNT(*) = 1          [public only]
+  X-Timelord-Authorizations: ops,audit -> actors [bob, cat]
+  body authorizations ["admin"]  -> COUNT(*) = 3
+
+SEC-2 over HTTP, Parquet path (post-flush, identical answers):
+  no auths                       -> COUNT(*) = 1
+  ops,audit                      -> [bob/read, cat/login]
+
+SEC-2 over Flight SQL (pyarrow client, gRPC metadata
+x-timelord-authorizations, CommandStatementQuery -> DoGet):
+  no auths   -> [cat]
+  ops,audit  -> [bob, cat]
+  admin      -> COUNT(*) = 3
+
+Enforcement metrics after the HTTP drill:
+  timelord_encryption_enabled 1
+  timelord_visibility_rows_filtered_total 6     (2+1+2+1 across the four
+                                                 restricted queries: exact)
+
+SEC-1 at rest (docker exec, head -c5 of every file under objects/):
+  poc/audit/data/2026080911/...parquet : T L D E 1
+  catalog/manifest/000000000001.json   : T L D E 1
+  (no PAR1 magic, no plaintext JSON anywhere under objects/)
+
+Restart drill: docker restart -t 0 -> recovery through ENCRYPTED
+manifests, admin COUNT(*) = 3. Zero loss.
+
+Wrong-key drill: the encrypted data directory mounted into a container
+with a different TIMELORD_ENCRYPTION_KEY -> exits at startup, exit=101:
+  open engine (recovery): "DEK unwrap failed — wrong encryption key for
+  this store?"
+A named refusal, never silent plaintext and never garbage rows.
+
+Regression gate: bench smoke on the SAME image, plaintext store,
+unlabeled tables (run timelorddb-sec12-smoke-20260809-075901):
+  ingest 72,806 lines, 0 errors; Shape A median 48 ms p95 54 ms;
+  all Shape B complete; burst 5,000 events 0 errors, mid-burst query ok;
+  context counts exact (77,806 / 3,000 / 21,000).
+Unlabeled workloads and plaintext stores are untouched by construction:
+no `_visibility` column -> mandatory_predicate returns None; no key ->
+LocalStore unwrapped.
+
+Workspace gate: cargo test --workspace all green (68 tests; +7 store
+encryption, +5 visibility parser, +2 query e2e incl. the COUNT(*)
+leak test, +2 server integration incl. encrypted restart), clippy 0
+warnings, fmt clean (rustfmt/clippy 1.97).

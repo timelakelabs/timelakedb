@@ -13,6 +13,49 @@ here.
 
 ## [Unreleased]
 
+### Added — SEC-1: encryption at rest, at the store chokepoint (2026-08-09)
+
+- `EncryptingStore(inner, kms)` in `timelord-store`: every object —
+  Parquet, manifests, checkpoints — is envelope-encrypted with a fresh
+  per-object AES-256-GCM data key, wrapped by the configured key. The
+  engine is unchanged; the decorator slots in at `Engine::open`.
+- Encrypted objects are chunked (64 KiB, one auth tag per chunk, header +
+  object path as AAD), so the range-read path keeps working: a bloom probe
+  decrypts a few KB, a footer read takes the tail, and chunks cannot be
+  reordered, cross-spliced, or truncated undetected. A tampered object or
+  a wrong key is a clean named error.
+- Opt-in: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
+  `TIMELORD_ENCRYPTION_KEY_FILE`. A malformed key refuses to start rather
+  than silently serving plaintext. Objects written before the key existed
+  remain readable. `timelord_encryption_enabled` gauge.
+- Decision recorded in ARCHITECTURE §11: whole-object envelope over
+  Parquet Modular Encryption — covers non-Parquet objects, no dependency
+  on arrow-rs PME maturity (retires §16 risk 2); PME per-column keys stay
+  open at the same seam.
+
+### Added — SEC-2: Accumulo-style row visibility labels (2026-08-09)
+
+- A `_visibility` tag holding a label expression — `admin`, `ops&audit`,
+  `(ops&audit)|admin`, quoted tokens — restricts each row to sessions
+  whose authorizations satisfy it. Labels are ordinary dictionary-encoded
+  tags: no write-path changes, FR-2 economics.
+- The SEC-2 hook is real: `mandatory_predicate(session, table, schema) →
+  Option<Restriction>`, called unconditionally inside `LazyTable::scan`
+  and applied to every batch (buffer and file) below user predicates and
+  before aggregation — `COUNT(*)` reads the label column even when the
+  query doesn't, so an aggregate cannot count a hidden row.
+- Semantics: unlabeled/NULL rows are public; malformed expressions are
+  visible to no one (fail closed); `&`/`|` may not mix without
+  parentheses (Accumulo's rule); expressions are evaluated once per
+  distinct dictionary value, not per row.
+- Authorizations arrive via `X-Timelord-Authorizations` (HTTP header,
+  comma-separated, or the `/api/sql` body field) and
+  `x-timelord-authorizations` gRPC metadata on Flight SQL, captured into
+  the flight ticket at planning time. They are **claims, not
+  credentials**, until token auth lands — SECURITY.md exposure 7.
+- `timelord_visibility_rows_filtered_total` counter: enforcement is
+  visible, not silent.
+
 ### Added — schema discovery (2026-08-08)
 
 - `information_schema` is enabled on the query session, so `SHOW TABLES`,

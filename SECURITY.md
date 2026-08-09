@@ -44,8 +44,8 @@ needs access.
 | Authentication | **Not implemented.** Write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything and returns an empty token. |
 | Authorization | **Not implemented.** No users, roles, or per-database/table permissions. |
 | Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
-| Encryption at rest | Not implemented. SEC-1 is a v1 *design constraint* (all object I/O flows through one narrow layer) and a v2 feature. |
-| Row visibility labels | Not implemented. SEC-2 is a v1 design constraint — one mandatory-predicate injection point in the query path. |
+| Encryption at rest | **Implemented, opt-in.** Set `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or `TIMELORD_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough); the local WAL is **not** encrypted. |
+| Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-Timelord-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
 | Audit logging | Not implemented. Writes and queries are not attributed to a principal, because there is no principal. |
 | Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
 
@@ -84,6 +84,19 @@ follow from "no authentication" and are listed so you can design around them.
    keep a query from killing the server, but nothing stops one client from
    consuming the whole admission budget.
 
+7. **Visibility authorizations are self-asserted.** There is no
+   authentication, so `X-Timelord-Authorizations: admin` is a claim any
+   client can make. Until token auth lands, SEC-2 is a correct enforcement
+   mechanism behind an honor-system front door: real isolation requires an
+   authenticating proxy that *sets* (and strips inbound) that header.
+
+8. **Encryption at rest does not cover the local WAL**, which holds recent
+   line-protocol bytes until flush, nor does it protect data from anyone who
+   can reach the query API (queries decrypt transparently). It protects the
+   object store's media: a stolen volume, a decommissioned disk, an S3
+   bucket leak. Key material is held in process memory and sourced from the
+   environment.
+
 ## Deploying it safely today
 
 - **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
@@ -109,10 +122,10 @@ follow from "no authentication" and are listed so you can design around them.
 | Item | Requirement | State |
 |---|---|---|
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
-| Token authentication | §12 (v1 scope) | Not started |
+| Token authentication | §12 (v1 scope) | Not started — the missing piece that turns SEC-2 claims into authorization |
 | Mutual TLS, intra-cluster | SEC-3 (v2) | Not started |
-| Encryption at rest | SEC-1 (design constraint v1, feature v2) | Design constraint honoured — one narrow object I/O layer |
-| Row visibility labels | SEC-2 (design constraint v1) | Design constraint honoured — one predicate injection point |
+| Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |
+| Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |
 
 `REQUIREMENTS.md` §8 is the full security specification and explains why
 SEC-1 and SEC-2 are constrained now and implemented later.

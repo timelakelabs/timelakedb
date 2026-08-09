@@ -112,15 +112,8 @@ async fn ping_and_metrics_shapes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let text = String::from_utf8(
-        res.into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-    )
-    .unwrap();
+    let text =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(text.starts_with('#'));
     assert!(text.contains("timelord_lines_written_total"));
 }
@@ -140,7 +133,13 @@ async fn write_then_query_exact_counts_mini_at2() {
         c = t - 1000
     );
     assert_eq!(
-        write_lp(&app, "/api/v3/write_lp?db=poc", lp.as_bytes().to_vec(), false).await,
+        write_lp(
+            &app,
+            "/api/v3/write_lp?db=poc",
+            lp.as_bytes().to_vec(),
+            false
+        )
+        .await,
         StatusCode::NO_CONTENT
     );
 
@@ -201,7 +200,10 @@ async fn v1_precision_and_v2_gzip_telegraf_contract() {
          WHERE time >= now() - INTERVAL '6 hours'",
     )
     .await;
-    assert_eq!(rows[0]["n"], 2, "precision=s timestamps must land in-window");
+    assert_eq!(
+        rows[0]["n"], 2,
+        "precision=s timestamps must land in-window"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +211,13 @@ async fn errors_are_400_with_line_context_and_never_wal_d() {
     let dir = tempfile::tempdir().unwrap();
     let app = timelord_server::app(engine(dir.path()));
 
-    let code = write_lp(&app, "/api/v3/write_lp?db=poc", b"good f=1i\nbroken".to_vec(), false).await;
+    let code = write_lp(
+        &app,
+        "/api/v3/write_lp?db=poc",
+        b"good f=1i\nbroken".to_vec(),
+        false,
+    )
+    .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
     // Line protocol has no byte escape, so a non-UTF-8 body cannot be
     // expressed at all: it is refused whole, before the parser and before
@@ -292,7 +300,10 @@ async fn flush_parquet_union_restart_and_dedup_m2() {
     let eng = engine(dir.path());
     let app = timelord_server::app(eng.clone());
     let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
-    assert_eq!(rows[0]["n"], 4, "acknowledged rows survive restart, no dups");
+    assert_eq!(
+        rows[0]["n"], 4,
+        "acknowledged rows survive restart, no dups"
+    );
     // schema alignment across files with different column sets works:
     let (code, _) = sql(
         &app,
@@ -312,9 +323,7 @@ async fn compaction_merges_files_and_completes_fr5_m3() {
 
     // write + flush, then RETRY the same PK with a new value + flush again:
     // the duplicate now lives across two files
-    let lp1 = format!(
-        "pipeline_events,product_id=p1,step=01-download,event=start value=1i {t}"
-    );
+    let lp1 = format!("pipeline_events,product_id=p1,step=01-download,event=start value=1i {t}");
     write_lp(&app, "/api/v3/write_lp?db=poc", lp1.into_bytes(), false).await;
     eng.flush_all().unwrap();
     let lp2 = format!(
@@ -408,7 +417,11 @@ async fn memory_pool_rejects_cleanly_never_kills_rr1() {
          FROM m a CROSS JOIN m b CROSS JOIN m c",
     )
     .await;
-    assert_eq!(code, StatusCode::BAD_REQUEST, "hog must be rejected: {body}");
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "hog must be rejected: {body}"
+    );
 
     // ...and the server is entirely fine afterwards (the RR-1 contract)
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM m").await;
@@ -610,4 +623,180 @@ async fn a_rejected_write_cannot_poison_the_table_or_the_engine() {
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
     assert_eq!(code, StatusCode::OK, "restart must not replay the poison");
     assert_eq!(rows[0]["n"], 2);
+}
+
+/// /api/sql with an authorizations header — the SEC-2 wire contract.
+async fn sql_as(
+    app: &axum::Router,
+    db: &str,
+    q: &str,
+    auths: &str,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::post("/api/sql")
+        .header("content-type", "application/json")
+        .header("x-timelord-authorizations", auths)
+        .body(Body::from(
+            serde_json::json!({"db": db, "sql": q}).to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn visibility_labels_gate_the_http_surface_sec2() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+
+    // labels are ordinary tags: no write-path ceremony (FR-2 economics)
+    let lp = format!(
+        "audit_log,actor=amy,_visibility=admin action=\"drop\" {t0}\n\
+         audit_log,actor=bob,_visibility=(ops&audit)|admin action=\"read\" {t1}\n\
+         audit_log,actor=cat action=\"login\" {t2}",
+        t0 = t - 1000,
+        t1 = t - 2000,
+        t2 = t - 3000,
+    );
+    assert_eq!(
+        write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // buffer path: no header → only the unlabeled row; an aggregate must
+    // not leak hidden rows either (the SEC-2 acceptance criterion)
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM audit_log").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 1, "no auths sees only public rows");
+
+    let (_, rows) = sql_as(
+        &app,
+        "poc",
+        "SELECT COUNT(*) AS n FROM audit_log",
+        "ops,audit",
+    )
+    .await;
+    assert_eq!(rows[0]["n"], 2, "ops+audit satisfies (ops&audit)|admin");
+
+    let (_, rows) = sql_as(&app, "poc", "SELECT COUNT(*) AS n FROM audit_log", "admin").await;
+    assert_eq!(rows[0]["n"], 3, "admin sees everything");
+
+    // parquet path: identical answers once the buffer drains to files
+    eng.flush_all().unwrap();
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM audit_log").await;
+    assert_eq!(rows[0]["n"], 1, "flushed: public only");
+    let (_, rows) = sql_as(
+        &app,
+        "poc",
+        "SELECT actor FROM audit_log ORDER BY actor",
+        "ops , audit",
+    )
+    .await;
+    let actors: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["actor"].as_str())
+        .collect();
+    assert_eq!(
+        actors,
+        vec!["bob", "cat"],
+        "flushed: filtered rows, header whitespace tolerated"
+    );
+
+    // enforcement is visible, not silent (RR-5 spirit)
+    assert!(
+        eng.metrics_text_impl()
+            .contains("timelord_visibility_rows_filtered_total"),
+        "filtered-rows counter must be exported"
+    );
+}
+
+#[tokio::test]
+async fn encrypted_store_serves_and_survives_restart_sec1() {
+    use timelord_store::{EncryptingStore, LocalKek, LocalStore, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let kek = timelord_store::key_from_hex(&"5a".repeat(32)).unwrap();
+    let open_encrypted = || {
+        let store: Arc<dyn Store> = Arc::new(EncryptingStore::new(
+            LocalStore::new(&dir.path().join("objects")).unwrap(),
+            Arc::new(LocalKek::new(kek)),
+        ));
+        timelord_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, true)
+            .unwrap()
+    };
+
+    let t = now_ns();
+    let eng = open_encrypted();
+    let app = timelord_server::app(eng.clone());
+    let lp: String = (0..500)
+        .map(|i| format!("sec,pid=p{i:03} v={i}i {}\n", t - 1000 - i as i64))
+        .collect();
+    assert_eq!(
+        write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+        StatusCode::NO_CONTENT
+    );
+    eng.flush_all().unwrap();
+
+    // reads work through the decorator, pruning and all
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM sec").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 500);
+    let (_, rows) = sql(&app, "poc", "SELECT v FROM sec WHERE pid = 'p042'").await;
+    assert_eq!(rows[0]["v"], 42);
+    assert!(
+        eng.metrics_text_impl()
+            .contains("timelord_encryption_enabled 1")
+    );
+
+    // at rest, NOTHING under objects/ is readable: not the parquet (no
+    // PAR1 magic), not the manifest JSON
+    let mut checked = 0;
+    for entry in walkdir(&dir.path().join("objects")) {
+        let bytes = std::fs::read(&entry).unwrap();
+        assert!(
+            bytes.starts_with(b"TLDE1"),
+            "object {entry:?} must be encrypted at rest"
+        );
+        assert!(
+            !bytes.windows(4).any(|w| w == b"PAR1"),
+            "no parquet magic in {entry:?}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "expected parquet + manifest under objects/, saw {checked}"
+    );
+
+    // restart: catalog manifests decrypt on load, data still answers
+    drop(app);
+    drop(eng);
+    let eng = open_encrypted();
+    let app = timelord_server::app(eng.clone());
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM sec").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 500);
+}
+
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
