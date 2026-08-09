@@ -252,7 +252,14 @@
 
     <section id="http">
       <h2>HTTP API</h2>
-      <p>Port 1963. No authentication — see <a href="index.html#security">Security</a>.</p>
+      <p>
+        Port 1963, shared by the data plane and the admin plane. Writes,
+        <code>/api/sql</code>, <code>/health</code>, <code>/ping</code> and
+        <code>/metrics</code> take no authentication; every
+        <code>/admin/*</code> route requires a session (SEC-4). See
+        <a href="index.html#security">Security</a> and
+        <a href="index.html#console">Admin Console</a>.
+      </p>
 
       <div class="table-wrap">
         <table>
@@ -328,6 +335,45 @@
         shrinking, introducing, or removing a window — plus TLS reload.
       </p>
 
+      <h3>Admin console (<code>/admin/ui</code>)</h3>
+      <p>
+        <code>GET /admin/ui</code> serves the management page: one
+        self-contained HTML document compiled into the binary — no build step,
+        no external assets, no separate service to deploy or expose. The page
+        itself loads without a session; everything it can <em>do</em> requires
+        one, so an unauthenticated visitor sees a sign-in form and nothing else.
+      </p>
+      <p>
+        The flow is sign in → rotate if required → manage. On a first run the
+        seeded <code>admin</code>/<code>admin</code> credential is quarantined,
+        so the console goes straight to a forced password change and returns to
+        sign-in afterwards (rotation ends every session for that principal,
+        including the current one). After that it manages per-table retention:
+        the active policies, a set/remove form with table-name completion from
+        <code>SHOW TABLES</code>, the live
+        <code>timelord_retention_drops_total</code> counter, and a standing
+        warning that shrinking a window deletes data on the next enforcement
+        pass — permanently once <code>TIMELORD_GC_GRACE_SECS</code> elapses. The
+        header shows who you are and your role, and the page states which role
+        each action needs; the server is what enforces it, so an action above
+        your role fails with <code>403</code> rather than being hidden. A banner
+        appears while the seeded credential is still active.
+      </p>
+      <div class="note warn">
+        <p>
+          <strong>The console is on the data port.</strong> It answers on 1963
+          alongside writes and <code>/api/sql</code>, so publishing the write API
+          publishes the console's front door — the session is what protects it,
+          not the network boundary. Binding privately
+          (<code>TIMELORD_ADDR=127.0.0.1:1963</code>) is still the primary
+          control, and a reverse proxy must forward cookies and the
+          <code>X-Timelord-CSRF</code> header. A dedicated admin listener on
+          <strong>1965</strong>, bound to loopback by default and carrying
+          <code>/admin/*</code> away from 1963, is designed as phase U0 in
+          <code>docs/CONSOLE.md</code> — not shipped.
+        </p>
+      </div>
+
       <h3>Row visibility labels (SEC-2)</h3>
       <p>
         A tag named <code>_visibility</code> holds an Accumulo-style label
@@ -343,8 +389,10 @@
         visible to <em>no one</em> (fail closed); <code>&amp;</code> and
         <code>|</code> may not mix without parentheses. Enforcement happens
         inside the scan, so aggregates cannot count hidden rows.
-        <strong>Until token authentication exists, authorizations are claims,
-        not credentials</strong> — see SECURITY.md.
+        <strong>Until the data plane itself requires authentication,
+        authorizations are claims, not credentials</strong> — the SEC-4 sessions
+        that guard <code>/admin/*</code> do not apply to
+        <code>/api/sql</code> or Flight SQL. See SECURITY.md.
       </p>
 
       <h3>Encryption at rest (SEC-1)</h3>
@@ -497,6 +545,9 @@
             <tr><td><code>timelord_s3_read_bytes_total</code> / <code>timelord_s3_write_bytes_total</code></td><td>counter</td><td>Bytes moved to/from S3 (S3 backend only)</td></tr>
             <tr><td><code>timelord_tls_cert_expiry_seconds</code></td><td>gauge</td><td>Seconds until the serving certificate expires (TLS mode only)</td></tr>
             <tr><td><code>timelord_tls_last_reload_ok</code></td><td>gauge</td><td>1 if the last certificate reload validated, 0 if it was rejected (TLS mode only)</td></tr>
+            <tr><td><code>timelord_admin_default_credential_active</code></td><td>gauge</td><td>1 while the seeded <code>admin</code>/<code>admin</code> password is still in place (SEC-4)</td></tr>
+            <tr><td><code>timelord_admin_logins_total</code></td><td>counter</td><td>Successful admin sign-ins since start</td></tr>
+            <tr><td><code>timelord_admin_login_failures_total</code></td><td>counter</td><td>Rejected sign-in attempts since start</td></tr>
           </tbody>
         </table>
       </div>
@@ -513,6 +564,12 @@
         <li><code>timelord_tls_cert_expiry_seconds</code> below two renewal periods.</li>
         <li><code>timelord_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
+        <li><code>timelord_admin_default_credential_active == 1</code> — the
+            well-known first-run password still works; anyone who reaches the
+            admin port can take the <code>admin</code> role.</li>
+        <li><code>rate(timelord_admin_login_failures_total[5m])</code> climbing —
+            someone is guessing; per-principal backoff is slowing them, not
+            stopping them.</li>
       </ul>
       <p>
         Logging is <code>tracing</code> to stdout, controlled by <code>RUST_LOG</code>

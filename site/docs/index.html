@@ -44,6 +44,9 @@
       <li><a href="#retention">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg>
         Retention</a></li>
+      <li><a href="#console">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h10M18 17h2"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="17" r="2"/></svg>
+        Admin Console</a></li>
       <li><a href="#security">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 5 6.5v5c0 4.3 2.9 7.6 7 9 4.1-1.4 7-4.7 7-9v-5Z"/><path d="m9 12 2 2 4-4"/></svg>
         Security</a></li>
@@ -82,10 +85,13 @@
       </div>
       <div class="note warn">
         <p>
-          <strong>There is no authentication.</strong> Any client that can reach
-          port 1963 or 1964 can read and write everything on the node. Network
-          reachability is the only access control TimelordDB has today — see
-          <a href="#security">Security</a> before exposing it anywhere.
+          <strong>The data plane has no authentication.</strong> Any client that
+          can reach port 1963 or 1964 can read and write everything on the node.
+          The <a href="#console">admin surface</a> is the exception — every
+          <code>/admin/*</code> route requires a session — but for writes and
+          queries, network reachability is still the only access control
+          TimelordDB has. Read <a href="#security">Security</a> before exposing
+          it anywhere.
         </p>
       </div>
 
@@ -279,7 +285,9 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         Retention is configured <strong>per table</strong>, not globally — metrics that
         matter for a year and debug streams that matter for three days live in the
-        same database without compromise.
+        same database without compromise. It is set two ways: the system property
+        below seeds it at startup, and the <a href="#console">admin console</a>
+        changes it on a running server without a restart.
       </p>
       <div class="code">
         <header>Per-table retention <button class="copy" type="button">Copy</button></header>
@@ -302,25 +310,138 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
     </section>
 
-    <section id="security">
-      <h2>Security</h2>
+    <section id="console">
+      <h2>Admin Console</h2>
       <p>
-        The honest version: transport encryption (TLS 1.3 with hot rotation),
-        encryption at rest, and row visibility labels are finished and
-        drilled — but <strong>authentication is not</strong>, so access
-        control is still network isolation, and visibility authorizations are
-        claims any client can assert. Plan the deployment around that rather
-        than around what a database of this shape usually offers.
+        A management page ships with the server at
+        <code>http://&lt;host&gt;:1963/admin/ui</code> — self-contained HTML from
+        the binary itself, no build step, no external assets, and no separate
+        deployment. It signs you in, makes you replace the first-run password,
+        and then manages what the server does at runtime.
       </p>
 
       <div class="note warn">
         <p>
-          <strong>No authentication, no authorization.</strong> Write endpoints
-          accept any token and ignore it; the Flight SQL handshake accepts
-          anything and returns an empty token. There are no users, roles or
-          per-table permissions, and databases are namespaces rather than
-          security boundaries. Treat an open TimelordDB port as equivalent to
-          an unauthenticated shell into the data.
+          <strong>The console shares port 1963 with the data plane today.</strong>
+          Every <code>/admin/*</code> route requires a session, but the port is
+          the same one your writers use — so keep 1963 private and treat console
+          reachability as an access-control decision. A dedicated, privately
+          bound admin listener is designed and phased as U0; see
+          <a href="#console-port">Ports and exposure</a>.
+        </p>
+      </div>
+
+      <h3>First run: sign in, then rotate</h3>
+      <p>
+        With no principals configured the server seeds
+        <code>admin</code>&nbsp;/&nbsp;<code>admin</code> and
+        <strong>quarantines it</strong>: the only route that answers is
+        <code>POST /admin/password</code>, and everything else returns
+        <code>403 password_change_required</code> until the password changes.
+        Rotating it ends every session for that principal — including the one
+        that just rotated it — so you sign in again with the new password.
+      </p>
+      <ul>
+        <li>The new password must be at least 8 characters, and cannot be the
+            username or the word <code>admin</code>.</li>
+        <li>Set <code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code> to provision a
+            real password at first start instead of the well-known default.</li>
+        <li>Alert on <code>timelord_admin_default_credential_active</code> — a
+            <code>1</code> means the seeded credential is still live.</li>
+      </ul>
+
+      <h3>Roles</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Role</th><th>Can do</th></tr></thead>
+          <tbody>
+            <tr><td><code>viewer</code></td><td>Read the console and every <code>/admin/*</code> GET. Changes nothing.</td></tr>
+            <tr><td><code>operator</code></td><td>Everything a viewer can, plus non-destructive changes — including <em>growing</em> a retention window.</td></tr>
+            <tr><td><code>admin</code></td><td>Everything an operator can, plus the destructive direction — shrinking, introducing or removing a retention window — and <code>POST /admin/tls/reload</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The split follows the data rather than the verb: growing a window keeps
+        more, shrinking one destroys history. That is why introducing a policy
+        on a table that had none is an <code>admin</code> action — it is a
+        deletion in disguise.
+      </p>
+
+      <h3>What it manages today</h3>
+      <p>
+        Per-table retention (FR-7): the active policies, a set/remove form with
+        table-name completion, the live
+        <code>timelord_retention_drops_total</code> counter, and an explicit
+        warning that shrinking a window deletes data on the next enforcement
+        pass — permanently once <code>TIMELORD_GC_GRACE_SECS</code> elapses.
+        Changes persist through the object store
+        (<code>catalog/config/retention.json</code>, encrypted with everything
+        else) and survive a restart, so the stored policy outlives a stale
+        <code>TIMELORD_RETENTION</code> in your compose file.
+      </p>
+      <p>
+        Layered configuration with visible provenance, application and audit
+        logs, metrics and performance views, and a cluster view are designed but
+        not built — the phases are U0–U3 in <code>ARCHITECTURE.md</code> §14,
+        specified in <code>docs/CONSOLE.md</code>.
+      </p>
+
+      <h3 id="console-port">Ports and exposure</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Port</th><th>Serves</th><th>Authentication</th></tr></thead>
+          <tbody>
+            <tr><td><code>1963</code></td><td>Writes, <code>/api/sql</code>, <code>/health</code>, <code>/ping</code>, <code>/metrics</code></td><td><strong>None</strong> — the data plane is open</td></tr>
+            <tr><td><code>1963</code></td><td><code>/admin/*</code> and the console at <code>/admin/ui</code></td><td><strong>Session required</strong> (SEC-4)</td></tr>
+            <tr><td><code>1964</code></td><td>Arrow Flight SQL</td><td>None — the handshake accepts anything</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Both listeners move together: <code>TIMELORD_ADDR</code> and
+        <code>TIMELORD_FLIGHT_ADDR</code> set the bind addresses, and TLS
+        (<code>TIMELORD_TLS_CERT</code>&nbsp;/&nbsp;<code>_KEY</code>) covers both
+        at once. There is no way to bind the console somewhere different from the
+        write API yet, so <code>TIMELORD_ADDR=127.0.0.1:1963</code> plus an
+        authenticating proxy is the way to reach it remotely — and a proxy in
+        front of the console must forward cookies and the
+        <code>X-Timelord-CSRF</code> header.
+      </p>
+      <p>
+        <strong>Planned (U0):</strong> the admin plane gets its own listener on
+        <code>1965</code>, bound to <code>127.0.0.1</code> by default, and
+        <code>/admin/*</code> leaves 1963. The most destructive endpoints should
+        not inherit the data plane's exposure. Until then, the port you publish
+        for writes is the port that reaches the console.
+      </p>
+    </section>
+
+    <section id="security">
+      <h2>Security</h2>
+      <p>
+        The honest version: transport encryption (TLS 1.3 with hot rotation),
+        encryption at rest, row visibility labels, and authentication on the
+        <a href="#console">admin surface</a> are finished and drilled — but the
+        <strong>data plane is still open by design</strong>, so access control
+        for writes and queries is network isolation, and visibility
+        authorizations remain claims any client can assert. Plan the deployment
+        around that rather than around what a database of this shape usually
+        offers.
+      </p>
+
+      <div class="note warn">
+        <p>
+          <strong>Authentication covers administration, not data.</strong> Every
+          <code>/admin/*</code> route requires a session with a role
+          (<code>viewer</code>, <code>operator</code>, <code>admin</code>) — but
+          write endpoints still accept any token and ignore it, the Flight SQL
+          handshake accepts anything and returns an empty token, and there are no
+          per-table permissions. Databases are namespaces, not security
+          boundaries. Treat an open 1963 or 1964 as equivalent to an
+          unauthenticated shell into the data. Requiring authentication on the
+          data plane is a deliberate later migration — it breaks every existing
+          client, Telegraf and Grafana included.
         </p>
       </div>
 
@@ -331,11 +452,11 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
           <tbody>
             <tr><td>Transport encryption</td><td><strong>Implemented, opt-in</strong> — TLS 1.3 on both listeners with hot rotation</td></tr>
             <tr><td>Client certificates / mTLS</td><td>Not implemented — server-side TLS only; mutual TLS is v2</td></tr>
-            <tr><td>Authentication</td><td>Not implemented — token auth is scoped for v1</td></tr>
-            <tr><td>Authorization</td><td>Not implemented</td></tr>
+            <tr><td>Authentication</td><td><strong>Implemented on the admin surface</strong> — sessions (cookie or bearer) with Argon2id credentials, 30 min idle / 12 h absolute expiry, CSRF and origin checks on cookie mutations, per-principal login backoff. <strong>Not on the data plane</strong> — writes, <code>/api/sql</code>, Flight SQL and <code>/metrics</code> stay open</td></tr>
+            <tr><td>Authorization</td><td><strong>Implemented on the admin surface</strong> — ordered roles <code>viewer</code> &lt; <code>operator</code> &lt; <code>admin</code>, with destructive retention changes requiring <code>admin</code>. No per-table or per-database permissions</td></tr>
             <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELORD_ENCRYPTION_KEY</code> and every stored object (data and manifests) is envelope-encrypted, AES-256-GCM per object, range-read compatible; the local WAL is not covered</td></tr>
-            <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan; authorizations are unauthenticated claims until token auth lands</td></tr>
-            <tr><td>Audit logging</td><td>Not implemented — there is no principal to attribute a write to</td></tr>
+            <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan; authorizations remain unauthenticated claims until the <em>data plane</em> requires a session — admin authentication does not cover them</td></tr>
+            <tr><td>Audit logging</td><td>Not implemented — administrative actions now have a principal to attribute, and a tamper-evident trail is specified (SR-6, phase U1), but nothing is recorded yet</td></tr>
             <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure</td></tr>
           </tbody>
         </table>
@@ -353,10 +474,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             are registered and DDL does not survive a request — but treat SQL
             access as filesystem-write access to the container.</li>
         <li>The container runs as root; the image sets no <code>USER</code>.</li>
-        <li><code>POST /admin/tls/reload</code> is unauthenticated. Impact is
-            bounded by design — it re-reads only the configured paths, validates
-            before swapping, and keeps the last-good pair — but it is an open
-            administrative endpoint.</li>
+        <li>The administrative surface — retention management, the console,
+            <code>POST /admin/tls/reload</code> — now requires an
+            authenticated session, so it is no longer open. Two things remain
+            true: it answers on the <strong>same port as the data plane</strong>
+            (1963), and a deployment that never rotates the seeded
+            <code>admin</code>/<code>admin</code> credential is one guess from
+            an <code>admin</code> role that can delete history. Alert on
+            <code>timelord_admin_default_credential_active</code>.</li>
         <li>Query errors are returned verbatim, disclosing table and column names.</li>
         <li>There is no per-client rate limit; one client can consume the whole
             admission budget.</li>
@@ -373,10 +498,17 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Deploying it safely</h3>
       <ul>
         <li>Bind to localhost or a private network — <code>TIMELORD_ADDR=127.0.0.1:1963</code>
-            — and publish nothing to an untrusted network.</li>
+            — and publish nothing to an untrusted network. That address carries
+            the console as well as the write API, so it is the only lever over
+            who can reach either.</li>
         <li>If remote access is needed, front it with something that
             authenticates. Flight SQL is gRPC over HTTP/2, so a proxy in front of
-            port 1964 must speak HTTP/2.</li>
+            port 1964 must speak HTTP/2; a proxy in front of the console must
+            forward cookies and the <code>X-Timelord-CSRF</code> header.</li>
+        <li>Provision the first administrator with
+            <code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code> rather than letting
+            the seeded <code>admin</code>/<code>admin</code> exist at all, and
+            alert on <code>timelord_admin_default_credential_active</code>.</li>
         <li>Enable TLS even on a private network — rotation costs no downtime —
             and set <code>TIMELORD_ENCRYPTION_KEY</code> so a lost volume or
             leaked bucket is ciphertext. Keep the key out of the data volume,
@@ -501,7 +633,24 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>GET /metrics</code></td><td>Prometheus exposition</td></tr>
             <tr><td><code>POST /write</code>, <code>/api/v2/write</code>, <code>/api/v3/write_lp</code></td><td>Line-protocol ingest</td></tr>
             <tr><td><code>POST /api/sql</code></td><td>SQL returning JSON rows</td></tr>
-            <tr><td><code>POST /admin/tls/reload</code></td><td>Re-read and validate the certificate pair (TLS mode only)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Admin endpoints (same port, session required)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method &amp; path</th><th>Role</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /admin/ui</code></td><td>—</td><td>The <a href="#console">console</a>: sign in, rotate, manage</td></tr>
+            <tr><td><code>POST /admin/session</code></td><td>—</td><td>Sign in; returns a session cookie and a CSRF token</td></tr>
+            <tr><td><code>GET /admin/session</code></td><td>viewer</td><td>Who you are, your role, whether rotation is pending</td></tr>
+            <tr><td><code>DELETE /admin/session</code></td><td>viewer</td><td>Sign out; clears the cookie</td></tr>
+            <tr><td><code>POST /admin/password</code></td><td>viewer</td><td>Change your password; ends all your sessions</td></tr>
+            <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>Active per-table policies</td></tr>
+            <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, admin to shrink or introduce</td><td>Set a window; persists durably, applies within 60 s</td></tr>
+            <tr><td><code>DELETE /admin/retention/{table}</code></td><td>admin</td><td>Remove a window; the table keeps everything again</td></tr>
+            <tr><td><code>POST /admin/tls/reload</code></td><td>admin</td><td>Re-read and validate the certificate pair (TLS mode only)</td></tr>
           </tbody>
         </table>
       </div>
@@ -521,7 +670,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELORD_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
             <tr><td><code>TIMELORD_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>
             <tr><td><code>TIMELORD_COMPACT_MIN_FILES</code></td><td>4</td><td>Files in a partition before compaction</td></tr>
-            <tr><td><code>TIMELORD_RETENTION</code></td><td>empty</td><td>Per-table retention specification</td></tr>
+            <tr><td><code>TIMELORD_RETENTION</code></td><td>empty</td><td>Per-table retention specification; seeds the policy at first start, after which the stored policy from the console wins</td></tr>
+            <tr><td><code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
             <tr><td><code>TIMELORD_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
             <tr><td><code>TIMELORD_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths)</td></tr>
             <tr><td><code>TIMELORD_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
@@ -539,7 +689,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <code>timelord_wal_bytes</code>, <code>timelord_databases</code>,
         <code>timelord_tables</code>. With TLS enabled,
         <code>timelord_tls_cert_expiry_seconds</code> and
-        <code>timelord_tls_last_reload_ok</code> are added.
+        <code>timelord_tls_last_reload_ok</code> are added. The admin surface adds
+        <code>timelord_admin_default_credential_active</code>,
+        <code>timelord_admin_logins_total</code> and
+        <code>timelord_admin_login_failures_total</code>.
       </p>
 
       <h3>TLS and certificate rotation</h3>
@@ -597,11 +750,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>Assume the port is the perimeter</h3>
       <p>
-        Until token authentication lands, whoever can reach 1963 or 1964 owns the
-        data. Bind to a private interface, keep TimelordDB off any network you do
-        not control, and read <a href="#security">Security</a> in full before a
-        deployment — particularly the note that <code>/api/sql</code> can write
-        files as the server process.
+        Administration is authenticated; the data plane is not. Until that
+        changes, whoever can reach 1963 or 1964 owns the data — and because the
+        console answers on 1963 too, that port also decides who can reach the
+        management surface. Bind to a private interface, keep TimelordDB off any
+        network you do not control, rotate the seeded credential, and read
+        <a href="#security">Security</a> in full before a deployment —
+        particularly the note that <code>/api/sql</code> can write files as the
+        server process.
       </p>
 
       <h3>Prove changes with the harness</h3>
