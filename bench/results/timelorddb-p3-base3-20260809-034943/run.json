@@ -1,0 +1,176 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-p3-base3-20260809-034943",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:2965",
+    "db": "poc",
+    "container": "tldb-perf",
+    "image": "timelorddb:perf"
+  },
+  "started_at": "2026-08-09T03:49:49-0400",
+  "finished_at": "2026-08-09T03:50:13-0400",
+  "config": {
+    "scale": "laptop",
+    "label": "p3-base3",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 100,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts",
+      "query_a",
+      "query_b",
+      "burst",
+      "storage",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 6.7,
+      "lines_per_s": 545620,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 57,
+      "batch_p95_ms": 98,
+      "batch_max_ms": 126
+    },
+    "host_ingest": {
+      "lines": 864000,
+      "wall_s": 2.1,
+      "lines_per_s": 407514,
+      "errors": 0
+    },
+    "query_shape_a": {
+      "n": 100,
+      "errors": 0,
+      "median_ms": 53,
+      "p95_ms": 114,
+      "max_ms": 158
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 57,
+          "warm_ms": 47,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 96,
+          "warm_ms": 91,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 27,
+          "warm_ms": 17,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 32,
+          "warm_ms": 28,
+          "rows": 476,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 34,
+          "warm_ms": 32,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "burst": {
+      "events": 100000,
+      "wall_s": 0.2,
+      "events_per_s": 507733,
+      "errors": 0,
+      "batch_p50_ms": 55,
+      "batch_p95_ms": 87,
+      "batch_max_ms": 99,
+      "concurrent_query_ms": 59,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "storage": {
+      "bytes": 394068422,
+      "gb_total": 0.394,
+      "days_of_data": 2,
+      "gb_per_day": 0.197,
+      "projected_gb_90d": 17.7,
+      "projected_gb_365d": 71.9
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 19,
+        "value": 2201646,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 3,
+        "value": null,
+        "error": "HTTP 400: {\"error\":\"Error during planning: table 'poc.public.host_metrics' not found\"}"
+      },
+      "disk_rows_6h": {
+        "ms": 3,
+        "value": null,
+        "error": "HTTP 400: {\"error\":\"Error during planning: table 'poc.public.disk_metrics' not found\"}"
+      }
+    },
+    "resources": {
+      "baseline_mem_mb": 6.2,
+      "settled_mem_mb": 2459.9,
+      "returned_to_baseline": false,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 6.2,
+          "peak_cpu_pct": 0.0,
+          "samples": 3
+        },
+        "ingest": {
+          "peak_mem_mb": 725.9,
+          "peak_cpu_pct": 207.6,
+          "samples": 3
+        },
+        "hosts": {
+          "peak_mem_mb": 438.5,
+          "peak_cpu_pct": 58.3,
+          "samples": 1
+        },
+        "query_a": {
+          "peak_mem_mb": 2448.1,
+          "peak_cpu_pct": 159.2,
+          "samples": 3
+        },
+        "settle": {
+          "peak_mem_mb": 2496.4,
+          "peak_cpu_pct": 236.6,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}
