@@ -61,6 +61,91 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 16:45 — Decode candidate files concurrently   [ADOPTED]
+
+**Hypothesis.** The last cycle's rule is to prove a cost is on the critical
+path first, so this one measured before it changed anything. On a 24-core
+container, `docker stats` during a funnel query shows **~1250% CPU** — the
+aggregation above the scan is already running ~12 wide. But `load_pruned`
+walks its candidate files in one `for` loop on a single blocking task, so the
+load is the one part of a Shape B query pinned to a single core. Decomposing
+B2 against a settled 62-file instance:
+
+| Probe | Median |
+|---|---|
+| `COUNT(step)` over 48 h — scan, no real aggregation | 37 ms |
+| `COUNT(product_id), COUNT(step)` with the `event='stop'` filter | 64 ms |
+| B2 in full (`COUNT(DISTINCT product_id)`) | 738 ms hammered |
+
+Against harness figures of B3 39 ms, B4 69 ms, B5 72 ms, the serial load is
+most of three of the five Shape B queries. Fan it out and those should fall
+roughly 2x; B1/B2 should barely move, because they are aggregation-bound.
+
+**Change.** `crates/query/src/provider.rs`. The per-file body of
+`load_pruned` moved out to `load_one_file` — files were already independent,
+each pruning and decoding through its own `StoreFile`, so nothing needed
+untangling. `load_pruned` now runs a `std::thread::scope` with
+`scan_threads()` workers (`min(files, cores, 8)`) pulling from an
+`AtomicUsize` cursor. Results land in per-file slots and are concatenated in
+file order, so a plan sees the same batch sequence as before. The RR-1
+reservation became a `Mutex<MemoryReservation>` and `try_grow` stays *inside*
+the decode loop — applying it after the join would have meant the memory was
+already allocated, which is the guarantee this whole thing exists to keep.
+RR-2's deadline is still checked between files, now by every worker; the
+first error wins and the rest stop.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network,
+100 Shape A samples, ingest 738–768K lines/s throughout (all runs clean).
+Labels `perf-base1`/`perf-base2` and `perf-cand1`/`perf-cand2`, 62–63 settled
+parquet files each, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B3_inflight_24h | 39/48, 37/29 | **16/11, 11/11** |
+| B4_hourly_throughput_48h | 69/65, 52/43 | **20/18, 17/18** |
+| B5_route_rollup_24h | 72/72, 62/56 | **26/25, 25/25** |
+| B1_funnel_24h | 109/98, 120/99 | 122/88, 81/89 |
+| B2_funnel_48h | 252/243, 257/214 | 205/183, 704/472 |
+| Shape A median | 4 ms, 4 ms | 3 ms, 4 ms |
+| Ingest | 778K, 738K | 738K, 768K |
+
+85 workspace tests pass, 0 failures; `cargo fmt` clean on the touched lines.
+
+**Verdict.** Adopted. B3, B4 and B5 drop **2.3–2.5x** with no overlap between
+the two sets and near-identical repeats, which is exactly the predicted size
+and exactly the three queries the probe said were load-bound. B1 and B2 are
+unchanged-to-noisy, also as predicted — they are dominated by
+`COUNT(DISTINCT product_id)` over 200K distinct products, not by the scan.
+B2's 704 ms candidate outlier is that aggregation's variance, not a
+regression: it sits alongside a 205 ms candidate run and the same query
+hammered 15x on *baseline* ranged 379–1079 ms. Shape A is untouched at 3–4 ms
+because it already prunes to almost nothing.
+
+**Lesson — and the measurement rig changed under this cycle, twice.**
+
+- **The laptop harness was not measuring the read path at all.** Run
+  in-network the whole laptop pass finishes in ~8 s, inside the 10 s flush
+  tick, so every scan logged `files_total=0` and all five Shape B queries read
+  the *write buffer*. Earlier cycles only saw files because the ~45 ms/request
+  port overhead made the run slow enough to cross a tick. **Load and query
+  must be separate harness invocations with a settle between** —
+  `bench/perf-cycle.sh` now does this, and prints the settled file count so a
+  pair can be checked for like-for-like.
+- **True in-network numbers are far off the recorded ones.** Ingest is
+  **740–780K lines/s**, not the ~590K every earlier entry records; Shape A is
+  **4 ms**, confirming the 07:15 finding on the harness's own terms. Any
+  comparison against a pre-07:15 figure in this log is invalid.
+- **Per-file cost analysis in the bloom entry was contaminated too.** Its
+  "0.30 ms per file at laptop scale" divided a 50 ms figure that was ~45 ms
+  transport by 167 files. The real per-file number was ~0.03 ms, which is why
+  that cycle's candidate-set reasoning pointed at a cost that was never large.
+- **What is left on Shape B is the aggregation, not the I/O.** B1/B2 are
+  `COUNT(DISTINCT product_id)` over 200K products; the scan under them is now
+  ~15 ms of a ~100–250 ms query. The next cycle should look there — and
+  should note that repeated B2 runs walked container memory from 2.4 to
+  3.6 GiB, because `load_pruned` still materialises every batch before the
+  plan starts. That is the streaming-exec lead, and it now has a number.
+
 ### 2026-08-09 07:15 — TCP_NODELAY on the listeners   [REJECTED — but read the lesson, it invalidates a metric]
 
 **Hypothesis.** Following the last cycle's rule, measure before optimising. A
