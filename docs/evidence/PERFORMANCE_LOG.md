@@ -61,6 +61,107 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 19:35 — Stop starving the partial-aggregation skip   [ADOPTED]
+
+**Hypothesis.** The last cycle handed this one its target: "what is left on
+Shape B is the aggregation, not the I/O." So this cycle localised the
+aggregation before touching it. Probing a settled instance decomposes B2
+cleanly:
+
+| Probe | Median |
+|---|---|
+| `COUNT(*)` over 48 h | 7.9 ms |
+| `COUNT(*)` with the `event='stop'` filter (1.83 M rows) | 11.2 ms |
+| `step, COUNT(*) GROUP BY step` | 18.1 ms |
+| `COUNT(DISTINCT product_id)`, no GROUP BY (200 K groups) | 37.1 ms |
+| `GROUP BY step, product_id` counted (1.83 M groups) | 114.2 ms |
+| B2 in full | 113.5 ms |
+
+So B2 is 18 ms of scan-and-filter and ~95 ms of one grouping, and that
+grouping produces **one group per row**: every (step, product_id) pair is
+unique, 1.83 M of them. `EXPLAIN ANALYZE` then named the waste exactly —
+`AggregateExec: mode=Partial ... reduction_factor=100% (1.83 M/1.83 M)`,
+365 ms of compute and 218 MB of peak memory spent building a hash table that
+deduplicates *nothing* before handing every row on to the final aggregate
+anyway. DataFusion already knows how to bail out of that (it measures its own
+reduction and switches to pass-through), and the same plan says why it never
+did: `skipped_aggregation_rows=0`, under `DataSourceExec: partitions=96,
+partition_sizes=[1, 1, 1, …]`. **One partition per batch means each partial
+aggregate makes its first measurement on its last input** — there is no next
+batch to skip. Fixing that should take ~30% off B1/B2/B5 and leave B3/B4
+alone, since their ten-group aggregates reduce enormously and must keep
+aggregating early.
+
+**Change.** Two coupled lines, because either alone is inert.
+`provider.rs::scan` packs the loaded batches round-robin into at most
+`state.config().target_partitions()` partitions instead of one partition per
+batch (the empty-partition guard from the range-read cycle is untouched).
+`lib.rs::run_sql_env` lowers
+`execution.skip_partial_aggregation_probe_rows_threshold` from 100_000 to
+8192, because a partition here holds 19 K–76 K rows and so never reached the
+default check either. The ratio threshold (0.8) is left alone, so the
+decision of *whether* to skip is still DataFusion's and still evidence-based.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network,
+100 Shape A samples. All four runs clean (ingest 753–774 K lines/s) and all
+four settled to **62 parquet files / 69 MB**, so the two arms queried the same
+shape of data. Labels `perf-base2`/`perf-base3`, `perf-cand1`/`perf-cand2`,
+cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 65/62, 81/66 | **52/48, 54/47** |
+| B2_funnel_48h | 117/132, 140/142 | **103/104, 110/95** |
+| B3_inflight_24h | 13/12, 15/13 | 13/11, 11/11 |
+| B4_hourly_throughput_48h | 18/18, 20/20 | 19/18, 16/16 |
+| B5_route_rollup_24h | 26/28, 29/28 | 28/28, 25/24 |
+| Shape A median | 3 ms, 4 ms | 3 ms, 3 ms |
+| Ingest | 753K, 774K | 757K, 770K |
+
+86 workspace tests pass, 0 failures; `cargo fmt --all --check` clean;
+no clippy findings in `timelake-query`.
+
+**Verdict.** Adopted. B1 goes from 62–81 ms to 47–54 ms and B2 from
+117–142 ms to 95–110 ms, with **no overlap between the two sets** on either
+query — about 24% off both, close to the predicted 30%. B3/B4/B5 sit inside
+the baseline spread and Shape A is untouched, which is exactly the predicted
+selectivity: only the two queries whose group-by explodes to one group per row
+were paying for the useless partial pass. `EXPLAIN ANALYZE` on the candidate
+confirms the mechanism rather than inferring it — `DataSourceExec:
+partitions=24, partition_sizes=[2, 2, …]`, and the inner partial aggregate
+drops from 365 ms to **53 ms** of compute and from 218 MB to **28.7 MB** of
+peak memory.
+
+**Lesson.**
+
+- **The confirming number is 196,608.** On the candidate the partial
+  aggregate reports `reduction_factor=100% (196.6 K/196.6 K)` — it hashes
+  196,608 rows and passes the other 1.63 M straight through. That is exactly
+  24 partitions × 8192 probe rows, which proves both halves of the change are
+  load-bearing: the threshold decides *when* the measurement happens, and the
+  packing is what gives the operator a batch left to act on afterwards. A
+  future cycle that reverts either half reverts the whole win.
+- **Partition count is a tuning knob this engine was setting by accident.**
+  `parts = batches.map(|b| vec![b])` reads like free parallelism and is
+  really an assertion that every operator above the scan should see exactly
+  one batch per partition. Adaptive operators — this one, and anything else
+  in DataFusion that measures then adapts — are silently disabled by it. The
+  scan's partitioning is now `target_partitions`; whether *that* is the right
+  number is unmeasured and worth its own cycle.
+- **The remaining B2 cost is now the final aggregate**, 573 ms of compute and
+  **410 MB** peak building 1.83 M groups keyed by two dictionary columns.
+  That is where the container-memory walk the last cycle recorded comes from,
+  and it is the next target. DataFusion's fast column-wise group-values path
+  does not cover `Dictionary` keys, so this grouping goes through the
+  row-format fallback — worth checking whether handing the aggregate a
+  `Utf8View` product_id beats the memory it costs, though FR-2 makes that a
+  measurement, not an assumption.
+- **The decomposition probe is reusable and cheap.** Six SQL statements
+  against a settled instance located 84% of B2's cost in about a minute, and
+  `EXPLAIN ANALYZE` named the operator. Do this before writing code, not
+  after; it is the second cycle running where the probe, not the idea, was
+  the valuable part.
+
 ### 2026-08-09 16:45 — Decode candidate files concurrently   [ADOPTED]
 
 **Hypothesis.** The last cycle's rule is to prove a cost is on the critical
