@@ -61,6 +61,68 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 04:15 — Cache the bloom filters next to the footers   [REJECTED]
+
+**Hypothesis.** Footers are cached for the engine's lifetime; the bloom filters
+they point at are not. So every entity lookup re-reads a filter per candidate
+file — roughly 80 small range reads per warm query after time pruning. Cache
+the parsed `Sbbf` alongside the footer, keyed by (path, row group, column), and
+those reads disappear. Expect the Shape A median to fall from ~51 ms, and the
+p95 tail (93–114 ms) to shorten more sharply, since that is where the reads
+pile up.
+
+**Change.** `MetaCache` became a struct holding two maps — footers as before,
+plus blooms — with the same crude 4096-entry bound on each. `None` is cached
+as well as `Some`, so a column without a filter is not re-probed. A unit test
+pins the mechanism: two identical lookups for an absent entity, and the second
+touches the store zero times.
+
+**Measurement.** Paired laptop runs, 100 Shape A samples, all six clean
+(ingest 544–591K):
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| Shape A median | 50, 50, 53 ms | 50, 55, 51 ms |
+| Shape A p95 | 93, 106, 114 ms | 100, 103, 75 ms |
+| B1 funnel warm | 49, 49, 47 ms | 49, 55, 57 ms |
+
+**Verdict.** Rejected. The median does not move and the p95 ranges overlap;
+p95 leans the right way but 75–103 against 93–114 is not a result. The
+mechanism demonstrably works — the test proves the reads go to zero — it simply
+does not buy time on this hardware, because a 4 KB re-read from a local volume
+comes out of the page cache. This is the same wall the range-read cycle hit,
+and the second time a change that removes I/O has measured as nothing. Adopting
+it would have meant carrying a cache, a lock per probe and a few hundred KB of
+memory for no measured return.
+
+**Lesson.** The bloom probe was never the bottleneck, so removing it could not
+help. What Shape A costs tracks the number of candidate files it must consider:
+
+| Scale | Files | Shape A median | Per file |
+|---|---|---|---|
+| smoke | 54 | 4 ms | 0.07 ms |
+| laptop | 167 | 50 ms | 0.30 ms |
+
+Not linear — laptop files hold ~22K rows against smoke's ~1.4K — so the cost is
+per-file overhead *and* work proportional to what survives, not I/O. The next
+cycle should attack the candidate set itself rather than the cost of examining
+each candidate:
+
+- **Entity summaries in the catalog.** `FileMeta` already carries min/max time
+  and prunes on it before any file is opened. The same trick for the clustering
+  column — a min/max, or a small digest — would let a lookup discard most files
+  without opening them at all. This is ARCHITECTURE §13's "bounded hot-entity
+  index" question, and it is now the obvious next move.
+- **Fewer, larger files.** 167 L0 files exist because compaction never runs at
+  laptop scale (a 20 s run against a 30 s tick). Whatever compaction would do
+  to Shape A is unmeasured at this scale — driving compaction explicitly before
+  the query phase would measure it.
+
+And a rule that would have saved this cycle: **before optimising a cost, prove
+it is on the critical path.** A probe of ~80 page-cached reads was always going
+to be ~1 ms against a 51 ms query; the arithmetic was available before the
+build.
+
 ### 2026-08-09 01:55 — Bloom filters on high-cardinality tags   [ADOPTED]
 
 **Hypothesis.** M4 recorded a constraint — "the arrow writer emits no bloom
