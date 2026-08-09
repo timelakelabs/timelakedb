@@ -16,6 +16,7 @@ timelord-wal = { path = "../wal" }
 timelord-buffer = { path = "../buffer" }
 timelord-query = { path = "../query" }
 timelord-store = { path = "../store" }
+timelord-store-s3 = { path = "../store-s3" }
 timelord-catalog = { path = "../catalog" }
 timelord-compact = { path = "../compact" }
 timelord-flight = { path = "../flight" }

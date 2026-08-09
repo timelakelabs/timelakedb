@@ -1,0 +1,166 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-c0-s3-cache-off-20260809-094819",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:3966",
+    "db": "poc",
+    "container": "timelorddb",
+    "image": "bench-timelorddb-timelorddb"
+  },
+  "started_at": "2026-08-09T09:48:25-0400",
+  "finished_at": "2026-08-09T09:48:37-0400",
+  "config": {
+    "scale": "smoke",
+    "label": "c0-s3-cache-off",
+    "products_per_day": 2000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 50,
+    "host_hours": 1.0,
+    "disk_devices": 7,
+    "burst_size": 5000,
+    "batch_size": 5000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts",
+      "query_a",
+      "query_b",
+      "burst",
+      "storage",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 72806,
+      "wall_s": 0.2,
+      "lines_per_s": 330416,
+      "mb_sent": 9.8,
+      "errors": 0,
+      "batch_p50_ms": 39,
+      "batch_p95_ms": 62,
+      "batch_max_ms": 100
+    },
+    "host_ingest": {
+      "lines": 24000,
+      "wall_s": 0.1,
+      "lines_per_s": 279813,
+      "errors": 0
+    },
+    "query_shape_a": {
+      "n": 20,
+      "errors": 0,
+      "median_ms": 48,
+      "p95_ms": 50,
+      "max_ms": 53
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 54,
+          "warm_ms": 52,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 53,
+          "warm_ms": 56,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 52,
+          "warm_ms": 51,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 50,
+          "warm_ms": 51,
+          "rows": 472,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 51,
+          "warm_ms": 52,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "burst": {
+      "events": 5000,
+      "wall_s": 0.04,
+      "events_per_s": 127329,
+      "errors": 0,
+      "batch_p50_ms": 38,
+      "batch_p95_ms": 38,
+      "batch_max_ms": 38,
+      "concurrent_query_ms": 39,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "storage": {
+      "bytes": 3366410,
+      "gb_total": 0.003,
+      "days_of_data": 2,
+      "gb_per_day": 0.002,
+      "projected_gb_90d": 0.2,
+      "projected_gb_365d": 0.6
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 47,
+        "value": 77806,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 47,
+        "value": 3000,
+        "error": null
+      },
+      "disk_rows_6h": {
+        "ms": 48,
+        "value": 21000,
+        "error": null
+      }
+    },
+    "resources": {
+      "baseline_mem_mb": 157.0,
+      "settled_mem_mb": 157.4,
+      "returned_to_baseline": true,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 157.0,
+          "peak_cpu_pct": 1.6,
+          "samples": 3
+        },
+        "query_a": {
+          "peak_mem_mb": 157.0,
+          "peak_cpu_pct": 0.1,
+          "samples": 1
+        },
+        "settle": {
+          "peak_mem_mb": 157.4,
+          "peak_cpu_pct": 1.6,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}

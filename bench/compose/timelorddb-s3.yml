@@ -1,0 +1,58 @@
+# TimelordDB on S3 (LocalStack) — the C0 rig (ARCHITECTURE §12.6).
+#   docker compose -f compose/timelorddb-s3.yml up -d --build
+#   python bench.py run --backend timelorddb --url http://localhost:3966 --scale smoke
+#
+# What this rig may claim: correctness, KMS/S3 call counts, recovery
+# behavior. What it may NOT claim: latency — localhost S3 is not S3.
+#
+# TLDB_KMS_CACHE=off re-runs the stack with strict per-object keys (the
+# drill's baseline for measuring what the key cache is worth).
+name: bench-timelorddb-s3
+services:
+  localstack:
+    # `latest` is license-gated as of the 2026 rebrand — 4.9 is the last
+    # community line with the s3+kms services (and S3 conditional-write
+    # support) this rig needs; pinned deliberately
+    image: localstack/localstack:4.9
+    container_name: timelord-localstack
+    environment:
+      SERVICES: s3,kms
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./s3-drill/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      # the init hook runs after services are up; gate on the alias so
+      # timelorddb never boots against a half-initialized stack
+      test: ["CMD-SHELL", "awslocal kms describe-key --key-id alias/timelord"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  timelorddb-s3:
+    build: ../..
+    container_name: timelorddb-s3
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "3966:1963"   # HTTP
+      - "3967:1964"   # Flight SQL
+    environment:
+      TIMELORD_OBJECT_STORE: s3://timelord-data/objects
+      TIMELORD_KMS_KEY_ID: alias/timelord
+      TIMELORD_KMS_CACHE: ${TLDB_KMS_CACHE:-on}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      TIMELORD_QUERY_MEM_BYTES: "3758096384"
+      TIMELORD_MAX_CONCURRENT_QUERIES: "2"
+    mem_limit: 8g
+    volumes:
+      # WAL and caches only — every object lives in the bucket (CL-1)
+      - timelord-s3-wal:/var/lib/timelord/data
+    restart: unless-stopped
+
+volumes:
+  timelord-s3-wal:

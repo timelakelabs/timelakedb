@@ -15,7 +15,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub mod encrypt;
+pub mod kms_cache;
 pub use encrypt::{EncryptingStore, Kms, LocalKek, key_from_hex};
+pub use kms_cache::{CachingKms, KmsStats};
 
 pub trait Store: Send + Sync + 'static {
     fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()>;
@@ -36,11 +38,24 @@ pub trait Store: Send + Sync + 'static {
     /// reason row-group pruning could not pay (see
     /// docs/evidence/PERFORMANCE_LOG.md, 2026-08-08).
     fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
+
+    /// Write `bytes` to `path` ONLY if no object exists there. Returns
+    /// `Ok(true)` when this call created the object, `Ok(false)` when
+    /// another writer already had — the multi-writer CAS primitive
+    /// (ARCHITECTURE §12.3): racing catalog commits collide on the same
+    /// sequence-numbered key and exactly one wins. No default impl on
+    /// purpose: a get-then-put emulation would race, and a backend that
+    /// cannot do this atomically must say so, loudly, at compile time.
+    /// (S3: PUT + `If-None-Match: *`; local: `File::create_new`.)
+    fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool>;
 }
 
 impl<S: Store> Store for std::sync::Arc<S> {
     fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
         (**self).put(path, bytes)
+    }
+    fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+        (**self).put_if_absent(path, bytes)
     }
     fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
         (**self).get(path)
@@ -64,6 +79,9 @@ impl<S: Store> Store for std::sync::Arc<S> {
 impl Store for std::sync::Arc<dyn Store> {
     fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
         (**self).put(path, bytes)
+    }
+    fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+        (**self).put_if_absent(path, bytes)
     }
     fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
         (**self).get(path)
@@ -122,6 +140,36 @@ impl Store for LocalStore {
         }
         std::fs::rename(&tmp, &dest)?;
         Ok(())
+    }
+
+    fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dest = self.abs(path);
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Durable-or-absent like put(), but the publish step is a hard
+        // link, which fails atomically when the destination exists on
+        // both Unix and NTFS — no window where a loser can clobber a
+        // winner, and no torn object at the final path.
+        let tmp = dest.with_extension(format!(
+            "tmp-cas-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_data()?;
+        }
+        let res = std::fs::hard_link(&tmp, &dest);
+        let _ = std::fs::remove_file(&tmp);
+        match res {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
@@ -218,5 +266,26 @@ mod tests {
         // traversal is neutralized
         s.put("../escape.txt", b"x").unwrap();
         assert!(dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn put_if_absent_is_first_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LocalStore::new(dir.path()).unwrap();
+        assert!(
+            s.put_if_absent("catalog/manifest/000000000007.json", b"WINNER")
+                .unwrap()
+        );
+        assert!(
+            !s.put_if_absent("catalog/manifest/000000000007.json", b"loser")
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("catalog/manifest/000000000007.json").unwrap(),
+            b"WINNER"
+        );
+        // no tmp litter left behind by either attempt
+        let all = s.list("catalog").unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
     }
 }

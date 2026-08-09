@@ -13,6 +13,38 @@ here.
 
 ## [Unreleased]
 
+### Added — C0: S3 object store with KMS envelope + SSE-KMS, key-cached (2026-08-09)
+
+- New `timelord-store-s3` crate: `S3Store` implements the `Store` trait
+  over aws-sdk-s3 (owned-runtime sync bridge, safe from blocking and
+  async contexts alike), and `AwsKms` implements the `Kms` trait over
+  aws-sdk-kms (`generate` ↔ GenerateDataKey, `unwrap` ↔ Decrypt). The
+  engine cannot tell S3 from a local directory (CL-1).
+- The `Store` trait gains ONE method — `put_if_absent` — the multi-writer
+  CAS primitive (S3 `If-None-Match: *`; local hard-link publish;
+  encrypted passthrough). The sequence-keyed manifest log makes racing
+  catalog commits collide on the same key, so exactly one wins.
+- The `Kms` trait gains `generate()` (default: local random + wrap), and
+  `CachingKms` decorates any Kms with the caching-CMM pattern: one data
+  key reused per bounded window (default 300 s / 1,000 uses, hard cap
+  2¹⁶) on encrypt, a bounded wrapped-blob→key LRU on decrypt. Thousands
+  of KMS calls become a handful; `TIMELORD_KMS_CACHE=off` restores
+  strict per-object keys and is the drill's measured baseline.
+- Server-side encryption rides every PUT: SSE-KMS headers with
+  **S3 Bucket Keys enabled**, plus bucket-default SSE in the rig's init.
+- Config: `TIMELORD_OBJECT_STORE=s3://bucket[/prefix]`,
+  `TIMELORD_KMS_KEY_ID` (alias ok), `TIMELORD_S3_SSE_KEY_ID`,
+  `TIMELORD_KMS_CACHE[_MAX_AGE_SECS|_MAX_USES]`; LocalStack via
+  `AWS_ENDPOINT_URL` (path-style auto-forced). Setting both KMS and
+  local-KEK key sources refuses to start.
+- Metrics: `timelord_kms_{generate,decrypt}_total`,
+  `timelord_kms_{generate,decrypt}_cache_hits_total`,
+  `timelord_s3_{get,put,head,list,delete}_total`,
+  `timelord_s3_{read,write}_bytes_total`.
+- LocalStack rig: `bench/compose/timelorddb-s3.yml` (S3+KMS, init
+  creates `alias/timelord` and buckets with default SSE + Bucket Keys).
+  The rig proves correctness, call counts, and recovery — never latency.
+
 ### Added — SEC-1: encryption at rest, at the store chokepoint (2026-08-09)
 
 - `EncryptingStore(inner, kms)` in `timelord-store`: every object —

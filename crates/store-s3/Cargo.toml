@@ -1,0 +1,16 @@
+[package]
+name = "timelord-store-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+timelord-store = { path = "../store" }
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-sdk-kms = "1"
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

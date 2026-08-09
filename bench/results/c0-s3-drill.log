@@ -1,0 +1,66 @@
+C0 drill — S3 (LocalStack) + KMS envelope + SSE-KMS, key-cached
+2026-08-09 · rig: bench/compose/timelorddb-s3.yml (LocalStack 4.9,
+s3+kms; init hook creates alias/timelord + buckets with default
+SSE-KMS + BucketKeyEnabled). Ports 3966/3967. What this rig may claim:
+correctness, call counts, recovery. NOT latency.
+================================================================================
+
+Stack under test: EncryptingStore(CachingKms(AwsKms), S3Store) — every
+object envelope-encrypted client-side AND SSE-KMS'd server-side, WAL on
+a local volume, everything else in the bucket (CL-1).
+
+1. THE BUG THE RIG CAUGHT FIRST (fixed before the gate, run
+   c0-s3-cache-on-20260809-093521 records it): acked rows went
+   unqueryable during a table's FIRST flush — buffer swapped out before
+   the catalog commit, and S3 upload latency stretched that
+   microsecond-wide local window to ~100s of ms. Intermittent
+   "table 'poc.public.pipeline_events' not found" hit B1/B2 (3 errors).
+   Fix: rows mid-flush stay served from a holding snapshot until the
+   catalog commit lands; readers consult holding BEFORE the catalog so
+   the residual micro-window errs toward a transient duplicate (the
+   documented M2 tolerance), never a vanish. Regression-pinned by
+   rows_stay_visible_while_a_slow_flush_uploads (150 ms/put SlowStore,
+   probes across the whole window).
+
+2. Smoke gate on S3, cache ON (run c0-s3-cache-on2-20260809-094702):
+   72,806 + 24,000 lines, 0 errors; Shape A errors=0; Shape B
+   all_completed=True; burst 5,000 clean with concurrent query ok;
+   context counts EXACT (77,806 / 3,000 / 21,000).
+
+3. KMS key cache, measured (identical smoke workload, 56 object PUTs
+   = 55 parquet + 1 manifest):
+                          cache ON        cache OFF
+   GenerateDataKey        1               56
+   engine-side hits       55              (no cache)
+   Decrypt                0               0
+   LocalStack's own API log confirms both counts independently.
+   56:1 on 56 objects; the window is 300 s / 1,000 uses, so at full
+   scale "thousands of calls" stays a handful per window. Cache-off
+   read-path corollary: recovery + one full-table scan cost 54 Decrypts
+   (one per distinct object header) — the decrypt LRU makes repeats
+   free.
+
+4. At rest, both layers on one object
+   (objects/poc/disk_metrics/data/.../...parquet):
+   head-object: SSE=aws:kms, KMS key=alias/timelord, BucketKeyEnabled=true
+   get-object bytes: T L D E 1  (client envelope; no PAR1 exposed)
+
+5. CAS fidelity (ARCHITECTURE §16 risk 6 — RETIRED): in-network
+   integration tests (cargo test -p timelord-store-s3 -- --ignored)
+   pass: full Store contract over S3 including range semantics at EOF,
+   directory-scoped list, and put_if_absent — LocalStack 4.9 honors
+   If-None-Match: * (winner wins, loser gets 412 → Ok(false)). The C1
+   two-writer catalog drill can run on this rig. Also green: AwsKms
+   generate/unwrap roundtrip and the full encrypted stack over S3
+   (20 objects, 1 GenerateDataKey, 0 Decrypts).
+
+6. Restart drill: docker restart -t 0 → recovery replays 55 files from
+   KMS-encrypted S3 manifests, COUNT(*) = 77,806 exact.
+
+Environment note: localstack/localstack:latest is license-gated as of
+the 2026 rebrand and exits(55) without a token; the rig pins
+localstack/localstack:4.9 (community, s3+kms, conditional writes).
+
+Workspace gate: cargo test --workspace green (16 server integration
+tests incl. the new slow-flush probe; store 14; store-s3 1 unit + 2
+LocalStack-gated), clippy 0 warnings, fmt clean.

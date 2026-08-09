@@ -90,7 +90,26 @@ This project is inspired by the following projects.
   states the posture, including that `/api/sql` can `COPY … TO` files as
   the (root) server process. Known engine hardening: manifest replay
   should skip non-`.json` files.
-- Status: **SEC-1 + SEC-2 SHIPPED** (2026-08-09). SEC-1: `EncryptingStore`
+- Status: **C0 SHIPPED — S3 + KMS, key-cached** (2026-08-09, ARCH §12
+  design phased C0-C3; drill log `bench/results/c0-s3-drill.log`).
+  New `timelord-store-s3` crate: `S3Store` (aws-sdk-s3 behind the Store
+  trait; owned-runtime sync bridge — never `block_on` in callers;
+  path-style auto under `AWS_ENDPOINT_URL`) and `AwsKms`
+  (GenerateDataKey/Decrypt behind the Kms trait). `Store` gained
+  `put_if_absent` (CAS primitive: S3 If-None-Match, local hard-link
+  publish) — C1 switches catalog commits to it. `Kms` gained
+  `generate()`; `CachingKms` decorator = caching-CMM (300s/1000-use
+  encrypt window, decrypt LRU, hard cap 2^16; `TIMELORD_KMS_CACHE=off`
+  is the measured baseline). SSE-KMS + Bucket Keys per PUT and as
+  bucket default. Env: `TIMELORD_OBJECT_STORE=s3://…`,
+  `TIMELORD_KMS_KEY_ID` (alias ok; mutually exclusive with
+  `TIMELORD_ENCRYPTION_KEY`). Rig: `bench/compose/timelorddb-s3.yml`
+  (LocalStack s3+kms, init hook creates alias/timelord + buckets;
+  ports 3966/3967) — proves correctness/call-counts/recovery, NEVER
+  latency. Ignored integration tests run in-network:
+  `cargo test -p timelord-store-s3 -- --ignored`. Next: C1 catalog CAS
+  (two-writer drill), C2 role split, C3 Consul+mTLS+real-AWS sizing.
+- Previous: **SEC-1 + SEC-2 SHIPPED** (2026-08-09). SEC-1: `EncryptingStore`
   decorator in `timelord-store` — per-object AES-256-GCM envelope
   encryption in 64 KiB authenticated chunks (range-read compatible; AAD =
   header + path), `Kms` trait with `LocalKek` from
