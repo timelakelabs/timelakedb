@@ -785,6 +785,108 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     assert_eq!(rows[0]["n"], 500);
 }
 
+async fn admin_json(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder().method(method).uri(path);
+    let b = match body {
+        Some(v) => {
+            req = req.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = app.clone().oneshot(req.body(b).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// FR-7 as a runtime control: policies set over /admin/retention take
+/// effect on the next enforcement pass, persist through the store, and
+/// outlive a restart with a stale environment.
+#[tokio::test]
+async fn retention_is_manageable_at_runtime_and_persists_fr7() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let day = 86_400_000_000_000i64;
+    let eng = engine(dir.path()); // NO env seed — everything via the API
+    let app = timelord_server::app(eng.clone());
+
+    let (code, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(v["policies"].as_array().map(Vec::len), Some(0));
+
+    let lp = format!(
+        "gui_ret,k=a v=1i {old}\ngui_ret,k=b v=2i {new}",
+        old = t - 3 * day,
+        new = t - 1000,
+    );
+    write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await;
+    eng.flush_all().unwrap();
+
+    // a bad duration is refused before anything changes
+    let (code, _) = admin_json(
+        &app,
+        "PUT",
+        "/admin/retention",
+        Some(serde_json::json!({"table": "gui_ret", "duration": "soon"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+
+    // keep 1 day
+    let (code, v) = admin_json(
+        &app,
+        "PUT",
+        "/admin/retention",
+        Some(serde_json::json!({"table": "gui_ret", "duration": "1d"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["duration"], "1d");
+
+    // the policy bites on the next pass: the 3-day-old partition drops
+    assert!(eng.enforce_retention().unwrap() >= 1);
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM gui_ret").await;
+    assert_eq!(rows[0]["n"], 1, "only the in-window row survives");
+
+    // restart: the policy came from the STORE, not the environment
+    drop(app);
+    drop(eng);
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng.clone());
+    let (_, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    assert_eq!(v["policies"][0]["table"], "gui_ret");
+    assert_eq!(v["policies"][0]["seconds"], 86_400);
+
+    // remove it; the removal persists too
+    let (code, _) = admin_json(&app, "DELETE", "/admin/retention/gui_ret", None).await;
+    assert_eq!(code, StatusCode::OK);
+    drop(app);
+    drop(eng);
+    let eng = engine(dir.path());
+    let app = timelord_server::app(eng);
+    let (_, v) = admin_json(&app, "GET", "/admin/retention", None).await;
+    assert_eq!(v["policies"].as_array().map(Vec::len), Some(0));
+
+    // and the management page itself serves
+    let res = app
+        .oneshot(Request::get("/admin/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(html.contains("Retention"));
+}
+
 /// The C0 S3 drill caught acked rows going UNQUERYABLE during a table's
 /// first flush: buffer swapped out, catalog commit still seconds away
 /// behind slow object writes → "table not found" mid-benchmark. Rows

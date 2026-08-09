@@ -90,7 +90,17 @@ This project is inspired by the following projects.
   states the posture, including that `/api/sql` can `COPY … TO` files as
   the (root) server process. Known engine hardening: manifest replay
   should skip non-`.json` files.
-- Status: **C0 SHIPPED — S3 + KMS, key-cached** (2026-08-09, ARCH §12
+- Status: **Retention GUI SHIPPED** (2026-08-09): FR-7 is runtime-managed —
+  `GET/PUT /admin/retention`, `DELETE /admin/retention/{table}`, GUI at
+  `/admin/ui` (self-contained HTML in `crates/api/src/admin_ui.html`,
+  site palette). Policies persist at `catalog/config/retention.json`
+  via the Store (encrypted; store copy outranks the `TIMELORD_RETENTION`
+  env seed at boot; plain put — CAS if concurrent admins ever matter).
+  Engine: `retention: RwLock<…>` replaces cfg reads in
+  `enforce_retention`. SECURITY exposure 3a: it's an unauthenticated
+  deletion control. Test: retention_is_manageable_at_runtime_and
+  _persists_fr7.
+- Previous: **C0 SHIPPED — S3 + KMS, key-cached** (2026-08-09, ARCH §12
   design phased C0-C3; drill log `bench/results/c0-s3-drill.log`).
   New `timelord-store-s3` crate: `S3Store` (aws-sdk-s3 behind the Store
   trait; owned-runtime sync bridge — never `block_on` in callers;

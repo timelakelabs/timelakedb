@@ -196,6 +196,9 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
     })
 }
 
+/// Where runtime retention config lives in the object store (FR-7).
+const RETENTION_CONFIG_PATH: &str = "catalog/config/retention.json";
+
 /// SEC-1 key config: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
 /// `TIMELORD_ENCRYPTION_KEY_FILE` (a file holding them). Key material
 /// stays out of [`EngineConfig`] so a `?cfg` log line can never leak it.
@@ -252,6 +255,14 @@ pub struct Engine {
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
     schemas: RwLock<HashMap<(String, String), timelord_query::QuerySchema>>,
+    /// FR-7 policies, runtime-mutable (the /admin/retention surface).
+    /// Seeded from `TIMELORD_RETENTION`; changes persist to
+    /// [`RETENTION_CONFIG_PATH`] through the store — encrypted like any
+    /// object, shared via S3 in the cluster era, and the store copy wins
+    /// over the env seed at boot. Plain put (last-writer-wins): admin
+    /// config, not data — CAS arrives with the C1 catalog work if
+    /// concurrent admins ever matter.
+    retention: RwLock<Vec<(String, u64)>>,
     /// Rows mid-flush: snapshotted at buffer swap-out, dropped after the
     /// catalog commit that makes their files visible. Queries union this
     /// with buffer + files, reading it BEFORE the catalog — acknowledged
@@ -330,6 +341,24 @@ impl Engine {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let (wal, frames) = Wal::open(&data_dir.join("wal"))?;
 
+        // FR-7 runtime policies: the store copy (written by
+        // /admin/retention) outranks the env seed — an operator's
+        // durable change must survive a restart with a stale env.
+        let retention: Vec<(String, u64)> = match store.get(RETENTION_CONFIG_PATH) {
+            Ok(bytes) => {
+                let map: std::collections::BTreeMap<String, u64> = serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{RETENTION_CONFIG_PATH}: {e}"),
+                    )
+                })?;
+                map.into_iter().collect()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => cfg.retention.clone(),
+            Err(e) => return Err(e),
+        };
+
         let query_env = timelord_query::QueryEnv::new(
             cfg.query_mem_bytes,
             cfg.max_concurrent_queries,
@@ -344,6 +373,7 @@ impl Engine {
             store_encrypted,
             query_env,
             schemas: RwLock::new(HashMap::new()),
+            retention: RwLock::new(retention),
             flushing: RwLock::new(HashMap::new()),
             cfg,
             lines_total: AtomicU64::new(0),
@@ -690,18 +720,14 @@ impl Engine {
 
     /// FR-7: drop whole partitions past their table's retention window.
     pub fn enforce_retention(&self) -> Result<usize, String> {
-        if self.cfg.retention.is_empty() {
+        let policies = self.retention.read().expect("retention lock").clone();
+        if policies.is_empty() {
             return Ok(0);
         }
         let now = Self::now_ns();
         let mut remove: Vec<String> = Vec::new();
         for f in self.catalog.all_files() {
-            if let Some((_, secs)) = self
-                .cfg
-                .retention
-                .iter()
-                .find(|(table, _)| *table == f.table)
-            {
+            if let Some((_, secs)) = policies.iter().find(|(table, _)| *table == f.table) {
                 let cutoff = flush::hour_partition(now - (*secs as i64) * 1_000_000_000);
                 // partition strings sort chronologically; a partition
                 // strictly before the cutoff hour is wholly expired
@@ -721,6 +747,39 @@ impl Engine {
             tracing::info!(files = n, "retention drop");
         }
         Ok(n)
+    }
+
+    /// Runtime FR-7 policy surface (backs /admin/retention).
+    pub fn retention_policies(&self) -> Vec<(String, u64)> {
+        self.retention.read().expect("retention lock").clone()
+    }
+
+    pub fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String> {
+        let mut r = self.retention.write().expect("retention lock");
+        match r.iter_mut().find(|(t, _)| t == table) {
+            Some(entry) => entry.1 = seconds,
+            None => r.push((table.to_string(), seconds)),
+        }
+        // persisted under the write lock so concurrent admin edits
+        // cannot land in the store out of order
+        Self::persist_retention(&self.store, &r)
+    }
+
+    pub fn remove_retention(&self, table: &str) -> Result<(), String> {
+        let mut r = self.retention.write().expect("retention lock");
+        r.retain(|(t, _)| t != table);
+        Self::persist_retention(&self.store, &r)
+    }
+
+    fn persist_retention(store: &Arc<dyn Store>, policies: &[(String, u64)]) -> Result<(), String> {
+        let map: std::collections::BTreeMap<&str, u64> =
+            policies.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        store
+            .put(
+                RETENTION_CONFIG_PATH,
+                &serde_json::to_vec_pretty(&map).expect("retention json"),
+            )
+            .map_err(|e| format!("persist retention config: {e}"))
     }
 
     fn defer_gc(&self, paths: Vec<String>) {
@@ -797,6 +856,18 @@ impl timelord_api::Engine for Engine {
 
     fn metrics_text(&self) -> String {
         self.metrics_text_impl()
+    }
+
+    fn retention_policies(&self) -> Vec<(String, u64)> {
+        Engine::retention_policies(self)
+    }
+
+    fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String> {
+        Engine::set_retention(self, table, seconds)
+    }
+
+    fn remove_retention(&self, table: &str) -> Result<(), String> {
+        Engine::remove_retention(self, table)
     }
 }
 

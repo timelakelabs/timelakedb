@@ -53,6 +53,44 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Prometheus exposition text (SR-4).
     fn metrics_text(&self) -> String;
+
+    /// Current per-table retention policies (FR-7), table → seconds.
+    fn retention_policies(&self) -> Vec<(String, u64)>;
+
+    /// Set (upsert) one table's retention window, durably.
+    fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String>;
+
+    /// Remove one table's policy (the table keeps everything again).
+    fn remove_retention(&self, table: &str) -> Result<(), String>;
+}
+
+/// Parse "365d", "72h", "90m", or bare seconds — the write half of the
+/// same grammar `TIMELORD_RETENTION` seeds with.
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = match s.chars().last()? {
+        'd' => (&s[..s.len() - 1], 86_400),
+        'h' => (&s[..s.len() - 1], 3_600),
+        'm' => (&s[..s.len() - 1], 60),
+        's' => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    n.checked_mul(unit).filter(|v| *v > 0)
+}
+
+/// Render seconds in the largest exact unit — the inverse of
+/// [`parse_duration_secs`], for display.
+pub fn humanize_secs(secs: u64) -> String {
+    if secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs.is_multiple_of(3_600) {
+        format!("{}h", secs / 3_600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 pub fn app<E: Engine>(engine: Arc<E>) -> Router {
@@ -64,7 +102,84 @@ pub fn app<E: Engine>(engine: Arc<E>) -> Router {
         .route("/api/v2/write", post(write_v2::<E>))
         .route("/api/v3/write_lp", post(write_v3::<E>))
         .route("/api/sql", post(sql::<E>))
+        .route(
+            "/admin/retention",
+            get(retention_list::<E>).put(retention_set::<E>),
+        )
+        .route(
+            "/admin/retention/{table}",
+            axum::routing::delete(retention_delete::<E>),
+        )
+        .route("/admin/ui", get(admin_ui))
         .with_state(engine)
+}
+
+/// The management page (FR-7 GUI): a single self-contained file — no
+/// build step, no external assets, same rules as `site/`.
+async fn admin_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("admin_ui.html"))
+}
+
+async fn retention_list<E: Engine>(State(engine): State<Arc<E>>) -> Json<Value> {
+    let mut policies: Vec<Value> = engine
+        .retention_policies()
+        .into_iter()
+        .map(|(table, seconds)| {
+            json!({
+                "table": table,
+                "seconds": seconds,
+                "duration": humanize_secs(seconds),
+            })
+        })
+        .collect();
+    policies.sort_by_key(|p| p["table"].as_str().unwrap_or("").to_string());
+    Json(json!({ "policies": policies }))
+}
+
+#[derive(Deserialize)]
+struct RetentionSet {
+    table: String,
+    /// "365d", "72h", "90m", or seconds.
+    duration: String,
+}
+
+async fn retention_set<E: Engine>(
+    State(engine): State<Arc<E>>,
+    Json(req): Json<RetentionSet>,
+) -> axum::response::Response {
+    let table = req.table.trim();
+    if table.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "table must not be empty");
+    }
+    let Some(seconds) = parse_duration_secs(&req.duration) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "duration {:?} is not <n>d, <n>h, <n>m, or seconds (and must be > 0)",
+                req.duration
+            ),
+        );
+    };
+    match engine.set_retention(table, seconds) {
+        Ok(()) => Json(json!({
+            "table": table,
+            "seconds": seconds,
+            "duration": humanize_secs(seconds),
+            "status": "set",
+        }))
+        .into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+async fn retention_delete<E: Engine>(
+    State(engine): State<Arc<E>>,
+    axum::extract::Path(table): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match engine.remove_retention(&table) {
+        Ok(()) => Json(json!({ "table": table, "status": "removed" })).into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
 }
 
 async fn health() -> Json<Value> {

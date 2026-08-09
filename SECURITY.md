@@ -72,6 +72,15 @@ follow from "no authentication" and are listed so you can design around them.
    so the realistic worst case is forced log/alarm noise rather than a
    downgrade. It is still an unauthenticated administrative endpoint.
 
+3a. **`/admin/retention` is an unauthenticated deletion control.** Anyone who
+   can reach port 1963 can set a one-second retention window on any table and
+   the enforcement pass (≤ 60 s later) will drop its history; after the GC
+   grace elapses, permanently. This is strictly worse than exposure 1's
+   "write anything, read everything" — it is *delete everything, durably* —
+   and it is the strongest single reason to treat the port as
+   private-network-only until token auth lands. The management page at
+   `/admin/ui` makes the same operations one click.
+
 4. **The container runs as root.** The image has no `USER` directive, so the
    server process and every file it writes are root-owned. Combined with (2),
    a reachable attacker can write root-owned files anywhere the container's
