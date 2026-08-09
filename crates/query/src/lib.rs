@@ -79,9 +79,24 @@ pub async fn run_sql_env(
     // database makes the three-part names those tools generate resolve —
     // Flight SQL reports each database as a catalog, so `poc.public.events`
     // has to mean something here.
-    let config = SessionConfig::new()
+    let mut config = SessionConfig::new()
         .with_information_schema(true)
         .with_default_catalog_and_schema(db, "public");
+    // A partial hash aggregate only pays for itself when it DEDUPLICATES.
+    // The funnel queries group by (step, product_id) — one group per row at
+    // 200K products — so the partial pass builds a 1.8 M-entry hash table
+    // that reduces nothing and then hands every row on anyway. DataFusion
+    // detects that and switches to pass-through, but only after
+    // `probe_rows_threshold` rows have gone through ONE partition; at the
+    // default 100_000 a scan whose partitions hold ~19K-76K rows never
+    // reaches the check. Probing a batch in makes the heuristic reachable at
+    // the sizes this engine actually produces. The ratio threshold (0.8) is
+    // untouched, so a genuinely reducing group-by — B3/B4's ten steps — still
+    // aggregates early exactly as before.
+    config
+        .options_mut()
+        .execution
+        .skip_partial_aggregation_probe_rows_threshold = 8192;
     let ctx = SessionContext::new_with_config_rt(config, env.runtime.clone());
     // SEC-2 note: enforcement is NOT here. The providers carry the session
     // and call mandatory_predicate inside scan() — the filter is part of

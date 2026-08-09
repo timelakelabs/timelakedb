@@ -734,7 +734,7 @@ impl TableProvider for LazyTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
@@ -857,16 +857,30 @@ impl TableProvider for LazyTable {
             // align to the (projected) schema: files may lack newer columns
             crate::align_to(target_schema.clone(), batches).map_err(DataFusionError::Execution)?
         };
-        // One partition per batch — but never ZERO partitions. A scan that
-        // prunes everything away used to build a source with no partitions
-        // at all, and any plan with a SortExec above it (every ORDER BY)
-        // then failed its sanity check with a 400 instead of returning an
-        // empty result. Sharper pruning makes that case common, so it has
-        // to be an empty partition rather than no partition.
+        // At most `target_partitions` partitions — but never ZERO. A scan
+        // that prunes everything away used to build a source with no
+        // partitions at all, and any plan with a SortExec above it (every
+        // ORDER BY) then failed its sanity check with a 400 instead of
+        // returning an empty result. Sharper pruning makes that case common,
+        // so it has to be an empty partition rather than no partition.
+        //
+        // It used to be one partition PER BATCH, which looks like free
+        // parallelism and is not: a partition then holds exactly one batch,
+        // so every operator above the scan makes its first decision on its
+        // last input. That is precisely what defeats DataFusion's
+        // partial-aggregation skip (see run_sql_env) — it can only act on a
+        // batch that comes after the one it measured. Packing round-robin
+        // keeps the partitions the same size within one batch while giving
+        // each one a sequence to work along.
         let parts: Vec<Vec<RecordBatch>> = if aligned.is_empty() {
             vec![Vec::new()]
         } else {
-            aligned.into_iter().map(|b| vec![b]).collect()
+            let n = state.config().target_partitions().max(1).min(aligned.len());
+            let mut parts: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
+            for (i, b) in aligned.into_iter().enumerate() {
+                parts[i % n].push(b);
+            }
+            parts
         };
         // projection already applied via the target schema
         MemorySourceConfig::try_new_exec(&parts, target_schema, None)
@@ -1225,6 +1239,69 @@ mod tests {
         for b in &batches {
             assert!(b.column_by_name("_visibility").is_none());
         }
+    }
+
+    /// One partition per batch gave every operator above the scan exactly
+    /// one batch to work with, which is what stopped DataFusion ever acting
+    /// on its own partial-aggregation measurement. Pin the packing: at most
+    /// `target_partitions` partitions, every batch still present.
+    #[tokio::test]
+    async fn scan_packs_batches_into_target_partitions() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let buffer: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![i as i64; 8]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let store: Arc<dyn Store> = CountingStore::with("unused", Vec::new());
+        let table = LazyTable::new(
+            "m".into(),
+            schema,
+            buffer,
+            Vec::new(),
+            store,
+            std::time::Duration::from_secs(60),
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            Arc::new(MetaCache::default()),
+            crate::QuerySession::default(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            4,
+            "20 batches must pack into target_partitions, not 20 partitions"
+        );
+
+        // and nothing is dropped on the way in
+        ctx.register_table("m", Arc::new(table)).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS n FROM m")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 160, "every batch survives the packing");
     }
 
     #[test]
