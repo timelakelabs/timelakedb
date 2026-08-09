@@ -61,6 +61,66 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 01:55 — Bloom filters on high-cardinality tags   [ADOPTED]
+
+**Hypothesis.** M4 recorded a constraint — "the arrow writer emits no bloom
+filters for dictionary columns" — and built entity clustering plus row-group
+statistics around it. The pinning test never enabled blooms, and the Parquet
+writer defaults them off, so the constraint may be an artifact. If it is, a
+bloom on the entity column lets a point lookup skip whole files it currently
+reads in full, which is exactly what fresh L0 data needs: unclustered, its
+statistics ranges span every entity and prune nothing.
+
+**Change.** `to_parquet_bytes_rg` enables a bloom on dictionary columns above
+`BLOOM_MIN_DISTINCT` (1024) distinct values, sized with the column's exact
+distinct count. The provider gains `bloom_keep_row_groups`, consulted after
+statistics: any literal a bloom positively excludes drops that row group.
+`Sbbf::read_from_column_chunk` reads through the range-read `StoreFile` from
+the last cycle, so a probe costs a few KB rather than a file.
+
+**Measurement.** The constraint is false: with blooms requested, a dictionary
+column gets one — `bloom_filter_offset = Some(2756)`. The old test passed only
+because its *reader* was never configured to load blooms. Paired laptop runs,
+100 Shape A samples, discarding runs whose ingest fell below 500K:
+
+| Metric | Baseline (n=4) | Candidate (n=6) |
+|---|---|---|
+| Shape A median | 56, 57, 57, 57 ms | 51, 47, 48, 49, 47, 48 ms |
+| Shape A p95 | 69, 71, 93, 169 ms | 63, 62, 62, 64, 59, 59 ms |
+| Ingest | 573–589K lines/s | 570–606K lines/s |
+| Objects on disk | 71 MB / 114 files | 72 MB / 113 files |
+
+A unit test pins the mechanism directly: a lookup for an entity that is not in
+the file reads under a quarter of it, and one that is still returns its row.
+
+**Verdict.** Adopted. Shape A median drops ~15% with no overlap between the two
+sets — the baseline is unusually tight at 56–57 ms — and p95 both drops and
+stops producing outliers. Storage costs 1.4%. Ingest is unchanged.
+
+**Two things that nearly produced a wrong answer, both worth remembering:**
+
+- **A 4x storage scare that was not real.** The first candidate reported 0.38 GB
+  against a 0.09 GB baseline, consistently, 3 runs against 3. That looks like
+  signal and is not: the harness samples storage right after ingest, and the
+  figure was the WAL mid-drain. Measured properly — `du` of `objects/` with the
+  WAL empty — it is 71 MB against 72 MB. **Never judge storage from the harness
+  metric at laptop scale; look at the data directory.**
+- **A 2x funnel regression that was an ordering artifact.** In full runs B1 went
+  from 57–91 ms to 115–135 ms, three runs against four, no overlap — damning
+  until Shape B was run *without* Shape A in front of it, where the two builds
+  are identical (warm 113, 108 baseline against 111, 107 candidate). The cause
+  is that Shape A now skips most files, so it no longer warms their footers in
+  the metadata cache, and the next query pays for them. Total work across the
+  suite is roughly conserved; the win is real for point lookups and neutral for
+  scans. **When a scenario regresses, re-run it in isolation before believing
+  it** — this harness runs its shapes in a fixed order and they share a cache.
+
+**Lesson.** A documented constraint is only as good as the test under it. This
+one had been load-bearing since M4 — entity clustering exists because of it —
+and it was never true; the test asserted the absence of something nobody had
+asked the writer to produce. Worth auditing the other pinned assumptions the
+same way: check that the test actually exercises the thing it claims to pin.
+
 ### 2026-08-08 23:50 — Range reads in the Store   [ADOPTED, on bytes read — latency was a wash]
 
 **Hypothesis.** The previous cycle established that pruning cannot pay while

@@ -252,9 +252,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <li><strong>Time pruning:</strong> partition bounds eliminate whole files before any I/O.</li>
         <li><strong>Statistics pruning:</strong> entity-clustered compaction means a single
             product's rows sit in a handful of row groups, and min/max statistics
-            skip the rest. (Bloom filters are deliberately not relied upon —
-            the Parquet writer does not emit them for dictionary columns, which a
-            unit test pins.)</li>
+            skip the rest.</li>
+        <li><strong>Bloom filters</strong> on high-cardinality tag columns answer
+            "this entity is definitely not in this file" without reading any of it —
+            which is what prunes freshly written data, where statistics ranges still
+            span every entity. Low-cardinality tags get none: a value present in
+            every file cannot be excluded, so the filter would be pure cost.</li>
         <li><strong>Row filters and projection pushdown:</strong> predicates are applied during
             decode, and only referenced columns are materialised.</li>
         <li><strong>Metadata cache:</strong> Parquet footers are immutable, so a repeat lookup

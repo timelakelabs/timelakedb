@@ -1,0 +1,86 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-perf2-probe-20260809-005418",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:2965",
+    "db": "poc",
+    "container": "tldb-perf",
+    "image": "timelorddb:perf"
+  },
+  "started_at": "2026-08-09T00:54:24-0400",
+  "finished_at": "2026-08-09T00:54:42-0400",
+  "config": {
+    "scale": "laptop",
+    "label": "perf2-probe",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 6.3,
+      "lines_per_s": 582998,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 51,
+      "batch_p95_ms": 96,
+      "batch_max_ms": 118
+    },
+    "host_ingest": {
+      "lines": 864000,
+      "wall_s": 1.9,
+      "lines_per_s": 449903,
+      "errors": 0
+    },
+    "resources": {
+      "baseline_mem_mb": 149.7,
+      "settled_mem_mb": 585.4,
+      "returned_to_baseline": false,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 149.7,
+          "peak_cpu_pct": 0.0,
+          "samples": 3
+        },
+        "ingest": {
+          "peak_mem_mb": 544.0,
+          "peak_cpu_pct": 130.4,
+          "samples": 3
+        },
+        "hosts": {
+          "peak_mem_mb": 1082.3,
+          "peak_cpu_pct": 118.4,
+          "samples": 1
+        },
+        "settle": {
+          "peak_mem_mb": 591.2,
+          "peak_cpu_pct": 28.4,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}

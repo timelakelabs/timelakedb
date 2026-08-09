@@ -290,6 +290,11 @@ impl TableBuffer {
 pub mod flush {
     use std::collections::BTreeMap;
 
+    /// A tag column gets a bloom filter only above this many distinct
+    /// values. Below it the value is in almost every file, so the filter
+    /// answers "maybe" every time and is pure cost on the read path.
+    const BLOOM_MIN_DISTINCT: usize = 1024;
+
     use datafusion::arrow::array::{Array, TimestampNanosecondArray, UInt32Array};
     use datafusion::arrow::compute::take;
     use datafusion::arrow::datatypes::DataType;
@@ -424,6 +429,41 @@ pub mod flush {
         let mut props = WriterProperties::builder().set_compression(Compression::SNAPPY);
         if let Some(rows) = rg_rows {
             props = props.set_max_row_group_row_count(Some(rows));
+        }
+        // Bloom filters on the tag columns: an equality lookup can then be
+        // told "not in this file" without reading any of it. Only the
+        // dictionary columns get one — a bloom over a float measurement
+        // would be paid for and never consulted.
+        //
+        // Sizing matters more than it looks. The writer's default assumes a
+        // million distinct values per column chunk and reserves accordingly,
+        // which quadrupled total storage when this was first measured. A
+        // dictionary column already knows exactly how many distinct values
+        // it holds, so say so.
+        for (i, f) in batch.schema().fields().iter().enumerate() {
+            if !matches!(f.data_type(), DataType::Dictionary(_, _)) {
+                continue;
+            }
+            let Some(d) = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<super::DictionaryArray<super::Int32Type>>()
+            else {
+                continue;
+            };
+            let ndv = d.values().len();
+            // Only entity-like columns. A bloom earns its keep by saying
+            // "not in this file", which needs the value to be ABSENT from
+            // most files — true of a product id, never true of `event`,
+            // which has two values and appears in every file. Writing one
+            // there costs a probe per file per query and prunes nothing:
+            // measured as a ~50% funnel regression before this guard.
+            if ndv < BLOOM_MIN_DISTINCT {
+                continue;
+            }
+            let path = datafusion::parquet::schema::types::ColumnPath::from(f.name().as_str());
+            props = props.set_column_bloom_filter_enabled(path.clone(), true);
+            props = props.set_column_bloom_filter_ndv(path, ndv as u64);
         }
         let props = props.build();
         let mut out = Vec::new();
@@ -617,12 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn dict_columns_get_no_blooms_hence_entity_clustering() {
-        // Documented constraint (M4): the arrow writer emits NO bloom
-        // filters for dictionary columns — so compaction clusters by
-        // entity and pruning uses row-group statistics instead. This
-        // test pins the constraint (if blooms ever appear, revisit) and
-        // verifies the clustered write path.
+    fn dict_columns_do_get_blooms() {
+        // This test used to pin the opposite: "the arrow writer emits no
+        // bloom filters for dictionary columns", which sent M4 to entity
+        // clustering and row-group statistics instead. The claim was an
+        // artifact of the test — the writer defaults blooms OFF and nobody
+        // had asked for one. Ask, and a dictionary column gets a bloom.
         use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
         let t = 1_786_179_600_000_000_000i64;
         let lp: String = (0..2000)
@@ -645,9 +685,26 @@ mod tests {
         let pid_idx = (0..descr.num_columns())
             .find(|i| descr.column(*i).name() == "pid")
             .expect("pid column");
-        // the constraint: still no bloom
-        let rg0 = reader.get_row_group(0).unwrap();
-        assert!(rg0.get_column_bloom_filter(pid_idx).is_none());
+        // every row group carries a bloom over the entity column
+        for rg in 0..md.num_row_groups() {
+            assert!(
+                md.row_group(rg)
+                    .column(pid_idx)
+                    .bloom_filter_offset()
+                    .is_some(),
+                "row group {rg} has no bloom for pid"
+            );
+        }
+        // and a float measurement does not pay for one it would never use
+        let v_idx = (0..descr.num_columns())
+            .find(|i| descr.column(*i).name() == "v")
+            .expect("v column");
+        assert!(
+            md.row_group(0)
+                .column(v_idx)
+                .bloom_filter_offset()
+                .is_none()
+        );
         // clustering: row-group pid ranges are disjoint & ordered
         use datafusion::parquet::file::statistics::Statistics;
         let mut prev_max: Option<Vec<u8>> = None;

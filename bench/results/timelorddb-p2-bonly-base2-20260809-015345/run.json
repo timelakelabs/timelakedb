@@ -1,0 +1,116 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelorddb-p2-bonly-base2-20260809-015345",
+  "backend": "timelorddb",
+  "backend_display": "TimelordDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:2965",
+    "db": "poc",
+    "container": "tldb-perf",
+    "image": "timelorddb:perf"
+  },
+  "started_at": "2026-08-09T01:53:51-0400",
+  "finished_at": "2026-08-09T01:54:09-0400",
+  "config": {
+    "scale": "laptop",
+    "label": "p2-bonly-base2",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "query_b"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322293760
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 6.5,
+      "lines_per_s": 563473,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 50,
+      "batch_p95_ms": 100,
+      "batch_max_ms": 129
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 118,
+          "warm_ms": 113,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 203,
+          "warm_ms": 191,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 65,
+          "warm_ms": 48,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 75,
+          "warm_ms": 77,
+          "rows": 476,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 96,
+          "warm_ms": 99,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "resources": {
+      "baseline_mem_mb": 6.2,
+      "settled_mem_mb": 1343.3,
+      "returned_to_baseline": false,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 6.2,
+          "peak_cpu_pct": 0.0,
+          "samples": 3
+        },
+        "ingest": {
+          "peak_mem_mb": 727.9,
+          "peak_cpu_pct": 199.4,
+          "samples": 3
+        },
+        "query_b": {
+          "peak_mem_mb": 1465.7,
+          "peak_cpu_pct": 420.1,
+          "samples": 1
+        },
+        "settle": {
+          "peak_mem_mb": 1646.0,
+          "peak_cpu_pct": 31.2,
+          "samples": 5
+        }
+      }
+    }
+  },
+  "notes": []
+}
