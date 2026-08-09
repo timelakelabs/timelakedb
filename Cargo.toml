@@ -6,6 +6,10 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "A time-series database for high-cardinality event analytics, specified from a five-engine benchmark."
+repository = "https://github.com/TimeLakeLabs/TimeLakeDB"
+homepage = "https://github.com/TimeLakeLabs/TimeLakeDB"
+readme = "README.md"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }

@@ -13,9 +13,10 @@ versions and no backports. The workspace version is `0.1.0`.
 ## Reporting a vulnerability
 
 Report privately through GitHub's **Security → Report a vulnerability**
-(private vulnerability reporting) on this repository. Please do not open a
-public issue for a suspected vulnerability, and do not attack a deployment
-you do not own.
+(private vulnerability reporting) at
+<https://github.com/TimeLakeLabs/TimeLakeDB/security/advisories/new>.
+Please do not open a public issue for a suspected vulnerability, and do
+not attack a deployment you do not own.
 
 A useful report includes the version or commit, the configuration
 (`TIMELAKE_*` variables, whether TLS is on), the exposure model (what a

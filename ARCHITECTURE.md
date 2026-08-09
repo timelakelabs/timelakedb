@@ -101,9 +101,10 @@ timelake/
     discovery/   Discovery trait; static backend (v1), Consul (v2)  ← CL-5
     tls/         validate-before-swap cert loading, rotation  ← SEC-3
     store-s3/    S3Store + AwsKms behind the Store/Kms traits  ← CL-1, C0
+    auth/        principals, sessions, roles                  ← SEC-4
+  (planned, not yet built)
     config/      layered resolver (default < property < override),
                  provenance, validation, hot-swap holder      ← §17, U0
-    auth/        principals, sessions, tokens, roles          ← SEC-4, U0
     audit/       chained append-only sink, system.audit       ← SR-6, U1
     admin/       admin listener: console REST API + embedded UI ← SR-5, U0
   tests/

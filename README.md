@@ -21,13 +21,15 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
-> **Security:** TimeLakeDB has **no authentication**. Any client that can
-> reach port 1963 or 1964 can read and write everything on the node — network
-> isolation is the only access control it has today. TLS 1.3, encryption at
-> rest, and row visibility labels are implemented and drilled, but visibility
-> authorizations are **unauthenticated claims** until token auth (scoped for
-> v1, not written yet) fronts them. Read `SECURITY.md` before deploying
-> anything.
+> **Security:** the **data plane has no authentication**. Any client that
+> can reach port 1963 or 1964 can read and write everything on the node, so
+> network isolation is still the only access control over your data. The
+> *administrative* surface does authenticate (SEC-4), and TLS 1.3,
+> encryption at rest and row visibility labels are implemented and drilled
+> — but SEC-2 authorizations remain **self-asserted claims** until
+> data-plane auth lands, and a fresh node seeds a quarantined
+> `admin`/`admin` console credential. Read [`SECURITY.md`](SECURITY.md)
+> before deploying anything.
 
 ## Website
 
@@ -37,7 +39,60 @@ publishes the directory on every push that touches it; enable it once per
 repository under **Settings → Pages → Source: GitHub Actions**. Every figure
 on the site traces to a run under `bench/results/`.
 
-## Status: SEC-1 + SEC-2 — encryption at rest and row visibility labels
+## Status: SEC-4 — the admin surface authenticates
+
+- **Every `/admin/*` route requires a session.** Argon2id credentials,
+  cookie or bearer sessions (30 min idle / 12 h absolute), CSRF and
+  Origin checks on mutations, per-principal backoff on failed logins.
+  Roles are ordered `viewer` < `operator` < `admin`, and retention
+  authorization follows the data rather than the verb: *growing* a
+  window needs `operator`, while *shrinking, introducing or removing*
+  one needs `admin`. This closes what SECURITY.md called an
+  unauthenticated deletion control.
+- **First run seeds `admin`/`admin`, quarantined.** It authenticates,
+  and then the only route that answers is `POST /admin/password` —
+  everything else returns `403 password_change_required`, so the
+  well-known credential cannot destroy data. Rotation invalidates every
+  session for that principal, including the one that performed it.
+  `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` provisions a real password so no
+  well-known default ever exists; alert on
+  `timelake_admin_default_credential_active`.
+- **The data plane is deliberately still open** — writes, `/api/sql` and
+  Flight SQL need no credentials, so Telegraf, Grafana and the harness
+  keep working. Requiring auth there breaks every existing client and is
+  its own migration.
+- Drill: `bench/results/sec4-auth-drill.log`.
+
+**Next:** data-plane authentication (which turns SEC-2's authorization
+claims into real authorization); the cluster phases C1–C3 (catalog
+compare-and-swap → role split → Consul and mTLS, `ARCHITECTURE.md` §12);
+re-baselining the benchmark inside the container network, because ~94% of
+the reported Shape A latency is Docker Desktop port forwarding
+(`docs/evidence/PERFORMANCE_LOG.md`); and CI actually running somewhere.
+
+### Previous: C0 — S3 object store with KMS envelope encryption
+
+- `S3Store` behind the same `Store` trait (aws-sdk-s3, owned-runtime sync
+  bridge), and `AwsKms` behind the same `Kms` trait. The engine cannot
+  tell S3 from a local directory (CL-1).
+- Client-side envelope encryption **and** SSE-KMS with S3 Bucket Keys,
+  each with its own key cache. Measured on the LocalStack rig: an
+  identical workload writing 56 objects cost **1 KMS call cached against
+  56 uncached**, confirmed by LocalStack's own API log.
+- `Store` gained `put_if_absent` — the compare-and-swap primitive
+  (S3 `If-None-Match`) that C1's multi-writer catalog needs.
+- Drill: `bench/results/c0-s3-drill.log`.
+
+### Previous: runtime retention management + console
+
+- `GET`/`PUT` `/admin/retention` and `DELETE /admin/retention/{table}`
+  manage per-table windows at runtime; policies persist through the
+  `Store` (so they are encrypted with everything else) and outlive a
+  restart with a stale environment.
+- A self-contained management page at `/admin/ui` — no build step, no
+  external assets.
+
+### Previous: SEC-1 + SEC-2 — encryption at rest and row visibility labels
 
 - **SEC-1, encryption at the store chokepoint:** set
   `TIMELAKE_ENCRYPTION_KEY` (64 hex chars, or `_KEY_FILE`) and every
@@ -61,9 +116,6 @@ on the site traces to a run under `bench/results/`.
   ciphertext (data *and* manifests); restart recovers through encrypted
   manifests; the smoke suite on the same image is unchanged (0 errors,
   exact counts).
-
-Remaining before v1: **token authentication** (turns SEC-2 claims into
-authorization), in-network bench re-baseline, CI on a remote.
 
 ### Previous: SEC-3 — TLS 1.3 with hot cert rotation, AT-7 passed
 
@@ -148,11 +200,16 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 ## Quickstart (Docker — no local Rust needed)
 
 ```bash
-cd bench
+git clone https://github.com/TimeLakeLabs/TimeLakeDB.git
+cd TimeLakeDB/bench
 docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
 python bench.py backends       # timelakedb is registered
 ```
+
+The admin console is at <http://localhost:1963/admin/ui>. A fresh node
+seeds `admin`/`admin`, which can do nothing until you change it — see
+[`SECURITY.md`](SECURITY.md).
 
 Local development additionally wants a Rust toolchain
 (`rustup` + MSVC build tools on Windows), then:
