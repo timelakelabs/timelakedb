@@ -320,6 +320,23 @@
         local WAL is not encrypted. Wrong key or tampered object is a clean
         named error, never silent data.
       </p>
+
+      <h3>S3 object store + AWS KMS</h3>
+      <p>
+        <code>TIMELORD_OBJECT_STORE=s3://bucket/prefix</code> moves every
+        object to S3 (the WAL stays on local disk);
+        <code>AWS_ENDPOINT_URL</code> points it at LocalStack for testing.
+        <code>TIMELORD_KMS_KEY_ID</code> (key id, ARN, or alias) switches the
+        envelope's key source to AWS KMS data keys, cached by default — one
+        data key per bounded window (<code>TIMELORD_KMS_CACHE_MAX_AGE_SECS</code>,
+        default 300; <code>TIMELORD_KMS_CACHE_MAX_USES</code>, default 1000)
+        and a decrypt-side cache, so thousands of objects cost a handful of
+        KMS calls. <code>TIMELORD_KMS_CACHE=off</code> restores strict
+        per-object keys. Server-side, every PUT carries SSE-KMS with S3
+        Bucket Keys (<code>TIMELORD_S3_SSE_KEY_ID</code>, defaulting to the
+        KMS key id). Setting both <code>TIMELORD_KMS_KEY_ID</code> and
+        <code>TIMELORD_ENCRYPTION_KEY</code> refuses to start.
+      </p>
     </section>
 
     <section id="flight">
@@ -435,6 +452,10 @@
             <tr><td><code>timelord_tables</code></td><td>gauge</td><td>Tables with a live buffer</td></tr>
             <tr><td><code>timelord_encryption_enabled</code></td><td>gauge</td><td>1 when the object store is envelope-encrypted (SEC-1), else 0</td></tr>
             <tr><td><code>timelord_visibility_rows_filtered_total</code></td><td>counter</td><td>Rows hidden by visibility-label enforcement (SEC-2) since start</td></tr>
+            <tr><td><code>timelord_kms_generate_total</code> / <code>timelord_kms_decrypt_total</code></td><td>counter</td><td>Calls that reached the real KMS (key-cached mode only)</td></tr>
+            <tr><td><code>timelord_kms_generate_cache_hits_total</code> / <code>timelord_kms_decrypt_cache_hits_total</code></td><td>counter</td><td>KMS calls the key cache absorbed</td></tr>
+            <tr><td><code>timelord_s3_get_total</code>, <code>_put_total</code>, <code>_head_total</code>, <code>_list_total</code>, <code>_delete_total</code></td><td>counter</td><td>S3 requests by operation (S3 backend only)</td></tr>
+            <tr><td><code>timelord_s3_read_bytes_total</code> / <code>timelord_s3_write_bytes_total</code></td><td>counter</td><td>Bytes moved to/from S3 (S3 backend only)</td></tr>
             <tr><td><code>timelord_tls_cert_expiry_seconds</code></td><td>gauge</td><td>Seconds until the serving certificate expires (TLS mode only)</td></tr>
             <tr><td><code>timelord_tls_last_reload_ok</code></td><td>gauge</td><td>1 if the last certificate reload validated, 0 if it was rejected (TLS mode only)</td></tr>
           </tbody>

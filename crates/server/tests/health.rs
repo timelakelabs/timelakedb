@@ -785,6 +785,94 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     assert_eq!(rows[0]["n"], 500);
 }
 
+/// The C0 S3 drill caught acked rows going UNQUERYABLE during a table's
+/// first flush: buffer swapped out, catalog commit still seconds away
+/// behind slow object writes → "table not found" mid-benchmark. Rows
+/// must stay visible across the whole upload window.
+#[tokio::test]
+async fn rows_stay_visible_while_a_slow_flush_uploads() {
+    use timelord_store::{LocalStore, Store};
+
+    struct SlowStore {
+        inner: LocalStore,
+        delay: std::time::Duration,
+    }
+    impl Store for SlowStore {
+        fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            std::thread::sleep(self.delay); // an object-store-shaped put
+            self.inner.put(path, bytes)
+        }
+        fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+            std::thread::sleep(self.delay);
+            self.inner.put_if_absent(path, bytes)
+        }
+        fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            self.inner.get(path)
+        }
+        fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            self.inner.get_range(path, offset, len)
+        }
+        fn size(&self, path: &str) -> std::io::Result<u64> {
+            self.inner.size(path)
+        }
+        fn delete(&self, path: &str) -> std::io::Result<()> {
+            self.inner.delete(path)
+        }
+        fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn timelord_store::Store> = Arc::new(SlowStore {
+        inner: LocalStore::new(&dir.path().join("objects")).unwrap(),
+        delay: std::time::Duration::from_millis(150),
+    });
+    let eng =
+        timelord_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, false)
+            .unwrap();
+
+    let t = now_ns();
+    let lp = format!(
+        "slowflush,k=a v=1i {}\nslowflush,k=b v=2i {}\nslowflush,k=c v=3i {}",
+        t - 1000,
+        t - 2000,
+        t - 3000
+    );
+    assert!(
+        timelord_api::Engine::write_lp(&*eng, "poc", lp.as_bytes(), None).is_ok(),
+        "write must land"
+    );
+
+    // first flush of this table: file put + manifest put ≈ 300 ms of
+    // window that used to serve "table not found"
+    let flusher = {
+        let eng = Arc::clone(&eng);
+        std::thread::spawn(move || eng.flush_all())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut probes = 0;
+    while !flusher.is_finished() && std::time::Instant::now() < deadline {
+        let batches = eng
+            .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
+            .await
+            .expect("mid-flush query must not fail");
+        let n = timelord_query::batches_to_json(&batches)[0]["n"].as_i64();
+        assert_eq!(n, Some(3), "acked rows vanished mid-flush");
+        probes += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(probes >= 3, "the flush window was never actually probed");
+    flusher.join().unwrap().unwrap();
+
+    // and after the flush the answer is identical, from files
+    let batches = eng
+        .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(timelord_query::batches_to_json(&batches)[0]["n"], 3);
+}
+
 fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

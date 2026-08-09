@@ -848,6 +848,14 @@ mod tests {
                 .insert(path.to_string(), bytes.to_vec());
             Ok(())
         }
+        fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
+            let mut m = self.objects.lock().unwrap();
+            if m.contains_key(path) {
+                return Ok(false);
+            }
+            m.insert(path.to_string(), bytes.to_vec());
+            Ok(true)
+        }
         fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
             let m = self.objects.lock().unwrap();
             let v = m

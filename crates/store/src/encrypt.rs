@@ -55,12 +55,25 @@ const WRAP_LEN_LEN: usize = 2;
 /// remote KMS ciphertext is a few hundred.
 const MAX_WRAP: usize = 4096;
 
-/// Wraps and unwraps per-object data keys. v1 backend: [`LocalKek`].
-/// A remote KMS (per-database or per-table key scoping, SEC-1's
-/// "key scope configurable") implements this same trait.
+/// Wraps and unwraps per-object data keys. Backends: [`LocalKek`], AWS
+/// KMS (timelord-store-s3), each optionally behind [`CachingKms`]
+/// (ARCHITECTURE §12.2) — per-database/table key scoping arrives on
+/// this same trait.
 pub trait Kms: Send + Sync + 'static {
     fn wrap(&self, dek: &[u8; 32]) -> Result<Vec<u8>>;
     fn unwrap(&self, wrapped: &[u8]) -> Result<[u8; 32]>;
+
+    /// A fresh data key with its wrapped form — what encryption actually
+    /// consumes per object. The default is local generation + `wrap`;
+    /// AWS KMS overrides it with GenerateDataKey (one call returns the
+    /// pair), and [`CachingKms`] overrides it to reuse a key within a
+    /// bounded window.
+    fn generate(&self) -> Result<([u8; 32], Vec<u8>)> {
+        let mut dek = [0u8; 32];
+        OsRng.fill_bytes(&mut dek);
+        let wrapped = self.wrap(&dek)?;
+        Ok((dek, wrapped))
+    }
 }
 
 /// A single key-encryption key held in memory, loaded from 64 hex chars
@@ -288,13 +301,17 @@ impl<S: Store> EncryptingStore<S> {
     }
 }
 
-impl<S: Store> Store for EncryptingStore<S> {
-    fn put(&self, path: &str, bytes: &[u8]) -> Result<()> {
-        let mut dek = [0u8; 32];
-        OsRng.fill_bytes(&mut dek);
+impl<S: Store> EncryptingStore<S> {
+    /// Encrypt `bytes` for `path`: the full ciphertext object plus the
+    /// parsed header to cache once the write lands.
+    fn seal(&self, path: &str, bytes: &[u8]) -> Result<(Vec<u8>, ObjHeader)> {
+        // The Kms decides the key: LocalKek generates fresh, AWS KMS
+        // returns a GenerateDataKey pair, CachingKms reuses within its
+        // window (§12.2) — nonce_prefix stays per-object random, which
+        // is what keeps key reuse across objects nonce-safe.
+        let (dek, wrapped) = self.kms.generate()?;
         let mut nonce_prefix = [0u8; 8];
         OsRng.fill_bytes(&mut nonce_prefix);
-        let wrapped = self.kms.wrap(&dek)?;
         if wrapped.len() > MAX_WRAP {
             return Err(Error::new(ErrorKind::InvalidInput, "wrapped DEK too large"));
         }
@@ -327,20 +344,36 @@ impl<S: Store> Store for EncryptingStore<S> {
                 .map_err(|_| Error::other("chunk encryption failed"))?;
             out.extend_from_slice(&ct);
         }
-        let header_len = FIXED_LEN + WRAP_LEN_LEN + wrapped.len();
+        let header = ObjHeader::Encrypted {
+            chunk_size: CHUNK_SIZE,
+            plen: bytes.len() as u64,
+            header_len: FIXED_LEN + WRAP_LEN_LEN + wrapped.len(),
+            aad_fixed: fixed,
+            nonce_prefix,
+            dek,
+        };
+        Ok((out, header))
+    }
+}
+
+impl<S: Store> Store for EncryptingStore<S> {
+    fn put(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let (out, header) = self.seal(path, bytes)?;
         self.inner.put(path, &out)?;
-        self.cache_put(
-            path,
-            Arc::new(ObjHeader::Encrypted {
-                chunk_size: CHUNK_SIZE,
-                plen: bytes.len() as u64,
-                header_len,
-                aad_fixed: fixed,
-                nonce_prefix,
-                dek,
-            }),
-        );
+        self.cache_put(path, Arc::new(header));
         Ok(())
+    }
+
+    fn put_if_absent(&self, path: &str, bytes: &[u8]) -> Result<bool> {
+        let (out, header) = self.seal(path, bytes)?;
+        if self.inner.put_if_absent(path, &out)? {
+            self.cache_put(path, Arc::new(header));
+            Ok(true)
+        } else {
+            // the object that exists is the WINNER's, sealed under its
+            // own DEK — our header must not shadow it
+            Ok(false)
+        }
     }
 
     fn get(&self, path: &str) -> Result<Vec<u8>> {
@@ -564,6 +597,34 @@ mod tests {
         assert_eq!(s.get("old.json").unwrap(), b"{\"v\":1}");
         assert_eq!(s.get_range("old.json", 1, 3).unwrap(), b"\"v\"");
         assert_eq!(s.size("old.json").unwrap(), 7);
+    }
+
+    #[test]
+    fn put_if_absent_encrypts_and_first_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = enc_store(dir.path());
+        assert!(
+            s.put_if_absent("catalog/manifest/000000000001.json", b"WINNER")
+                .unwrap()
+        );
+        assert!(
+            !s.put_if_absent("catalog/manifest/000000000001.json", b"loser")
+                .unwrap()
+        );
+        // the winner's content survives, decrypted, and the loser's
+        // header never poisoned the cache
+        assert_eq!(
+            s.get("catalog/manifest/000000000001.json").unwrap(),
+            b"WINNER"
+        );
+        assert_eq!(
+            s.get_range("catalog/manifest/000000000001.json", 0, 6)
+                .unwrap(),
+            b"WINNER"
+        );
+        // and at rest it is ciphertext like any other object
+        let raw = std::fs::read(dir.path().join("catalog/manifest/000000000001.json")).unwrap();
+        assert_eq!(&raw[..8], MAGIC);
     }
 
     #[test]

@@ -27,7 +27,8 @@ use timelord_buffer::{TableBuffer, flush};
 use timelord_catalog::{Catalog, FileMeta};
 use timelord_ingest::{parse_lines, precision_multiplier};
 use timelord_query::{QuerySession, batches_to_json};
-use timelord_store::{EncryptingStore, LocalKek, LocalStore, Store};
+use timelord_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
+use timelord_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelord_wal::Wal;
 
 #[derive(Clone, Debug)]
@@ -65,6 +66,134 @@ impl Default for EngineConfig {
             gc_grace_secs: 900,
         }
     }
+}
+
+/// The composed storage stack (ARCHITECTURE §12): base backend (local
+/// directory or S3), optional envelope encryption (LocalKek or AWS KMS,
+/// optionally key-cached), plus the stats handles /metrics exports.
+pub struct StoreStack {
+    pub store: Arc<dyn Store>,
+    pub encrypted: bool,
+    pub backend: &'static str,
+    pub kms_stats: Option<Arc<KmsStats>>,
+    pub s3_stats: Option<Arc<S3Stats>>,
+}
+
+impl StoreStack {
+    fn plain(store: Arc<dyn Store>, encrypted: bool) -> StoreStack {
+        StoreStack {
+            store,
+            encrypted,
+            backend: "custom",
+            kms_stats: None,
+            s3_stats: None,
+        }
+    }
+}
+
+/// Build the storage stack from the environment. The decisions live here
+/// and only here — nothing downstream can tell local from S3 or
+/// plaintext from encrypted (SEC-1/CL-1, §12).
+///
+/// - `TIMELORD_OBJECT_STORE` — unset = local `objects/` dir;
+///   `s3://bucket[/prefix]` = S3 (LocalStack via `AWS_ENDPOINT_URL`).
+/// - `TIMELORD_KMS_KEY_ID` — envelope-encrypt with AWS KMS data keys,
+///   behind the key cache unless `TIMELORD_KMS_CACHE=off`
+///   (`TIMELORD_KMS_CACHE_MAX_AGE_SECS` / `_MAX_USES` bound the window).
+/// - `TIMELORD_ENCRYPTION_KEY[_FILE]` — envelope-encrypt with a local
+///   KEK, as before. Setting BOTH key sources is a refused ambiguity.
+/// - `TIMELORD_S3_SSE_KEY_ID` — SSE-KMS key for server-side encryption
+///   (defaults to `TIMELORD_KMS_KEY_ID`; Bucket Keys requested per PUT).
+pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
+    let object_store = std::env::var("TIMELORD_OBJECT_STORE").ok();
+    let kms_key = std::env::var("TIMELORD_KMS_KEY_ID").ok();
+    let local_key = encryption_key_from_env()?;
+    if kms_key.is_some() && local_key.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TIMELORD_KMS_KEY_ID and TIMELORD_ENCRYPTION_KEY are both set — \
+             pick one key source",
+        ));
+    }
+
+    let is_s3 = object_store
+        .as_deref()
+        .is_some_and(|u| u.starts_with("s3://"));
+    let ctx = if is_s3 || kms_key.is_some() {
+        Some(AwsContext::new()?)
+    } else {
+        None
+    };
+
+    let (base, s3_stats, backend): (Arc<dyn Store>, Option<Arc<S3Stats>>, &'static str) =
+        match object_store {
+            None => (
+                Arc::new(LocalStore::new(&data_dir.join("objects"))?),
+                None,
+                "local",
+            ),
+            Some(url) if url.starts_with("s3://") => {
+                let sse = std::env::var("TIMELORD_S3_SSE_KEY_ID")
+                    .ok()
+                    .or_else(|| kms_key.clone());
+                let s3 = S3Store::new(ctx.clone().expect("ctx built for s3"), &url, sse)?;
+                let stats = s3.stats();
+                (Arc::new(s3), Some(stats), "s3")
+            }
+            Some(other) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("TIMELORD_OBJECT_STORE {other:?} is not s3://bucket[/prefix]"),
+                ));
+            }
+        };
+
+    fn env_u64(k: &str, d: u64) -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    }
+    let (store, encrypted, kms_stats): (Arc<dyn Store>, bool, Option<Arc<KmsStats>>) =
+        match (kms_key, local_key) {
+            (Some(key_id), None) => {
+                let aws = AwsKms::new(ctx.expect("ctx built for kms"), key_id);
+                if std::env::var("TIMELORD_KMS_CACHE").as_deref() == Ok("off") {
+                    tracing::warn!(
+                        "TIMELORD_KMS_CACHE=off: strict per-object data keys, \
+                         one KMS call per object (the drill's baseline mode)"
+                    );
+                    let kms: Arc<dyn Kms> = Arc::new(aws);
+                    (Arc::new(EncryptingStore::new(base, kms)), true, None)
+                } else {
+                    let cached = CachingKms::new(
+                        aws,
+                        std::time::Duration::from_secs(env_u64(
+                            "TIMELORD_KMS_CACHE_MAX_AGE_SECS",
+                            300,
+                        )),
+                        env_u64("TIMELORD_KMS_CACHE_MAX_USES", 1000) as u32,
+                    );
+                    let stats = cached.stats();
+                    let kms: Arc<dyn Kms> = Arc::new(cached);
+                    (Arc::new(EncryptingStore::new(base, kms)), true, Some(stats))
+                }
+            }
+            (None, Some(kek)) => {
+                let kms: Arc<dyn Kms> = Arc::new(LocalKek::new(kek));
+                (Arc::new(EncryptingStore::new(base, kms)), true, None)
+            }
+            (None, None) => (base, false, None),
+            (Some(_), Some(_)) => unreachable!("refused above"),
+        };
+
+    Ok(StoreStack {
+        store,
+        encrypted,
+        backend,
+        kms_stats,
+        s3_stats,
+    })
 }
 
 /// SEC-1 key config: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
@@ -123,6 +252,16 @@ pub struct Engine {
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
     schemas: RwLock<HashMap<(String, String), timelord_query::QuerySchema>>,
+    /// Rows mid-flush: snapshotted at buffer swap-out, dropped after the
+    /// catalog commit that makes their files visible. Queries union this
+    /// with buffer + files, reading it BEFORE the catalog — acknowledged
+    /// rows must never vanish for the duration of an object-store upload
+    /// (the C0 S3 drill caught exactly that: first flush of a table took
+    /// long enough on S3 that "table not found" hit the benchmark; on
+    /// local disk the same window was microseconds wide). The residual
+    /// commit→clear window errs toward a transient duplicate, which is
+    /// the M2-documented tolerance, never a vanish.
+    flushing: RwLock<HashMap<(String, String), timelord_query::QueryBatch>>,
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
@@ -135,6 +274,10 @@ pub struct Engine {
     meta_cache: Arc<timelord_query::provider::MetaCache>,
     /// SEC-2: rows the mandatory predicate dropped, across all queries.
     visibility_filtered: Arc<AtomicU64>,
+    /// §12.2: KMS call/cache counters, when the key cache is active.
+    kms_stats: Option<Arc<KmsStats>>,
+    /// §12.1: S3 request counters, when the backend is S3.
+    s3_stats: Option<Arc<S3Stats>>,
     /// SEC-3: set when the listeners run TLS; feeds the expiry gauge and
     /// renewal-health metric so a failing rotation is visible (RR-5).
     tls: RwLock<Option<Arc<timelord_tls::RotatingCert>>>,
@@ -144,37 +287,45 @@ impl Engine {
     /// Open the engine: catalog load + WAL replay happen BEFORE serving
     /// (RR-3 — writes are accepted as soon as this returns).
     ///
-    /// SEC-1 is decided here and only here: with an encryption key in the
-    /// environment the object store is wrapped in [`EncryptingStore`] and
-    /// nothing downstream can tell. A malformed key refuses to start —
-    /// silently running plaintext would be the worst possible reading of
-    /// "encryption enabled".
+    /// SEC-1/CL-1 are decided here and only here: the environment picks
+    /// the backend (local or S3) and the key source (local KEK or AWS
+    /// KMS, cached), and nothing downstream can tell. A malformed key or
+    /// URL refuses to start — silently running plaintext (or the wrong
+    /// bucket) would be the worst possible reading of "configured".
     pub fn open(data_dir: &Path, cfg: EngineConfig) -> std::io::Result<Arc<Engine>> {
-        let local = LocalStore::new(&data_dir.join("objects"))?;
-        match encryption_key_from_env()? {
-            Some(kek) => {
-                tracing::info!(
-                    "SEC-1: object-store encryption enabled (per-object DEK, AES-256-GCM)"
-                );
-                Self::open_with_store(
-                    data_dir,
-                    cfg,
-                    Arc::new(EncryptingStore::new(local, Arc::new(LocalKek::new(kek)))),
-                    true,
-                )
-            }
-            None => Self::open_with_store(data_dir, cfg, Arc::new(local), false),
-        }
+        let stack = store_stack_from_env(data_dir)?;
+        tracing::info!(
+            backend = stack.backend,
+            encrypted = stack.encrypted,
+            kms_cached = stack.kms_stats.is_some(),
+            "object store stack"
+        );
+        Self::open_with_stack(data_dir, cfg, stack)
     }
 
-    /// Open over an explicit store (tests wire the encrypting decorator
-    /// directly; `open` is the env-driven front door).
+    /// Open over an explicit store (tests wire decorators directly;
+    /// `open` is the env-driven front door).
     pub fn open_with_store(
         data_dir: &Path,
         cfg: EngineConfig,
         store: Arc<dyn Store>,
         store_encrypted: bool,
     ) -> std::io::Result<Arc<Engine>> {
+        Self::open_with_stack(data_dir, cfg, StoreStack::plain(store, store_encrypted))
+    }
+
+    pub fn open_with_stack(
+        data_dir: &Path,
+        cfg: EngineConfig,
+        stack: StoreStack,
+    ) -> std::io::Result<Arc<Engine>> {
+        let StoreStack {
+            store,
+            encrypted: store_encrypted,
+            backend: _,
+            kms_stats,
+            s3_stats,
+        } = stack;
         let catalog = Catalog::load(store.clone())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let (wal, frames) = Wal::open(&data_dir.join("wal"))?;
@@ -193,6 +344,7 @@ impl Engine {
             store_encrypted,
             query_env,
             schemas: RwLock::new(HashMap::new()),
+            flushing: RwLock::new(HashMap::new()),
             cfg,
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
@@ -202,6 +354,8 @@ impl Engine {
             pending_gc: Mutex::new(Vec::new()),
             meta_cache: Arc::new(Default::default()),
             visibility_filtered: Arc::new(AtomicU64::new(0)),
+            kms_stats,
+            s3_stats,
             tls: RwLock::new(None),
         };
         let n = frames.len();
@@ -340,14 +494,39 @@ impl Engine {
             (owned, sealed)
         };
 
+        // 1b. snapshot the swapped-out rows into the holding area BEFORE
+        // any upload: from here on, queries serve them from `flushing`
+        // while the (possibly slow, S3-era) object writes proceed. Pure
+        // CPU — the unavoidable swap→holding gap stays sub-millisecond.
+        let mut snapshots: Vec<(String, String, timelord_query::QueryBatch)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for (db, table, buf) in owned {
+            match buf.snapshot() {
+                Ok(batch) => {
+                    self.flushing
+                        .write()
+                        .expect("flushing lock")
+                        .insert((db.clone(), table.clone()), batch.clone());
+                    snapshots.push((db, table, batch));
+                }
+                Err(err) => {
+                    tracing::error!(%db, %table, %err, "flush snapshot failed; others continue");
+                    failed.push(format!("{db}.{table}"));
+                }
+            }
+        }
+
         // 2. encode + upload through the Store chokepoint. One table's
         // failure must not discard the others' rows, so each is encoded
         // independently and a failure is recorded rather than propagated.
         let mut metas = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        for (db, table, buf) in owned {
-            match self.flush_one(&db, &table, buf) {
-                Ok(mut m) => metas.append(&mut m),
+        let mut done: Vec<(String, String)> = Vec::new();
+        for (db, table, batch) in &snapshots {
+            match self.flush_one(db, table, batch) {
+                Ok(mut m) => {
+                    metas.append(&mut m);
+                    done.push((db.clone(), table.clone()));
+                }
                 Err(err) => {
                     tracing::error!(%db, %table, %err, "flush failed for this table; others continue");
                     failed.push(format!("{db}.{table}"));
@@ -360,6 +539,16 @@ impl Engine {
         self.catalog
             .commit_add(metas)
             .map_err(|e| format!("catalog commit: {e}"))?;
+        // committed tables leave holding — their files are visible now.
+        // FAILED tables stay: their rows keep serving from the snapshot
+        // (strictly better than the old swap-and-hope; the retained WAL
+        // still replays them at restart).
+        {
+            let mut hold = self.flushing.write().expect("flushing lock");
+            for key in &done {
+                hold.remove(key);
+            }
+        }
         if failed.is_empty() {
             self.wal
                 .lock()
@@ -384,10 +573,14 @@ impl Engine {
         }
     }
 
-    /// Encode and upload one table's buffer. Split out of [`Self::flush_all`]
-    /// so a single bad buffer is contained.
-    fn flush_one(&self, db: &str, table: &str, buf: TableBuffer) -> Result<Vec<FileMeta>, String> {
-        let batch = buf.snapshot()?;
+    /// Encode and upload one table's snapshot. Split out of
+    /// [`Self::flush_all`] so a single bad batch is contained.
+    fn flush_one(
+        &self,
+        db: &str,
+        table: &str,
+        batch: &timelord_query::QueryBatch,
+    ) -> Result<Vec<FileMeta>, String> {
         // keep the registry current: flushed columns must remain
         // queryable after the buffer empties (and after restart)
         {
@@ -397,7 +590,7 @@ impl Engine {
             reg.insert(key, merged);
         }
         let mut metas = Vec::new();
-        for (partition, part) in flush::prepare(&batch)? {
+        for (partition, part) in flush::prepare(batch)? {
             let (min_ts, max_ts) = flush::time_bounds(&part);
             let bytes = flush::to_parquet_bytes(&part)?;
             let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
@@ -629,13 +822,24 @@ impl Engine {
         let mut tables: Vec<(String, Arc<dyn timelord_query::DfTableProvider>)> =
             Vec::with_capacity(names.len());
         for name in names {
-            let buffer: Vec<timelord_query::QueryBatch> = {
+            let mut buffer: Vec<timelord_query::QueryBatch> = {
                 let dbs = self.dbs.read().expect("dbs lock");
                 match dbs.get(db).and_then(|t| t.get(&name)) {
                     Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
                     _ => Vec::new(),
                 }
             };
+            // rows mid-flush: MUST be read before the catalog, so the
+            // race with a completing flush errs toward a transient
+            // duplicate, never a vanish (see the `flushing` field)
+            if let Some(held) = self
+                .flushing
+                .read()
+                .expect("flushing lock")
+                .get(&(db.to_string(), name.clone()))
+            {
+                buffer.push(held.clone());
+            }
             let files = self.catalog.files_for(db, &name);
             if buffer.is_empty() && files.is_empty() {
                 continue;
@@ -740,6 +944,44 @@ impl Engine {
             (dbs.len(), tables, rows)
         };
         let wal_bytes = self.wal.lock().expect("wal lock").size();
+        let kms_lines = match &self.kms_stats {
+            Some(k) => format!(
+                "# TYPE timelord_kms_generate_total counter\n\
+                 timelord_kms_generate_total {}\n\
+                 # TYPE timelord_kms_decrypt_total counter\n\
+                 timelord_kms_decrypt_total {}\n\
+                 # TYPE timelord_kms_generate_cache_hits_total counter\n\
+                 timelord_kms_generate_cache_hits_total {}\n\
+                 # TYPE timelord_kms_decrypt_cache_hits_total counter\n\
+                 timelord_kms_decrypt_cache_hits_total {}\n",
+                k.generate_calls.load(Ordering::Relaxed),
+                k.decrypt_calls.load(Ordering::Relaxed),
+                k.generate_hits.load(Ordering::Relaxed),
+                k.decrypt_hits.load(Ordering::Relaxed),
+            ),
+            None => String::new(),
+        };
+        let s3_lines = match &self.s3_stats {
+            Some(s) => format!(
+                "# TYPE timelord_s3_get_total counter\ntimelord_s3_get_total {}\n\
+                 # TYPE timelord_s3_put_total counter\ntimelord_s3_put_total {}\n\
+                 # TYPE timelord_s3_head_total counter\ntimelord_s3_head_total {}\n\
+                 # TYPE timelord_s3_list_total counter\ntimelord_s3_list_total {}\n\
+                 # TYPE timelord_s3_delete_total counter\ntimelord_s3_delete_total {}\n\
+                 # TYPE timelord_s3_read_bytes_total counter\n\
+                 timelord_s3_read_bytes_total {}\n\
+                 # TYPE timelord_s3_write_bytes_total counter\n\
+                 timelord_s3_write_bytes_total {}\n",
+                s.get_total.load(Ordering::Relaxed),
+                s.put_total.load(Ordering::Relaxed),
+                s.head_total.load(Ordering::Relaxed),
+                s.list_total.load(Ordering::Relaxed),
+                s.delete_total.load(Ordering::Relaxed),
+                s.read_bytes_total.load(Ordering::Relaxed),
+                s.write_bytes_total.load(Ordering::Relaxed),
+            ),
+            None => String::new(),
+        };
         let tls_lines = match self.tls.read().expect("tls lock").as_ref() {
             Some(t) => format!(
                 "# TYPE timelord_tls_cert_expiry_seconds gauge\n\
@@ -764,7 +1006,7 @@ impl Engine {
              # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n\
              # TYPE timelord_encryption_enabled gauge\ntimelord_encryption_enabled {}\n\
              # TYPE timelord_visibility_rows_filtered_total counter\n\
-             timelord_visibility_rows_filtered_total {}\n{}",
+             timelord_visibility_rows_filtered_total {}\n{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -776,6 +1018,8 @@ impl Engine {
             self.retention_drops_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),
+            kms_lines,
+            s3_lines,
             tls_lines,
         )
     }

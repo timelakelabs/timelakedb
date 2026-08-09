@@ -350,11 +350,15 @@ trait that v1 lacks — that is CL-1's practical meaning, kept.
 
 ### 12.1 S3Store (CL-1 made real)
 
-`S3Store` implements `Store` over the `object_store` crate (the decided
-abstraction, §0), holding its **own single-thread tokio runtime** for
-the sync↔async bridge — engine threads call the store from
-`spawn_blocking` contexts, and `Handle::block_on` against the server's
-runtime can deadlock; an owned runtime cannot. Mapping: `put` →
+`S3Store` implements `Store` over **aws-sdk-s3** (build-time deviation
+from the original `object_store` sketch, recorded in the crate docs: the
+SDK exposes exact control of SSE-KMS, `bucket-key-enabled`, and
+`If-None-Match` — which is the point; the abstraction that matters is
+our own `Store` trait, unchanged). It holds its **own tokio runtime**
+for the sync↔async bridge — engine threads call the store from
+`spawn_blocking` contexts *and* from async contexts, and `block_on`
+there panics; work is spawned onto the owned runtime and awaited over a
+channel, safe from any thread. Mapping: `put` →
 PutObject (SSE headers below; multipart when L2 splits exceed single-PUT
 limits), `get_range` → ranged GET (the seam range reads were built for),
 `list` → ListObjectsV2 (lexicographic — exactly what manifest replay
@@ -489,6 +493,32 @@ evidence style:
   `If-None-Match` conditional PUT and Bucket Keys support are verified
   at C0 start; if either is unfaithful, the CAS drill runs against a
   real S3 sandbox and LocalStack keeps the rest.
+
+### 12.7 Node sizing (hypotheses until the C3 sizing drill)
+
+Memory sizing is derivable now — §10's budget model is arithmetic over
+RAM (pool = 20%, buffers 2 GB, WAL 2 GB, caches ~0.75 GB). CPU and
+network ceilings are NOT derivable: every recorded number comes from one
+Windows laptop under Docker Desktop. The starting grid, to be replaced
+cell-by-cell with measured results from a **C3 sizing drill** on real
+AWS (full-scale gate per candidate type, recording ingest ceiling,
+Shape A/B, S3 request rates, KMS latency share, and cost/day):
+
+| Role | Binds on | Starting type |
+|---|---|---|
+| Ingester | parse CPU + WAL fsync latency + pair RTT | c7gd.xlarge (NVMe) — or EBS gp3 when replication is degraded-tolerant |
+| Querier | pool RAM + S3 throughput + decode CPU | r7g.xlarge+ |
+| Compactor | CPU + network, spiky | c7g.xlarge, spot-friendly |
+| Router | network | c7g.large |
+
+Traps the drill must not fall into: **burst-vs-baseline network** on
+sub-4xlarge instances (great for ten minutes, then the credits drain —
+run long enough to exhaust them); WAL on instance store is a
+durability fork coupled to CL-2 replication health, not a pure perf
+choice; and the cost model is dominated by a **VPC gateway endpoint for
+S3** (without it, NAT processing charges eclipse everything) and by
+cross-AZ ingester-pair placement ($/GB + ~1 ms per replicated ack)
+before instance families matter at all.
 
 ## 13. Observability (SR-4)
 
