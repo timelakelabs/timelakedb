@@ -61,6 +61,103 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 22:35 — Present tags as `Utf8View`, not `Dictionary`   [REJECTED]
+
+**Hypothesis.** The last cycle named the target: B2's remaining cost is the
+final aggregate over 1.83 M `(step, product_id)` groups, keyed by two
+dictionary columns, and DataFusion's fast column-wise group-values path does
+not cover `Dictionary`. Confirmed in the dependency source before writing any
+code — `datafusion-physical-plan-54.1.0`'s `supported_type` lists `Utf8`,
+`Utf8View`, `BinaryView` and the primitives, and `Dictionary` is absent, so
+every tag group-by falls into the row-format `GroupValuesRows`. Then confirmed
+on the critical path, `EXPLAIN ANALYZE` on a settled master instance:
+
+| Operator (B2, summed over 24 partitions) | Baseline |
+|---|---|
+| `AggregateExec: FinalPartitioned, gby=[step, product_id]` | **1.71 s** compute |
+| ... its `time_calculating_group_ids` | 378 ms |
+| ... its peak memory | 179.7 MB |
+| ... **its spills** | **95 spills, 39.6 MB, 1.83 M rows** |
+| `AggregateExec: Partial` below it | 47 ms compute |
+| `FilterExec` + scan | 12 ms compute |
+
+So one operator is ~95% of B2's compute, and it is spilling. Present the tag
+columns as `Utf8View` and that operator gets `GroupValuesColumn` with inline
+views — predicted 30–40% off B1/B2, spills gone, B3/B4 untouched, Shape A
+untouched. The recorded risk before measuring: views cost 16 bytes a row where
+a dictionary key costs 4, so the scan-heavy queries pay for what the
+group-heavy ones save.
+
+**Change.** `group_friendly_schema` in `provider.rs` rewrites every
+`Dictionary<_, Utf8>` field to `Utf8View` in the schema `LazyTable` presents,
+so storage, the WAL and the write buffer are untouched (FR-2 intact) and only
+the planner's view of the table changes. `align_to` gained a cast when a
+batch's column type differs from the target field, which is where the
+conversion actually happens — arrow's `view_from_dict_values` fast path, no
+string copied. `str_literal` learned `ScalarValue::Utf8View`, without which
+coercion against a view column silently turns off tag pruning and the blooms.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network, 100
+Shape A samples. All four runs clean (ingest 734–774 K lines/s) and all four
+settled to **62 parquet files / 69 MB**. Labels `perf-base1`/`perf-base2`,
+`perf-cand1`/`perf-cand2`, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 78/68, 76/81 | **42/41, 42/41** |
+| B2_funnel_48h | 161/140, 191/136 | **127/126, 133/129** |
+| B3_inflight_24h | 12/11, 12/12 | *53/67, 53/66* |
+| B4_hourly_throughput_48h | 18/18, 19/18 | *71/51, 76/57* |
+| B5_route_rollup_24h | 26/27, 26/26 | *48/46, 45/67* |
+| Shape A median | 3, 4 ms | 3, 3 ms |
+| Ingest | 742K, 774K | 734K, 764K |
+
+Row counts are identical in both arms (10/10/10/477/40) and Shape A reports
+zero errors, so the candidate answered correctly — it was simply slower
+overall.
+
+**Verdict.** Rejected. The mechanism works and is large: B1 goes 76–81 → 41–42
+(**~45% off**, no overlap, both repeats identical) and B2 136–191 → 126–133.
+But B3 pays **4–5×**, B4 **3–4×** and B5 **~2×**, equally consistently, and
+those three are more of the suite than the two that win. Trading 35 ms of
+funnel for 100 ms spread across the other three queries is a net loss, and no
+amount of framing makes it one.
+
+**Lesson — the win is real, the delivery is wrong, and the next cycle can have both.**
+
+- **Where the regression lives is measured, not guessed.** `EXPLAIN ANALYZE`
+  on the *candidate* B3 sums its whole plan to ~35 ms of compute across 24
+  partitions — about 1.5 ms of wall — against a 53 ms query. The missing ~50 ms
+  is outside the plan entirely: it is `align_to` converting every dictionary
+  column of every batch **on one thread, after the parallel load has already
+  finished**. The scan decodes on up to 8 workers and then funnels through a
+  serial pass that touches every row. Same plan's `FilterExec` reports
+  **530 MB** of output bytes where the dictionary version moved a few MB.
+- **So the conversion must happen inside the decode, not after it.** Two
+  candidates, in order of preference: hand the parquet reader an overridden
+  arrow schema (`ArrowReaderOptions::with_schema`) so a BYTE_ARRAY column
+  decodes straight to `Utf8View` and never builds a dictionary at all — that is
+  what DataFusion's own `schema_force_view_types` does — or, failing that, cast
+  per file inside `load_one_file`, on the worker threads. Note that
+  `apply_restriction` matches `Dictionary` and `Utf8` explicitly and would need
+  a `Utf8View` arm if the conversion moves above it (SEC-2 fails closed, so
+  this would be a hard error, not a leak).
+- **A blanket schema rewrite is the wrong shape regardless.** `step` and
+  `event` have ten distinct values; a dictionary is exactly right for them and
+  a view is 4× the bytes for nothing. Only `product_id` — 200 K distinct, the
+  key that explodes to one group per row — is worth converting. The provider
+  has no cardinality signal today, which is the actual missing ingredient:
+  compaction already computes a highest-cardinality cluster column
+  (`buffer::flush::cluster_column`) and `FileMeta` could carry a per-column
+  distinct count as cheaply as it carries min/max time. **That is the enabling
+  cycle, and it is worth running before retrying this one.**
+- **The spill is a separate, unclaimed win.** Baseline B2's inner aggregate
+  spills 95 times for 39.6 MB. Whatever fixes the group-key encoding also stops
+  the spilling, and the spilling is worth measuring on its own — the query
+  memory pool is sized by config, and no cycle has yet checked whether Shape B
+  is spilling because the pool is too small or because the row format is too
+  fat.
+
 ### 2026-08-09 19:35 — Stop starving the partial-aggregation skip   [ADOPTED]
 
 **Hypothesis.** The last cycle handed this one its target: "what is left on
