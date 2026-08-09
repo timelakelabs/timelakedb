@@ -1,4 +1,4 @@
-Run one TimeLakeDB performance-improvement cycle in C:\project-time-lord-db\TimeLakeDB. Work autonomously and finish inside ~90 minutes; if you cannot, log it as ABORTED and clean up.
+Run one TimeLakeDB performance-improvement cycle in this repository — the runner (`ops/run-perf-cycle.ps1`) has already set the working directory to the repository root, so use relative paths throughout and never hardcode a checkout location. Work autonomously and finish inside ~90 minutes; if you cannot, log it as ABORTED and clean up.
 
 ISOLATION — non-negotiable, this Docker host runs production services:
 - NEVER touch the running containers `timelakedb`, `timelake-telegraf`, `timelake-grafana`, the volume `bench-timelakedb_timelake-data`, or anything else already running (Paperless, Tailscale, Caddy, etc).
@@ -7,7 +7,7 @@ ISOLATION — non-negotiable, this Docker host runs production services:
 - Remove your container, volume and image at the end of the cycle, win or lose.
 
 NO local Rust toolchain — build and test through Docker:
-docker run --rm -v "C:/project-time-lord-db/TimeLakeDB":/src -w /src -v timelake-cargo-cache:/usr/local/cargo/registry rust:1-slim cargo test --workspace
+docker run --rm -v "${PWD}":/src -w /src -v timelake-cargo-cache:/usr/local/cargo/registry rust:1-slim cargo test --workspace
 
 THE CYCLE:
 1. Read docs/evidence/PERFORMANCE_LOG.md first, all of it. Do not repeat an idea already logged unless the entry says a retry is worthwhile. The "Standing leads" section is starting material, not a mandate, and later entries carry measurement rules that override it.

@@ -8,16 +8,19 @@ description: Build, test, and run TimeLakeDB's benchmark gate cheaply — the ex
 This machine has NO Rust toolchain — everything runs via Docker. Filter
 all command output (grep/Select-String) — never dump full build logs.
 
+All commands below assume the repository root as the working directory,
+and mount it via `${PWD}` rather than any absolute path.
+
 ## Test (fast, cached)
 
 ```powershell
-docker run --rm -v "C:\project-time-lord-db\TimeLakeDB:/src" -v timelake-cargo-cache:/usr/local/cargo/registry -w /src rust:1-slim sh -c "cargo test --workspace 2>&1 | grep -E 'test result|error|FAILED' | grep -v 'ok. 0 passed'"
+docker run --rm -v "${PWD}:/src" -v timelake-cargo-cache:/usr/local/cargo/registry -w /src rust:1-slim sh -c "cargo test --workspace 2>&1 | grep -E 'test result|error|FAILED' | grep -v 'ok. 0 passed'"
 ```
 
 ## Rebuild + start (with Grafana fixture)
 
 ```powershell
-cd C:\project-time-lord-db\TimeLakeDB\bench
+cd bench
 docker compose -f compose/timelakedb.yml --profile grafana up -d --build
 # fresh data: down first, then Remove-Item -Recurse compose\data\timelake
 ```
@@ -25,7 +28,7 @@ docker compose -f compose/timelakedb.yml --profile grafana up -d --build
 ## Bench gate
 
 ```powershell
-cd C:\project-time-lord-db\TimeLakeDB\bench
+cd bench   # from the repository root
 python bench.py run --backend timelakedb --scale smoke  --label <X>   # shakeout, ~15 s
 python bench.py run --backend timelakedb --scale laptop --label <X>   # milestone gate, ~1 min
 ```

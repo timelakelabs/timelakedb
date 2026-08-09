@@ -34,5 +34,5 @@ tsdb-bench run: timelorddb-tldb-m4-full4-20260808-142619
 [14:30:07]   context disk_rows_6h: value=6247500 (440ms)
 
 Run complete in 231s
-  C:\project-time-lord-db\TimelordDB\bench\results\timelorddb-tldb-m4-full4-20260808-142619\run.json
-  compare runs with: python bench.py compare C:\project-time-lord-db\TimelordDB\bench\results\*\run.json
+  <repo>\bench\results\timelorddb-tldb-m4-full4-20260808-142619\run.json
+  compare runs with: python bench.py compare <repo>\bench\results\*\run.json
