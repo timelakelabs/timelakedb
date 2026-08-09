@@ -17,8 +17,7 @@ async fn main() {
     let cfg = timelord_server::config_from_env();
 
     tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelorddb M3 starting");
-    let engine =
-        timelord_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
+    let engine = timelord_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
 
     // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
     // every 30 s, retention every 60 s — sequential on one blocking task
@@ -31,8 +30,8 @@ async fn main() {
             tick.tick().await;
             n += 1;
             let e = Arc::clone(&maint);
-            let compact = n % 3 == 0;
-            let retention = n % 6 == 0;
+            let compact = n.is_multiple_of(3);
+            let retention = n.is_multiple_of(6);
             // Each stage is independent. A failing flush used to abort the
             // rest of the tick, so one unflushable table stopped compaction
             // and retention for every table on the node.
@@ -117,8 +116,9 @@ async fn main() {
             // HTTP over TLS. axum-server drives hyper over our rustls
             // config; the resolver inside it is the rotation point.
             let http_tls = rot.server_config(allow_tls12, &[b"h2".as_slice(), b"http/1.1"]);
-            let sock_addr: std::net::SocketAddr =
-                addr.parse().expect("TIMELORD_ADDR must be host:port under TLS");
+            let sock_addr: std::net::SocketAddr = addr
+                .parse()
+                .expect("TIMELORD_ADDR must be host:port under TLS");
             let app = timelord_server::app_with_tls_admin(engine, rot);
             axum_server::bind_rustls(
                 sock_addr,

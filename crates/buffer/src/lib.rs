@@ -214,7 +214,8 @@ impl TableBuffer {
     /// The buffer's schema without materializing any arrays (cheap —
     /// used to keep the engine's schema registry current).
     pub fn schema_only(&self) -> Arc<Schema> {
-        let mut fields: Vec<Field> = Vec::with_capacity(1 + self.tag_names.len() + self.field_names.len());
+        let mut fields: Vec<Field> =
+            Vec::with_capacity(1 + self.tag_names.len() + self.field_names.len());
         fields.push(Field::new(
             "time",
             DataType::Timestamp(TimeUnit::Nanosecond, Some(TZ.into())),
@@ -258,8 +259,8 @@ impl TableBuffer {
             let col = &self.tags[name];
             let keys = datafusion::arrow::array::Int32Array::from(col.keys.clone());
             let values = Arc::new(StringArray::from(col.values.clone()));
-            let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
-                .map_err(|e| e.to_string())?;
+            let dict =
+                DictionaryArray::<Int32Type>::try_new(keys, values).map_err(|e| e.to_string())?;
             fields.push(Field::new(
                 name,
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -329,10 +330,10 @@ pub mod flush {
             return Ok(Vec::new());
         }
         let mut pk_cols = Vec::new();
-        if let Some(name) = leading {
-            if let Some(c) = batch.column_by_name(name) {
-                pk_cols.push(c.clone());
-            }
+        if let Some(name) = leading
+            && let Some(c) = batch.column_by_name(name)
+        {
+            pk_cols.push(c.clone());
         }
         // time (index 0 by construction) + every dictionary (tag) column
         pk_cols.push(batch.column(0).clone());
@@ -350,7 +351,9 @@ pub mod flush {
                 .collect(),
         )
         .map_err(|e| e.to_string())?;
-        let rows = converter.convert_columns(&pk_cols).map_err(|e| e.to_string())?;
+        let rows = converter
+            .convert_columns(&pk_cols)
+            .map_err(|e| e.to_string())?;
 
         let mut idx: Vec<usize> = (0..n).collect();
         // stable: equal PKs stay in arrival order, so .last() is LWW
@@ -358,11 +361,11 @@ pub mod flush {
 
         let mut kept: Vec<usize> = Vec::with_capacity(n);
         for &i in &idx {
-            if let Some(&prev) = kept.last() {
-                if rows.row(prev) == rows.row(i) {
-                    *kept.last_mut().unwrap() = i; // last write wins (FR-5)
-                    continue;
-                }
+            if let Some(&prev) = kept.last()
+                && rows.row(prev) == rows.row(i)
+            {
+                *kept.last_mut().unwrap() = i; // last write wins (FR-5)
+                continue;
             }
             kept.push(i);
         }
@@ -709,9 +712,7 @@ mod tests {
         use datafusion::parquet::file::statistics::Statistics;
         let mut prev_max: Option<Vec<u8>> = None;
         for rg in 0..md.num_row_groups() {
-            if let Some(Statistics::ByteArray(s)) =
-                md.row_group(rg).column(pid_idx).statistics()
-            {
+            if let Some(Statistics::ByteArray(s)) = md.row_group(rg).column(pid_idx).statistics() {
                 let (min, max) = (s.min_opt().unwrap(), s.max_opt().unwrap());
                 if let Some(prev) = &prev_max {
                     assert!(
@@ -727,7 +728,10 @@ mod tests {
     #[test]
     fn hour_partition_format() {
         // 2026-08-08T09:00:00Z == 1786179600
-        assert_eq!(flush::hour_partition(1_786_179_600_000_000_000), "2026080809");
+        assert_eq!(
+            flush::hour_partition(1_786_179_600_000_000_000),
+            "2026080809"
+        );
         assert_eq!(flush::hour_partition(0), "1970010100");
     }
 
