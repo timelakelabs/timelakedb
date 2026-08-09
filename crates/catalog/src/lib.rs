@@ -156,7 +156,12 @@ impl<S: Store> Catalog<S> {
     }
 
     pub fn file_count(&self) -> usize {
-        self.files.lock().expect("catalog lock").values().map(Vec::len).sum()
+        self.files
+            .lock()
+            .expect("catalog lock")
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 }
 
@@ -183,8 +188,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
-            cat.commit_add(vec![meta("poc", "pipeline_events", "2026080800", "a.parquet")])
-                .unwrap();
+            cat.commit_add(vec![meta(
+                "poc",
+                "pipeline_events",
+                "2026080800",
+                "a.parquet",
+            )])
+            .unwrap();
             cat.commit_add(vec![
                 meta("poc", "pipeline_events", "2026080801", "b.parquet"),
                 meta("poc", "host_metrics", "2026080801", "c.parquet"),
@@ -194,7 +204,10 @@ mod tests {
         let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
         assert_eq!(cat.files_for("poc", "pipeline_events").len(), 2);
         assert_eq!(cat.files_for("poc", "host_metrics").len(), 1);
-        assert_eq!(cat.tables_for("poc"), vec!["host_metrics", "pipeline_events"]);
+        assert_eq!(
+            cat.tables_for("poc"),
+            vec!["host_metrics", "pipeline_events"]
+        );
         assert_eq!(cat.file_count(), 3);
         // seq continues after reload
         cat.commit_add(vec![meta("poc", "disk_metrics", "2026080802", "d.parquet")])

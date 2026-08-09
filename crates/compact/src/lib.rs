@@ -110,8 +110,7 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::Float64Array>()
             .unwrap();
         for i in 0..b0.num_rows() {
-            let tag =
-                datafusion::arrow::util::display::array_value_to_string(tags, i).unwrap();
+            let tag = datafusion::arrow::util::display::array_value_to_string(tags, i).unwrap();
             if tag == "a" {
                 assert_eq!(vals.value(i), 2.0, "newest file wins");
             }

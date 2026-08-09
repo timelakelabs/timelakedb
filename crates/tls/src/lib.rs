@@ -38,7 +38,9 @@ pub enum TlsError {
     /// Certificate or key failed to parse, or the key doesn't match the cert.
     Invalid(String),
     /// The pair parsed but the leaf certificate is already expired.
-    Expired { not_after_epoch: i64 },
+    Expired {
+        not_after_epoch: i64,
+    },
 }
 
 impl std::fmt::Display for TlsError {
@@ -48,7 +50,10 @@ impl std::fmt::Display for TlsError {
             TlsError::Missing(what) => write!(f, "no {what} found in PEM"),
             TlsError::Invalid(msg) => write!(f, "invalid cert/key pair: {msg}"),
             TlsError::Expired { not_after_epoch } => {
-                write!(f, "certificate already expired (notAfter epoch {not_after_epoch})")
+                write!(
+                    f,
+                    "certificate already expired (notAfter epoch {not_after_epoch})"
+                )
             }
         }
     }
@@ -183,8 +188,12 @@ impl RotatingCert {
 
     /// Watched-file mtimes, for the poll-based watcher in the server.
     pub fn mtimes(&self) -> Option<(SystemTime, SystemTime)> {
-        let c = std::fs::metadata(&self.cert_path).and_then(|m| m.modified()).ok()?;
-        let k = std::fs::metadata(&self.key_path).and_then(|m| m.modified()).ok()?;
+        let c = std::fs::metadata(&self.cert_path)
+            .and_then(|m| m.modified())
+            .ok()?;
+        let k = std::fs::metadata(&self.key_path)
+            .and_then(|m| m.modified())
+            .ok()?;
         Some((c, k))
     }
 
@@ -194,11 +203,7 @@ impl RotatingCert {
     ///
     /// `allow_tls12` lowers the floor from the default TLS 1.3-only
     /// (SEC-3: 1.3 everywhere, configurable 1.2 floor for old clients).
-    pub fn server_config(
-        self: &Arc<Self>,
-        allow_tls12: bool,
-        alpn: &[&[u8]],
-    ) -> Arc<ServerConfig> {
+    pub fn server_config(self: &Arc<Self>, allow_tls12: bool, alpn: &[&[u8]]) -> Arc<ServerConfig> {
         let versions: &[&rustls::SupportedProtocolVersion] = if allow_tls12 {
             &[&rustls::version::TLS13, &rustls::version::TLS12]
         } else {
@@ -246,8 +251,8 @@ mod tests {
     /// Mint a self-signed localhost cert valid for `hours` from now
     /// (negative = already expired), returning (cert_pem, key_pem).
     fn mint(hours: i64) -> (String, String) {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-            .expect("params");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(1);
         params.not_after = now + time::Duration::hours(hours);
@@ -357,7 +362,10 @@ mod tests {
         let (c, k) = write_pair(dir.path(), &cert, &key);
         let rot = RotatingCert::load(&c, &k).expect("load");
         let strict = rot.server_config(false, &[b"h2".as_slice(), b"http/1.1"]);
-        assert_eq!(strict.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            strict.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
         let floored = rot.server_config(true, &[b"h2".as_slice()]);
         assert_eq!(floored.alpn_protocols, vec![b"h2".to_vec()]);
     }

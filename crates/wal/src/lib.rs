@@ -208,7 +208,8 @@ mod tests {
             let (mut wal, replay) = Wal::open(dir.path()).unwrap();
             assert!(replay.is_empty());
             wal.append("poc", 1, b"m f=1i 1").unwrap();
-            wal.append("poc", 1_000_000_000, b"m f=2i 2\nm f=3i 3").unwrap();
+            wal.append("poc", 1_000_000_000, b"m f=2i 2\nm f=3i 3")
+                .unwrap();
             wal.append("other", 1, b"h c=0.5 4").unwrap();
         }
         let (_, replay) = Wal::open(dir.path()).unwrap();

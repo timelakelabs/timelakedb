@@ -64,10 +64,12 @@ pub fn parse_lines(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        out.push(parse_line(line, mult, default_ts_ns).map_err(|msg| ParseError {
-            line_no: i + 1,
-            msg: format!("{msg} in {line:?}"),
-        })?);
+        out.push(
+            parse_line(line, mult, default_ts_ns).map_err(|msg| ParseError {
+                line_no: i + 1,
+                msg: format!("{msg} in {line:?}"),
+            })?,
+        );
     }
     Ok(out)
 }
@@ -77,7 +79,7 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
     let mut pos = 0usize;
 
     // measurement
-    let table = take_escaped(bytes, &mut pos, &[b','])?;
+    let table = take_escaped(bytes, &mut pos, b",")?;
     if table.is_empty() {
         return Err("empty measurement".into());
     }
@@ -86,12 +88,12 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
     let mut tags = Vec::new();
     while pos < bytes.len() && bytes[pos] == b',' {
         pos += 1;
-        let key = take_escaped(bytes, &mut pos, &[b'='])?;
+        let key = take_escaped(bytes, &mut pos, b"=")?;
         if pos >= bytes.len() || bytes[pos] != b'=' {
             return Err(format!("tag '{key}' has no value"));
         }
         pos += 1;
-        let val = take_escaped(bytes, &mut pos, &[b','])?;
+        let val = take_escaped(bytes, &mut pos, b",")?;
         tags.push((key, val));
     }
 
@@ -103,7 +105,7 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
     // fields
     let mut fields = Vec::new();
     loop {
-        let key = take_escaped(bytes, &mut pos, &[b'='])?;
+        let key = take_escaped(bytes, &mut pos, b"=")?;
         if pos >= bytes.len() || bytes[pos] != b'=' {
             return Err(format!("field '{key}' has no value"));
         }
