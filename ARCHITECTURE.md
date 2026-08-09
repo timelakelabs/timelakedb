@@ -7,7 +7,9 @@ requirement is decoration and should be challenged).
 **Stack (decided, §11):** Rust · Apache DataFusion (SQL + vectorized
 execution + memory pool) · Arrow (in-memory columnar, dictionary encoding)
 · Parquet (immutable storage format) · `object_store` (storage
-abstraction) · `arrow-flight` (Flight SQL surface).
+abstraction) · `arrow-flight` (Flight SQL surface) · aws-sdk-kms +
+SSE-KMS/Bucket Keys for the S3 era (§12.2) · LocalStack as the
+cluster test rig (§12.6).
 
 ---
 
@@ -316,7 +318,13 @@ Three rungs, cheapest first; the harness decides how far to climb:
   keeps OpenSSL out of the build. AT-6 exercises Telegraf/Grafana over
   TLS; AT-7 is the rotation-under-load drill.
 
-## 12. Clustering evolution (CL)
+## 12. Clustering v2 on S3 (CL-1..CL-5 + SEC-1 on AWS) — design
+
+**Status: designed 2026-08-09; build phased C0–C3 (§14).** Every seam
+this composes from is already shipped: the `Store` chokepoint with
+`EncryptingStore` and the `Kms` trait (SEC-1), the sequence-keyed
+manifest-log catalog, the `Discovery` trait, and one binary that
+composes every role.
 
 ```mermaid
 flowchart LR
@@ -325,35 +333,162 @@ flowchart LR
         R --> I2[Ingester B]
         I1 <-->|WAL replication CL-2| I2
         Q1[Querier 1] & Q2[Querier N]
+        Q1 & Q2 -.->|buffer snapshots, Arrow IPC| I1
         CMPD[Compactor - per-shard singleton]
         CATS[Catalog - CAS on manifest head]
     end
-    OS2[(Shared object store)]
+    OS2[(S3: envelope-encrypted objects,
+         SSE-KMS + Bucket Keys)]
     I1 & I2 --> OS2
     Q1 & Q2 --> OS2
     CMPD --> OS2
     CATS --> OS2
 ```
 
-v1 runs all roles in one process behind the same traits. The v2 split
-changes deployment, not architecture: ingesters replicate WAL before ack
-(CL-2), queriers are stateless over store+catalog (CL-3), the catalog
-gains conditional-put arbitration, and any node rebuilds from the store
-(CL-4, bounded by cache warmup). Nothing in v1 may violate this diagram —
-that is CL-1's practical meaning.
+The v2 split changes deployment, not architecture: nothing below adds a
+trait that v1 lacks — that is CL-1's practical meaning, kept.
 
-**Membership & discovery (CL-5).** Topology comes from the `Discovery`
-trait: `members(role)`, `register(self)`, `watch()`, and `lease(name)`
-for role election. Backends: **static** (config file — v1, dev, and the
-bench harness) and **Consul** (service registration + health checks +
-sessions for the compactor-singleton lease). Two rules keep this honest:
-discovery informs *routing and availability only* — a stale or lying
-membership view can waste work but never corrupt state, because every
-commit still goes through catalog CAS; and leases are advisory
-optimizations — the compactor holds a Consul lease to avoid duplicate
-work, but a double-fired compaction is safe (both produce valid file
-sets; catalog CAS accepts one, GC collects the loser). Intra-cluster
-links discovered this way connect over mTLS (SEC-3).
+### 12.1 S3Store (CL-1 made real)
+
+`S3Store` implements `Store` over the `object_store` crate (the decided
+abstraction, §0), holding its **own single-thread tokio runtime** for
+the sync↔async bridge — engine threads call the store from
+`spawn_blocking` contexts, and `Handle::block_on` against the server's
+runtime can deadlock; an owned runtime cannot. Mapping: `put` →
+PutObject (SSE headers below; multipart when L2 splits exceed single-PUT
+limits), `get_range` → ranged GET (the seam range reads were built for),
+`list` → ListObjectsV2 (lexicographic — exactly what manifest replay
+requires), `size` → catalog-recorded sizes on the hot path, HeadObject
+otherwise. Config: `TIMELORD_OBJECT_STORE=s3://bucket/prefix` (unset =
+local directory, as today); `AWS_ENDPOINT_URL` + path-style addressing
+for LocalStack. Per-op request/byte/retry counters feed `/metrics`.
+
+**One new trait method — the CAS primitive:** `put_if_absent(path,
+bytes) -> Ok(true)|Ok(false)` (S3: PUT + `If-None-Match: *`, 412 = the
+other writer won; LocalStore: `File::create_new`; EncryptingStore:
+passthrough with encryption). Everything multi-writer reduces to this.
+
+### 12.2 KMS: envelope client-side + SSE-KMS server-side, both cached
+
+Two layers, each with its own key cache, because each layer otherwise
+pays one KMS call per object at thousands of objects per day:
+
+- **Client-side (SEC-1, shipped path):** `EncryptingStore` unchanged.
+  `AwsKms` implements `Kms` via aws-sdk-kms; the trait gains
+  `generate() -> (dek, wrapped)` with a default impl (OsRng + `wrap`) so
+  `LocalKek` is untouched — GenerateDataKey returns exactly that pair in
+  one call (CiphertextBlob ≈ 184 B, inside the header's 4 KiB wrap cap).
+- **`CachingKms` decorator** (the caching-CMM pattern): encrypt-side,
+  one (dek, wrapped) pair reused until max-age (default 300 s) or
+  max-uses (default 1,000, hard cap 2¹⁶); decrypt-side, a bounded LRU of
+  wrapped-blob → dek (4,096 entries) so re-opened files cost zero KMS
+  calls. Nonce safety under reuse: each object still draws a random
+  64-bit nonce prefix, so ≤1,000 objects per DEK puts cross-object
+  nonce-collision odds near 2⁻⁴⁵. SEC-1's "per-object data keys" is
+  hereby amended to "per-window, bounds configurable" — recorded in
+  REQUIREMENTS §8. Keys live only in memory; caches are size- and
+  age-bounded. Metrics: `timelord_kms_generate_total`,
+  `timelord_kms_decrypt_total`, cache-hit counters — the drill turns
+  "reduces KMS cost" into a measured before/after number.
+- **Server-side:** every PUT carries SSE-KMS headers with
+  **S3 Bucket Keys enabled** — S3's own key cache; without it SSE-KMS
+  costs a KMS call per object and no client code can help. Key ids:
+  `TIMELORD_KMS_KEY_ID` (client layer) and `TIMELORD_S3_SSE_KEY_ID`
+  (defaults to the same; separate for blast-radius isolation if wanted).
+- Honesty about the money: at reference scale the dollar cost is small
+  (~10⁴ calls/day ≈ cents) — the cache's real wins are **latency off the
+  flush path** (a KMS round trip per L0 file otherwise), survival of KMS
+  throttling/outage windows, and call-count hygiene that stays flat as
+  the fleet grows.
+
+### 12.3 Catalog: CAS on the manifest head + checkpoints
+
+The v1 manifest log is already sequence-keyed
+(`catalog/manifest/{seq:012}.json`), so two writers racing commit seq N
+collide on the **same object key** — `put_if_absent` makes exactly one
+win. Commit becomes a loop: propose seq = head+1 → `put_if_absent` →
+on loss, list-and-replay entries past the local head, **re-validate the
+commit against the new state** (a compaction whose inputs were
+concurrently retention-dropped must abort, not commit; its orphan
+output falls to GC), re-propose. Bounded retries with jitter; commits
+are small and rare, contention is negligible at this fleet size.
+**Checkpoints** (`catalog/checkpoint/{seq}.json`, every 512 entries,
+also via `put_if_absent`) bound boot to newest-checkpoint + tail replay
+instead of a full-log LIST/GET storm. GC grace now protects the whole
+fleet's in-flight queries: it must exceed the maximum query timeout of
+any node, not just the local one.
+
+### 12.4 Roles: one binary, `TIMELORD_ROLE`
+
+`all` (v1 default — today's behavior, bench fixtures unchanged) |
+`router` | `ingester` | `querier` | `compactor`. Same crates throughout.
+
+- **Router** — stateless: hashes (db, table) → an ingester pair for LP
+  writes, forwards SQL/Flight to queriers; it is the single endpoint the
+  bench adapter, Telegraf, and Grafana keep seeing (FR-8/FR-9 contracts
+  intact, adapter untouched).
+- **Ingester (CL-2)** — write path per §5 plus: append the WAL frame to
+  the paired ingester over gRPC before the 204 ("replicated"). Peer
+  down ⇒ **degraded mode, loudly**: keep accepting on local durability
+  with a named alarm and gauge (RR-5) rather than failing writes (PR-7
+  outranks replication when a pair is half up). A dead ingester's rows
+  recover from its peer's WAL copy; replay overlap is safe because LWW
+  dedup (FR-5) makes it idempotent. Each ingester flushes its own
+  buffers to S3 and commits via catalog CAS.
+- **Querier (CL-3)** — stateless: replays the catalog from S3, then
+  tails the manifest log (~1 s poll of the list past its head — cheap).
+  **Freshness is not optional:** AT-2 demands exact counts seconds after
+  ingest, so queriers must see unflushed rows. Ingesters therefore serve
+  their live buffer snapshots over an internal Flight endpoint (Arrow
+  IPC is the natural wire for RecordBatches; PR-9's immutable snapshots
+  make it a cheap zero-copy read), and the querier's table provider
+  unions snapshot + S3 files exactly as v1 unions buffer + files. This
+  is the IOx-proven shape, forced here by the harness rather than taste.
+- **Compactor** — the §7 loops (compact/retention/GC) as a role,
+  singleton by advisory `Discovery::lease`; a double-fired compaction
+  stays safe (CAS accepts one output, GC collects the loser).
+
+### 12.5 Discovery & intra-cluster TLS
+
+Topology from the `Discovery` trait: **static** backend (config/env —
+C0–C2, dev, the drill rig) then **Consul** (registration, health,
+sessions for the compactor lease) at C3. The two standing rules hold:
+discovery informs routing and availability only — a stale membership
+view wastes work but cannot corrupt state, because every commit goes
+through catalog CAS; and leases are advisory, never correctness.
+Intra-cluster links (WAL replication, buffer snapshots, router
+forwarding) run plaintext inside the drill network at C2 and move to
+mTLS at C3 — the client-verifier `RootCertStore` behind the same
+ArcSwap machinery SEC-3 shipped.
+
+### 12.6 LocalStack: the test-and-metrics rig
+
+`bench/compose/timelorddb-s3.yml` (C0: localstack `s3,kms` + an init
+container that creates the bucket with default SSE-KMS + Bucket Keys
+and a KMS key + one `TIMELORD_ROLE=all` node) and
+`timelorddb-cluster.yml` (C2: router, ingester×2, querier×2, compactor,
+localstack). Drills recorded in `bench/results/`, in the repo's
+evidence style:
+
+- **C0 gate:** bench smoke against the S3-backed node — counts exact,
+  0 errors; the drill log records KMS calls and S3 requests with the
+  cache on vs off (`TIMELORD_KMS_CACHE=off` exists for exactly this
+  measurement), and an at-rest check (`get-object` → TLDE1 magic,
+  `head-object` → SSE-KMS fields).
+- **CAS drill:** two engines, one bucket, concurrent flush/compact —
+  exactly one winner per seq, loser converges, zero lost or duplicated
+  files after LWW.
+- **C2 drills:** cluster smoke through the router; SIGKILL an ingester
+  mid-ingest (CL-2: zero acknowledged loss via the peer's WAL); kill a
+  querier (reads continue); boot a node from an empty disk (CL-4).
+- **What LocalStack may NOT claim:** latency. Localhost S3 is not S3 —
+  the port-forwarding lesson (PERFORMANCE_LOG 2026-08-09) applies
+  doubly. LocalStack evidence is correctness, call counts, and recovery
+  behavior; latency claims wait for real S3.
+- **Fidelity checks before relying on them:** LocalStack's
+  `If-None-Match` conditional PUT and Bucket Keys support are verified
+  at C0 start; if either is unfaithful, the CAS drill runs against a
+  real S3 sandbox and LocalStack keeps the rest.
 
 ## 13. Observability (SR-4)
 
@@ -373,6 +508,15 @@ so the harness never has to shell into a container again.
 | M3 | Compaction + per-table retention; Flight SQL; Grafana renders | laptop scale; dashboards fixture (AT-6 read half) |
 | M4 | Memory pool + admission + cancellation hardening; bloom pruning | **full scale: PR-1..PR-9, RR-1..RR-4 (AT-3)** |
 | M5 | Telegraf contract tests, backup/restore drill, repeat runs | AT-4, AT-5, AT-6 complete |
+
+M0–M5 are complete. The cluster phases (§12 design):
+
+| C | Deliverable | Gate (tsdb-bench + drill) |
+|---|---|---|
+| C0 | `S3Store` + `put_if_absent`, SSE-KMS + Bucket Keys, `AwsKms` + `CachingKms`; single node on LocalStack | smoke exact on S3; KMS calls measured cache-on vs cache-off; at-rest + SSE verified |
+| C1 | Catalog CAS + checkpoints, commit re-validation | two-writer race drill: one winner per seq, loser converges, no lost/dup files |
+| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Flight), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild |
+| C3 | Consul discovery, intra-cluster mTLS, full scale | AT-3-style gate against the cluster; latency re-baselined off LocalStack |
 
 The rule from `CLAUDE.md` stands: the harness is the spec. No milestone
 is "done" on unit tests alone.
@@ -405,4 +549,16 @@ is "done" on unit tests alone.
    materializes strings for DISTINCT, funnel memory grows. *Check plan
    output at M2; contribute upstream or pre-aggregate per partition.*
 5. **Single-writer catalog becomes v2 contention point** — *CAS design
-   reviewed before M4; Iceberg prior art.*
+   reviewed before M4; Iceberg prior art. Now concretely designed as
+   `put_if_absent` on the sequence-keyed manifest (§12.3).*
+6. **LocalStack fidelity (conditional PUT, Bucket Keys)** — *verify at
+   C0 start; fallback: the CAS drill runs against a real S3 sandbox.*
+7. **Sync `Store` over an async SDK deadlocks** — *S3Store owns its
+   runtime (§12.1); loaded at C0 under concurrent scans.*
+8. **S3 request amplification on Shape A** — `load_pruned` walks
+   candidate files sequentially; latency × file count. *Measure at C0;
+   levers are parallel file loads and catalog entity summaries
+   (PERFORMANCE_LOG lead), not more caching.*
+9. **WAL replication cost vs PR-1 ingest floor** — one intra-pair RTT
+   per ack. *Measure at C2; the degraded-mode policy (§12.4) is the
+   pressure valve and must stay loud (RR-5).*
