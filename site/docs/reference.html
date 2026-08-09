@@ -265,6 +265,10 @@
             <tr><td><code>GET /health</code></td><td>—</td><td>—</td><td>200 + <code>{"status":"pass","name":"timelorddb","version":…}</code></td></tr>
             <tr><td><code>GET|HEAD /ping</code></td><td>—</td><td>—</td><td>204 + <code>x-timelorddb-version</code></td></tr>
             <tr><td><code>GET /metrics</code></td><td>—</td><td>—</td><td>200 + Prometheus text</td></tr>
+            <tr><td><code>GET /admin/retention</code></td><td>—</td><td>—</td><td>200 + <code>{"policies":[{table, seconds, duration}]}</code></td></tr>
+            <tr><td><code>PUT /admin/retention</code></td><td>body <code>table</code>, <code>duration</code> (<code>365d</code>/<code>72h</code>/<code>90m</code>/secs)</td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
+            <tr><td><code>DELETE /admin/retention/{table}</code></td><td>—</td><td>—</td><td>200; the table keeps everything again</td></tr>
+            <tr><td><code>GET /admin/ui</code></td><td>—</td><td>—</td><td>200 + the retention management page</td></tr>
             <tr><td><code>POST /admin/tls/reload</code></td><td>—</td><td>—</td><td>200 (TLS mode only)</td></tr>
           </tbody>
         </table>

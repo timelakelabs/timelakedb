@@ -13,6 +13,24 @@ here.
 
 ## [Unreleased]
 
+### Added — runtime retention management + GUI (2026-08-09)
+
+- Retention (FR-7) is now a runtime control, not a boot-time setting:
+  `GET/PUT /admin/retention` and `DELETE /admin/retention/{table}` manage
+  per-table windows (`365d`/`72h`/`90m`/seconds); changes persist to
+  `catalog/config/retention.json` through the store — envelope-encrypted
+  like every object, S3-shared in the cluster era — and outlive a restart
+  with a stale environment. `TIMELORD_RETENTION` remains the seed when no
+  stored config exists; bench fixtures are untouched.
+- `GET /admin/ui`: a self-contained management page (no build step, no
+  external assets, site palette) listing active policies, table-name
+  autocomplete from `SHOW TABLES`, set/remove with an explicit
+  "shrinking a window deletes data" warning, and the live
+  `timelord_retention_drops_total` counter.
+- SECURITY.md exposure 3a: `/admin/retention` is an **unauthenticated
+  deletion control** — the strongest reason yet to keep 1963 private
+  until token auth lands.
+
 ### Added — C0: S3 object store with KMS envelope + SSE-KMS, key-cached (2026-08-09)
 
 - New `timelord-store-s3` crate: `S3Store` implements the `Store` trait

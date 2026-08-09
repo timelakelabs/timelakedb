@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TimelordDB — Retention</title>
+<style>
+  :root{--navy:#0B1320;--blue:#2563EB;--gold:#D4AF37;--mist:#E6E8EC;--gray:#6B7280;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--navy);color:var(--mist);padding:2rem 1rem;min-height:100vh}
+  .shell{max-width:760px;margin:0 auto}
+  h1{font-size:1.4rem;font-weight:600;margin-bottom:.25rem}
+  h1 b{color:var(--gold)}
+  .sub{color:var(--gray);margin-bottom:1.5rem;font-size:.9rem}
+  .card{background:rgba(255,255,255,.04);border:1px solid rgba(230,232,236,.12);border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
+  h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--gray);margin-bottom:.9rem}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid rgba(230,232,236,.08);font-size:.92rem}
+  th{color:var(--gray);font-weight:500;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
+  td.mono{font-family:ui-monospace,Consolas,monospace}
+  .empty{color:var(--gray);padding:.6rem;font-style:italic}
+  form{display:flex;gap:.6rem;flex-wrap:wrap;align-items:flex-end}
+  label{display:flex;flex-direction:column;gap:.3rem;font-size:.78rem;color:var(--gray)}
+  input,select{background:rgba(255,255,255,.06);border:1px solid rgba(230,232,236,.18);border-radius:6px;color:var(--mist);padding:.45rem .6rem;font-size:.92rem;min-width:9rem}
+  input:focus,select:focus{outline:2px solid var(--blue);border-color:transparent}
+  button{background:var(--blue);border:0;border-radius:6px;color:#fff;padding:.5rem 1rem;font-size:.92rem;cursor:pointer}
+  button:hover{filter:brightness(1.1)}
+  button.ghost{background:transparent;border:1px solid rgba(230,232,236,.25);color:var(--mist);padding:.25rem .6rem;font-size:.8rem}
+  button.ghost:hover{border-color:#ef4444;color:#ef4444}
+  .warn{border-left:3px solid var(--gold);background:rgba(212,175,55,.08);padding:.7rem .9rem;border-radius:0 8px 8px 0;font-size:.85rem;margin-top:1rem;color:var(--mist)}
+  .msg{margin-top:.8rem;font-size:.85rem;min-height:1.2em}
+  .msg.err{color:#ef4444}.msg.ok{color:#34d399}
+  .stat{color:var(--gray);font-size:.82rem;margin-top:.6rem}
+  .stat b{color:var(--mist)}
+</style>
+</head>
+<body>
+<div class="shell">
+  <h1>Timelord<b>DB</b> · Retention</h1>
+  <div class="sub">Per-table retention windows (FR-7). Data outside a table's
+  window is dropped by whole partitions on the next enforcement pass and
+  physically deleted after the GC grace period.</div>
+
+  <div class="card">
+    <h2>Active policies</h2>
+    <table id="policies"><thead>
+      <tr><th>Table</th><th>Window</th><th>Seconds</th><th></th></tr>
+    </thead><tbody></tbody></table>
+    <div class="stat" id="dropstat"></div>
+  </div>
+
+  <div class="card">
+    <h2>Set a policy</h2>
+    <form id="setform">
+      <label>Table
+        <input id="table" list="tables" placeholder="pipeline_events" required>
+        <datalist id="tables"></datalist>
+      </label>
+      <label>Keep for
+        <input id="amount" type="number" min="1" value="90" required style="min-width:6rem">
+      </label>
+      <label>Unit
+        <select id="unit">
+          <option value="d" selected>days</option>
+          <option value="h">hours</option>
+          <option value="m">minutes</option>
+          <option value="s">seconds</option>
+        </select>
+      </label>
+      <button type="submit">Apply</button>
+    </form>
+    <div class="msg" id="msg"></div>
+    <div class="warn"><b>Shrinking a window deletes data.</b> A policy takes
+    effect on the next enforcement pass (≤ 60 s) and drops become permanent
+    once the GC grace elapses. This endpoint has no authentication —
+    see SECURITY.md.</div>
+  </div>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+
+async function loadPolicies() {
+  const r = await fetch('/admin/retention');
+  const { policies } = await r.json();
+  const tb = $('#policies tbody');
+  tb.innerHTML = '';
+  if (!policies.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">No policies — every table keeps everything.</td></tr>';
+    return;
+  }
+  for (const p of policies) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="mono">${p.table}</td><td>${p.duration}</td>` +
+      `<td class="mono">${p.seconds}</td><td style="text-align:right"></td>`;
+    const del = document.createElement('button');
+    del.className = 'ghost'; del.textContent = 'remove';
+    del.onclick = async () => {
+      if (!confirm(`Remove the ${p.duration} window on ${p.table}? The table will keep everything again.`)) return;
+      await fetch('/admin/retention/' + encodeURIComponent(p.table), { method: 'DELETE' });
+      loadPolicies();
+    };
+    tr.lastElementChild.appendChild(del);
+    tb.appendChild(tr);
+  }
+}
+
+async function loadTables() {
+  try {
+    const r = await fetch('/api/sql', { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sql: 'SHOW TABLES' }) });
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return;
+    const dl = $('#tables');
+    dl.innerHTML = '';
+    for (const row of rows) {
+      if (row.table_schema && row.table_schema !== 'public') continue;
+      const o = document.createElement('option');
+      o.value = row.table_name;
+      dl.appendChild(o);
+    }
+  } catch (_) { /* no data yet: free-text entry still works */ }
+}
+
+async function loadDrops() {
+  try {
+    const t = await (await fetch('/metrics')).text();
+    const m = t.match(/timelord_retention_drops_total (\d+)/);
+    if (m) $('#dropstat').innerHTML = `Files dropped by retention since start: <b>${m[1]}</b>`;
+  } catch (_) {}
+}
+
+$('#setform').onsubmit = async (e) => {
+  e.preventDefault();
+  const table = $('#table').value.trim();
+  const duration = $('#amount').value + $('#unit').value;
+  const msg = $('#msg');
+  msg.className = 'msg';
+  msg.textContent = 'applying…';
+  const r = await fetch('/admin/retention', { method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ table, duration }) });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = `${body.table}: keep ${body.duration} — saved durably.`;
+    loadPolicies();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'failed';
+  }
+};
+
+loadPolicies(); loadTables(); loadDrops();
+setInterval(loadDrops, 10000);
+</script>
+</body>
+</html>
