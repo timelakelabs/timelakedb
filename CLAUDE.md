@@ -90,7 +90,28 @@ This project is inspired by the following projects.
   states the posture, including that `/api/sql` can `COPY … TO` files as
   the (root) server process. Known engine hardening: manifest replay
   should skip non-`.json` files.
-- Status: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
+- Status: **SEC-1 + SEC-2 SHIPPED** (2026-08-09). SEC-1: `EncryptingStore`
+  decorator in `timelord-store` — per-object AES-256-GCM envelope
+  encryption in 64 KiB authenticated chunks (range-read compatible; AAD =
+  header + path), `Kms` trait with `LocalKek` from
+  `TIMELORD_ENCRYPTION_KEY`/`_KEY_FILE` (64 hex chars; malformed key
+  refuses to start). Chose envelope-at-chokepoint over Parquet Modular
+  Encryption (covers manifests, no arrow-rs PME dependency — ARCH §16
+  risk 2 retired); engine holds `Arc<dyn Store>`, wrap decided in
+  `Engine::open` only. Plaintext objects remain readable (migration);
+  local WAL not covered. SEC-2: `_visibility` tag with Accumulo-style
+  expressions (`(ops&audit)|admin`; no `&`/`|` mixing without parens;
+  malformed = visible to no one; unlabeled = public), enforced in
+  `LazyTable::scan` via `mandatory_predicate(session, table, schema) →
+  Option<Restriction>` — applied to every batch below user predicates,
+  COUNT(*) reads the label column so aggregates can't leak. Auths:
+  `X-Timelord-Authorizations` header / body field / Flight gRPC metadata
+  (captured into the ticket) — CLAIMS until token auth exists.  Metrics:
+  `timelord_encryption_enabled`, `timelord_visibility_rows_filtered_total`.
+  Clippy/rustfmt 1.97 drift fixed workspace-wide (byte_char_slices,
+  collapsible_if, is_multiple_of). Next: token auth (turns SEC-2 claims
+  into authorization), in-network bench re-baseline, CI on a remote.
+- Previous: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
   `bench/results/at7-drill.log`). New `timelord-tls` crate:
   validate-before-swap cert loading (PEM, expiry via x509-parser,
   key↔cert match via `CertifiedKey::from_der`), `ArcSwap` resolver

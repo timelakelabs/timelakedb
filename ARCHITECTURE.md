@@ -72,8 +72,8 @@ Two invariants shape everything:
 |---|---|
 | FR-2 no series index | Tags are Arrow dictionary columns end-to-end; no structure grows with distinct-tag-combination count |
 | RR-1 no query kills | One shared `MemoryPool` (default 20% RAM, configurable) + admission queue + spill-capable operators |
-| SEC-1 encryption later | Single `Store` trait wraps *all* object reads/writes; encryption becomes a `Store` decorator |
-| SEC-2 visibility labels later | Planner has exactly one mandatory-predicate injection hook, called for every table scan |
+| SEC-1 encryption | Single `Store` trait wraps *all* object reads/writes; encryption IS a `Store` decorator (shipped — §11) |
+| SEC-2 visibility labels | Exactly one mandatory-predicate injection hook, called for every table scan (shipped — §11) |
 | CL-1 cluster-ready | `Catalog`, `Wal`, `Store` are traits; no component assumes sole ownership except via catalog commits |
 | FR-7 per-table retention | Files never mix tables; partition time-spans align to retention granularity |
 | PR-6 fresh-data penalty | Aggressive minutes-scale L0 compaction (the lever InfluxDB 3 Core lacks — its 26× gap is our headroom) |
@@ -209,9 +209,9 @@ Flight SQL (flight)
   → session {authorizations, limits}          (SEC-2 context)
   → SQL parse/plan (DataFusion)
   → for every table scan:
-       mandatory_predicate(session, table)    ← the ONE injection point
-       (v1: passthrough no-op; later: _visibility label filter,
-        retention boundary, tenant scoping)
+       mandatory_predicate(session, table, schema)  ← the ONE injection point
+       (shipped: _visibility label filter, applied in-scan to every
+        batch; later variants: retention boundary, tenant scoping)
   → TableProvider = union of:
        a) buffer snapshot (zero-copy Arrow, immutable view)
        b) Parquet files from catalog, pruned by:
@@ -264,20 +264,41 @@ Three rungs, cheapest first; the harness decides how far to climb:
 | Dictionaries in-flight, misc | ~1 GB | bounded by batch lifecycle |
 | **Idle steady state** | **≤ 6 GB (RR-4)** | budgets above are caps, not reservations |
 
-## 11. Security hooks (SEC — designed now, wired later)
+## 11. Security hooks (SEC — SEC-1/SEC-2/SEC-3 shipped)
 
-- **`Store` chokepoint (SEC-1):** `trait Store { get, put, delete, list }`
-  over `object_store`. Encryption ships as `EncryptingStore(inner, kms)` —
-  a decorator; the engine never knows. Direction: Parquet Modular
-  Encryption for per-column keys; fallback if arrow-rs PME lags (§13
-  open question): whole-object envelope encryption at the same seam.
-- **Predicate hook (SEC-2):** `fn mandatory_predicate(session, table) ->
-  Option<Expr>` — called unconditionally by the TableProvider, composed
-  with AND below any user predicate, *before* aggregation. v1 returns
-  `None`; the visibility-label filter, retention boundaries, and tenant
-  scoping all arrive as implementations of this one function. Aggregate
-  leakage is impossible by construction because the filter is part of the
-  scan, not the API.
+- **`Store` chokepoint (SEC-1 — SHIPPED):** encryption is
+  `EncryptingStore(inner, kms)` — a decorator on the one object-I/O
+  trait; the engine cannot tell. Every object (Parquet, manifest,
+  checkpoint) gets a fresh AES-256-GCM data key, wrapped by the KMS
+  (v1: a local KEK from `TIMELORD_ENCRYPTION_KEY[_FILE]`; the `Kms`
+  trait is where per-table scoping and real KMS backends arrive).
+  Objects are encrypted in 64 KiB chunks, one auth tag each, with the
+  header and object path as AAD — chunks cannot be reordered, spliced
+  across objects, or truncated undetected. Chunking exists because the
+  read path is range reads: a bloom probe decrypts a few KB, not the
+  file. *Decision vs the original sketch:* whole-object envelope at the
+  chokepoint was chosen over Parquet Modular Encryption (§16 risk 2) —
+  it covers manifests too and owes nothing to arrow-rs PME maturity.
+  PME per-column keys remain the evolution, at this same seam.
+  Plaintext objects written before a key was configured stay readable;
+  the local WAL is out of scope (it holds minutes of data and dies with
+  the node; CL-2 WAL uploads will pass through the same store).
+- **Predicate hook (SEC-2 — SHIPPED):** `fn mandatory_predicate(session,
+  table, schema) -> Option<Restriction>` — called unconditionally by the
+  TableProvider inside `scan()`, applied to every batch (buffer and
+  file) below any user predicate and *before* aggregation; a COUNT(*)
+  that never touches the label column still reads it and still cannot
+  count a hidden row. v1 restriction: Accumulo-style row visibility —
+  a `_visibility` dictionary tag holds expressions like
+  `(ops&audit)|admin`, evaluated per distinct label against the
+  session's authorizations (HTTP `X-Timelord-Authorizations` /
+  Flight SQL metadata). Unlabeled rows are public; malformed labels are
+  visible to no one (fail closed). Retention boundaries and tenant
+  scoping arrive as further `Restriction` variants through this same
+  hook. Note: until token auth lands (§12), authorizations are claims,
+  not credentials — SECURITY.md is explicit about this.
+  Observability: `timelord_visibility_rows_filtered_total`,
+  `timelord_encryption_enabled`.
 - **TLS 1.3 everywhere, built for daily cert rotation (SEC-3):** one
   rustls `ServerConfig` shared by the HTTP stack (axum/hyper) and Flight
   SQL (tonic), TLS 1.3 with a configurable 1.2 floor. Rotation mechanics:
@@ -373,8 +394,10 @@ is "done" on unit tests alone.
 1. **Ingest target (PR-1/2) with WAL fsync on the path** — group commit
    must sustain 75K lines/s. *Test at M1 with bench ingest; if short,
    fsync window tuning before architecture changes.*
-2. **arrow-rs Parquet Modular Encryption maturity (SEC-1)** — *spike at
-   M2; fallback (envelope-at-chokepoint) already designed.*
+2. **arrow-rs Parquet Modular Encryption maturity (SEC-1)** — *resolved
+   by decision: envelope-at-chokepoint shipped instead (§11); PME
+   deferred to the per-column-key evolution, no longer on any critical
+   path.*
 3. **Fresh-penalty budget (PR-6 ≤10×)** — depends on L0 cadence under
    load. *Measured from M3 via `--scenarios query_b` on just-ingested
    data.*

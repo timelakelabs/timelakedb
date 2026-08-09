@@ -41,11 +41,14 @@ pub trait Engine: Send + Sync + 'static {
     -> Result<usize, WriteError>;
 
     /// Execute SQL against one database; returns a JSON array of row
-    /// objects (the /api/sql wire contract).
+    /// objects (the /api/sql wire contract). `authorizations` are the
+    /// session's visibility authorizations (SEC-2), from the
+    /// `X-Timelord-Authorizations` header and/or the request body.
     fn sql(
         &self,
         db: String,
         query: String,
+        authorizations: Vec<String>,
     ) -> impl std::future::Future<Output = Result<Value, String>> + Send;
 
     /// Prometheus exposition text (SR-4).
@@ -110,7 +113,14 @@ async fn write_v2<E: Engine>(
     let Some(bucket) = params.get("bucket").cloned() else {
         return err_response(StatusCode::BAD_REQUEST, "missing 'bucket' parameter");
     };
-    write_common(state.0, bucket, params.get("precision").cloned(), headers, body).await
+    write_common(
+        state.0,
+        bucket,
+        params.get("precision").cloned(),
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn write_v3<E: Engine>(
@@ -136,10 +146,9 @@ async fn write_common<E: Engine>(
         Ok(b) => b,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &format!("bad gzip body: {e}")),
     };
-    let res = tokio::task::spawn_blocking(move || {
-        engine.write_lp(&db, &body, precision.as_deref())
-    })
-    .await;
+    let res =
+        tokio::task::spawn_blocking(move || engine.write_lp(&db, &body, precision.as_deref()))
+            .await;
     match res {
         Ok(Ok(_lines)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(WriteError::BadRequest(msg))) => err_response(StatusCode::BAD_REQUEST, &msg),
@@ -149,9 +158,7 @@ async fn write_common<E: Engine>(
             Json(json!({ "error": msg })),
         )
             .into_response(),
-        Ok(Err(WriteError::Internal(msg))) => {
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
-        }
+        Ok(Err(WriteError::Internal(msg))) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
         Err(join) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &join.to_string()),
     }
 }
@@ -175,14 +182,42 @@ struct SqlRequest {
     #[serde(default)]
     db: Option<String>,
     sql: String,
+    /// Visibility authorizations (SEC-2); unioned with the
+    /// `X-Timelord-Authorizations` header.
+    #[serde(default)]
+    authorizations: Vec<String>,
+}
+
+/// Parse a comma-separated authorizations header value. Claims, not
+/// credentials, while the surface has no authn (SECURITY.md posture);
+/// the seam is what SEC-2 mandates, and a token layer slots in front.
+fn auths_from_headers(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("x-timelord-authorizations")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn sql<E: Engine>(
     State(engine): State<Arc<E>>,
+    headers: HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> axum::response::Response {
     let db = req.db.unwrap_or_else(|| "poc".to_string());
-    match engine.sql(db, req.sql).await {
+    let mut auths = auths_from_headers(&headers);
+    for a in req.authorizations {
+        if !auths.contains(&a) {
+            auths.push(a);
+        }
+    }
+    match engine.sql(db, req.sql, auths).await {
         Ok(rows) => Json(rows).into_response(),
         Err(msg) => err_response(StatusCode::BAD_REQUEST, &msg),
     }
