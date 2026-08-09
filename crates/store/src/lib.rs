@@ -20,6 +20,18 @@ pub trait Store: Send + Sync + 'static {
     /// Paths under `prefix`, sorted lexicographically (manifest replay
     /// relies on the ordering).
     fn list(&self, prefix: &str) -> std::io::Result<Vec<String>>;
+
+    /// Size in bytes, without reading the object.
+    fn size(&self, path: &str) -> std::io::Result<u64>;
+
+    /// Read `len` bytes starting at `offset`. A short object yields what
+    /// is there rather than an error, matching an HTTP range read.
+    ///
+    /// This is the seam that lets a reader take a Parquet footer and a
+    /// couple of column chunks instead of the whole file — the measured
+    /// reason row-group pruning could not pay (see
+    /// docs/evidence/PERFORMANCE_LOG.md, 2026-08-08).
+    fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 }
 
 impl<S: Store> Store for std::sync::Arc<S> {
@@ -34,6 +46,12 @@ impl<S: Store> Store for std::sync::Arc<S> {
     }
     fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         (**self).list(prefix)
+    }
+    fn size(&self, path: &str) -> std::io::Result<u64> {
+        (**self).size(path)
+    }
+    fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        (**self).get_range(path, offset, len)
     }
 }
 
@@ -79,6 +97,28 @@ impl Store for LocalStore {
 
     fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(self.abs(path))
+    }
+
+    fn size(&self, path: &str) -> std::io::Result<u64> {
+        Ok(std::fs::metadata(self.abs(path))?.len())
+    }
+
+    fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(self.abs(path))?;
+        f.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        // read_exact would fail at EOF; a range that runs past the end
+        // should return the tail, as an HTTP range read does
+        let mut filled = 0usize;
+        while filled < len {
+            match f.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
     }
 
     fn delete(&self, path: &str) -> std::io::Result<()> {
