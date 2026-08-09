@@ -61,6 +61,65 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-08 23:50 — Range reads in the Store   [ADOPTED, on bytes read — latency was a wash]
+
+**Hypothesis.** The previous cycle established that pruning cannot pay while
+`LazyTable` calls `store.get()` for the whole object and `with_row_groups`
+bounds only decoding. Give `Store` a range API, read the footer and then just
+the surviving row groups, and both the bytes moved and the latency should fall.
+
+**Change.** `Store::size` and `Store::get_range` (+ `LocalStore`), and a
+`StoreFile` in the provider implementing Parquet's `ChunkReader` over them. The
+scan now loads metadata via `ArrowReaderMetadata::load` (footer only), prunes,
+prefetches exactly the byte spans the kept row groups occupy — coalescing
+neighbours within 64 KB into one request — and decodes from those. The file
+length comes from `FileMeta::size_bytes`, so no stat either. Warm-footer scans
+reuse the cached metadata through `new_with_metadata`.
+
+**Measurement.** Bytes: a unit test on a 228 KB clustered file reads **18,493
+bytes — 8% of the file** — for a single-entity lookup, and asserts it stays
+under half. That is the whole point, it is deterministic, and it is now
+guarded. Latency, paired laptop runs (baseline n=4, candidate n=2 clean):
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| Shape A median | 53–57 ms | 57, 57 ms |
+| Shape A p95 | 72–78 ms | 69, 72 ms |
+| B1 funnel cold | 54–67 ms | 52, 93 ms |
+| Ingest | 596–605K lines/s | 594K, 578K lines/s |
+
+**Verdict.** Adopted, with the reason stated plainly: **latency is a wash on
+this hardware**, and the win is the 92% reduction in bytes read plus the seam
+itself. On a local volume a whole-file read comes out of the page cache, so
+moving less data buys nothing measurable — the syscalls saved and the syscalls
+added roughly cancel. The value is that a scan no longer *needs* the whole
+object, which is the difference between a viable and a ruinous S3 backend
+(CL-1), and it is a precondition for anything that prunes harder. Re-measure
+against real object storage before claiming a latency win.
+
+**Also fixed here, and worth more than the performance work:** a scan that
+pruned everything away built a source with **zero partitions**, so any plan
+with an `ORDER BY` above it failed its sanity check —
+`DataSourceExec: partitions=0 … does not satisfy distribution requirements:
+SinglePartition` — and returned 400 instead of an empty result. It surfaced as
+2–4 intermittent Shape A errors per 100 lookups in the benchmark. Latent in
+master, and made common by sharper pruning. Now an empty partition, with a test
+that fails without the fix.
+
+**Lesson.** Two things for the next cycle:
+
+- **Bytes moved and time taken are different metrics, and this rig only
+  resolves one of them.** A local named volume makes I/O nearly free, so any
+  change that trades syscalls for bytes will read as noise here. Measure I/O
+  work as I/O work (the counting-store test) and do not expect the laptop
+  harness to show it.
+- **An unexplained ingest anomaly recurred**: four candidate runs out of ~11
+  ingested at ~235K lines/s instead of ~590K — a clean 2.5x — while zero of six
+  baseline runs did. Every occurrence followed a Docker image build, which makes
+  host contention the likely cause, but it is not proven, and a read-path change
+  has no mechanism to slow the write path. Anyone measuring here should discard
+  runs whose ingest falls below ~500K rather than average them in.
+
 ### 2026-08-08 22:10 — Cluster L0 by entity and bound its row groups   [REJECTED]
 
 **Hypothesis.** L0 files are written time-first in one default-sized row
@@ -95,6 +154,19 @@ about 70% in three runs out of three, with no overlap between the two sets, and
 ingest drifted down. One candidate run also reported 4 Shape A errors that did
 not recur in two further runs and left no trace in the container log; unexplained,
 and not the reason for rejection, but recorded.
+
+**Retried on 2026-08-08 23:50 over range reads, and rejected again.** With the
+reader fetching only the surviving groups, Shape A did improve — median 47–50 ms
+against a 53–57 ms baseline, p95 59–64 against 72–78, max 64–71 against 88–98,
+consistent across three runs — but B1 funnel went from 54–67 ms to **153–172 ms**
+and B4 from 29–38 to 47–55, equally consistently. Coalescing the range requests
+did not help, which located the cost: it is the *row-group count*, not the I/O.
+A full scan keeps every group, and at 8K rows there are four times as many, so
+the reader emits four times as many batches — each re-carrying the shared
+dictionary, the exact effect the M4 notes warn about. Trading a 2.6x funnel
+regression for a point lookup already ten times inside its 250 ms target (PR-3)
+is a bad bargain. If this is tried a third time, vary the row-group size against
+*both* query shapes rather than optimising Shape A alone.
 
 **Lesson.** *Row-group pruning cannot pay while the reader still fetches whole
 objects.* `LazyTable` calls `store.get(&path)` (provider.rs:276 and :304) to pull

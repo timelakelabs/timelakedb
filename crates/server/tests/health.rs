@@ -436,6 +436,50 @@ async fn wal_replay_survives_restart_rr3() {
 }
 
 #[tokio::test]
+async fn a_query_pruned_to_nothing_returns_empty_not_an_error() {
+    // Pruning every row group away left the plan with a source that had no
+    // partitions at all, so anything with an ORDER BY above it failed its
+    // sanity check and came back 400. Sharper pruning makes this the common
+    // case, not a corner.
+    let dir = tempfile::tempdir().unwrap();
+    let engine_ref = engine(dir.path());
+    let app = timelord_server::app(Arc::clone(&engine_ref));
+    let t = now_ns();
+    for i in 0..20 {
+        let lp = format!("ev,pid=p{i} v=1i {}", t + i);
+        assert_eq!(
+            write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    // drain the buffer so the query has only files to prune
+    engine_ref.flush_all().expect("flush");
+
+    let (code, rows) = sql(
+        &app,
+        "poc",
+        "SELECT time, pid FROM ev WHERE pid = 'no-such-entity' ORDER BY time",
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "pruned-to-nothing must not be an error"
+    );
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(0));
+
+    // and the same query without ORDER BY, for good measure
+    let (code, rows) = sql(
+        &app,
+        "poc",
+        "SELECT COUNT(*) AS n FROM ev WHERE pid = 'no-such-entity'",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(rows[0]["n"], 0);
+}
+
+#[tokio::test]
 async fn schema_is_discoverable_over_sql() {
     // Without information_schema, SHOW TABLES failed outright and every
     // BI tool that starts by enumerating a schema was locked out.

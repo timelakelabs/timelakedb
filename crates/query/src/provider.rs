@@ -29,6 +29,189 @@ use timelord_store::Store;
 
 use datafusion::arrow::record_batch::RecordBatch;
 
+/// A Parquet file read through the [`Store`] in ranges rather than whole.
+///
+/// The reader asks for the footer, then for the column chunks of the row
+/// groups that survived pruning; nothing else leaves the store. Before
+/// this, every scan pulled the entire object into memory and `with_row_groups`
+/// bounded only *decoding* — which is why finer row groups measured as a
+/// regression rather than a win (docs/evidence/PERFORMANCE_LOG.md).
+pub struct StoreFile {
+    store: Arc<dyn Store>,
+    path: String,
+    len: u64,
+    /// Ranges already fetched, sorted by start and non-overlapping. The
+    /// reader is served from these; anything outside falls back to a
+    /// fresh range request.
+    blocks: Vec<(u64, bytes::Bytes)>,
+}
+
+impl StoreFile {
+    pub fn open(store: Arc<dyn Store>, path: &str) -> Result<Self, String> {
+        let len = store
+            .size(path)
+            .map_err(|e| format!("store size {path}: {e}"))?;
+        Ok(Self::with_len(store, path, len))
+    }
+
+    /// The catalog already records every file's size, so a scan does not
+    /// need to stat it — one syscall per candidate file, on a path that
+    /// touches every file in the partition.
+    pub fn with_len(store: Arc<dyn Store>, path: &str, len: u64) -> Self {
+        StoreFile {
+            store,
+            path: path.to_string(),
+            len,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Fetch exactly the bytes the kept row groups occupy — one request per
+    /// group, because a group's column chunks are contiguous on disk.
+    ///
+    /// Doing this up front is what makes pruning worth anything: without it
+    /// the reader pulls whatever it happens to need through small reads and
+    /// (with read-ahead) can fetch several times the file.
+    pub fn prefetch_row_groups(
+        &mut self,
+        md: &datafusion::parquet::file::metadata::ParquetMetaData,
+        keep: &[usize],
+    ) -> Result<(), String> {
+        let mut spans: Vec<(u64, u64)> = Vec::with_capacity(keep.len());
+        for &rg in keep {
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for c in md.row_group(rg).columns() {
+                let (start, len) = c.byte_range();
+                lo = lo.min(start);
+                hi = hi.max(start + len);
+            }
+            if lo < hi {
+                spans.push((lo, hi));
+            }
+        }
+        spans.sort_unstable();
+
+        // Coalesce neighbours before fetching. A point lookup keeps one or
+        // two groups and reads a sliver; a full scan keeps them all, and
+        // without this it paid a separate request per group — which is what
+        // turned the funnel queries 2.6x slower when this was first measured.
+        // Bridging a small gap is cheaper than a second round trip.
+        const GAP: u64 = 64 << 10;
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+        for (lo, hi) in spans {
+            match merged.last_mut() {
+                Some((_, prev_hi)) if lo <= *prev_hi + GAP => *prev_hi = (*prev_hi).max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+
+        for (lo, hi) in merged {
+            let bytes = self
+                .store
+                .get_range(&self.path, lo, (hi - lo) as usize)
+                .map_err(|e| format!("store range {}: {e}", self.path))?;
+            self.blocks.push((lo, bytes::Bytes::from(bytes)));
+        }
+        self.blocks.sort_by_key(|(start, _)| *start);
+        Ok(())
+    }
+
+    /// The prefetched block containing `start`, and the offset into it.
+    fn covering(&self, start: u64) -> Option<(&bytes::Bytes, usize)> {
+        self.blocks.iter().find_map(|(s, b)| {
+            (start >= *s && start < *s + b.len() as u64).then(|| (b, (start - *s) as usize))
+        })
+    }
+}
+
+impl datafusion::parquet::file::reader::Length for StoreFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl datafusion::parquet::file::reader::ChunkReader for StoreFile {
+    type T = Box<dyn std::io::Read + Send>;
+
+    fn get_read(&self, start: u64) -> datafusion::parquet::errors::Result<Self::T> {
+        if let Some((block, off)) = self.covering(start) {
+            return Ok(Box::new(std::io::Cursor::new(block.slice(off..))));
+        }
+        Ok(Box::new(StoreRangeReader {
+            store: self.store.clone(),
+            path: self.path.clone(),
+            pos: start,
+            end: self.len,
+            buf: Vec::new(),
+            buf_pos: 0,
+        }))
+    }
+
+    fn get_bytes(
+        &self,
+        start: u64,
+        length: usize,
+    ) -> datafusion::parquet::errors::Result<bytes::Bytes> {
+        if let Some((block, off)) = self.covering(start)
+            && off + length <= block.len()
+        {
+            return Ok(block.slice(off..off + length));
+        }
+        let v = self
+            .store
+            .get_range(&self.path, start, length)
+            .map_err(|e| {
+                datafusion::parquet::errors::ParquetError::General(format!(
+                    "store range {}[{start}+{length}]: {e}",
+                    self.path
+                ))
+            })?;
+        Ok(bytes::Bytes::from(v))
+    }
+}
+
+/// Sequential reader over a store object, fetched in chunks on demand.
+/// The Parquet reader takes a column chunk as `get_read(start).take(len)`,
+/// so this never needs to know the chunk length up front.
+pub struct StoreRangeReader {
+    store: Arc<dyn Store>,
+    path: String,
+    pos: u64,
+    end: u64,
+    buf: Vec<u8>,
+    buf_pos: usize,
+}
+
+impl StoreRangeReader {
+    /// Fallback granularity only — the row groups a scan actually decodes
+    /// are prefetched whole by [`StoreFile::prefetch_row_groups`]. Kept
+    /// small because read-ahead here is speculative: at 1 MiB a scan of a
+    /// 228 KB file read 1.79 MB, which is how the first attempt at this
+    /// was caught.
+    const CHUNK: usize = 64 << 10;
+}
+
+impl std::io::Read for StoreRangeReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.buf_pos >= self.buf.len() {
+            if self.pos >= self.end {
+                return Ok(0);
+            }
+            let want = Self::CHUNK.min((self.end - self.pos) as usize);
+            self.buf = self.store.get_range(&self.path, self.pos, want)?;
+            self.buf_pos = 0;
+            if self.buf.is_empty() {
+                return Ok(0);
+            }
+            self.pos += self.buf.len() as u64;
+        }
+        let n = out.len().min(self.buf.len() - self.buf_pos);
+        out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        Ok(n)
+    }
+}
+
 /// Time bounds and tag-equality literals extracted from pushed filters.
 #[derive(Debug, Default, Clone)]
 pub struct Pruning {
@@ -260,52 +443,41 @@ fn load_pruned(
             .expect("meta cache lock")
             .get(&meta.path)
             .cloned();
-        let (keep, mut bytes_opt): (Vec<usize>, Option<bytes::Bytes>) = match cached_md {
-            Some(md) => {
-                let keep = if pruning.tag_equals.is_empty() {
-                    (0..md.num_row_groups()).collect()
-                } else {
-                    stats_keep_row_groups(&md, &pruning.tag_equals)
-                };
-                (keep, None)
-            }
+        // Range-read handle: only the footer and the surviving row groups
+        // ever leave the store.
+        use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+        let mut file = StoreFile::with_len(store.clone(), &meta.path, meta.size_bytes);
+
+        let md: Arc<_> = match cached_md {
+            Some(md) => md,
             None => {
-                let bytes = bytes::Bytes::from(
-                    store
-                        .get(&meta.path)
-                        .map_err(|e| format!("store get {}: {e}", meta.path))?,
-                );
-                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                // footer only — a range read, not the file
+                let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
                     .map_err(|e| e.to_string())?;
-                let md: Arc<_> = Arc::new(builder.metadata().as_ref().clone());
-                {
-                    let mut cache = meta_cache.lock().expect("meta cache lock");
-                    if cache.len() > 4096 {
-                        cache.clear(); // crude bound; files are few post-compaction
-                    }
-                    cache.insert(meta.path.clone(), md.clone());
+                let md = loaded.metadata().clone();
+                let mut cache = meta_cache.lock().expect("meta cache lock");
+                if cache.len() > 4096 {
+                    cache.clear(); // crude bound; files are few post-compaction
                 }
-                let keep = if pruning.tag_equals.is_empty() {
-                    (0..md.num_row_groups()).collect()
-                } else {
-                    stats_keep_row_groups(&md, &pruning.tag_equals)
-                };
-                (keep, Some(bytes))
+                cache.insert(meta.path.clone(), md.clone());
+                md
             }
+        };
+
+        let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
+            (0..md.num_row_groups()).collect()
+        } else {
+            stats_keep_row_groups(&md, &pruning.tag_equals)
         };
         if keep.is_empty() {
             continue;
         }
-        let bytes = match bytes_opt.take() {
-            Some(b) => b,
-            None => bytes::Bytes::from(
-                store
-                    .get(&meta.path)
-                    .map_err(|e| format!("store get {}: {e}", meta.path))?,
-            ),
-        };
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| e.to_string())?;
+
+        // fetch just those groups, then decode from memory
+        file.prefetch_row_groups(&md, &keep)?;
+        let arrow_md = ArrowReaderMetadata::try_new(md, ArrowReaderOptions::default())
+            .map_err(|e| e.to_string())?;
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_md);
 
         // projection pushdown: decode only the columns the plan needs
         let builder = match needed {
@@ -484,7 +656,17 @@ impl TableProvider for LazyTable {
             crate::align_to(target_schema.clone(), batches)
                 .map_err(DataFusionError::Execution)?
         };
-        let parts: Vec<Vec<RecordBatch>> = aligned.into_iter().map(|b| vec![b]).collect();
+        // One partition per batch — but never ZERO partitions. A scan that
+        // prunes everything away used to build a source with no partitions
+        // at all, and any plan with a SortExec above it (every ORDER BY)
+        // then failed its sanity check with a 400 instead of returning an
+        // empty result. Sharper pruning makes that case common, so it has
+        // to be an empty partition rather than no partition.
+        let parts: Vec<Vec<RecordBatch>> = if aligned.is_empty() {
+            vec![Vec::new()]
+        } else {
+            aligned.into_iter().map(|b| vec![b]).collect()
+        };
         // projection already applied via the target schema
         MemorySourceConfig::try_new_exec(&parts, target_schema, None)
             .map(|e| e as Arc<dyn ExecutionPlan>)
@@ -531,6 +713,141 @@ mod tests {
         // no literals: everything survives
         let keep = stats_keep_row_groups(md, &[]);
         assert_eq!(keep.len(), total);
+    }
+
+    /// An in-memory store that remembers how many bytes it handed out.
+    struct CountingStore {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        bytes_read: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingStore {
+        fn with(path: &str, bytes: Vec<u8>) -> Arc<CountingStore> {
+            let mut m = std::collections::HashMap::new();
+            m.insert(path.to_string(), bytes);
+            Arc::new(CountingStore {
+                objects: std::sync::Mutex::new(m),
+                bytes_read: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read(&self) -> u64 {
+            self.bytes_read.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Store for CountingStore {
+        fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bytes.to_vec());
+            Ok(())
+        }
+        fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            let m = self.objects.lock().unwrap();
+            let v = m
+                .get(path)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path))?;
+            self.bytes_read
+                .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(v.clone())
+        }
+        fn delete(&self, path: &str) -> std::io::Result<()> {
+            self.objects.lock().unwrap().remove(path);
+            Ok(())
+        }
+        fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            let m = self.objects.lock().unwrap();
+            let mut out: Vec<String> = m
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+        fn size(&self, path: &str) -> std::io::Result<u64> {
+            let m = self.objects.lock().unwrap();
+            m.get(path)
+                .map(|v| v.len() as u64)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path))
+        }
+        fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            let m = self.objects.lock().unwrap();
+            let v = m
+                .get(path)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path))?;
+            let start = (offset as usize).min(v.len());
+            let end = start.saturating_add(len).min(v.len());
+            self.bytes_read
+                .fetch_add((end - start) as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(v[start..end].to_vec())
+        }
+    }
+
+    #[test]
+    fn a_pruned_scan_reads_ranges_not_the_whole_file() {
+        use timelord_buffer::{TableBuffer, flush};
+        use timelord_ingest::parse_lines;
+
+        // one entity-clustered file, small row groups
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..20_000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", (i * 7919) % 20_000, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let parts = flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
+        let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(1024)).unwrap();
+        let file_len = bytes.len() as u64;
+
+        let path = "poc/m/data/2026080809/f.parquet";
+        let store = CountingStore::with(path, bytes);
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let meta = FileMeta {
+            db: "poc".into(),
+            table: "m".into(),
+            partition: "2026080809".into(),
+            path: path.into(),
+            rows: 20_000,
+            size_bytes: file_len,
+            min_ts_ns: t,
+            max_ts_ns: t + 20_000,
+        };
+
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let pruning = Pruning {
+            tag_equals: vec![("pid".into(), "p00042".into())],
+            ..Default::default()
+        };
+        let (batches, _res) = load_pruned(
+            &[],
+            std::slice::from_ref(&meta),
+            &store_dyn,
+            &pruning,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            &pool,
+            "m",
+            &Arc::new(MetaCache::default()),
+        )
+        .expect("scan");
+
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "the row filter still returns exactly the entity");
+
+        // The point of the exercise: a single-entity lookup must not pull
+        // the whole object. It used to read 100% of every candidate file,
+        // which is why row-group pruning bought nothing.
+        let read = store.read();
+        assert!(
+            read < file_len / 2,
+            "read {read} of {file_len} bytes — pruning must not fetch the whole file"
+        );
+        // measured at ~8% of the file when this landed
     }
 
     #[test]
