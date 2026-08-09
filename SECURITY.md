@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-TimelordDB is **pre-v1**. Only `main` is supported; there are no released
+TimeLakeDB is **pre-v1**. Only `main` is supported; there are no released
 versions and no backports. The workspace version is `0.1.0`.
 
 | Version | Supported |
@@ -18,7 +18,7 @@ public issue for a suspected vulnerability, and do not attack a deployment
 you do not own.
 
 A useful report includes the version or commit, the configuration
-(`TIMELORD_*` variables, whether TLS is on), the exposure model (what a
+(`TIMELAKE_*` variables, whether TLS is on), the exposure model (what a
 reachable attacker can do), and a reproduction. Expect an acknowledgement
 within a week; this is a single-maintainer project with no on-call rotation,
 so please size your disclosure timeline accordingly.
@@ -34,21 +34,21 @@ design until the data-plane migration (a deliberate breaking change for
 Telegraf, Grafana and every existing client). Network reachability is
 still the only access control over your data.
 
-Treat a TimelordDB port as equivalent to an unauthenticated shell into the
+Treat a TimeLakeDB port as equivalent to an unauthenticated shell into the
 data. Bind it to localhost or a private network segment, and put an
 authenticating proxy in front of it if anything other than your own agents
 needs access.
 
 | Control | Status |
 |---|---|
-| Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELORD_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
+| Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELAKE_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
 | Client certificate / mTLS | Not implemented — server-side TLS only. Mutual TLS is v2 (SEC-3 intra-cluster). |
 | Authentication | **Admin surface only (SEC-4).** `/admin/*` requires a session: Argon2id credentials, cookie sessions (HttpOnly, SameSite=Strict, idle 30 min / absolute 12 h) or bearer tokens, CSRF + Origin checks on mutations, per-principal backoff on failed logins. **The data plane is still open** — write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything. |
 | Authorization | **Roles on the admin surface.** `viewer` (read), `operator` (non-destructive changes, *growing* a retention window), `admin` (shrinking/removing retention, principal management). No per-database/table permissions on the data plane. |
-| First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelord_admin_default_credential_active`. |
+| First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelake_admin_default_credential_active`. |
 | Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
-| Encryption at rest | **Implemented, opt-in.** Set `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or `TIMELORD_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough); the local WAL is **not** encrypted. |
-| Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-Timelord-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
+| Encryption at rest | **Implemented, opt-in.** Set `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or `TIMELAKE_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough); the local WAL is **not** encrypted. |
+| Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-TimeLake-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
 | Audit logging | Not implemented. Writes and queries are not attributed to a principal, because there is no principal. |
 | Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
 
@@ -81,9 +81,9 @@ follow from "no authentication" and are listed so you can design around them.
    (see below), so the window between first start and the first password
    change is a window in which a reachable attacker can take the console.
    The seeded credential can do nothing but change its own password, and
-   `timelord_admin_default_credential_active` is 1 until it does — but the
+   `timelake_admin_default_credential_active` is 1 until it does — but the
    mitigation is procedural, not structural. Set
-   `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` to skip the well-known default
+   `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` to skip the well-known default
    entirely, or change the password immediately after first start.
 
 4. **The container runs as root.** The image has no `USER` directive, so the
@@ -99,7 +99,7 @@ follow from "no authentication" and are listed so you can design around them.
    consuming the whole admission budget.
 
 7. **Visibility authorizations are self-asserted.** There is no
-   authentication, so `X-Timelord-Authorizations: admin` is a claim any
+   authentication, so `X-TimeLake-Authorizations: admin` is a claim any
    client can make. Until token auth lands, SEC-2 is a correct enforcement
    mechanism behind an honor-system front door: real isolation requires an
    authenticating proxy that *sets* (and strips inbound) that header.
@@ -114,20 +114,20 @@ follow from "no authentication" and are listed so you can design around them.
 ## Deploying it safely today
 
 - **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
-  (`TIMELORD_ADDR=127.0.0.1:1963`) or to a private Docker/Kubernetes network,
+  (`TIMELAKE_ADDR=127.0.0.1:1963`) or to a private Docker/Kubernetes network,
   and publish nothing.
 - **Front it with something that authenticates** if remote access is needed — a
   reverse proxy doing mTLS or token checks, or a VPN/overlay network. Note that
   Flight SQL is gRPC over HTTP/2, so any proxy in front of `:1964` must speak
   HTTP/2.
-- **Enable TLS** (`TIMELORD_TLS_CERT`/`_KEY`) even on a private network; it is
+- **Enable TLS** (`TIMELAKE_TLS_CERT`/`_KEY`) even on a private network; it is
   the one security control that is finished and drilled.
 - **Set a container memory limit.** `mem_limit` is not optional in practice —
   an unbounded engine took down an entire Docker VM during development.
 - **Run it on a dedicated volume** with nothing else of value on the filesystem,
   given exposure (2) and (4).
-- **Alert on certificate health**: `timelord_tls_last_reload_ok == 0` and
-  `timelord_tls_cert_expiry_seconds` below two renewal periods. A failed
+- **Alert on certificate health**: `timelake_tls_last_reload_ok == 0` and
+  `timelake_tls_cert_expiry_seconds` below two renewal periods. A failed
   renewal keeps serving on the last-good pair, which is exactly why it can go
   unnoticed until expiry.
 

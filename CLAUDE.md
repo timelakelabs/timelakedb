@@ -1,4 +1,4 @@
-# TimelordDB
+# TimeLakeDB
 
 A new time-series database, specified from evidence: five engines ran the
 identical high-cardinality workload under `bench/` (tsdb-bench), and
@@ -45,12 +45,12 @@ This project is inspired by the following projects.
   row visibility labels (SEC-2) are v1 *design constraints* — one narrow
   object-I/O layer, one mandatory-predicate injection point.
 - **Configuration is layered, not owned by one place** (§17, designed
-  2026-08-09): `EngineConfig::default()` < `TIMELORD_*` system property <
+  2026-08-09): `EngineConfig::default()` < `TIMELAKE_*` system property <
   stored override, with every layer visible, a revert to the layer
   beneath, and divergence from the property reported loudly (RR-5).
   Overrides are three-state — absent (inherit), a value, or explicit-none
   (off regardless of the property) — because "revert to the property" and
-  "keep everything anyway" are different intents. `TIMELORD_CONFIG_PINNED`
+  "keep everything anyway" are different intents. `TIMELAKE_CONFIG_PINNED`
   locks named keys to the property layer. The console gets its own
   listener (1965, private by default) with SEC-4 auth; the admin
   endpoints move off 1963.
@@ -66,7 +66,7 @@ This project is inspired by the following projects.
 
 - **This machine has Docker but no Rust toolchain** (no MSVC either) —
   build and test via Docker:
-  `docker compose -f bench/compose/timelorddb.yml up -d --build`
+  `docker compose -f bench/compose/timelakedb.yml up -d --build`
   then `curl http://localhost:1963/health`.
 - CI (`.github/workflows/ci.yml`) runs fmt + clippy -D warnings + tests.
 - The website is `site/` — hand-written HTML/CSS/SVG, no build step, all
@@ -79,7 +79,7 @@ This project is inspired by the following projects.
   local design asset, deliberately untracked.) Site claims must trace to
   `bench/results/` — no marketing numbers.
 - With a local toolchain: `cargo test --workspace`,
-  `cargo run -p timelord-server` (listens on TIMELORD_ADDR,
+  `cargo run -p timelake-server` (listens on TIMELAKE_ADDR,
   default 0.0.0.0:1963).
 - Reference docs: `site/docs/reference.html` (line protocol, SQL dialect,
   HTTP + Flight SQL surface, InfluxDB compatibility matrix, metrics,
@@ -104,8 +104,20 @@ This project is inspired by the following projects.
   states the posture, including that `/api/sql` can `COPY … TO` files as
   the (root) server process. Known engine hardening: manifest replay
   should skip non-`.json` files.
+- **RENAMED TimelordDB → TimeLakeDB** (2026-08-09). Crates `timelake-*`,
+  env `TIMELAKE_*`, metrics `timelake_*`, headers
+  `X-TimeLake-Authorizations` / `x-timelake-csrf`, data dir
+  `/var/lib/timelake/data`, adapter `bench/backends/timelakedb.py`
+  (backend key `timelakedb`), compose `bench/compose/timelakedb*.yml`.
+  Target GitHub org: `timelakedb` (free; `timelakelabs` parked).
+  **Deliberately unchanged:** the `TLDE1` encryption magic (format
+  marker, not brand — renaming it makes old objects fail the magic check
+  and fall into plaintext passthrough = silent corruption), historical
+  `bench/results/**` and `ops/logs/**` (records of runs that really
+  happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
+  Local repo directory is still `TimelordDB/` — rename it whenever.
 - Status: **SEC-4 admin auth SHIPPED** (2026-08-09, drill
-  `bench/results/sec4-auth-drill.log`). New `timelord-auth` crate:
+  `bench/results/sec4-auth-drill.log`). New `timelake-auth` crate:
   roles viewer<operator<admin, Argon2id, sessions (cookie or bearer,
   30 min idle / 12 h absolute), CSRF double-submit + Origin on cookie
   mutations, per-principal login backoff; principals persist at
@@ -115,13 +127,13 @@ This project is inspired by the following projects.
   answers is POST /admin/password; everything else 403
   `password_change_required`. Rotation kills all that principal's
   sessions (including the one that rotated). Policy: ≥8 chars, not the
-  username, not "admin". `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` avoids the
+  username, not "admin". `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` avoids the
   well-known default. This REVERSES the bootstrap-token design — cost
   and mitigations recorded in docs/CONSOLE.md §4.2, REQUIREMENTS SEC-4
   amended. Retention authz follows the data: grow=operator,
   shrink/introduce/remove=admin. Console `/admin/ui` is now
   sign-in → forced rotation → manage. Metrics:
-  timelord_admin_default_credential_active (ALERT ON THIS),
+  timelake_admin_default_credential_active (ALERT ON THIS),
   _logins_total, _login_failures_total. **Data plane deliberately still
   open** so Telegraf/Grafana/bench work — that migration is its own
   milestone. Tests: 6 auth unit + 19 server integration.
@@ -129,7 +141,7 @@ This project is inspired by the following projects.
   `GET/PUT /admin/retention`, `DELETE /admin/retention/{table}`, GUI at
   `/admin/ui` (self-contained HTML in `crates/api/src/admin_ui.html`,
   site palette). Policies persist at `catalog/config/retention.json`
-  via the Store (encrypted; store copy outranks the `TIMELORD_RETENTION`
+  via the Store (encrypted; store copy outranks the `TIMELAKE_RETENTION`
   env seed at boot; plain put — CAS if concurrent admins ever matter).
   Engine: `retention: RwLock<…>` replaces cfg reads in
   `enforce_retention`. SECURITY exposure 3a: it's an unauthenticated
@@ -137,28 +149,28 @@ This project is inspired by the following projects.
   _persists_fr7.
 - Previous: **C0 SHIPPED — S3 + KMS, key-cached** (2026-08-09, ARCH §12
   design phased C0-C3; drill log `bench/results/c0-s3-drill.log`).
-  New `timelord-store-s3` crate: `S3Store` (aws-sdk-s3 behind the Store
+  New `timelake-store-s3` crate: `S3Store` (aws-sdk-s3 behind the Store
   trait; owned-runtime sync bridge — never `block_on` in callers;
   path-style auto under `AWS_ENDPOINT_URL`) and `AwsKms`
   (GenerateDataKey/Decrypt behind the Kms trait). `Store` gained
   `put_if_absent` (CAS primitive: S3 If-None-Match, local hard-link
   publish) — C1 switches catalog commits to it. `Kms` gained
   `generate()`; `CachingKms` decorator = caching-CMM (300s/1000-use
-  encrypt window, decrypt LRU, hard cap 2^16; `TIMELORD_KMS_CACHE=off`
+  encrypt window, decrypt LRU, hard cap 2^16; `TIMELAKE_KMS_CACHE=off`
   is the measured baseline). SSE-KMS + Bucket Keys per PUT and as
-  bucket default. Env: `TIMELORD_OBJECT_STORE=s3://…`,
-  `TIMELORD_KMS_KEY_ID` (alias ok; mutually exclusive with
-  `TIMELORD_ENCRYPTION_KEY`). Rig: `bench/compose/timelorddb-s3.yml`
-  (LocalStack s3+kms, init hook creates alias/timelord + buckets;
+  bucket default. Env: `TIMELAKE_OBJECT_STORE=s3://…`,
+  `TIMELAKE_KMS_KEY_ID` (alias ok; mutually exclusive with
+  `TIMELAKE_ENCRYPTION_KEY`). Rig: `bench/compose/timelakedb-s3.yml`
+  (LocalStack s3+kms, init hook creates alias/timelake + buckets;
   ports 3966/3967) — proves correctness/call-counts/recovery, NEVER
   latency. Ignored integration tests run in-network:
-  `cargo test -p timelord-store-s3 -- --ignored`. Next: C1 catalog CAS
+  `cargo test -p timelake-store-s3 -- --ignored`. Next: C1 catalog CAS
   (two-writer drill), C2 role split, C3 Consul+mTLS+real-AWS sizing.
 - Previous: **SEC-1 + SEC-2 SHIPPED** (2026-08-09). SEC-1: `EncryptingStore`
-  decorator in `timelord-store` — per-object AES-256-GCM envelope
+  decorator in `timelake-store` — per-object AES-256-GCM envelope
   encryption in 64 KiB authenticated chunks (range-read compatible; AAD =
   header + path), `Kms` trait with `LocalKek` from
-  `TIMELORD_ENCRYPTION_KEY`/`_KEY_FILE` (64 hex chars; malformed key
+  `TIMELAKE_ENCRYPTION_KEY`/`_KEY_FILE` (64 hex chars; malformed key
   refuses to start). Chose envelope-at-chokepoint over Parquet Modular
   Encryption (covers manifests, no arrow-rs PME dependency — ARCH §16
   risk 2 retired); engine holds `Arc<dyn Store>`, wrap decided in
@@ -169,24 +181,24 @@ This project is inspired by the following projects.
   `LazyTable::scan` via `mandatory_predicate(session, table, schema) →
   Option<Restriction>` — applied to every batch below user predicates,
   COUNT(*) reads the label column so aggregates can't leak. Auths:
-  `X-Timelord-Authorizations` header / body field / Flight gRPC metadata
+  `X-TimeLake-Authorizations` header / body field / Flight gRPC metadata
   (captured into the ticket) — CLAIMS until token auth exists.  Metrics:
-  `timelord_encryption_enabled`, `timelord_visibility_rows_filtered_total`.
+  `timelake_encryption_enabled`, `timelake_visibility_rows_filtered_total`.
   Clippy/rustfmt 1.97 drift fixed workspace-wide (byte_char_slices,
   collapsible_if, is_multiple_of). Next: token auth (turns SEC-2 claims
   into authorization), in-network bench re-baseline, CI on a remote.
 - Previous: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
-  `bench/results/at7-drill.log`). New `timelord-tls` crate:
+  `bench/results/at7-drill.log`). New `timelake-tls` crate:
   validate-before-swap cert loading (PEM, expiry via x509-parser,
   key↔cert match via `CertifiedKey::from_der`), `ArcSwap` resolver
   consulted only at handshake, last-good + named
   `SEC3_CERT_RENEWAL_FAILED` alarm on a bad renewal. Both listeners TLS
-  when `TIMELORD_TLS_CERT`/`_KEY` set (HTTP via axum-server, Flight via
+  when `TIMELAKE_TLS_CERT`/`_KEY` set (HTTP via axum-server, Flight via
   tokio-rustls accept loop into `serve_with_incoming`); plaintext stays
   the default (bench/fixtures unchanged). Triggers: 2 s mtime watcher
   (works through a Windows bind mount) + POST /admin/tls/reload.
-  Gauges: timelord_tls_cert_expiry_seconds, timelord_tls_last_reload_ok.
-  Drill stack: `compose/timelorddb-tls.yml` (ports 2963/2964) +
+  Gauges: timelake_tls_cert_expiry_seconds, timelake_tls_last_reload_ok.
+  Drill stack: `compose/timelakedb-tls.yml` (ports 2963/2964) +
   `tls-drill/` (gen-certs.sh, at7_drill.py). Gotcha: rust:1-slim moved
   to trixie — runtime stage must be trixie-slim or the binary dies with
   `GLIBC_2.38 not found`. Post-TLS smoke gate green (0 errors, Shape A
@@ -225,7 +237,7 @@ This project is inspired by the following projects.
      spawn_blocking or yielding chunked loads. THIS FIRST.
   2. Compose service has NO memory limit — a runaway container took down
      the Docker VM (all host containers!). Add mem_limit ~6g to
-     bench/compose/timelorddb.yml before any further full-scale run.
+     bench/compose/timelakedb.yml before any further full-scale run.
   3. Shape A ~4 s/lookup at full scale: bloom row-group pruning
      apparently ineffective — VERIFY blooms are actually written for
      Dictionary columns (SerializedFileReader on a real file); arrow
@@ -242,8 +254,8 @@ This project is inspired by the following projects.
 ## Ground rules for work in this directory
 
 - The acceptance test is `bench/` — do not invent a new harness.
-  A `timelorddb` backend adapter + compose target makes any prototype
-  measurable with `python bench.py run --backend timelorddb` and
+  A `timelakedb` backend adapter + compose target makes any prototype
+  measurable with `python bench.py run --backend timelakedb` and
   comparable via `bench.py compare` against the recorded baselines in
   `bench/results/`.
 - The hard invariant is RR-1: no query may kill the server. Designs that

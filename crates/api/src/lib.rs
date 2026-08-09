@@ -5,7 +5,7 @@
 //! parse errors are 400 with the offending line identified.
 //!
 //! The router is generic over the [`Engine`] trait so this crate owns the
-//! wire contract while timelord-server owns the machinery.
+//! wire contract while timelake-server owns the machinery.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use timelord_auth::{Auth, Role, SessionInfo};
+use timelake_auth::{Auth, Role, SessionInfo};
 
 /// Errors the write path can surface over the wire.
 pub enum WriteError {
@@ -33,7 +33,7 @@ pub enum WriteError {
 }
 
 /// The seam between HTTP and the engine. Implemented by
-/// `timelord_server::Engine`; mockable for endpoint tests.
+/// `timelake_server::Engine`; mockable for endpoint tests.
 pub trait Engine: Send + Sync + 'static {
     /// Parse, make durable (WAL), and apply one line-protocol body.
     /// Returns the number of lines written. Blocking (fsync) — the
@@ -44,7 +44,7 @@ pub trait Engine: Send + Sync + 'static {
     /// Execute SQL against one database; returns a JSON array of row
     /// objects (the /api/sql wire contract). `authorizations` are the
     /// session's visibility authorizations (SEC-2), from the
-    /// `X-Timelord-Authorizations` header and/or the request body.
+    /// `X-TimeLake-Authorizations` header and/or the request body.
     fn sql(
         &self,
         db: String,
@@ -66,7 +66,7 @@ pub trait Engine: Send + Sync + 'static {
 }
 
 /// Parse "365d", "72h", "90m", or bare seconds — the write half of the
-/// same grammar `TIMELORD_RETENTION` seeds with.
+/// same grammar `TIMELAKE_RETENTION` seeds with.
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num, unit) = match s.chars().last()? {
@@ -173,7 +173,7 @@ async fn admin_ui() -> axum::response::Html<&'static str> {
 }
 
 const SESSION_COOKIE: &str = "tldb_admin_session";
-const CSRF_HEADER: &str = "x-timelord-csrf";
+const CSRF_HEADER: &str = "x-timelake-csrf";
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -350,7 +350,7 @@ async fn session_login<E: Engine>(
             )
                 .into_response()
         }
-        Err(e @ timelord_auth::LoginError::RateLimited(_)) => (
+        Err(e @ timelake_auth::LoginError::RateLimited(_)) => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({ "error": e.to_string(), "code": "rate_limited" })),
         )
@@ -555,7 +555,7 @@ async fn retention_delete<E: Engine>(
 async fn health() -> Json<Value> {
     Json(json!({
         "status": "pass",
-        "name": "timelorddb",
+        "name": "timelakedb",
         "version": env!("CARGO_PKG_VERSION"),
         "milestone": "M3",
     }))
@@ -566,7 +566,7 @@ async fn ping<E: Engine>(
 ) -> (StatusCode, [(&'static str, &'static str); 1]) {
     (
         StatusCode::NO_CONTENT,
-        [("x-timelorddb-version", env!("CARGO_PKG_VERSION"))],
+        [("x-timelakedb-version", env!("CARGO_PKG_VERSION"))],
     )
 }
 
@@ -668,7 +668,7 @@ struct SqlRequest {
     db: Option<String>,
     sql: String,
     /// Visibility authorizations (SEC-2); unioned with the
-    /// `X-Timelord-Authorizations` header.
+    /// `X-TimeLake-Authorizations` header.
     #[serde(default)]
     authorizations: Vec<String>,
 }
@@ -678,7 +678,7 @@ struct SqlRequest {
 /// the seam is what SEC-2 mandates, and a token layer slots in front.
 fn auths_from_headers(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get("x-timelord-authorizations")
+        .get("x-timelake-authorizations")
         .and_then(|v| v.to_str().ok())
         .map(|v| {
             v.split(',')

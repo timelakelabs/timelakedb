@@ -42,6 +42,13 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 
 use crate::Store;
 
+/// On-disk format identifier, deliberately NOT rebranded with the rest of
+/// the codebase (TimeLakeDB, 2026-08-09). It is a format version marker,
+/// not a brand string, and changing it would make every previously
+/// written object fail the magic check — which routes it down the
+/// plaintext-passthrough path and returns ciphertext as if it were data.
+/// A cosmetic rename is not worth a silent-corruption mode; read it as
+/// "TimeLake Data Encryption v1" and leave it alone.
 const MAGIC: &[u8; 8] = b"TLDE1\0\0\0";
 /// 64 KiB chunks: a bloom probe decrypts one chunk, a footer read one or
 /// two, and the tag overhead is 16 bytes per 65536 (0.02%).
@@ -56,7 +63,7 @@ const WRAP_LEN_LEN: usize = 2;
 const MAX_WRAP: usize = 4096;
 
 /// Wraps and unwraps per-object data keys. Backends: [`LocalKek`], AWS
-/// KMS (timelord-store-s3), each optionally behind [`CachingKms`]
+/// KMS (timelake-store-s3), each optionally behind [`CachingKms`]
 /// (ARCHITECTURE §12.2) — per-database/table key scoping arrives on
 /// this same trait.
 pub trait Kms: Send + Sync + 'static {
@@ -77,7 +84,7 @@ pub trait Kms: Send + Sync + 'static {
 }
 
 /// A single key-encryption key held in memory, loaded from 64 hex chars
-/// (`TIMELORD_ENCRYPTION_KEY`). Wrapping is AES-256-GCM with a random
+/// (`TIMELAKE_ENCRYPTION_KEY`). Wrapping is AES-256-GCM with a random
 /// nonce: `nonce (12) | ciphertext (32) | tag (16)`.
 pub struct LocalKek {
     kek: [u8; 32],

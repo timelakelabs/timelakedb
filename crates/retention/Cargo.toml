@@ -1,5 +1,5 @@
 [package]
-name = "timelord-retention"
+name = "timelake-retention"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

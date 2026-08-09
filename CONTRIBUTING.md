@@ -1,6 +1,6 @@
-# Contributing to TimelordDB
+# Contributing to TimeLakeDB
 
-TimelordDB is specified from evidence: five engines ran an identical
+TimeLakeDB is specified from evidence: five engines ran an identical
 high-cardinality workload, and their measured failures became the
 requirements. That history sets the one rule that matters here — **claims
 are measured, not asserted.** If a change is supposed to make something
@@ -30,10 +30,10 @@ only speeds up the edit loop.
 A named cache volume keeps `cargo` from recompiling the world each time:
 
 ```bash
-docker volume create timelord-cargo-cache
+docker volume create timelake-cargo-cache
 
 docker run --rm -v "$PWD":/src -w /src \
-  -v timelord-cargo-cache:/usr/local/cargo/registry \
+  -v timelake-cargo-cache:/usr/local/cargo/registry \
   rust:1-slim cargo test --workspace
 ```
 
@@ -41,7 +41,7 @@ Run the server the way the benchmarks do:
 
 ```bash
 cd bench
-docker compose -f compose/timelorddb.yml up -d --build
+docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
 ```
 
@@ -49,7 +49,7 @@ curl http://localhost:1963/health
 
 ```bash
 cargo test --workspace
-cargo run -p timelord-server        # listens on TIMELORD_ADDR, default 0.0.0.0:1963
+cargo run -p timelake-server        # listens on TIMELAKE_ADDR, default 0.0.0.0:1963
 ```
 
 The toolchain is pinned by `rust-toolchain.toml`. On Windows this also needs
@@ -108,8 +108,8 @@ memory, run the harness and attach the result:
 
 ```bash
 cd bench
-python bench.py run --backend timelorddb --scale smoke --label my-change   # ~30 s sanity
-python bench.py run --backend timelorddb --scale laptop --label my-change  # real signal
+python bench.py run --backend timelakedb --scale smoke --label my-change   # ~30 s sanity
+python bench.py run --backend timelakedb --scale laptop --label my-change  # real signal
 python bench.py compare <baseline-run> <my-change-run>
 ```
 
@@ -137,7 +137,7 @@ Two hard-won measurement rules:
 - Update the documentation that the change invalidates: `README.md` status,
   `site/docs/index.html` (API reference, configuration table, behaviour),
   `CHANGELOG.md`, and `REQUIREMENTS.md`/`ARCHITECTURE.md` if a decision
-  changed. A new `TIMELORD_*` variable is not finished until it is in the
+  changed. A new `TIMELAKE_*` variable is not finished until it is in the
   configuration table with its real default.
 - Include the benchmark evidence for performance or robustness claims.
 

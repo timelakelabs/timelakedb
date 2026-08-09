@@ -38,17 +38,17 @@ pub type SqlFuture<'a> =
 /// What the blanket `FlightService` impl expects back from every DoGet.
 type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
 
-/// Flight SQL addresses tables as catalog.db_schema.table; TimelordDB has
+/// Flight SQL addresses tables as catalog.db_schema.table; TimeLakeDB has
 /// database.table. A database is reported as the catalog, and every table
 /// lives in one fixed schema — which is also what the SQL side registers,
 /// so `poc.public.events` means the same thing through either interface.
 const DB_SCHEMA: &str = "public";
 const TABLE_TYPE: &str = "BASE TABLE";
 
-/// The seam to the engine (implemented by `timelord_server::Engine`).
+/// The seam to the engine (implemented by `timelake_server::Engine`).
 pub trait SqlBackend: Send + Sync + 'static {
     /// `authorizations` are the session's visibility authorizations
-    /// (SEC-2), from `x-timelord-authorizations` request metadata.
+    /// (SEC-2), from `x-timelake-authorizations` request metadata.
     fn query_batches<'a>(
         &'a self,
         db: String,
@@ -67,13 +67,13 @@ pub trait SqlBackend: Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub struct TimelordFlight {
+pub struct TimeLakeFlight {
     backend: Arc<dyn SqlBackend>,
 }
 
-impl TimelordFlight {
+impl TimeLakeFlight {
     pub fn new(backend: Arc<dyn SqlBackend>) -> Self {
-        TimelordFlight { backend }
+        TimeLakeFlight { backend }
     }
 }
 
@@ -93,7 +93,7 @@ fn db_from_metadata(md: &tonic::metadata::MetadataMap) -> String {
 /// GetFlightInfo time into the ticket, because some clients DoGet on a
 /// fresh connection that no longer carries the metadata.
 fn auths_from_metadata(md: &tonic::metadata::MetadataMap) -> Vec<String> {
-    md.get("x-timelord-authorizations")
+    md.get("x-timelake-authorizations")
         .and_then(|v| v.to_str().ok())
         .map(|v| {
             v.split(',')
@@ -144,7 +144,7 @@ fn sql_info() -> &'static SqlInfoData {
     static DATA: OnceLock<SqlInfoData> = OnceLock::new();
     DATA.get_or_init(|| {
         let mut b = SqlInfoDataBuilder::new();
-        b.append(SqlInfo::FlightSqlServerName, "TimelordDB");
+        b.append(SqlInfo::FlightSqlServerName, "TimeLakeDB");
         b.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
         b.append(SqlInfo::FlightSqlServerArrowVersion, "58");
         b.append(SqlInfo::FlightSqlServerReadOnly, true);
@@ -156,8 +156,8 @@ fn sql_info() -> &'static SqlInfoData {
 }
 
 #[tonic::async_trait]
-impl FlightSqlService for TimelordFlight {
-    type FlightService = TimelordFlight;
+impl FlightSqlService for TimeLakeFlight {
+    type FlightService = TimeLakeFlight;
 
     async fn do_handshake(
         &self,
@@ -377,13 +377,13 @@ pub async fn serve(
 ) -> Result<(), tonic::transport::Error> {
     tracing::info!(%addr, "flight sql listening");
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(TimelordFlight::new(backend)))
+        .add_service(FlightServiceServer::new(TimeLakeFlight::new(backend)))
         .serve(addr)
         .await
 }
 
 /// Serve Flight SQL over TLS (SEC-3). The `ServerConfig` comes from
-/// `timelord_tls::RotatingCert::server_config` — its cert resolver is
+/// `timelake_tls::RotatingCert::server_config` — its cert resolver is
 /// consulted per handshake, so cert rotation needs no listener restart
 /// and never touches established gRPC streams.
 pub async fn serve_tls(
@@ -418,7 +418,7 @@ pub async fn serve_tls(
     });
 
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(TimelordFlight::new(backend)))
+        .add_service(FlightServiceServer::new(TimeLakeFlight::new(backend)))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
@@ -471,7 +471,7 @@ mod tests {
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             tonic::transport::Server::builder()
-                .add_service(FlightServiceServer::new(TimelordFlight::new(Arc::new(
+                .add_service(FlightServiceServer::new(TimeLakeFlight::new(Arc::new(
                     StubBackend,
                 ))))
                 .serve_with_incoming(incoming)

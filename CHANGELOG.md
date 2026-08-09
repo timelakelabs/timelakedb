@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to TimelordDB are recorded here. The format follows
+All notable changes to TimeLakeDB are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 will follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from
 its first release.
@@ -13,9 +13,44 @@ here.
 
 ## [Unreleased]
 
+### Changed — renamed TimelordDB → TimeLakeDB (2026-08-09)
+
+The project is now **TimeLakeDB**, and the name says what the architecture
+is: immutable Parquet on object storage behind an Iceberg-style manifest
+log, with compute replaceable (CL-1). Nothing has been released, so this
+is a rename rather than a migration — but several of the strings are
+user-facing contracts and they all moved together:
+
+- **Crates:** `timelord-*` → `timelake-*` (all 15).
+- **Environment:** `TIMELORD_*` → `TIMELAKE_*` (~20 variables, including
+  `TIMELAKE_ADDR`, `TIMELAKE_DATA_DIR`, `TIMELAKE_OBJECT_STORE`,
+  `TIMELAKE_KMS_KEY_ID`, `TIMELAKE_ENCRYPTION_KEY`).
+- **Metrics:** `timelord_*` → `timelake_*` (~30 series). Renaming now
+  costs nothing; after a release it would have broken every dashboard.
+- **HTTP headers:** `X-Timelord-Authorizations` → `X-TimeLake-Authorizations`
+  (SEC-2), `x-timelord-csrf` → `x-timelake-csrf` (SEC-4).
+- **Paths:** `/var/lib/timelord/data` → `/var/lib/timelake/data`.
+- **Harness:** `bench/backends/timelakedb.py`, backend key `timelakedb`,
+  and the three compose targets (`timelakedb.yml`, `-tls`, `-s3`).
+- **Brand:** logo, wordmark, site and all documentation.
+
+Two things deliberately did **not** change:
+
+- **The `TLDE1` encryption magic bytes.** It is a format version marker,
+  not a brand string, and changing it would make every previously written
+  object fail the magic check — routing it down the plaintext-passthrough
+  path and returning ciphertext as data. A cosmetic rename is not worth a
+  silent-corruption mode.
+- **Historical evidence** under `bench/results/` and `ops/logs/`. Those
+  record runs that actually happened under the old name; rewriting them
+  would falsify the record.
+
+`TLDB_*` / `tldb-*` identifiers (the backup script, drill variables, the
+session cookie) were left alone — the abbreviation is true of both names.
+
 ### Added — SEC-4: authentication on the admin surface (2026-08-09)
 
-- New `timelord-auth` crate: principals with `viewer`/`operator`/`admin`
+- New `timelake-auth` crate: principals with `viewer`/`operator`/`admin`
   roles, Argon2id credentials, server-side sessions (cookie or bearer)
   with 30-minute idle and 12-hour absolute expiry, per-principal
   exponential backoff on failed logins. Principals persist through the
@@ -30,7 +65,7 @@ here.
   else returns `403 password_change_required`. Rotation invalidates every
   session for that principal, including the one that performed it. The
   replacement cannot be shorter than 8 characters, the username, or
-  `admin`. `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` provisions a real password
+  `admin`. `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` provisions a real password
   instead so no well-known default ever exists. This reverses the
   bootstrap-token design; the cost is recorded in docs/CONSOLE.md §4.2.
 - Retention authorization follows the data, not the verb: **growing** a
@@ -40,8 +75,8 @@ here.
   password change, then management — still one self-contained file with
   no build step. It ships no data; every value it shows is fetched
   through an authenticated call.
-- Metrics: `timelord_admin_default_credential_active` (alert on this),
-  `timelord_admin_logins_total`, `timelord_admin_login_failures_total`.
+- Metrics: `timelake_admin_default_credential_active` (alert on this),
+  `timelake_admin_logins_total`, `timelake_admin_login_failures_total`.
 - **The data plane is deliberately untouched**: `/write`, `/api/sql` and
   Flight SQL still require no credentials, so Telegraf, Grafana and the
   harness keep working. That migration is its own milestone (SEC-4
@@ -54,20 +89,20 @@ here.
   per-table windows (`365d`/`72h`/`90m`/seconds); changes persist to
   `catalog/config/retention.json` through the store — envelope-encrypted
   like every object, S3-shared in the cluster era — and outlive a restart
-  with a stale environment. `TIMELORD_RETENTION` remains the seed when no
+  with a stale environment. `TIMELAKE_RETENTION` remains the seed when no
   stored config exists; bench fixtures are untouched.
 - `GET /admin/ui`: a self-contained management page (no build step, no
   external assets, site palette) listing active policies, table-name
   autocomplete from `SHOW TABLES`, set/remove with an explicit
   "shrinking a window deletes data" warning, and the live
-  `timelord_retention_drops_total` counter.
+  `timelake_retention_drops_total` counter.
 - SECURITY.md exposure 3a: `/admin/retention` is an **unauthenticated
   deletion control** — the strongest reason yet to keep 1963 private
   until token auth lands.
 
 ### Added — C0: S3 object store with KMS envelope + SSE-KMS, key-cached (2026-08-09)
 
-- New `timelord-store-s3` crate: `S3Store` implements the `Store` trait
+- New `timelake-store-s3` crate: `S3Store` implements the `Store` trait
   over aws-sdk-s3 (owned-runtime sync bridge, safe from blocking and
   async contexts alike), and `AwsKms` implements the `Kms` trait over
   aws-sdk-kms (`generate` ↔ GenerateDataKey, `unwrap` ↔ Decrypt). The
@@ -80,26 +115,26 @@ here.
   `CachingKms` decorates any Kms with the caching-CMM pattern: one data
   key reused per bounded window (default 300 s / 1,000 uses, hard cap
   2¹⁶) on encrypt, a bounded wrapped-blob→key LRU on decrypt. Thousands
-  of KMS calls become a handful; `TIMELORD_KMS_CACHE=off` restores
+  of KMS calls become a handful; `TIMELAKE_KMS_CACHE=off` restores
   strict per-object keys and is the drill's measured baseline.
 - Server-side encryption rides every PUT: SSE-KMS headers with
   **S3 Bucket Keys enabled**, plus bucket-default SSE in the rig's init.
-- Config: `TIMELORD_OBJECT_STORE=s3://bucket[/prefix]`,
-  `TIMELORD_KMS_KEY_ID` (alias ok), `TIMELORD_S3_SSE_KEY_ID`,
-  `TIMELORD_KMS_CACHE[_MAX_AGE_SECS|_MAX_USES]`; LocalStack via
+- Config: `TIMELAKE_OBJECT_STORE=s3://bucket[/prefix]`,
+  `TIMELAKE_KMS_KEY_ID` (alias ok), `TIMELAKE_S3_SSE_KEY_ID`,
+  `TIMELAKE_KMS_CACHE[_MAX_AGE_SECS|_MAX_USES]`; LocalStack via
   `AWS_ENDPOINT_URL` (path-style auto-forced). Setting both KMS and
   local-KEK key sources refuses to start.
-- Metrics: `timelord_kms_{generate,decrypt}_total`,
-  `timelord_kms_{generate,decrypt}_cache_hits_total`,
-  `timelord_s3_{get,put,head,list,delete}_total`,
-  `timelord_s3_{read,write}_bytes_total`.
-- LocalStack rig: `bench/compose/timelorddb-s3.yml` (S3+KMS, init
-  creates `alias/timelord` and buckets with default SSE + Bucket Keys).
+- Metrics: `timelake_kms_{generate,decrypt}_total`,
+  `timelake_kms_{generate,decrypt}_cache_hits_total`,
+  `timelake_s3_{get,put,head,list,delete}_total`,
+  `timelake_s3_{read,write}_bytes_total`.
+- LocalStack rig: `bench/compose/timelakedb-s3.yml` (S3+KMS, init
+  creates `alias/timelake` and buckets with default SSE + Bucket Keys).
   The rig proves correctness, call counts, and recovery — never latency.
 
 ### Added — SEC-1: encryption at rest, at the store chokepoint (2026-08-09)
 
-- `EncryptingStore(inner, kms)` in `timelord-store`: every object —
+- `EncryptingStore(inner, kms)` in `timelake-store`: every object —
   Parquet, manifests, checkpoints — is envelope-encrypted with a fresh
   per-object AES-256-GCM data key, wrapped by the configured key. The
   engine is unchanged; the decorator slots in at `Engine::open`.
@@ -108,10 +143,10 @@ here.
   decrypts a few KB, a footer read takes the tail, and chunks cannot be
   reordered, cross-spliced, or truncated undetected. A tampered object or
   a wrong key is a clean named error.
-- Opt-in: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
-  `TIMELORD_ENCRYPTION_KEY_FILE`. A malformed key refuses to start rather
+- Opt-in: `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or
+  `TIMELAKE_ENCRYPTION_KEY_FILE`. A malformed key refuses to start rather
   than silently serving plaintext. Objects written before the key existed
-  remain readable. `timelord_encryption_enabled` gauge.
+  remain readable. `timelake_encryption_enabled` gauge.
 - Decision recorded in ARCHITECTURE §11: whole-object envelope over
   Parquet Modular Encryption — covers non-Parquet objects, no dependency
   on arrow-rs PME maturity (retires §16 risk 2); PME per-column keys stay
@@ -132,12 +167,12 @@ here.
   visible to no one (fail closed); `&`/`|` may not mix without
   parentheses (Accumulo's rule); expressions are evaluated once per
   distinct dictionary value, not per row.
-- Authorizations arrive via `X-Timelord-Authorizations` (HTTP header,
+- Authorizations arrive via `X-TimeLake-Authorizations` (HTTP header,
   comma-separated, or the `/api/sql` body field) and
-  `x-timelord-authorizations` gRPC metadata on Flight SQL, captured into
+  `x-timelake-authorizations` gRPC metadata on Flight SQL, captured into
   the flight ticket at planning time. They are **claims, not
   credentials**, until token auth lands — SECURITY.md exposure 7.
-- `timelord_visibility_rows_filtered_total` counter: enforcement is
+- `timelake_visibility_rows_filtered_total` counter: enforcement is
   visible, not silent.
 
 ### Added — schema discovery (2026-08-08)
@@ -190,7 +225,7 @@ here.
   longer discards the other tables' rows; WAL generations are retained when
   any table fails to flush, and the maintenance tick runs flush, compaction
   and retention independently rather than aborting on the first error.
-- Regression tests: three in `timelord-buffer`, plus
+- Regression tests: three in `timelake-buffer`, plus
   `a_rejected_write_cannot_poison_the_table_or_the_engine` covering the whole
   cascade end to end — reject, read, second table, duplicate key, flush,
   restart.
@@ -214,17 +249,17 @@ here.
 
 ### Added — SEC-3: TLS 1.3 with hot certificate rotation (2026-08-08)
 
-- New `timelord-tls` crate: validate-before-swap certificate loading (PEM
+- New `timelake-tls` crate: validate-before-swap certificate loading (PEM
   structure, leaf expiry, key↔certificate match) behind an `ArcSwap`
   resolver that is consulted only during a handshake.
-- TLS on both listeners when `TIMELORD_TLS_CERT` and `TIMELORD_TLS_KEY` are
+- TLS on both listeners when `TIMELAKE_TLS_CERT` and `TIMELAKE_TLS_KEY` are
   set — HTTP via `axum-server`, Flight SQL via a `tokio-rustls` accept loop.
-  Plaintext remains the default. `TIMELORD_TLS_MIN=1.2` lowers the floor.
+  Plaintext remains the default. `TIMELAKE_TLS_MIN=1.2` lowers the floor.
 - Rotation triggers: a 2 s file-modification watcher and
   `POST /admin/tls/reload`.
 - A rejected renewal keeps the last-good pair serving and raises the named
   alarm `SEC3_CERT_RENEWAL_FAILED`.
-- Metrics: `timelord_tls_cert_expiry_seconds`, `timelord_tls_last_reload_ok`.
+- Metrics: `timelake_tls_cert_expiry_seconds`, `timelake_tls_last_reload_ok`.
 - **AT-7 drill: 19/19** (`bench/results/at7-drill.log`). Under stock
   Telegraf-over-HTTPS plus sustained writes, a rotation landed mid-flight in a
   20 s Flight SQL query with an exact result, zero write errors and zero
@@ -256,7 +291,7 @@ here.
   be preempted.
 - Pruning table provider: time-bound file skipping, row-group statistics
   pruning, projection pushdown, decode-time row filters.
-- Entity-clustered compaction, grace-period GC (`TIMELORD_GC_GRACE_SECS`),
+- Entity-clustered compaction, grace-period GC (`TIMELAKE_GC_GRACE_SECS`),
   and a schema registry.
 - **AT-3 gate green with two carve-outs** at 36.6M events against the
   InfluxDB 3 baseline: ingest 365–671K lines/s with zero errors, Shape A
@@ -293,7 +328,7 @@ here.
   `Dictionary<Int32, Utf8>` tag columns, DataFusion SQL over the buffer, and
   the InfluxDB-compatible write endpoints (`/write`, `/api/v2/write`,
   `/api/v3/write_lp`).
-- `timelorddb` backend adapter for the tsdb-bench harness.
+- `timelakedb` backend adapter for the tsdb-bench harness.
 
 ### Added — the evidence base (2026-08-08)
 

@@ -1,10 +1,10 @@
 #!/bin/sh
-# TimelordDB backup and restore (AT-5).
+# TimeLakeDB backup and restore (AT-5).
 #
 # Everything runs through a throwaway helper container, so the only host
 # prerequisite is Docker: no tar, no gzip, no host bind mounts (which are
 # what break this on Windows and macOS), and no dependency on the
-# TimelordDB image itself.
+# TimeLakeDB image itself.
 #
 #   ./ops/tldb-backup.sh backup                       # live, no downtime
 #   ./ops/tldb-backup.sh verify  -f FILE
@@ -18,7 +18,7 @@ set -eu
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
-VOLUME="${TLDB_VOLUME:-bench-timelorddb_timelord-data}"
+VOLUME="${TLDB_VOLUME:-bench-timelakedb_timelake-data}"
 HELPER="${TLDB_HELPER_IMAGE:-alpine:3}"
 COMPRESS=1
 RECREATE=0
@@ -40,9 +40,9 @@ commands:
   restore  -f FILE  restore an archive into a data volume
 
 options:
-  -v VOLUME         Docker volume holding TIMELORD_DATA_DIR
-                    (default: $TLDB_VOLUME or bench-timelorddb_timelord-data)
-  -o FILE           backup output path (default: ./timelord-backup-<UTC>.tgz)
+  -v VOLUME         Docker volume holding TIMELAKE_DATA_DIR
+                    (default: $TLDB_VOLUME or bench-timelakedb_timelake-data)
+  -o FILE           backup output path (default: ./timelake-backup-<UTC>.tgz)
   -f FILE           archive to verify or restore
   --no-compress     write a plain .tar; Parquet is already compressed, so
                     this is usually much faster and barely larger
@@ -119,8 +119,8 @@ backup)
 
   if [ -z "$OUT" ]; then
     stamp=$(date -u +%Y%m%d-%H%M%S)
-    if [ "$COMPRESS" -eq 1 ]; then OUT="timelord-backup-$stamp.tgz"
-    else OUT="timelord-backup-$stamp.tar"; fi
+    if [ "$COMPRESS" -eq 1 ]; then OUT="timelake-backup-$stamp.tgz"
+    else OUT="timelake-backup-$stamp.tar"; fi
   fi
   [ -e "$OUT" ] && die "$OUT already exists"
 
@@ -173,7 +173,7 @@ verify)
   note "parquet files:  $parquet"
   note "WAL segments:   $wal"
 
-  [ "$manifests" -gt 0 ] || die "no catalog manifests — this is not a TimelordDB data directory"
+  [ "$manifests" -gt 0 ] || die "no catalog manifests — this is not a TimeLakeDB data directory"
 
   # Objects are written temp-then-rename, so a live backup can catch a
   # half-written .tmp-write file. It is never referenced by the catalog, but

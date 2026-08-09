@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use timelord_store::{Kms, Store};
+use timelake_store::{Kms, Store};
 
 /// One runtime + one credential/config resolution, shared by the S3 and
 /// KMS clients (same region, same endpoint override, same chain —
@@ -33,7 +33,7 @@ impl AwsContext {
     pub fn new() -> Result<Arc<AwsContext>> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("timelord-aws")
+            .thread_name("timelake-aws")
             .enable_all()
             .build()
             .map_err(|e| Error::other(format!("aws runtime: {e}")))?;
@@ -93,13 +93,13 @@ pub struct S3Store {
 impl S3Store {
     /// `url` is `s3://bucket` or `s3://bucket/prefix`. Path-style
     /// addressing is forced automatically under an endpoint override
-    /// (LocalStack), or explicitly via `TIMELORD_S3_FORCE_PATH_STYLE=1`.
+    /// (LocalStack), or explicitly via `TIMELAKE_S3_FORCE_PATH_STYLE=1`.
     pub fn new(ctx: Arc<AwsContext>, url: &str, sse_key_id: Option<String>) -> Result<S3Store> {
         let (bucket, prefix) = parse_s3_url(url)?;
 
         let endpoint_override = std::env::var("AWS_ENDPOINT_URL").is_ok();
         let force_path = endpoint_override
-            || std::env::var("TIMELORD_S3_FORCE_PATH_STYLE").as_deref() == Ok("1");
+            || std::env::var("TIMELAKE_S3_FORCE_PATH_STYLE").as_deref() == Ok("1");
         let s3cfg = aws_sdk_s3::config::Builder::from(&ctx.config)
             .force_path_style(force_path)
             .build();
@@ -146,7 +146,7 @@ fn parse_s3_url(url: &str) -> Result<(String, String)> {
     let rest = url.strip_prefix("s3://").ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,
-            format!("TIMELORD_OBJECT_STORE must be s3://bucket[/prefix], got {url:?}"),
+            format!("TIMELAKE_OBJECT_STORE must be s3://bucket[/prefix], got {url:?}"),
         )
     })?;
     let (bucket, prefix) = match rest.split_once('/') {
@@ -396,12 +396,12 @@ impl Store for S3Store {
 
 /// [`Kms`] over AWS KMS. `generate` maps 1:1 to GenerateDataKey (one
 /// call returns the plaintext/wrapped pair); Decrypt infers the CMK from
-/// the ciphertext blob. Wrap behind [`timelord_store::CachingKms`] in
+/// the ciphertext blob. Wrap behind [`timelake_store::CachingKms`] in
 /// production — that is where "thousands of calls" becomes a handful.
 pub struct AwsKms {
     ctx: Arc<AwsContext>,
     client: aws_sdk_kms::Client,
-    /// Key id, ARN, or alias (`alias/timelord`).
+    /// Key id, ARN, or alias (`alias/timelake`).
     key_id: String,
 }
 
@@ -511,8 +511,8 @@ mod tests {
     /// default. The C0 drill runs it inside the compose network:
     ///   AWS_ENDPOINT_URL=http://localstack:4566 AWS_REGION=us-east-1 \
     ///   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-    ///   TLDB_S3_TEST_BUCKET=timelord-it TLDB_KMS_TEST_KEY=alias/timelord \
-    ///   cargo test -p timelord-store-s3 -- --ignored
+    ///   TLDB_S3_TEST_BUCKET=timelake-it TLDB_KMS_TEST_KEY=alias/timelake \
+    ///   cargo test -p timelake-store-s3 -- --ignored
     fn it_env() -> Option<(Arc<AwsContext>, String, String)> {
         let bucket = std::env::var("TLDB_S3_TEST_BUCKET").ok()?;
         let key = std::env::var("TLDB_KMS_TEST_KEY").ok()?;
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     #[ignore = "needs LocalStack/AWS: see it_env()"]
     fn kms_roundtrip_and_encrypted_store_over_s3() {
-        use timelord_store::{CachingKms, EncryptingStore};
+        use timelake_store::{CachingKms, EncryptingStore};
         let (ctx, bucket, key_id) = it_env().expect("TLDB env not set");
 
         let kms = AwsKms::new(ctx.clone(), key_id);

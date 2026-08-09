@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TimelordDB — Console</title>
+<title>TimeLakeDB — Console</title>
 <style>
   :root{--navy:#0B1320;--blue:#2563EB;--gold:#D4AF37;--mist:#E6E8EC;--gray:#6B7280;--red:#ef4444;--green:#34d399}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -42,7 +42,7 @@
 </head>
 <body>
 <div class="shell">
-  <h1>Timelord<b>DB</b> · Console</h1>
+  <h1>TimeLake<b>DB</b> · Console</h1>
   <div class="sub" id="subtitle">Sign in to manage this node.</div>
 
   <!-- 1. login -->
@@ -89,7 +89,7 @@
     <div class="warn danger" id="defaultbanner" hidden>
       <b>A default credential is active on this node.</b> Until every seeded
       password is changed, anyone who can reach this port can take the
-      console. Alert on <code>timelord_admin_default_credential_active</code>.
+      console. Alert on <code>timelake_admin_default_credential_active</code>.
     </div>
 
     <div class="card">
@@ -139,7 +139,7 @@ async function api(method, path, body) {
     opts.headers['content-type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  if (CSRF && method !== 'GET') opts.headers['x-timelord-csrf'] = CSRF;
+  if (CSRF && method !== 'GET') opts.headers['x-timelake-csrf'] = CSRF;
   const r = await fetch(path, opts);
   let payload = null;
   try { payload = await r.json(); } catch (_) {}
@@ -238,7 +238,7 @@ async function loadTables() {
 async function loadDrops() {
   try {
     const t = await (await fetch('/metrics')).text();
-    const m = t.match(/timelord_retention_drops_total (\d+)/);
+    const m = t.match(/timelake_retention_drops_total (\d+)/);
     if (m) $('#dropstat').innerHTML = `Files dropped by retention since start: <b>${m[1]}</b>`;
   } catch (_) {}
 }

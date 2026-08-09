@@ -1,5 +1,5 @@
 <#
-    One unattended TimelordDB performance cycle.
+    One unattended TimeLakeDB performance cycle.
 
     Registered as a Windows scheduled task (see register-perf-task.ps1). The
     prompt lives in perf-cycle-prompt.md; what the agent is permitted to do

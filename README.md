@@ -1,4 +1,4 @@
-# TimelordDB
+# TimeLakeDB
 
 A time-series database for high-cardinality event analytics, specified
 from evidence: five engines ran an identical 36M-event workload and their
@@ -21,7 +21,7 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
-> **Security:** TimelordDB has **no authentication**. Any client that can
+> **Security:** TimeLakeDB has **no authentication**. Any client that can
 > reach port 1963 or 1964 can read and write everything on the node — network
 > isolation is the only access control it has today. TLS 1.3, encryption at
 > rest, and row visibility labels are implemented and drilled, but visibility
@@ -40,7 +40,7 @@ on the site traces to a run under `bench/results/`.
 ## Status: SEC-1 + SEC-2 — encryption at rest and row visibility labels
 
 - **SEC-1, encryption at the store chokepoint:** set
-  `TIMELORD_ENCRYPTION_KEY` (64 hex chars, or `_KEY_FILE`) and every
+  `TIMELAKE_ENCRYPTION_KEY` (64 hex chars, or `_KEY_FILE`) and every
   object — Parquet data, catalog manifests, checkpoints — is
   envelope-encrypted: a fresh AES-256-GCM data key per object, wrapped by
   your key, in 64 KiB authenticated chunks so the range-read path
@@ -51,7 +51,7 @@ on the site traces to a run under `bench/results/`.
   arrow-rs dependency); PME per-column keys remain open at the same seam.
 - **SEC-2, Accumulo-style row visibility:** a `_visibility` tag holds a
   label expression per row — `(ops&audit)|admin` — evaluated against the
-  session's authorizations (`X-Timelord-Authorizations` header, or Flight
+  session's authorizations (`X-TimeLake-Authorizations` header, or Flight
   SQL metadata) *inside the scan*, below user predicates and before
   aggregation, so a `COUNT(*)` cannot count a hidden row. Unlabeled rows
   are public; malformed labels are visible to no one. Labels are ordinary
@@ -70,12 +70,12 @@ authorization), in-network bench re-baseline, CI on a remote.
 - **TLS 1.3 (rustls) on both listeners** — HTTPS (writes, /api/sql) and
   Flight SQL — from one shared `ArcSwap<CertifiedKey>` resolver
   consulted only at handshake, so rotation never touches established
-  connections. Configurable 1.2 floor (`TIMELORD_TLS_MIN=1.2`);
-  plaintext remains the default when `TIMELORD_TLS_CERT`/`_KEY` are
+  connections. Configurable 1.2 floor (`TIMELAKE_TLS_MIN=1.2`);
+  plaintext remains the default when `TIMELAKE_TLS_CERT`/`_KEY` are
   unset. Renewals validate (PEM, expiry, key↔cert match) *before* an
   atomic swap; triggers are a 2 s file watcher and POST
   `/admin/tls/reload`; `/metrics` exports
-  `timelord_tls_cert_expiry_seconds` and `timelord_tls_last_reload_ok`.
+  `timelake_tls_cert_expiry_seconds` and `timelake_tls_last_reload_ok`.
 - **AT-7 drill 19/19** (`bench/results/at7-drill.log`): under stock
   Telegraf-over-HTTPS plus sustained writes, rotating to a fresh 24 h
   cert landed mid-flight in a 20 s Flight SQL query (219B-combo SUM,
@@ -123,7 +123,7 @@ cardinality decay) — both addressed by streaming/range-read execution.
 Compaction merges L0 files per (table, hour) with cross-file
 last-write-wins dedup (FR-5 complete); per-table retention drops whole
 partitions (FR-7); Flight SQL serves Grafana's stock datasource on :1964
-(FR-8) — the unchanged fixture dashboards render against TimelordDB.
+(FR-8) — the unchanged fixture dashboards render against TimeLakeDB.
 
 M3 gate: laptop scale (3.66M events) — ingest 616K lines/s, 0 errors,
 all Shape B ≤1.6 s, burst 100K in 0.17 s with concurrent query, Grafana
@@ -149,9 +149,9 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 
 ```bash
 cd bench
-docker compose -f compose/timelorddb.yml up -d --build
+docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
-python bench.py backends       # timelorddb is registered
+python bench.py backends       # timelakedb is registered
 ```
 
 Local development additionally wants a Rust toolchain
@@ -159,7 +159,7 @@ Local development additionally wants a Rust toolchain
 
 ```bash
 cargo test --workspace
-cargo run -p timelord-server
+cargo run -p timelake-server
 ```
 
 ## Backup
@@ -177,7 +177,7 @@ source and the restored copy (40,327,616). Runbook: `docs/BACKUP_RESTORE.md`.
 ## The rule
 
 The benchmark harness is the specification. Every milestone gates on a
-`bench.py run --backend timelorddb` result, compared against the recorded
+`bench.py run --backend timelakedb` result, compared against the recorded
 InfluxDB 3 baselines in `bench/results/`.
 
 ## License

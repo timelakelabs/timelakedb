@@ -1,4 +1,4 @@
-# TimelordDB — Requirements
+# TimeLakeDB — Requirements
 
 **Status:** Draft v1 · 2026-08-08
 **Evidence base:** Every requirement below traces to a measured result from
@@ -6,7 +6,7 @@ the tsdb-bench evaluation (`docs/evidence/BENCHMARK_RESULTS.md`, raw records in
 `bench/results/`), in which five engines ran the identical workload:
 InfluxDB 1.8 (OOM-killed by a query), InfluxDB 2.7 (funnel never completed),
 QuestDB and VictoriaMetrics (prior trials, OOM on the same query shape), and
-InfluxDB 3 Core (passed everything). TimelordDB must beat the survivor and
+InfluxDB 3 Core (passed everything). TimeLakeDB must beat the survivor and
 must be structurally incapable of the four failures.
 
 
@@ -14,19 +14,19 @@ must be structurally incapable of the four failures.
 
 ## 0. Prior art and inspirations
 
-TimelordDB stands on the projects below — four of which we benchmarked
+TimeLakeDB stands on the projects below — four of which we benchmarked
 directly on the reference workload. Each contributes something specific;
 none satisfies the full requirement set, which is why this project exists.
 
-| Project | Branch | Query languages | Docs | What TimelordDB takes from it |
+| Project | Branch | Query languages | Docs | What TimeLakeDB takes from it |
 |---------|--------|-----------------|------|-------------------------------|
 | InfluxDB v3 | [`main`](https://github.com/influxdata/influxdb/tree/main) | SQL, InfluxQL | [docs.influxdata.com/influxdb3/core/](https://docs.influxdata.com/influxdb3/core/) | **The architecture to beat** — the only engine that passed Shape B. Validates FR-2 (dictionary-encoded tag columns), SR-1 (Parquet on object store), RR-1 (query memory pool), FR-8 (Flight SQL). Its weak spots define our targets: PR-3 (slow point lookups vs 1.x) and PR-6 (26× fresh-data penalty). |
 | InfluxDB v2 | [`main-2.x`](https://github.com/influxdata/influxdb/tree/main-2.x) | Flux, InfluxQL | [docs.influxdata.com/influxdb/v2/](https://docs.influxdata.com/influxdb/v2/) | Cautionary evidence for FR-3 and FR-4: Flux's expressiveness cost (schema collisions, silent `stop: now()`) and the TSI decay curve (123K → 10K lines/s) behind FR-2/AR-1. |
 | InfluxDB v1 | [`master-1.x`](https://github.com/influxdata/influxdb/tree/master-1.x) | InfluxQL, Flux | [docs.influxdata.com/influxdb/v1/](https://docs.influxdata.com/influxdb/v1/) | Proof that 18 ms point lookups exist (PR-3's stretch goal) — and proof of what the unbounded series index that delivers them costs (the OOM kill behind RR-1). Its TSM/WAL write path opened at 308K lines/s: raw write-path speed worth studying. |
-| InfluxDB Cluster | [`master`](https://github.com/chengshiwen/influxdb-cluster/tree/master) | Flux, InfluxQL | [docs.influxdata.com/influxdb/v2/](https://docs.influxdata.com/influxdb/v2/) | Community clustering of the 1.x-era meta/data-node design — reference reading for §7: what a replication topology looks like when bolted on rather than designed in. TimelordDB inverts it: state in the object store, compute replaceable. |
+| InfluxDB Cluster | [`master`](https://github.com/chengshiwen/influxdb-cluster/tree/master) | Flux, InfluxQL | [docs.influxdata.com/influxdb/v2/](https://docs.influxdata.com/influxdb/v2/) | Community clustering of the 1.x-era meta/data-node design — reference reading for §7: what a replication topology looks like when bolted on rather than designed in. TimeLakeDB inverts it: state in the object store, compute replaceable. |
 | QuestDB | [`master`](https://github.com/questdb/questdb/tree/master) | SQL (SIMD/AVX2 execution) | [questdb.com/docs/](https://questdb.com/docs/) | Vectorized (SIMD) columnar execution and designated-timestamp ordered storage — the techniques for PR-5/PR-8 latency targets. Benchmarked history: OOM'd on Shape B in the prior trial, so its execution ideas must sit *behind* an RR-1 memory pool. |
 | VictoriaMetrics | [`master`](https://github.com/VictoriaMetrics/VictoriaMetrics/tree/master) | MetricsQL (PromQL-compatible) | [docs.victoriametrics.com/victoriametrics/](https://docs.victoriametrics.com/victoriametrics/) | Resource-frugality engineering worth studying (compression, mmap discipline) — and two cautions it embodies: a metrics data model taxes event analytics (FR-6), and silent search guardrails mask capability (RR-5). Prior trial OOM'd on Shape B. |
-| Apache Accumulo | [`main`](https://github.com/apache/accumulo) | scan API (server-side iterators) | [accumulo.apache.org](https://accumulo.apache.org/) | The cell-visibility security model (SEC-2): per-entry label expressions like `(ops&audit)\|admin` evaluated against session authorizations at scan time. TimelordDB adopts the *label model* at row granularity plus per-column keys — not the per-cell KV economics, which fight columnar storage. |
+| Apache Accumulo | [`main`](https://github.com/apache/accumulo) | scan API (server-side iterators) | [accumulo.apache.org](https://accumulo.apache.org/) | The cell-visibility security model (SEC-2): per-entry label expressions like `(ops&audit)\|admin` evaluated against session authorizations at scan time. TimeLakeDB adopts the *label model* at row granularity plus per-column keys — not the per-cell KV economics, which fight columnar storage. |
 
 ## 1. Mission
 
@@ -113,7 +113,7 @@ datasource — no custom plugin — connects, passes its health check, and
 queries. Primary path: Flight SQL (the InfluxDB datasource's SQL mode);
 PostgreSQL wire is an acceptable alternative. Concrete bar: the four
 provisioned dashboards in `fixtures/grafana/` (pipeline funnel,
-host fleet, host detail, product journey) render against TimelordDB with
+host fleet, host detail, product journey) render against TimeLakeDB with
 no change beyond the datasource URL. *Evidence: those dashboards are plain
 SQL over Flight SQL and served as the evaluation's entire read path.*
 
@@ -360,14 +360,14 @@ administrative surface (MUST, v1 · data plane phased).**
   can do nothing but change its own password, rather than the originally
   specified one-time bootstrap token — a deliberate product call whose
   cost and mitigations are recorded in docs/CONSOLE.md §4.2.
-  `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` preserves the no-well-known-default
+  `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` preserves the no-well-known-default
   posture for provisioning.* Browser sessions are cookie-based with idle and absolute
   expiry plus CSRF and origin checks; automation uses revocable
   role-scoped tokens stored as password hashes. The admin listener binds
   privately by default and refuses plaintext unless explicitly and loudly
   overridden.
 - **Phased:** the same principal store gives SEC-2 authorizations an
-  owner. Today `X-Timelord-Authorizations` is an unauthenticated claim;
+  owner. Today `X-TimeLake-Authorizations` is an unauthenticated claim;
   once the data plane requires a session, the scan-time predicate can
   trust the intersection of *claimed* and *granted* labels. That change
   breaks every existing client, so it is a deliberate migration of its
@@ -396,7 +396,7 @@ administrative surface (MUST, v1 · data plane phased).**
 
 The existing harness (`bench/`) is the executable acceptance test.
 
-- **AT-1 (MUST):** Implement a `timelorddb` tsdb-bench adapter (~100 lines:
+- **AT-1 (MUST):** Implement a `timelakedb` tsdb-bench adapter (~100 lines:
   write endpoint, five canonical Shape B queries in SQL, Shape A, health,
   storage path) and a compose target.
 - **AT-2 (MUST):** At `--scale smoke`, all context sanity counts and
@@ -410,10 +410,10 @@ The existing harness (`bench/`) is the executable acceptance test.
 - **AT-5 (SHOULD):** Kill-during-load, backup/restore drill (≤ 2 min /
   ≤ 1 min), and the sustained-repeated-burst variant.
 - **AT-6 (MUST):** Ecosystem end-to-end: a stock Telegraf agent
-  (`influxdb_v2` output, gzip enabled) writes host metrics to TimelordDB
+  (`influxdb_v2` output, gzip enabled) writes host metrics to TimeLakeDB
   while the evaluation's Grafana provisioning (`fixtures/grafana/`)
   points at it — datasource health check passes and all four dashboards
-  render and refresh. This reruns the plan's T5 + T8 against TimelordDB.
+  render and refresh. This reruns the plan's T5 + T8 against TimeLakeDB.
   **Runs twice: plaintext and TLS 1.3 end-to-end** (Telegraf `tls_*`
   options, Grafana secure connection — SEC-3).
 - **AT-7 (MUST):** Certificate rotation drill: under sustained Telegraf
@@ -437,7 +437,7 @@ foundation** — libraries, not a fork.
   (SQL with `COUNT(DISTINCT)`), FR-8 (`arrow-flight` → Flight SQL →
   stock Grafana), SR-1 (`object_store` — the crate InfluxData donated),
   and SEC-1's direction (Parquet Modular Encryption).
-- TimelordDB builds what differentiates it: line-protocol ingest + WAL,
+- TimeLakeDB builds what differentiates it: line-protocol ingest + WAL,
   catalog/partitioning (CL-1), compaction (PR-6), per-table retention
   (FR-7), the bounded hot-entity index experiment (PR-3), and the
   mandatory-predicate injection point (SEC-2).

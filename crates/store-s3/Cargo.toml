@@ -1,11 +1,11 @@
 [package]
-name = "timelord-store-s3"
+name = "timelake-store-s3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-timelord-store = { path = "../store" }
+timelake-store = { path = "../store" }
 aws-config = "1"
 aws-sdk-s3 = "1"
 aws-sdk-kms = "1"

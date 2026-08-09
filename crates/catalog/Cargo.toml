@@ -1,5 +1,5 @@
 ﻿[package]
-name = "timelord-catalog"
+name = "timelake-catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json.workspace = true
-timelord-store = { path = "../store" }
+timelake-store = { path = "../store" }
 
 [dev-dependencies]
 tempfile.workspace = true

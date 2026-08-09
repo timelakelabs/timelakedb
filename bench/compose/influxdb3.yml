@@ -1,4 +1,4 @@
-# InfluxDB 3 Core target for tsdb-bench — the baseline TimelordDB must beat
+# InfluxDB 3 Core target for tsdb-bench — the baseline TimeLakeDB must beat
 # (recorded baseline runs live in ../results/influxdb3-idb3-full-*).
 #   docker compose -f compose/influxdb3.yml up -d
 #   python bench.py run --backend influxdb3 --scale smoke --label idb3-smoke

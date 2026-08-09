@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img"
-     aria-label="TimelordDB mark: an hourglass inside a compass clock">
+     aria-label="TimeLakeDB mark: an hourglass inside a compass clock">
   <defs>
     <!-- the lower bulb fills with data, so the blue lines are clipped to it -->
     <clipPath id="bulb">

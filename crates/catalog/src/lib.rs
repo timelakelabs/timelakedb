@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use timelord_store::Store;
+use timelake_store::Store;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileMeta {
@@ -168,7 +168,7 @@ impl<S: Store> Catalog<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use timelord_store::LocalStore;
+    use timelake_store::LocalStore;
 
     fn meta(db: &str, table: &str, part: &str, path: &str) -> FileMeta {
         FileMeta {

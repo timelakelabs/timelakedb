@@ -432,8 +432,8 @@ fn cell_to_json(col: &dyn Array, row: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use timelord_buffer::TableBuffer;
-    use timelord_ingest::parse_lines;
+    use timelake_buffer::TableBuffer;
+    use timelake_ingest::parse_lines;
 
     fn buffer_with(lp: &str) -> RecordBatch {
         let mut buf = TableBuffer::default();

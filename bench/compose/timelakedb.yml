@@ -1,11 +1,11 @@
-# TimelordDB target for tsdb-bench — the system under test.
-#   docker compose -f compose/timelorddb.yml up -d --build
-#   python bench.py run --backend timelorddb --scale smoke --label tldb-smoke
-name: bench-timelorddb
+# TimeLakeDB target for tsdb-bench — the system under test.
+#   docker compose -f compose/timelakedb.yml up -d --build
+#   python bench.py run --backend timelakedb --scale smoke --label tldb-smoke
+name: bench-timelakedb
 services:
-  timelorddb:
+  timelakedb:
     build: ../..
-    container_name: timelorddb
+    container_name: timelakedb
     ports:
       - "1963:1963"   # HTTP: line-protocol writes + /api/sql
       - "1964:1964"   # Flight SQL (Grafana, FR-8)
@@ -13,8 +13,8 @@ services:
       # RR-1: one shared 3.5 GB pool; with 2 admitted queries worst-case
       # tracked residency is 7 GB, inside the 8 GB cap below. (The
       # influxdb3 baseline peaked at 9.2 GB unconstrained on this VM.)
-      TIMELORD_QUERY_MEM_BYTES: "3758096384"
-      TIMELORD_MAX_CONCURRENT_QUERIES: "2"
+      TIMELAKE_QUERY_MEM_BYTES: "3758096384"
+      TIMELAKE_MAX_CONCURRENT_QUERIES: "2"
     # A runaway engine must never take the host VM down with it (learned
     # the hard way: an unkillable scan wedged Docker Desktop entirely)
     mem_limit: 8g
@@ -22,14 +22,14 @@ services:
       # named volume: native VM filesystem. A Windows bind mount here cost
       # ~3 s/query in whole-file read overhead (measured); range reads
       # over a real object store are the M5 refinement.
-      - timelord-data:/var/lib/timelord/data
+      - timelake-data:/var/lib/timelake/data
     restart: unless-stopped
 
   # AT-6 read half: the UNCHANGED fixture dashboards over Flight SQL.
-  #   docker compose -f compose/timelorddb.yml --profile grafana up -d
+  #   docker compose -f compose/timelakedb.yml --profile grafana up -d
   grafana:
     image: grafana/grafana:latest
-    container_name: timelord-grafana
+    container_name: timelake-grafana
     profiles: ["grafana"]
     ports:
       - "3003:3000"
@@ -42,19 +42,19 @@ services:
       - ../../fixtures/grafana/dashboards:/var/lib/grafana/dashboards:ro
     restart: unless-stopped
     depends_on:
-      - timelorddb
+      - timelakedb
 
-  # AT-6 write half: stock Telegraf feeding TimelordDB.
-  #   docker compose -f compose/timelorddb.yml --profile telegraf up -d
+  # AT-6 write half: stock Telegraf feeding TimeLakeDB.
+  #   docker compose -f compose/timelakedb.yml --profile telegraf up -d
   telegraf:
     image: telegraf:latest
-    container_name: timelord-telegraf
+    container_name: timelake-telegraf
     profiles: ["telegraf"]
     volumes:
       - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
     restart: unless-stopped
     depends_on:
-      - timelorddb
+      - timelakedb
 
 volumes:
-  timelord-data:
+  timelake-data:

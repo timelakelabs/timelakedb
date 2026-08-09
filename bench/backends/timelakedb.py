@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TimelordDB adapter — the system under test (AT-1).
+"""TimeLakeDB adapter — the system under test (AT-1).
 
 This adapter doubles as the API contract the server must implement:
 
@@ -14,7 +14,7 @@ This adapter doubles as the API contract the server must implement:
 Milestone honesty: at M0 only healthy()/version() answer (the AT-1 gate);
 writes and queries 501 until M1.
 
-Launch the target with: docker compose -f compose/timelorddb.yml up -d --build
+Launch the target with: docker compose -f compose/timelakedb.yml up -d --build
 """
 
 import time
@@ -22,13 +22,13 @@ import time
 from .base import Backend
 
 
-class TimelordDB(Backend):
-    name = "timelorddb"
-    display = "TimelordDB"
+class TimeLakeDB(Backend):
+    name = "timelakedb"
+    display = "TimeLakeDB"
     default_url = "http://localhost:1963"
     default_db = "poc"
-    default_container = "timelorddb"
-    data_dir = "/var/lib/timelord/data"
+    default_container = "timelakedb"
+    data_dir = "/var/lib/timelake/data"
 
     def prepare(self):
         pass  # databases are created on first write (M1)

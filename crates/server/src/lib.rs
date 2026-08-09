@@ -1,4 +1,4 @@
-//! TimelordDB server — M2: a real storage engine.
+//! TimeLakeDB server — M2: a real storage engine.
 //!
 //! Write path (ARCHITECTURE §5): parse → WAL (durable before 204) →
 //! mutable buffer. Flush (§6/§7 L0): buffers swap out under the ingest
@@ -22,14 +22,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use serde_json::Value;
-use timelord_api::WriteError;
-use timelord_buffer::{TableBuffer, flush};
-use timelord_catalog::{Catalog, FileMeta};
-use timelord_ingest::{parse_lines, precision_multiplier};
-use timelord_query::{QuerySession, batches_to_json};
-use timelord_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
-use timelord_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
-use timelord_wal::Wal;
+use timelake_api::WriteError;
+use timelake_buffer::{TableBuffer, flush};
+use timelake_catalog::{Catalog, FileMeta};
+use timelake_ingest::{parse_lines, precision_multiplier};
+use timelake_query::{QuerySession, batches_to_json};
+use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
+use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
+use timelake_wal::Wal;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -95,23 +95,23 @@ impl StoreStack {
 /// and only here — nothing downstream can tell local from S3 or
 /// plaintext from encrypted (SEC-1/CL-1, §12).
 ///
-/// - `TIMELORD_OBJECT_STORE` — unset = local `objects/` dir;
+/// - `TIMELAKE_OBJECT_STORE` — unset = local `objects/` dir;
 ///   `s3://bucket[/prefix]` = S3 (LocalStack via `AWS_ENDPOINT_URL`).
-/// - `TIMELORD_KMS_KEY_ID` — envelope-encrypt with AWS KMS data keys,
-///   behind the key cache unless `TIMELORD_KMS_CACHE=off`
-///   (`TIMELORD_KMS_CACHE_MAX_AGE_SECS` / `_MAX_USES` bound the window).
-/// - `TIMELORD_ENCRYPTION_KEY[_FILE]` — envelope-encrypt with a local
+/// - `TIMELAKE_KMS_KEY_ID` — envelope-encrypt with AWS KMS data keys,
+///   behind the key cache unless `TIMELAKE_KMS_CACHE=off`
+///   (`TIMELAKE_KMS_CACHE_MAX_AGE_SECS` / `_MAX_USES` bound the window).
+/// - `TIMELAKE_ENCRYPTION_KEY[_FILE]` — envelope-encrypt with a local
 ///   KEK, as before. Setting BOTH key sources is a refused ambiguity.
-/// - `TIMELORD_S3_SSE_KEY_ID` — SSE-KMS key for server-side encryption
-///   (defaults to `TIMELORD_KMS_KEY_ID`; Bucket Keys requested per PUT).
+/// - `TIMELAKE_S3_SSE_KEY_ID` — SSE-KMS key for server-side encryption
+///   (defaults to `TIMELAKE_KMS_KEY_ID`; Bucket Keys requested per PUT).
 pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
-    let object_store = std::env::var("TIMELORD_OBJECT_STORE").ok();
-    let kms_key = std::env::var("TIMELORD_KMS_KEY_ID").ok();
+    let object_store = std::env::var("TIMELAKE_OBJECT_STORE").ok();
+    let kms_key = std::env::var("TIMELAKE_KMS_KEY_ID").ok();
     let local_key = encryption_key_from_env()?;
     if kms_key.is_some() && local_key.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "TIMELORD_KMS_KEY_ID and TIMELORD_ENCRYPTION_KEY are both set — \
+            "TIMELAKE_KMS_KEY_ID and TIMELAKE_ENCRYPTION_KEY are both set — \
              pick one key source",
         ));
     }
@@ -133,7 +133,7 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
                 "local",
             ),
             Some(url) if url.starts_with("s3://") => {
-                let sse = std::env::var("TIMELORD_S3_SSE_KEY_ID")
+                let sse = std::env::var("TIMELAKE_S3_SSE_KEY_ID")
                     .ok()
                     .or_else(|| kms_key.clone());
                 let s3 = S3Store::new(ctx.clone().expect("ctx built for s3"), &url, sse)?;
@@ -143,7 +143,7 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
             Some(other) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("TIMELORD_OBJECT_STORE {other:?} is not s3://bucket[/prefix]"),
+                    format!("TIMELAKE_OBJECT_STORE {other:?} is not s3://bucket[/prefix]"),
                 ));
             }
         };
@@ -158,9 +158,9 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
         match (kms_key, local_key) {
             (Some(key_id), None) => {
                 let aws = AwsKms::new(ctx.expect("ctx built for kms"), key_id);
-                if std::env::var("TIMELORD_KMS_CACHE").as_deref() == Ok("off") {
+                if std::env::var("TIMELAKE_KMS_CACHE").as_deref() == Ok("off") {
                     tracing::warn!(
-                        "TIMELORD_KMS_CACHE=off: strict per-object data keys, \
+                        "TIMELAKE_KMS_CACHE=off: strict per-object data keys, \
                          one KMS call per object (the drill's baseline mode)"
                     );
                     let kms: Arc<dyn Kms> = Arc::new(aws);
@@ -169,10 +169,10 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
                     let cached = CachingKms::new(
                         aws,
                         std::time::Duration::from_secs(env_u64(
-                            "TIMELORD_KMS_CACHE_MAX_AGE_SECS",
+                            "TIMELAKE_KMS_CACHE_MAX_AGE_SECS",
                             300,
                         )),
-                        env_u64("TIMELORD_KMS_CACHE_MAX_USES", 1000) as u32,
+                        env_u64("TIMELAKE_KMS_CACHE_MAX_USES", 1000) as u32,
                     );
                     let stats = cached.stats();
                     let kms: Arc<dyn Kms> = Arc::new(cached);
@@ -199,20 +199,20 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
 /// Where runtime retention config lives in the object store (FR-7).
 const RETENTION_CONFIG_PATH: &str = "catalog/config/retention.json";
 
-/// SEC-1 key config: `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or
-/// `TIMELORD_ENCRYPTION_KEY_FILE` (a file holding them). Key material
+/// SEC-1 key config: `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or
+/// `TIMELAKE_ENCRYPTION_KEY_FILE` (a file holding them). Key material
 /// stays out of [`EngineConfig`] so a `?cfg` log line can never leak it.
 fn encryption_key_from_env() -> std::io::Result<Option<[u8; 32]>> {
-    let hex = match std::env::var("TIMELORD_ENCRYPTION_KEY") {
+    let hex = match std::env::var("TIMELAKE_ENCRYPTION_KEY") {
         Ok(k) => k,
-        Err(_) => match std::env::var("TIMELORD_ENCRYPTION_KEY_FILE") {
+        Err(_) => match std::env::var("TIMELAKE_ENCRYPTION_KEY_FILE") {
             Ok(path) => std::fs::read_to_string(&path).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("encryption key file {path}: {e}"))
             })?,
             Err(_) => return Ok(None),
         },
     };
-    timelord_store::key_from_hex(&hex).map(Some)
+    timelake_store::key_from_hex(&hex).map(Some)
 }
 
 /// Parse "pipeline_events=365d,host_metrics=90d,disk_metrics=72h" (FR-7).
@@ -246,19 +246,19 @@ pub struct Engine {
     store: Arc<dyn Store>,
     catalog: Catalog<Arc<dyn Store>>,
     /// SEC-1: true when the store is the encrypting decorator (drives the
-    /// timelord_encryption_enabled gauge; the engine itself cannot tell).
+    /// timelake_encryption_enabled gauge; the engine itself cannot tell).
     store_encrypted: bool,
     cfg: EngineConfig,
     /// Shared pool + admission + timeout (RR-1/RR-2) — ONE for all queries.
-    query_env: timelord_query::QueryEnv,
+    query_env: timelake_query::QueryEnv,
     /// Full column set per (db, table): survives flushes and restarts so
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
-    schemas: RwLock<HashMap<(String, String), timelord_query::QuerySchema>>,
+    schemas: RwLock<HashMap<(String, String), timelake_query::QuerySchema>>,
     /// SEC-4 principals and sessions for the admin surface.
-    auth: Arc<timelord_auth::Auth>,
+    auth: Arc<timelake_auth::Auth>,
     /// FR-7 policies, runtime-mutable (the /admin/retention surface).
-    /// Seeded from `TIMELORD_RETENTION`; changes persist to
+    /// Seeded from `TIMELAKE_RETENTION`; changes persist to
     /// [`RETENTION_CONFIG_PATH`] through the store — encrypted like any
     /// object, shared via S3 in the cluster era, and the store copy wins
     /// over the env seed at boot. Plain put (last-writer-wins): admin
@@ -274,7 +274,7 @@ pub struct Engine {
     /// local disk the same window was microseconds wide). The residual
     /// commit→clear window errs toward a transient duplicate, which is
     /// the M2-documented tolerance, never a vanish.
-    flushing: RwLock<HashMap<(String, String), timelord_query::QueryBatch>>,
+    flushing: RwLock<HashMap<(String, String), timelake_query::QueryBatch>>,
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
@@ -284,7 +284,7 @@ pub struct Engine {
     /// after gc_grace_secs so in-flight catalog snapshots never dangle.
     pending_gc: Mutex<Vec<(std::time::Instant, String)>>,
     /// Immutable-footer cache: warm queries prune without fetching files.
-    meta_cache: Arc<timelord_query::provider::MetaCache>,
+    meta_cache: Arc<timelake_query::provider::MetaCache>,
     /// SEC-2: rows the mandatory predicate dropped, across all queries.
     visibility_filtered: Arc<AtomicU64>,
     /// §12.2: KMS call/cache counters, when the key cache is active.
@@ -293,7 +293,7 @@ pub struct Engine {
     s3_stats: Option<Arc<S3Stats>>,
     /// SEC-3: set when the listeners run TLS; feeds the expiry gauge and
     /// renewal-health metric so a failing rotation is visible (RR-5).
-    tls: RwLock<Option<Arc<timelord_tls::RotatingCert>>>,
+    tls: RwLock<Option<Arc<timelake_tls::RotatingCert>>>,
 }
 
 impl Engine {
@@ -361,16 +361,16 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
-        let query_env = timelord_query::QueryEnv::new(
+        let query_env = timelake_query::QueryEnv::new(
             cfg.query_mem_bytes,
             cfg.max_concurrent_queries,
             cfg.query_timeout_secs,
         );
         // SEC-4 principals live in the store like everything else, so
         // they are encrypted with it and travel with a cluster's bucket.
-        let auth = timelord_auth::Auth::open(
+        let auth = timelake_auth::Auth::open(
             store.clone(),
-            std::env::var("TIMELORD_ADMIN_BOOTSTRAP_PASSWORD")
+            std::env::var("TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD")
                 .ok()
                 .as_deref(),
         )?;
@@ -482,7 +482,7 @@ impl Engine {
                     dbs[db][&table].schema_only()
                 };
                 let mut reg = self.schemas.write().expect("schemas lock");
-                let merged = timelord_query::schema_union(reg.get(&key).cloned(), schema)?;
+                let merged = timelake_query::schema_union(reg.get(&key).cloned(), schema)?;
                 reg.insert(key, merged);
             }
         }
@@ -539,7 +539,7 @@ impl Engine {
         // any upload: from here on, queries serve them from `flushing`
         // while the (possibly slow, S3-era) object writes proceed. Pure
         // CPU — the unavoidable swap→holding gap stays sub-millisecond.
-        let mut snapshots: Vec<(String, String, timelord_query::QueryBatch)> = Vec::new();
+        let mut snapshots: Vec<(String, String, timelake_query::QueryBatch)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for (db, table, buf) in owned {
             match buf.snapshot() {
@@ -620,14 +620,14 @@ impl Engine {
         &self,
         db: &str,
         table: &str,
-        batch: &timelord_query::QueryBatch,
+        batch: &timelake_query::QueryBatch,
     ) -> Result<Vec<FileMeta>, String> {
         // keep the registry current: flushed columns must remain
         // queryable after the buffer empties (and after restart)
         {
             let key = (db.to_string(), table.to_string());
             let mut reg = self.schemas.write().expect("schemas lock");
-            let merged = timelord_query::schema_union(reg.get(&key).cloned(), batch.schema())?;
+            let merged = timelake_query::schema_union(reg.get(&key).cloned(), batch.schema())?;
             reg.insert(key, merged);
         }
         let mut metas = Vec::new();
@@ -690,7 +690,7 @@ impl Engine {
                     .map_err(|e| format!("store get {}: {e}", f.path))?;
                 batch_sets.push(flush::read_parquet_bytes(bytes)?);
             }
-            let merged = timelord_compact::merge_files(batch_sets)?;
+            let merged = timelake_compact::merge_files(batch_sets)?;
             let f0 = &files[0];
             let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
             let path = format!(
@@ -761,7 +761,7 @@ impl Engine {
     }
 
     /// SEC-4 principal/session store, shared with the admin router.
-    pub fn auth(&self) -> Arc<timelord_auth::Auth> {
+    pub fn auth(&self) -> Arc<timelake_auth::Auth> {
         self.auth.clone()
     }
 
@@ -824,7 +824,7 @@ impl Engine {
     }
 }
 
-impl timelord_api::Engine for Engine {
+impl timelake_api::Engine for Engine {
     fn write_lp(
         &self,
         db: &str,
@@ -897,7 +897,7 @@ impl Engine {
         db: &str,
         query: &str,
         authorizations: Vec<String>,
-    ) -> Result<Vec<timelord_query::QueryBatch>, String> {
+    ) -> Result<Vec<timelake_query::QueryBatch>, String> {
         let names = self.table_names(db);
         if names.is_empty() {
             return Err(format!(
@@ -906,10 +906,10 @@ impl Engine {
         }
 
         let session = QuerySession::with_authorizations(authorizations);
-        let mut tables: Vec<(String, Arc<dyn timelord_query::DfTableProvider>)> =
+        let mut tables: Vec<(String, Arc<dyn timelake_query::DfTableProvider>)> =
             Vec::with_capacity(names.len());
         for name in names {
-            let mut buffer: Vec<timelord_query::QueryBatch> = {
+            let mut buffer: Vec<timelake_query::QueryBatch> = {
                 let dbs = self.dbs.read().expect("dbs lock");
                 match dbs.get(db).and_then(|t| t.get(&name)) {
                     Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
@@ -934,11 +934,11 @@ impl Engine {
             // merged schema: registry (covers files + past flushes) ∪ buffer
             let mut schema = self.table_schema(db, &name);
             if let Some(b) = buffer.first() {
-                schema = Some(timelord_query::schema_union(schema, b.schema())?);
+                schema = Some(timelake_query::schema_union(schema, b.schema())?);
             }
             let Some(schema) = schema else { continue };
 
-            let provider = timelord_query::provider::LazyTable::new(
+            let provider = timelake_query::provider::LazyTable::new(
                 name.clone(),
                 schema,
                 buffer,
@@ -953,7 +953,7 @@ impl Engine {
             tables.push((name, Arc::new(provider)));
         }
 
-        timelord_query::run_sql_env(&self.query_env, &session, db, tables, query).await
+        timelake_query::run_sql_env(&self.query_env, &session, db, tables, query).await
     }
 
     /// Databases that hold data — live buffers plus anything the catalog
@@ -993,7 +993,7 @@ impl Engine {
 
     /// Merged schema for one table: the registry (files and past flushes)
     /// unioned with whatever the live buffer has added since.
-    pub fn table_schema(&self, db: &str, table: &str) -> Option<timelord_query::QuerySchema> {
+    pub fn table_schema(&self, db: &str, table: &str) -> Option<timelake_query::QuerySchema> {
         let key = (db.to_string(), table.to_string());
         let registered = self
             .schemas
@@ -1009,13 +1009,13 @@ impl Engine {
                 .map(|b| b.schema_only())
         };
         match buffered {
-            Some(b) => timelord_query::schema_union(registered, b).ok(),
+            Some(b) => timelake_query::schema_union(registered, b).ok(),
             None => registered,
         }
     }
 
     /// Attach the TLS rotator so /metrics exports cert health (SEC-3).
-    pub fn set_tls(&self, rot: Arc<timelord_tls::RotatingCert>) {
+    pub fn set_tls(&self, rot: Arc<timelake_tls::RotatingCert>) {
         *self.tls.write().expect("tls lock") = Some(rot);
     }
 
@@ -1033,14 +1033,14 @@ impl Engine {
         let wal_bytes = self.wal.lock().expect("wal lock").size();
         let kms_lines = match &self.kms_stats {
             Some(k) => format!(
-                "# TYPE timelord_kms_generate_total counter\n\
-                 timelord_kms_generate_total {}\n\
-                 # TYPE timelord_kms_decrypt_total counter\n\
-                 timelord_kms_decrypt_total {}\n\
-                 # TYPE timelord_kms_generate_cache_hits_total counter\n\
-                 timelord_kms_generate_cache_hits_total {}\n\
-                 # TYPE timelord_kms_decrypt_cache_hits_total counter\n\
-                 timelord_kms_decrypt_cache_hits_total {}\n",
+                "# TYPE timelake_kms_generate_total counter\n\
+                 timelake_kms_generate_total {}\n\
+                 # TYPE timelake_kms_decrypt_total counter\n\
+                 timelake_kms_decrypt_total {}\n\
+                 # TYPE timelake_kms_generate_cache_hits_total counter\n\
+                 timelake_kms_generate_cache_hits_total {}\n\
+                 # TYPE timelake_kms_decrypt_cache_hits_total counter\n\
+                 timelake_kms_decrypt_cache_hits_total {}\n",
                 k.generate_calls.load(Ordering::Relaxed),
                 k.decrypt_calls.load(Ordering::Relaxed),
                 k.generate_hits.load(Ordering::Relaxed),
@@ -1050,15 +1050,15 @@ impl Engine {
         };
         let s3_lines = match &self.s3_stats {
             Some(s) => format!(
-                "# TYPE timelord_s3_get_total counter\ntimelord_s3_get_total {}\n\
-                 # TYPE timelord_s3_put_total counter\ntimelord_s3_put_total {}\n\
-                 # TYPE timelord_s3_head_total counter\ntimelord_s3_head_total {}\n\
-                 # TYPE timelord_s3_list_total counter\ntimelord_s3_list_total {}\n\
-                 # TYPE timelord_s3_delete_total counter\ntimelord_s3_delete_total {}\n\
-                 # TYPE timelord_s3_read_bytes_total counter\n\
-                 timelord_s3_read_bytes_total {}\n\
-                 # TYPE timelord_s3_write_bytes_total counter\n\
-                 timelord_s3_write_bytes_total {}\n",
+                "# TYPE timelake_s3_get_total counter\ntimelake_s3_get_total {}\n\
+                 # TYPE timelake_s3_put_total counter\ntimelake_s3_put_total {}\n\
+                 # TYPE timelake_s3_head_total counter\ntimelake_s3_head_total {}\n\
+                 # TYPE timelake_s3_list_total counter\ntimelake_s3_list_total {}\n\
+                 # TYPE timelake_s3_delete_total counter\ntimelake_s3_delete_total {}\n\
+                 # TYPE timelake_s3_read_bytes_total counter\n\
+                 timelake_s3_read_bytes_total {}\n\
+                 # TYPE timelake_s3_write_bytes_total counter\n\
+                 timelake_s3_write_bytes_total {}\n",
                 s.get_total.load(Ordering::Relaxed),
                 s.put_total.load(Ordering::Relaxed),
                 s.head_total.load(Ordering::Relaxed),
@@ -1071,35 +1071,35 @@ impl Engine {
         };
         let tls_lines = match self.tls.read().expect("tls lock").as_ref() {
             Some(t) => format!(
-                "# TYPE timelord_tls_cert_expiry_seconds gauge\n\
-                 timelord_tls_cert_expiry_seconds {}\n\
-                 # TYPE timelord_tls_last_reload_ok gauge\n\
-                 timelord_tls_last_reload_ok {}\n",
+                "# TYPE timelake_tls_cert_expiry_seconds gauge\n\
+                 timelake_tls_cert_expiry_seconds {}\n\
+                 # TYPE timelake_tls_last_reload_ok gauge\n\
+                 timelake_tls_last_reload_ok {}\n",
                 t.expires_in_secs(),
                 if t.last_reload_ok() { 1 } else { 0 },
             ),
             None => String::new(),
         };
         format!(
-            "# TYPE timelord_lines_written_total counter\n\
-             timelord_lines_written_total {}\n\
-             # TYPE timelord_flushes_total counter\ntimelord_flushes_total {}\n\
-             # TYPE timelord_parquet_files gauge\ntimelord_parquet_files {}\n\
-             # TYPE timelord_databases gauge\ntimelord_databases {}\n\
-             # TYPE timelord_tables gauge\ntimelord_tables {}\n\
-             # TYPE timelord_buffer_rows gauge\ntimelord_buffer_rows {}\n\
-             # TYPE timelord_wal_bytes gauge\ntimelord_wal_bytes {}\n\
-             # TYPE timelord_compactions_total counter\ntimelord_compactions_total {}\n\
-             # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n\
-             # TYPE timelord_encryption_enabled gauge\ntimelord_encryption_enabled {}\n\
-             # TYPE timelord_visibility_rows_filtered_total counter\n\
-             timelord_visibility_rows_filtered_total {}\n\
-             # TYPE timelord_admin_default_credential_active gauge\n\
-             timelord_admin_default_credential_active {}\n\
-             # TYPE timelord_admin_logins_total counter\n\
-             timelord_admin_logins_total {}\n\
-             # TYPE timelord_admin_login_failures_total counter\n\
-             timelord_admin_login_failures_total {}\n{}{}{}",
+            "# TYPE timelake_lines_written_total counter\n\
+             timelake_lines_written_total {}\n\
+             # TYPE timelake_flushes_total counter\ntimelake_flushes_total {}\n\
+             # TYPE timelake_parquet_files gauge\ntimelake_parquet_files {}\n\
+             # TYPE timelake_databases gauge\ntimelake_databases {}\n\
+             # TYPE timelake_tables gauge\ntimelake_tables {}\n\
+             # TYPE timelake_buffer_rows gauge\ntimelake_buffer_rows {}\n\
+             # TYPE timelake_wal_bytes gauge\ntimelake_wal_bytes {}\n\
+             # TYPE timelake_compactions_total counter\ntimelake_compactions_total {}\n\
+             # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
+             # TYPE timelake_encryption_enabled gauge\ntimelake_encryption_enabled {}\n\
+             # TYPE timelake_visibility_rows_filtered_total counter\n\
+             timelake_visibility_rows_filtered_total {}\n\
+             # TYPE timelake_admin_default_credential_active gauge\n\
+             timelake_admin_default_credential_active {}\n\
+             # TYPE timelake_admin_logins_total counter\n\
+             timelake_admin_logins_total {}\n\
+             # TYPE timelake_admin_login_failures_total counter\n\
+             timelake_admin_login_failures_total {}\n{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1131,13 +1131,13 @@ impl Engine {
     }
 }
 
-impl timelord_flight::SqlBackend for Engine {
+impl timelake_flight::SqlBackend for Engine {
     fn query_batches<'a>(
         &'a self,
         db: String,
         sql: String,
         authorizations: Vec<String>,
-    ) -> timelord_flight::SqlFuture<'a> {
+    ) -> timelake_flight::SqlFuture<'a> {
         Box::pin(async move { self.sql_batches(&db, &sql, authorizations).await })
     }
 
@@ -1149,7 +1149,7 @@ impl timelord_flight::SqlBackend for Engine {
         self.table_names(db)
     }
 
-    fn table_schema(&self, db: &str, table: &str) -> Option<timelord_query::QuerySchema> {
+    fn table_schema(&self, db: &str, table: &str) -> Option<timelake_query::QuerySchema> {
         Engine::table_schema(self, db, table)
     }
 }
@@ -1158,7 +1158,7 @@ impl timelord_flight::SqlBackend for Engine {
 /// plane does not (that migration is its own milestone).
 pub fn app(engine: Arc<Engine>) -> axum::Router {
     let auth = engine.auth();
-    timelord_api::app(engine, auth, false)
+    timelake_api::app(engine, auth, false)
 }
 
 /// The TLS-enabled router: the api surface plus the explicit rotation
@@ -1168,7 +1168,7 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
 /// of /admin.
 pub fn app_with_tls_admin(
     engine: Arc<Engine>,
-    rot: Arc<timelord_tls::RotatingCert>,
+    rot: Arc<timelake_tls::RotatingCert>,
 ) -> axum::Router {
     use axum::response::IntoResponse;
     let reload = move || {
@@ -1190,7 +1190,7 @@ pub fn app_with_tls_admin(
                     axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                     axum::Json(serde_json::json!({
                         "error": e.to_string(),
-                        "alarm": timelord_tls::RENEWAL_ALARM,
+                        "alarm": timelake_tls::RENEWAL_ALARM,
                         "serving": "last-good certificate",
                     })),
                 )
@@ -1204,12 +1204,12 @@ pub fn app_with_tls_admin(
         }
     };
     let auth = engine.auth();
-    timelord_api::app(engine, auth.clone(), true).merge(
+    timelake_api::app(engine, auth.clone(), true).merge(
         axum::Router::new()
             .route("/admin/tls/reload", axum::routing::post(reload))
             .layer(axum::middleware::from_fn_with_state(
                 auth,
-                timelord_api::require_admin_session,
+                timelake_api::require_admin_session,
             )),
     )
 }
@@ -1224,21 +1224,21 @@ pub fn config_from_env() -> EngineConfig {
     }
     let d = EngineConfig::default();
     EngineConfig {
-        query_mem_bytes: env("TIMELORD_QUERY_MEM_BYTES", d.query_mem_bytes),
-        flush_rows: env("TIMELORD_FLUSH_ROWS", d.flush_rows),
-        flush_age_secs: env("TIMELORD_FLUSH_AGE_SECS", d.flush_age_secs),
-        wal_max_bytes: env("TIMELORD_WAL_MAX_BYTES", d.wal_max_bytes),
-        compact_min_files: env("TIMELORD_COMPACT_MIN_FILES", d.compact_min_files),
-        retention: std::env::var("TIMELORD_RETENTION")
+        query_mem_bytes: env("TIMELAKE_QUERY_MEM_BYTES", d.query_mem_bytes),
+        flush_rows: env("TIMELAKE_FLUSH_ROWS", d.flush_rows),
+        flush_age_secs: env("TIMELAKE_FLUSH_AGE_SECS", d.flush_age_secs),
+        wal_max_bytes: env("TIMELAKE_WAL_MAX_BYTES", d.wal_max_bytes),
+        compact_min_files: env("TIMELAKE_COMPACT_MIN_FILES", d.compact_min_files),
+        retention: std::env::var("TIMELAKE_RETENTION")
             .map(|s| parse_retention(&s))
             .unwrap_or_default(),
-        max_concurrent_queries: env("TIMELORD_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
-        query_timeout_secs: env("TIMELORD_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
-        gc_grace_secs: env("TIMELORD_GC_GRACE_SECS", d.gc_grace_secs),
+        max_concurrent_queries: env("TIMELAKE_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
+        query_timeout_secs: env("TIMELAKE_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
+        gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
     }
 }
 
 /// Convenience used by main and tests.
 pub fn data_dir_from_env() -> PathBuf {
-    PathBuf::from(std::env::var("TIMELORD_DATA_DIR").unwrap_or_else(|_| "./data".to_string()))
+    PathBuf::from(std::env::var("TIMELAKE_DATA_DIR").unwrap_or_else(|_| "./data".to_string()))
 }

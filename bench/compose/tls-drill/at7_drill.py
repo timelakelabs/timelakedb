@@ -8,7 +8,7 @@ certificate. Then repeat with a deliberately corrupt renewal: the server
 keeps serving on the last-good cert and raises the SEC-3 alarm.
 
 Run from bench/:  python compose/tls-drill/at7_drill.py
-Prereqs: gen-certs.sh initial + the timelorddb-tls compose stack up.
+Prereqs: gen-certs.sh initial + the timelakedb-tls compose stack up.
 """
 
 import shutil
@@ -28,8 +28,8 @@ RUN_TAG = f"r{int(time.time())}"  # rerun-safe: this run's writes are countable 
 CA = str(CERTS / "ca.crt")
 BASE = "https://localhost:2963"
 FLIGHT = "grpc+tls://localhost:2964"
-CONTAINER = "timelorddb-tls"
-TELEGRAF = "timelord-telegraf-tls"
+CONTAINER = "timelakedb-tls"
+TELEGRAF = "timelake-telegraf-tls"
 
 results: list[tuple[bool, str]] = []
 
@@ -169,9 +169,9 @@ def main():
     v = tls_version(2963)
     check(v == "TLSv1.3", "TLS 1.3 negotiated (default floor)", v)
     m = metrics()
-    exp = m.get("timelord_tls_cert_expiry_seconds", -1)
+    exp = m.get("timelake_tls_cert_expiry_seconds", -1)
     check(0 < exp <= 86400, "expiry gauge ~24h", f"{exp:.0f}s")
-    check(m.get("timelord_tls_last_reload_ok") == 1.0, "reload-ok gauge starts 1")
+    check(m.get("timelake_tls_last_reload_ok") == 1.0, "reload-ok gauge starts 1")
 
     serial_http_0 = serving_serial(2963)
     serial_flight_0 = serving_serial(2964)
@@ -284,7 +284,7 @@ def main():
     check(not terr, "Telegraf (TLS) logged zero output errors", terr[0] if terr else "")
 
     m = metrics()
-    check(m.get("timelord_tls_last_reload_ok") == 1.0, "reload-ok gauge still 1 after rotation")
+    check(m.get("timelake_tls_last_reload_ok") == 1.0, "reload-ok gauge still 1 after rotation")
 
     print("== leg 2: corrupt renewal ==")
     writer2 = Writer()
@@ -297,7 +297,7 @@ def main():
           "admin reload rejects corrupt pair with named alarm", f"HTTP {rr.status_code} {body}")
     check(serving_serial(2963) == new_serial, "still serving last-good cert")
     m = metrics()
-    check(m.get("timelord_tls_last_reload_ok") == 0.0, "reload-ok gauge dropped to 0")
+    check(m.get("timelake_tls_last_reload_ok") == 0.0, "reload-ok gauge dropped to 0")
     slogs = docker_logs(CONTAINER, t0)
     check("SEC3_CERT_RENEWAL_FAILED" in slogs, "SEC3_CERT_RENEWAL_FAILED alarm in server logs")
 
@@ -312,12 +312,12 @@ def main():
     ok = False
     for _ in range(20):
         time.sleep(0.5)
-        if metrics().get("timelord_tls_last_reload_ok") == 1.0:
+        if metrics().get("timelake_tls_last_reload_ok") == 1.0:
             ok = True
             break
     if not ok:
         requests.post(f"{BASE}/admin/tls/reload", verify=CA, timeout=10)
-        ok = metrics().get("timelord_tls_last_reload_ok") == 1.0
+        ok = metrics().get("timelake_tls_last_reload_ok") == 1.0
     check(ok, "good renewal after the bad one restores health")
 
     print("\n== AT-7 verdict ==")

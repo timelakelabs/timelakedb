@@ -1,13 +1,13 @@
-Run one TimelordDB performance-improvement cycle in C:\project-time-lord-db\TimelordDB. Work autonomously and finish inside ~90 minutes; if you cannot, log it as ABORTED and clean up.
+Run one TimeLakeDB performance-improvement cycle in C:\project-time-lord-db\TimeLakeDB. Work autonomously and finish inside ~90 minutes; if you cannot, log it as ABORTED and clean up.
 
 ISOLATION — non-negotiable, this Docker host runs production services:
-- NEVER touch the running containers `timelorddb`, `timelord-telegraf`, `timelord-grafana`, the volume `bench-timelorddb_timelord-data`, or anything else already running (Paperless, Tailscale, Caddy, etc).
+- NEVER touch the running containers `timelakedb`, `timelake-telegraf`, `timelake-grafana`, the volume `bench-timelakedb_timelake-data`, or anything else already running (Paperless, Tailscale, Caddy, etc).
 - NEVER restart Docker Desktop, and never use `docker compose` — it would recreate the user's stack. Plain `docker run` only.
-- Use your own instance only: build an image tag like `timelorddb:perf`, run a container named `tldb-perf` with `--memory 8g`, port `2965:1963`, and a dedicated volume `tldb-perf-data`. Point the harness at it with `--url http://localhost:2965 --container tldb-perf`.
+- Use your own instance only: build an image tag like `timelakedb:perf`, run a container named `tldb-perf` with `--memory 8g`, port `2965:1963`, and a dedicated volume `tldb-perf-data`. Point the harness at it with `--url http://localhost:2965 --container tldb-perf`.
 - Remove your container, volume and image at the end of the cycle, win or lose.
 
 NO local Rust toolchain — build and test through Docker:
-docker run --rm -v "C:/project-time-lord-db/TimelordDB":/src -w /src -v timelord-cargo-cache:/usr/local/cargo/registry rust:1-slim cargo test --workspace
+docker run --rm -v "C:/project-time-lord-db/TimeLakeDB":/src -w /src -v timelake-cargo-cache:/usr/local/cargo/registry rust:1-slim cargo test --workspace
 
 THE CYCLE:
 1. Read docs/evidence/PERFORMANCE_LOG.md first, all of it. Do not repeat an idea already logged unless the entry says a retry is worthwhile. The "Standing leads" section is starting material, not a mandate, and later entries carry measurement rules that override it.

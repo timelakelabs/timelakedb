@@ -1,4 +1,4 @@
-# TimelordDB Console — Design
+# TimeLakeDB Console — Design
 
 **Status: designed 2026-08-09; build phased U0–U3 (ARCHITECTURE §14).**
 The console is the operator plane: one authenticated surface for changing
@@ -6,9 +6,9 @@ what the server does, seeing what it did, and watching what it is doing —
 on a node, and later across a cluster.
 
 Everything here composes from seams that already exist: the `Store`
-chokepoint (SEC-1), the sequence-keyed manifest catalog, `timelord-tls`'s
+chokepoint (SEC-1), the sequence-keyed manifest catalog, `timelake-tls`'s
 validate-before-swap rotation (SEC-3), the `Discovery` trait (CL-5), and
-the Prometheus exposition in `timelord-server`. The console adds four
+the Prometheus exposition in `timelake-server`. The console adds four
 crates and one listener; it does not add a second way to store state.
 
 ---
@@ -28,7 +28,7 @@ problems that this design exists to answer:
    authentication is a remote data-destruction button.
 2. **Stored config silently outranks the environment.** Today the store
    copy wins at boot and nothing says so. An operator who edits
-   `TIMELORD_RETENTION` in compose, restarts, and sees no change has hit
+   `TIMELAKE_RETENTION` in compose, restarts, and sees no change has hit
    a silent guardrail — exactly what RR-5 forbids ("guardrails are
    visible, tunable, and never silent").
 3. **`DELETE` is ambiguous.** Removing a policy means "keep everything"
@@ -89,7 +89,7 @@ Three layers resolve, lowest to highest:
 
 ```
 built-in default   EngineConfig::default()          — compiled in
-system property    TIMELORD_*  (env / compose / unit file)
+system property    TIMELAKE_*  (env / compose / unit file)
 stored override    catalog/config/settings.json     — written by the console
 ```
 
@@ -108,7 +108,7 @@ answer:
   "effective": {"value": "30d", "source": "override"},
   "layers": {
     "default":  null,
-    "property": {"value": "90d", "env": "TIMELORD_RETENTION"},
+    "property": {"value": "90d", "env": "TIMELAKE_RETENTION"},
     "override": {"value": "30d", "revision": 41,
                  "actor": "rcowell", "at": "2026-08-09T09:52:11Z",
                  "property_at_write": "90d"}
@@ -123,7 +123,7 @@ property differs from the one recorded at override time, the operator
 changed the deployment and the change is being shadowed. That is
 reported three ways: a banner on the setting, a `WARN` log line at boot
 and at detection, and the gauge
-`timelord_config_divergent_settings`.
+`timelake_config_divergent_settings`.
 
 ### 3.3 Override states — three, not two
 
@@ -134,12 +134,12 @@ and at detection, and the gauge
 | explicit-none | the feature is *off* here, even if the property sets it | `PUT` with `null` |
 
 This resolves problem 3 from §0. For retention: `DELETE` reverts a table
-to whatever `TIMELORD_RETENTION` declares; `PUT null` means "this table
+to whatever `TIMELAKE_RETENTION` declares; `PUT null` means "this table
 keeps everything, and I mean it".
 
 ### 3.4 Pinning: the property layer can lock a setting
 
-`TIMELORD_CONFIG_PINNED=gc_grace_secs,query_mem_bytes` marks named
+`TIMELAKE_CONFIG_PINNED=gc_grace_secs,query_mem_bytes` marks named
 settings read-only in the console. The UI shows them with the property
 value and a lock, and the API rejects writes with `409 pinned by system
 property`. Deployments that require configuration-as-code keep it for the
@@ -157,19 +157,19 @@ change and a "restart required" marker).
 
 | Key | Property | Scope | Apply | Min role | Validation / danger |
 |---|---|---|---|---|---|
-| `retention.<table>` | `TIMELORD_RETENTION` | cluster | hot | operator to grow, **admin to shrink** | Shrink deletes data — impact preview required (§11) |
-| `flush_rows` | `TIMELORD_FLUSH_ROWS` | node | hot | operator | 1e3..1e7; high values grow the buffer (RR-4) |
-| `flush_age_secs` | `TIMELORD_FLUSH_AGE_SECS` | node | hot | operator | 1..3600 |
-| `wal_max_bytes` | `TIMELORD_WAL_MAX_BYTES` | node | hot | operator | Lowering below current depth causes immediate 429s — warn with the current depth |
-| `compact_min_files` | `TIMELORD_COMPACT_MIN_FILES` | cluster | hot | operator | 2..64; drives the PR-6 fresh penalty |
-| `max_concurrent_queries` | `TIMELORD_MAX_CONCURRENT_QUERIES` | node | staged | admin | 1..64; raising it divides the same pool further (RR-1) |
-| `query_timeout_secs` | `TIMELORD_QUERY_TIMEOUT_SECS` | cluster | staged | operator | Must stay **below** `gc_grace_secs` |
-| `gc_grace_secs` | `TIMELORD_GC_GRACE_SECS` | cluster | hot | admin | **Must exceed `query_timeout_secs`** — the AT-3 compaction-vs-query race |
-| `query_mem_bytes` | `TIMELORD_QUERY_MEM_BYTES` | node | staged | admin | Warn when > 60 % of the cgroup limit (RR-1) |
-| `kms_cache*` | `TIMELORD_KMS_CACHE*` | node | boot | admin | v1 boot-only; hot candidate later |
-| `tls.cert/key` | `TIMELORD_TLS_CERT/_KEY` | node | boot (paths) | admin | Contents already hot-rotate (SEC-3); path changes need a restart |
-| `object_store`, `data_dir`, `role`, `addr`, `flight_addr`, `admin_addr` | `TIMELORD_*` | node | boot | admin (read-only) | Displayed with provenance; never editable at runtime |
-| `encryption_key`, `kms_key_id` | `TIMELORD_ENCRYPTION_KEY*`, `_KMS_KEY_ID` | node | boot | admin | **Never rendered.** Presence, source and key id fingerprint only |
+| `retention.<table>` | `TIMELAKE_RETENTION` | cluster | hot | operator to grow, **admin to shrink** | Shrink deletes data — impact preview required (§11) |
+| `flush_rows` | `TIMELAKE_FLUSH_ROWS` | node | hot | operator | 1e3..1e7; high values grow the buffer (RR-4) |
+| `flush_age_secs` | `TIMELAKE_FLUSH_AGE_SECS` | node | hot | operator | 1..3600 |
+| `wal_max_bytes` | `TIMELAKE_WAL_MAX_BYTES` | node | hot | operator | Lowering below current depth causes immediate 429s — warn with the current depth |
+| `compact_min_files` | `TIMELAKE_COMPACT_MIN_FILES` | cluster | hot | operator | 2..64; drives the PR-6 fresh penalty |
+| `max_concurrent_queries` | `TIMELAKE_MAX_CONCURRENT_QUERIES` | node | staged | admin | 1..64; raising it divides the same pool further (RR-1) |
+| `query_timeout_secs` | `TIMELAKE_QUERY_TIMEOUT_SECS` | cluster | staged | operator | Must stay **below** `gc_grace_secs` |
+| `gc_grace_secs` | `TIMELAKE_GC_GRACE_SECS` | cluster | hot | admin | **Must exceed `query_timeout_secs`** — the AT-3 compaction-vs-query race |
+| `query_mem_bytes` | `TIMELAKE_QUERY_MEM_BYTES` | node | staged | admin | Warn when > 60 % of the cgroup limit (RR-1) |
+| `kms_cache*` | `TIMELAKE_KMS_CACHE*` | node | boot | admin | v1 boot-only; hot candidate later |
+| `tls.cert/key` | `TIMELAKE_TLS_CERT/_KEY` | node | boot (paths) | admin | Contents already hot-rotate (SEC-3); path changes need a restart |
+| `object_store`, `data_dir`, `role`, `addr`, `flight_addr`, `admin_addr` | `TIMELAKE_*` | node | boot | admin (read-only) | Displayed with provenance; never editable at runtime |
+| `encryption_key`, `kms_key_id` | `TIMELAKE_ENCRYPTION_KEY*`, `_KMS_KEY_ID` | node | boot | admin | **Never rendered.** Presence, source and key id fingerprint only |
 
 Secrets follow the existing discipline — key material stays out of
 `EngineConfig` precisely so a `?cfg` log line cannot leak it, and the
@@ -222,7 +222,7 @@ prefix at U0, with a one-time migration read.
 Cluster-scope config is polled from the store on the existing maintenance
 tick (10 s) and applied through the same hot-swap holder used locally.
 Each node exposes its applied `revision` on `/health` and as
-`timelord_config_revision`, so the console can show convergence and flag
+`timelake_config_revision`, so the console can show convergence and flag
 a node that is behind or diverged (U3). Nothing about correctness depends
 on propagation speed — config is policy, and CL-5's guard stands: the
 discovery/console path may affect availability and routing, never
@@ -231,7 +231,7 @@ correctness.
 ### 3.9 Hot application
 
 Config is held as an immutable snapshot behind an `ArcSwap` — the same
-pattern `timelord-tls` uses for certificates, for the same reason: readers
+pattern `timelake-tls` uses for certificates, for the same reason: readers
 on the hot path take a pointer, writers publish a whole validated
 snapshot, and in-flight work keeps the version it started with. Concretely:
 
@@ -296,18 +296,18 @@ and made noisy.
   with the password.
 - The replacement is refused if it is shorter than 8 characters, equal
   to the username, or `admin`.
-- `timelord_admin_default_credential_active` is `1` until rotation, a
+- `timelake_admin_default_credential_active` is `1` until rotation, a
   `WARN` names the risk at every start, and the console shows a
   persistent red banner. This is the difference between a known default
   and a *silent* one.
-- `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` keeps the original posture
+- `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` keeps the original posture
   available: provision a real password, no well-known default ever
   exists, and the rotation flag still applies.
 
 **Deployment consequence:** with the admin surface still riding on 1963
 (the listener split is U0 work), a fresh node exposed to an untrusted
 network is exposed *with* a known credential. Bind privately, or set
-`TIMELORD_ADMIN_BOOTSTRAP_PASSWORD`, before that node is reachable.
+`TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD`, before that node is reachable.
 
 ### 4.3 Sessions and tokens
 
@@ -324,15 +324,15 @@ network is exposed *with* a known credential. Bind privately, or set
 ### 4.4 Transport
 
 The admin listener refuses to serve plaintext unless
-`TIMELORD_ADMIN_INSECURE=1` is set, which logs a `WARN` on every start and
-shows a persistent banner in the UI. It reuses `timelord-tls` wholesale —
+`TIMELAKE_ADMIN_INSECURE=1` is set, which logs a `WARN` on every start and
+shows a persistent banner in the UI. It reuses `timelake-tls` wholesale —
 the same rotating resolver, the same last-good behaviour, no second
 certificate story.
 
 ### 4.5 The bridge to SEC-2
 
 SEC-2 visibility authorizations are, in SECURITY.md's words,
-"unauthenticated claims" — `X-Timelord-Authorizations` is whatever the
+"unauthenticated claims" — `X-TimeLake-Authorizations` is whatever the
 caller says it is. SEC-4 gives them an owner: a principal has a set of
 grantable authorizations, and once the data plane requires authentication
 the scan-time predicate can trust the intersection of *claimed* and
@@ -390,7 +390,7 @@ table: the retention UI must not be able to delete the record of its own
 use. They are exposed read-only as `system.audit` so the console, SQL and
 Flight SQL all read them the same way.
 
-Audit retention has a floor: `TIMELORD_AUDIT_MIN_RETENTION_DAYS`
+Audit retention has a floor: `TIMELAKE_AUDIT_MIN_RETENTION_DAYS`
 (default 90) is pinned to the property layer, so lowering it requires
 deployment access, not a console session — and the attempt is audited.
 
@@ -399,7 +399,7 @@ deployment access, not a console session — and the attempt is audited.
 If the audit sink cannot append, mutations are **refused** with `503
 audit sink unavailable`; reads and the data plane are unaffected. An
 administrative change that leaves no record is worse than a change that
-did not happen. `TIMELORD_AUDIT_FAIL_OPEN=1` exists for the operator who
+did not happen. `TIMELAKE_AUDIT_FAIL_OPEN=1` exists for the operator who
 disagrees, logs loudly, and is itself audited when the sink recovers.
 
 ---
@@ -427,7 +427,7 @@ a second, bounded subscriber layer:
   the first place (the existing `EngineConfig` discipline), and the
   console refuses to render any field named like a secret.
 
-App logs are explicitly *not* written into TimelordDB. A database that
+App logs are explicitly *not* written into TimeLakeDB. A database that
 ingests its own logs feeds a write amplification loop precisely when it is
 unhealthy, which is when the logs matter most.
 
@@ -473,18 +473,18 @@ filtering, KMS, S3 and TLS. Missing, and needed for the views above:
 
 | Metric | Type | For |
 |---|---|---|
-| `timelord_uptime_seconds`, `timelord_build_info` | gauge | Overview |
-| `timelord_query_duration_seconds` | histogram | Query latency, PR-3 |
-| `timelord_query_peak_memory_bytes` | histogram | RR-1 headroom |
-| `timelord_query_admission_queued`, `_wait_seconds` | gauge/histogram | Admission pressure |
-| `timelord_query_rejected_total{reason}`, `_timeout_total` | counter | RR-2/RR-5 |
-| `timelord_query_files_pruned_total`, `_row_groups_pruned_total` | counter | Pruning effectiveness |
-| `timelord_write_rejected_total{reason}` | counter | Backpressure (429s) |
-| `timelord_storage_bytes{table}`, `timelord_files{level}` | gauge | Storage view, SR-2 |
-| `timelord_compaction_lag_seconds`, `timelord_flush_lag_seconds` | gauge | SR-3 |
-| `timelord_gc_pending_files` | gauge | GC grace behaviour |
-| `timelord_config_revision`, `timelord_config_divergent_settings` | gauge | §3.2, §3.8 |
-| `timelord_audit_records_total`, `timelord_audit_sink_healthy` | counter/gauge | SR-6 |
+| `timelake_uptime_seconds`, `timelake_build_info` | gauge | Overview |
+| `timelake_query_duration_seconds` | histogram | Query latency, PR-3 |
+| `timelake_query_peak_memory_bytes` | histogram | RR-1 headroom |
+| `timelake_query_admission_queued`, `_wait_seconds` | gauge/histogram | Admission pressure |
+| `timelake_query_rejected_total{reason}`, `_timeout_total` | counter | RR-2/RR-5 |
+| `timelake_query_files_pruned_total`, `_row_groups_pruned_total` | counter | Pruning effectiveness |
+| `timelake_write_rejected_total{reason}` | counter | Backpressure (429s) |
+| `timelake_storage_bytes{table}`, `timelake_files{level}` | gauge | Storage view, SR-2 |
+| `timelake_compaction_lag_seconds`, `timelake_flush_lag_seconds` | gauge | SR-3 |
+| `timelake_gc_pending_files` | gauge | GC grace behaviour |
+| `timelake_config_revision`, `timelake_config_divergent_settings` | gauge | §3.2, §3.8 |
+| `timelake_audit_records_total`, `timelake_audit_sink_healthy` | counter/gauge | SR-6 |
 
 These are useful to Grafana and the harness independently of the console,
 which is the argument for adding them at U2 regardless.
@@ -533,7 +533,7 @@ may consult the console.
 | **1965** | **Admin** | **`127.0.0.1`** | console UI + `/admin/*` API |
 
 The admin listener is private by default and must be opened deliberately
-(`TIMELORD_ADMIN_ADDR=0.0.0.0:1965`), which is the opposite of the
+(`TIMELAKE_ADMIN_ADDR=0.0.0.0:1965`), which is the opposite of the
 current situation where the most destructive endpoint in the system rides
 on the most exposed port.
 
@@ -602,14 +602,14 @@ for.
 **Overview** — the page an operator opens at 3 a.m.
 
 ```
-Timelord DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
+TimeLake DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
 ─────────────────────────────────────────────────────────────────────
  INGEST            73.2K lines/s  ▁▂▅▇▇▆▇█    WAL      412 MiB / 2 GiB
  QUERIES        2 in flight, 0 queued        POOL     318 MiB / 1 GiB
  STORAGE            0.50 GB/day  ▁▁▂▂▃▃▄▄    FILES    L0 12 · L1 40 · L2 8
  TLS       cert expires in 21h 04m           KMS      cache hit 99.2%
 ─────────────────────────────────────────────────────────────────────
- ⚠ config revision 42 applied · TIMELORD_RETENTION differs from 1
+ ⚠ config revision 42 applied · TIMELAKE_RETENTION differs from 1
    override (pipeline_events)                              [review]
 ```
 
@@ -620,7 +620,7 @@ Timelord DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
  ──────────────────────────────────────────────────────────────────
  gc_grace_secs        1200           override      [edit] [revert]
    ├ override         1200   rcowell · 2026-08-09 09:52
-   ├ property          900   TIMELORD_GC_GRACE_SECS   ⚠ changed since
+   ├ property          900   TIMELAKE_GC_GRACE_SECS   ⚠ changed since
    └ default           900
  query_timeout_secs    600           property      [edit]
  query_mem_bytes      1 GiB          default       [edit]
@@ -647,7 +647,7 @@ Timelord DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
 
 ```
  [ level ≥ WARN ▾ ] [ target… ] [ contains… ]   ● live  ⟨247 dropped⟩
- 09:52:11.418 WARN  timelord_server::flush  table=pipeline_events
+ 09:52:11.418 WARN  timelake_server::flush  table=pipeline_events
               partition=2026-08-09T09  flush took 4.2s (lag 12s)
               request_id=r_2c… → [audit] [query]
 ```
@@ -686,7 +686,7 @@ Timelord DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
    grace; within that window the console offers "restore the window",
    which re-widens the policy before physical deletion. After the grace,
    the UI says so plainly instead of implying recoverability.
-4. **Global read-only switch** (`TIMELORD_ADMIN_READ_ONLY=1`) for
+4. **Global read-only switch** (`TIMELAKE_ADMIN_READ_ONLY=1`) for
    change-freeze periods: the console renders, nothing mutates.
 5. **Rate limits** on mutating routes, per principal, audited on trip.
 6. **Every guardrail is visible**: each shows its own configured value and
@@ -716,7 +716,7 @@ CLAUDE.md's rule that no milestone is done on unit tests alone.
 
 **U0 — Admin plane: layered config, auth, retention rebuilt.**
 The admin listener on 1965 with TLS and SEC-4 (bootstrap, roles,
-sessions, tokens); `timelord-config` with the three layers, provenance,
+sessions, tokens); `timelake-config` with the three layers, provenance,
 pinning, validation and hot-swap; the settings inventory of §3.5;
 retention migrated onto it (three-state override, impact preview);
 `/admin/*` moved off 1963 with `410` stubs.
@@ -727,7 +727,7 @@ returns 401 and is audited; `gc_grace_secs ≤ query_timeout_secs` is
 rejected with its invariant named.
 
 **U1 — Logs and audit.**
-Ring-buffer app log with snapshot and SSE tail; `timelord-audit` with the
+Ring-buffer app log with snapshot and SSE tail; `timelake-audit` with the
 hash chain, segments, upload, `system.audit`, and the verifier script.
 *Gate*: an audit drill in which every mutating route produces exactly one
 record (including denials), the chain verifies, a hand-edited record is
@@ -766,10 +766,10 @@ C1; U3 depends on the C2 role split.
 | Auth scope at U0 | Admin plane only | Whole-server auth at once | Data-plane auth breaks every client and Telegraf/Grafana fixtures; it deserves its own migration, not a side effect |
 | Audit storage | Append-only chained segments outside the tables | A regular table in the DB | The retention UI must not be able to delete the record of its own use; the sink must work when the engine is unhealthy |
 | Audit failure | Fail closed | Fail open | An unrecorded administrative change is worse than a refused one; opt-out exists and is loud |
-| App logs | Bounded ring + stdout | Ingest logs into TimelordDB | Self-ingestion amplifies writes exactly when the server is unhealthy (RR-4) |
+| App logs | Bounded ring + stdout | Ingest logs into TimeLakeDB | Self-ingestion amplifies writes exactly when the server is unhealthy (RR-4) |
 | History | 6 h in-memory sample ring | Persisted metrics store | Grafana is the real answer (FR-8); the console needs enough to triage, not a second TSDB inside the TSDB |
 | Charts | Hand-drawn SVG | A charting library | Same rule as `site/`: no build step, no external assets, CSP stays strict |
-| Hot apply | `ArcSwap` snapshot, per-query capture | Mutex-guarded live config | Proven in `timelord-tls`; in-flight work keeps a consistent view and readers stay lock-free |
+| Hot apply | `ArcSwap` snapshot, per-query capture | Mutex-guarded live config | Proven in `timelake-tls`; in-flight work keeps a consistent view and readers stay lock-free |
 
 ## 15. Risks, each with its falsification test
 

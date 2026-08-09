@@ -23,7 +23,7 @@ docker rm -f tldb-perf >/dev/null 2>&1 || true
 docker volume rm tldb-perf-data >/dev/null 2>&1 || true
 docker volume create tldb-perf-data >/dev/null
 docker run -d --name tldb-perf --memory 8g -p 2965:1963 \
-  -v tldb-perf-data:/var/lib/timelord/data "$IMAGE" >/dev/null
+  -v tldb-perf-data:/var/lib/timelake/data "$IMAGE" >/dev/null
 
 until curl -sf http://localhost:2965/health >/dev/null 2>&1; do sleep 1; done
 
@@ -33,7 +33,7 @@ sh "$HERE/run-innet.sh" tldb-perf "$LABEL-load" "$SCALE" --scenarios ingest,host
 # phase 2: settle — flush ticks at 10 s, compaction at 30 s. Wait for the
 # on-disk file count to stop moving so both arms of a pair query the same
 # shape of data.
-count() { docker exec tldb-perf sh -c 'find /var/lib/timelord/data/objects -name "*.parquet" | wc -l'; }
+count() { docker exec tldb-perf sh -c 'find /var/lib/timelake/data/objects -name "*.parquet" | wc -l'; }
 sleep 35
 prev=$(count)
 i=0
@@ -45,8 +45,8 @@ while [ "$i" -lt 5 ]; do
   i=$((i + 1))
 done
 echo "--- settled: $prev parquet files ---"
-docker exec tldb-perf du -sh /var/lib/timelord/data/objects 2>/dev/null || true
-curl -s http://localhost:2965/metrics 2>/dev/null | grep -E "^timelord_(compactions|flushes)_total" || true
+docker exec tldb-perf du -sh /var/lib/timelake/data/objects 2>/dev/null || true
+curl -s http://localhost:2965/metrics 2>/dev/null | grep -E "^timelake_(compactions|flushes)_total" || true
 
 # phase 3: read path
 sh "$HERE/run-innet.sh" tldb-perf "$LABEL-read" "$SCALE" --scenarios query_a,query_b "$@"
