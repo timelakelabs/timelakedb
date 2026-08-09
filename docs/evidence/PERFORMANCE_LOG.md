@@ -61,6 +61,61 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-09 07:15 — TCP_NODELAY on the listeners   [REJECTED — but read the lesson, it invalidates a metric]
+
+**Hypothesis.** Following the last cycle's rule, measure before optimising. A
+single lookup was timed directly with `curl` at **6 ms** while the harness
+reported a 46 ms median for the same query shape against the same instance.
+Something outside the engine was eating ~40 ms. `axum::serve` on a bare
+`TcpListener` never sets `TCP_NODELAY` — and the TLS path gets it free from
+axum-server, which the plaintext path does not — so Nagle holding the tail of
+each response until the peer's delayed ACK fired looked like the answer.
+Setting it should have collapsed the harness median from ~46 ms to ~6 ms.
+
+**Change.** `ListenerExt::tap_io` to set nodelay on every accepted HTTP
+connection, `tcp_nodelay(true)` on the tonic builder, and `set_nodelay` on the
+TCP socket before the TLS wrap in the Flight accept loop.
+
+**Measurement.** It is not the server. With the change in, the same Python
+client still measured 47.9 ms median and **100 of 100 requests over 35 ms**.
+Isolating the variables against one instance, one query, one product id:
+
+| Client | Result |
+|---|---|
+| `curl`, new connection each time | 5.7–6.6 ms |
+| `curl`, one process, connection reused | 2.4, 0.5, 0.4, 0.4 ms |
+| Python `requests`, `Connection: close` | 4.5–22 ms |
+| Python `requests`, keep-alive | 9 ms once, then **47, 47, 48, 48 ms** |
+| Python `requests`, keep-alive, forced client `TCP_NODELAY` | still 45–53 ms |
+| **Python `requests`, keep-alive, run INSIDE the docker network** | **2.7 ms median, 0/30 over 35 ms** |
+
+**Verdict.** Rejected — the change fixes nothing, because nothing in the server
+was broken. Harness runs bore it out: 4 ms, 52 ms, 45 ms across three
+candidates, which is the artifact toggling rather than an effect.
+
+**Lesson — this is the deliverable, and it is bigger than the change.**
+**Shape A latency as this harness reports it is roughly 94% Docker Desktop
+port-forwarding overhead on Windows.** The same client, the same server and the
+same query cost 2.7 ms inside the docker network and ~47 ms through the
+published port, and only on a reused connection. Consequences:
+
+- **True server-side Shape A at laptop scale is ~3 ms, not ~46 ms.** Every
+  Shape A figure in this log, and in the M4/M5 record if it was measured the
+  same way, carries ~45 ms of overhead that has nothing to do with the engine.
+- **Any Shape A improvement smaller than the artifact is invisible**, which is
+  the most likely reason two cycles measured real mechanisms as "no change".
+  The bloom cycle's 57 → 48 ms was, in server terms, more like 12 → 3 ms: a
+  much larger win than it was credited with.
+- **Shape B is far less affected** — its true cost is 50–150 ms, so a fixed
+  ~45 ms distorts but does not dominate it.
+
+**What the next cycle must do about it.** Run the harness where the client and
+server share a network — `docker run --network container:tldb-perf` with the
+harness inside, or a compose service — and re-baseline. Until then, do not
+trust a Shape A delta under ~45 ms, and do not spend a cycle optimising
+milliseconds that the transport is hiding. It is also worth re-measuring the
+adopted bloom change this way to record what it is actually worth.
+
 ### 2026-08-09 04:15 — Cache the bloom filters next to the footers   [REJECTED]
 
 **Hypothesis.** Footers are cached for the engine's lifetime; the bloom filters
