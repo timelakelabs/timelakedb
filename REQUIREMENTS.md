@@ -252,7 +252,11 @@ accommodate early and prohibitively expensive to retrofit.
 **SEC-1 · Object-level encryption (design constraint v1 · implement SHOULD v2).**
 Every stored object must be encryptable at rest with envelope encryption:
 per-object data keys wrapped by KMS-managed master keys, key scope
-configurable per database / table / column. Direction: **Parquet Modular
+configurable per database / table / column. *Amended 2026-08-09
+(ARCHITECTURE §12.2): data keys MAY be reused across objects within a
+bounded window (max-age and max-use caps, configurable) to cache KMS
+calls — the caching-CMM pattern; per-object remains the cache-off
+behavior.* Direction: **Parquet Modular
 Encryption** — encrypted footer plus per-column keys — which makes column
 access a key-distribution decision and composes with SEC-2. Key rotation
 rides compaction rewrites; FR-7 retention gains crypto-shredding (destroy
