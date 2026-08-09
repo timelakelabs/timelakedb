@@ -14,3 +14,8 @@ bench/compose/tls-drill/certs/
 # Brand sheet: a local design asset, not a repo artifact. The palette and
 # mark it defined now live in site/assets/ (style.css, logo.svg).
 docs/evidence/TimeLoadDB.png
+
+# Scheduled perf-cycle output and the local permission allowlist that
+# lets it run unattended (personal, not a repo contract).
+ops/logs/
+.claude/settings.local.json
