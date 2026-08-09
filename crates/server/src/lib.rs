@@ -255,6 +255,8 @@ pub struct Engine {
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
     schemas: RwLock<HashMap<(String, String), timelord_query::QuerySchema>>,
+    /// SEC-4 principals and sessions for the admin surface.
+    auth: Arc<timelord_auth::Auth>,
     /// FR-7 policies, runtime-mutable (the /admin/retention surface).
     /// Seeded from `TIMELORD_RETENTION`; changes persist to
     /// [`RETENTION_CONFIG_PATH`] through the store — encrypted like any
@@ -364,6 +366,14 @@ impl Engine {
             cfg.max_concurrent_queries,
             cfg.query_timeout_secs,
         );
+        // SEC-4 principals live in the store like everything else, so
+        // they are encrypted with it and travel with a cluster's bucket.
+        let auth = timelord_auth::Auth::open(
+            store.clone(),
+            std::env::var("TIMELORD_ADMIN_BOOTSTRAP_PASSWORD")
+                .ok()
+                .as_deref(),
+        )?;
         let engine = Engine {
             dbs: RwLock::new(HashMap::new()),
             ingest_gate: RwLock::new(()),
@@ -373,6 +383,7 @@ impl Engine {
             store_encrypted,
             query_env,
             schemas: RwLock::new(HashMap::new()),
+            auth,
             retention: RwLock::new(retention),
             flushing: RwLock::new(HashMap::new()),
             cfg,
@@ -749,6 +760,11 @@ impl Engine {
         Ok(n)
     }
 
+    /// SEC-4 principal/session store, shared with the admin router.
+    pub fn auth(&self) -> Arc<timelord_auth::Auth> {
+        self.auth.clone()
+    }
+
     /// Runtime FR-7 policy surface (backs /admin/retention).
     pub fn retention_policies(&self) -> Vec<(String, u64)> {
         self.retention.read().expect("retention lock").clone()
@@ -1077,7 +1093,13 @@ impl Engine {
              # TYPE timelord_retention_drops_total counter\ntimelord_retention_drops_total {}\n\
              # TYPE timelord_encryption_enabled gauge\ntimelord_encryption_enabled {}\n\
              # TYPE timelord_visibility_rows_filtered_total counter\n\
-             timelord_visibility_rows_filtered_total {}\n{}{}{}",
+             timelord_visibility_rows_filtered_total {}\n\
+             # TYPE timelord_admin_default_credential_active gauge\n\
+             timelord_admin_default_credential_active {}\n\
+             # TYPE timelord_admin_logins_total counter\n\
+             timelord_admin_logins_total {}\n\
+             # TYPE timelord_admin_login_failures_total counter\n\
+             timelord_admin_login_failures_total {}\n{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1089,6 +1111,13 @@ impl Engine {
             self.retention_drops_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),
+            if self.auth.default_credential_active() {
+                1
+            } else {
+                0
+            },
+            self.auth.logins_total.load(Ordering::Relaxed),
+            self.auth.login_failures_total.load(Ordering::Relaxed),
             kms_lines,
             s3_lines,
             tls_lines,
@@ -1125,14 +1154,18 @@ impl timelord_flight::SqlBackend for Engine {
     }
 }
 
+/// The plaintext router. Admin routes authenticate (SEC-4); the data
+/// plane does not (that migration is its own milestone).
 pub fn app(engine: Arc<Engine>) -> axum::Router {
-    timelord_api::app(engine)
+    let auth = engine.auth();
+    timelord_api::app(engine, auth, false)
 }
 
 /// The TLS-enabled router: the api surface plus the explicit rotation
 /// trigger (SEC-3 mandates BOTH a file watcher and an admin endpoint;
-/// reload-by-restart is forbidden). No auth at this milestone,
-/// consistent with the rest of the PoC surface.
+/// reload-by-restart is forbidden). Session cookies are `Secure` here,
+/// and the reload endpoint sits behind the same SEC-4 guard as the rest
+/// of /admin.
 pub fn app_with_tls_admin(
     engine: Arc<Engine>,
     rot: Arc<timelord_tls::RotatingCert>,
@@ -1170,8 +1203,15 @@ pub fn app_with_tls_admin(
             }
         }
     };
-    timelord_api::app(engine)
-        .merge(axum::Router::new().route("/admin/tls/reload", axum::routing::post(reload)))
+    let auth = engine.auth();
+    timelord_api::app(engine, auth.clone(), true).merge(
+        axum::Router::new()
+            .route("/admin/tls/reload", axum::routing::post(reload))
+            .layer(axum::middleware::from_fn_with_state(
+                auth,
+                timelord_api::require_admin_session,
+            )),
+    )
 }
 
 /// Parse engine config from environment (main + integration use).

@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use timelord_auth::{Auth, Role, SessionInfo};
 
 /// Errors the write path can surface over the wire.
 pub enum WriteError {
@@ -93,8 +94,29 @@ pub fn humanize_secs(secs: u64) -> String {
     }
 }
 
-pub fn app<E: Engine>(engine: Arc<E>) -> Router {
-    Router::new()
+/// State for the authenticated admin surface (SEC-4).
+pub struct AdminState<E: Engine> {
+    engine: Arc<E>,
+    auth: Arc<Auth>,
+    /// Mark session cookies `Secure` — set when the listener is TLS.
+    secure_cookies: bool,
+}
+
+impl<E: Engine> Clone for AdminState<E> {
+    fn clone(&self) -> Self {
+        AdminState {
+            engine: self.engine.clone(),
+            auth: self.auth.clone(),
+            secure_cookies: self.secure_cookies,
+        }
+    }
+}
+
+/// The data plane (unauthenticated — FR-1/FR-8/FR-9 clients) plus the
+/// admin surface (authenticated — SEC-4). Two routers, two states,
+/// merged: no admin route can accidentally inherit the open state.
+pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> Router {
+    let data = Router::new()
         .route("/health", get(health))
         .route("/ping", get(ping::<E>).head(ping::<E>))
         .route("/metrics", get(metrics::<E>))
@@ -102,6 +124,17 @@ pub fn app<E: Engine>(engine: Arc<E>) -> Router {
         .route("/api/v2/write", post(write_v2::<E>))
         .route("/api/v3/write_lp", post(write_v3::<E>))
         .route("/api/sql", post(sql::<E>))
+        .with_state(engine.clone());
+
+    let state = AdminState {
+        engine,
+        auth,
+        secure_cookies,
+    };
+
+    // Guarded: every one of these needs a session. The guard also
+    // enforces the forced-rotation lockout and CSRF.
+    let guarded = Router::new()
         .route(
             "/admin/retention",
             get(retention_list::<E>).put(retention_set::<E>),
@@ -110,17 +143,309 @@ pub fn app<E: Engine>(engine: Arc<E>) -> Router {
             "/admin/retention/{table}",
             axum::routing::delete(retention_delete::<E>),
         )
+        .route(
+            "/admin/session",
+            get(session_show::<E>).delete(session_logout::<E>),
+        )
+        .route("/admin/password", post(change_password::<E>))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_guard::<E>,
+        ))
+        .with_state(state.clone());
+
+    // Public: the page shell (it contains no data — it asks for it) and
+    // the login endpoint itself.
+    let public = Router::new()
         .route("/admin/ui", get(admin_ui))
-        .with_state(engine)
+        .route("/admin/session", post(session_login::<E>))
+        .with_state(state);
+
+    data.merge(guarded).merge(public)
 }
 
-/// The management page (FR-7 GUI): a single self-contained file — no
-/// build step, no external assets, same rules as `site/`.
+/// The management page (FR-7 GUI + SEC-4 login): a single self-contained
+/// file — no build step, no external assets, same rules as `site/`. It
+/// ships no data; it asks for it, and every one of those calls is
+/// authenticated.
 async fn admin_ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("admin_ui.html"))
 }
 
-async fn retention_list<E: Engine>(State(engine): State<Arc<E>>) -> Json<Value> {
+const SESSION_COOKIE: &str = "tldb_admin_session";
+const CSRF_HEADER: &str = "x-timelord-csrf";
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.trim() == name)
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// SEC-4 gate for every admin route. Order matters: authenticate, then
+/// CSRF, then the forced-rotation lockout — a caller who has not proved
+/// who they are gets no information about what they would be asked next.
+async fn admin_guard<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let headers = req.headers().clone();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    // Bearer for automation, cookie for browsers.
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let cookie = cookie_value(&headers, SESSION_COOKIE);
+    let token = bearer.clone().or(cookie.clone());
+
+    let Some(session) = token.as_deref().and_then(|t| state.auth.session(t)) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "authentication required", "code": "unauthenticated" })),
+        )
+            .into_response();
+    };
+
+    let mutating = !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD);
+    if mutating && bearer.is_none() {
+        // Cookie-authenticated mutation: a form on any page the operator
+        // visits could otherwise drive this API. Double-submit token plus
+        // an Origin sanity check.
+        let presented = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
+        if presented != Some(session.csrf.as_str()) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "CSRF token missing or wrong", "code": "csrf" })),
+            )
+                .into_response();
+        }
+        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+            let host = headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let origin_host = origin.rsplit("//").next().unwrap_or("");
+            if !host.is_empty() && origin_host != host {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "cross-origin request refused", "code": "origin" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Forced rotation: the seeded credential can do exactly one thing.
+    if session.must_change_password && !(path == "/admin/password" || (path == "/admin/session")) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "the password must be changed before this credential can do anything else",
+                "code": "password_change_required",
+            })),
+        )
+            .into_response();
+    }
+
+    let mut req = req;
+    req.extensions_mut().insert(session);
+    next.run(req).await
+}
+
+/// Standalone SEC-4 guard requiring the `admin` role, for admin routes
+/// that live outside the main router (the TLS reload endpoint, which
+/// the server composes only when TLS is on).
+pub async fn require_admin_session(
+    State(auth): State<Arc<Auth>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let headers = req.headers().clone();
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or_else(|| cookie_value(&headers, SESSION_COOKIE));
+
+    let Some(session) = token.as_deref().and_then(|t| auth.session(t)) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "authentication required", "code": "unauthenticated" })),
+        )
+            .into_response();
+    };
+    if session.must_change_password {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "the password must be changed first",
+                "code": "password_change_required",
+            })),
+        )
+            .into_response();
+    }
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    next.run(req).await
+}
+
+fn session_of(req: &axum::http::Extensions) -> SessionInfo {
+    req.get::<SessionInfo>()
+        .cloned()
+        .expect("admin_guard inserts the session before any handler runs")
+}
+
+fn require(session: &SessionInfo, needed: Role) -> Option<axum::response::Response> {
+    (!session.role.allows(needed)).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "role '{}' is not sufficient; '{}' required",
+                    session.role.as_str(),
+                    needed.as_str()
+                ),
+                "code": "forbidden",
+            })),
+        )
+            .into_response()
+    })
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn session_login<E: Engine>(
+    State(state): State<AdminState<E>>,
+    Json(req): Json<LoginRequest>,
+) -> axum::response::Response {
+    match state.auth.login(&req.username, &req.password) {
+        Ok((token, info)) => {
+            let secure = if state.secure_cookies { "; Secure" } else { "" };
+            let cookie =
+                format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/admin{secure}");
+            (
+                StatusCode::OK,
+                [(axum::http::header::SET_COOKIE, cookie)],
+                Json(json!({
+                    "username": info.username,
+                    "role": info.role.as_str(),
+                    "must_change_password": info.must_change_password,
+                    "csrf": info.csrf,
+                })),
+            )
+                .into_response()
+        }
+        Err(e @ timelord_auth::LoginError::RateLimited(_)) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": e.to_string(), "code": "rate_limited" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": e.to_string(), "code": "invalid_credentials" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn session_show<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let s = session_of(req.extensions());
+    Json(json!({
+        "username": s.username,
+        "role": s.role.as_str(),
+        "must_change_password": s.must_change_password,
+        "csrf": s.csrf,
+        "default_credential_active": state.auth.default_credential_active(),
+    }))
+    .into_response()
+}
+
+async fn session_logout<E: Engine>(
+    State(state): State<AdminState<E>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
+        state.auth.logout(&t);
+    }
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::SET_COOKIE,
+            format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0{secure}"),
+        )],
+        Json(json!({ "status": "logged out" })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PasswordChange {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let change: PasswordChange = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    match state.auth.change_password(
+        &session.username,
+        &change.current_password,
+        &change.new_password,
+    ) {
+        // Every session for this principal — including this one — is
+        // invalidated by the rotation, so the client must log in again.
+        Ok(()) => Json(json!({
+            "status": "password changed",
+            "reauthenticate": true,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e, "code": "password_rejected" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn retention_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Viewer) {
+        return deny;
+    }
+    let engine = state.engine;
     let mut policies: Vec<Value> = engine
         .retention_policies()
         .into_iter()
@@ -133,7 +458,11 @@ async fn retention_list<E: Engine>(State(engine): State<Arc<E>>) -> Json<Value> 
         })
         .collect();
     policies.sort_by_key(|p| p["table"].as_str().unwrap_or("").to_string());
-    Json(json!({ "policies": policies }))
+    Json(json!({
+        "policies": policies,
+        "role": session.role.as_str(),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -144,28 +473,62 @@ struct RetentionSet {
 }
 
 async fn retention_set<E: Engine>(
-    State(engine): State<Arc<E>>,
-    Json(req): Json<RetentionSet>,
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
-    let table = req.table.trim();
+    let session = session_of(req.extensions());
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let set: RetentionSet = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    let table = set.table.trim();
     if table.is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "table must not be empty");
     }
-    let Some(seconds) = parse_duration_secs(&req.duration) else {
+    let Some(seconds) = parse_duration_secs(&set.duration) else {
         return err_response(
             StatusCode::BAD_REQUEST,
             &format!(
                 "duration {:?} is not <n>d, <n>h, <n>m, or seconds (and must be > 0)",
-                req.duration
+                set.duration
             ),
         );
     };
-    match engine.set_retention(table, seconds) {
+
+    // The operator/admin split follows the data, not the verb: growing a
+    // window keeps more, shrinking (or introducing one where none
+    // existed) destroys. Only the destructive direction needs `admin`.
+    let current = state
+        .engine
+        .retention_policies()
+        .into_iter()
+        .find(|(t, _)| t == table)
+        .map(|(_, s)| s);
+    let destructive = match current {
+        Some(existing) => seconds < existing,
+        None => true, // unbounded -> bounded: data starts expiring
+    };
+    let needed = if destructive {
+        Role::Admin
+    } else {
+        Role::Operator
+    };
+    if let Some(deny) = require(&session, needed) {
+        return deny;
+    }
+
+    match state.engine.set_retention(table, seconds) {
         Ok(()) => Json(json!({
             "table": table,
             "seconds": seconds,
             "duration": humanize_secs(seconds),
             "status": "set",
+            "destructive": destructive,
         }))
         .into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
@@ -173,10 +536,17 @@ async fn retention_set<E: Engine>(
 }
 
 async fn retention_delete<E: Engine>(
-    State(engine): State<Arc<E>>,
+    State(state): State<AdminState<E>>,
     axum::extract::Path(table): axum::extract::Path<String>,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
-    match engine.remove_retention(&table) {
+    // Removing a policy makes the table grow without bound — governing
+    // the node's storage, so it sits with `admin` alongside shrinking.
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    match state.engine.remove_retention(&table) {
         Ok(()) => Json(json!({ "table": table, "status": "removed" })).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }

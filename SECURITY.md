@@ -25,12 +25,14 @@ so please size your disclosure timeline accordingly.
 
 ## Current security posture — read this before deploying
 
-**TimelordDB has no authentication and no authorization.** Any client that
-can open a TCP connection to port 1963 or 1964 has full read and write
-access to every database on the node. This is a deliberate pre-v1 state
-(REQUIREMENTS.md §12 scopes token auth for v1; it is not implemented yet),
-not an oversight — but it means the *only* access control today is network
-reachability.
+**The data plane has no authentication.** Any client that can open a TCP
+connection to port 1963 or 1964 has full read and write access to every
+database on the node. The *administrative* surface (`/admin/*`) does
+authenticate as of SEC-4, which closes the remote-deletion exposure, but
+it does not protect the data: reads, writes and `/api/sql` remain open by
+design until the data-plane migration (a deliberate breaking change for
+Telegraf, Grafana and every existing client). Network reachability is
+still the only access control over your data.
 
 Treat a TimelordDB port as equivalent to an unauthenticated shell into the
 data. Bind it to localhost or a private network segment, and put an
@@ -41,8 +43,9 @@ needs access.
 |---|---|
 | Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELORD_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
 | Client certificate / mTLS | Not implemented — server-side TLS only. Mutual TLS is v2 (SEC-3 intra-cluster). |
-| Authentication | **Not implemented.** Write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything and returns an empty token. |
-| Authorization | **Not implemented.** No users, roles, or per-database/table permissions. |
+| Authentication | **Admin surface only (SEC-4).** `/admin/*` requires a session: Argon2id credentials, cookie sessions (HttpOnly, SameSite=Strict, idle 30 min / absolute 12 h) or bearer tokens, CSRF + Origin checks on mutations, per-principal backoff on failed logins. **The data plane is still open** — write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything. |
+| Authorization | **Roles on the admin surface.** `viewer` (read), `operator` (non-destructive changes, *growing* a retention window), `admin` (shrinking/removing retention, principal management). No per-database/table permissions on the data plane. |
+| First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelord_admin_default_credential_active`. |
 | Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
 | Encryption at rest | **Implemented, opt-in.** Set `TIMELORD_ENCRYPTION_KEY` (64 hex chars) or `TIMELORD_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough); the local WAL is **not** encrypted. |
 | Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-Timelord-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
@@ -72,14 +75,16 @@ follow from "no authentication" and are listed so you can design around them.
    so the realistic worst case is forced log/alarm noise rather than a
    downgrade. It is still an unauthenticated administrative endpoint.
 
-3a. **`/admin/retention` is an unauthenticated deletion control.** Anyone who
-   can reach port 1963 can set a one-second retention window on any table and
-   the enforcement pass (≤ 60 s later) will drop its history; after the GC
-   grace elapses, permanently. This is strictly worse than exposure 1's
-   "write anything, read everything" — it is *delete everything, durably* —
-   and it is the strongest single reason to treat the port as
-   private-network-only until token auth lands. The management page at
-   `/admin/ui` makes the same operations one click.
+3a. **~~`/admin/retention` is an unauthenticated deletion control.~~
+   CLOSED (SEC-4).** `/admin/*` now authenticates every request. What
+   replaces it is smaller but real: **a fresh node seeds `admin`/`admin`**
+   (see below), so the window between first start and the first password
+   change is a window in which a reachable attacker can take the console.
+   The seeded credential can do nothing but change its own password, and
+   `timelord_admin_default_credential_active` is 1 until it does — but the
+   mitigation is procedural, not structural. Set
+   `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` to skip the well-known default
+   entirely, or change the password immediately after first start.
 
 4. **The container runs as root.** The image has no `USER` directive, so the
    server process and every file it writes are root-owned. Combined with (2),
@@ -131,7 +136,8 @@ follow from "no authentication" and are listed so you can design around them.
 | Item | Requirement | State |
 |---|---|---|
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
-| Token authentication | §12 (v1 scope) | Not started — the missing piece that turns SEC-2 claims into authorization |
+| Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
+| Data-plane authentication | SEC-4 (phased) | Not started — the piece that turns SEC-2 claims into authorization; breaks every existing client, so it is its own migration |
 | Mutual TLS, intra-cluster | SEC-3 (v2) | Not started |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |
 | Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |

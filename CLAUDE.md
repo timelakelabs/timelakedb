@@ -25,6 +25,10 @@ This project is inspired by the following projects.
   workspace, write/read paths, manifest-log catalog, compaction levels,
   memory budgets, the SEC seams, clustering evolution, and the M0–M5
   milestones (each gated by a tsdb-bench run).
+- `docs/CONSOLE.md` — the operator plane design (SR-5/SR-6/SEC-4,
+  ARCHITECTURE §17): layered configuration with provenance, admin auth
+  and roles, the hash-chained audit trail, logs, metrics views, cluster
+  view. Phased U0–U3 in §14.
 - `docs/evidence/BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
   query), 2.7 (funnel never completed, 12× ingest decay), 3 Core (passed
   everything — the bar to beat), plus prior QuestDB/VictoriaMetrics OOMs.
@@ -40,6 +44,16 @@ This project is inspired by the following projects.
 - Retention is per-table (FR-7). Encryption (SEC-1) and Accumulo-style
   row visibility labels (SEC-2) are v1 *design constraints* — one narrow
   object-I/O layer, one mandatory-predicate injection point.
+- **Configuration is layered, not owned by one place** (§17, designed
+  2026-08-09): `EngineConfig::default()` < `TIMELORD_*` system property <
+  stored override, with every layer visible, a revert to the layer
+  beneath, and divergence from the property reported loudly (RR-5).
+  Overrides are three-state — absent (inherit), a value, or explicit-none
+  (off regardless of the property) — because "revert to the property" and
+  "keep everything anyway" are different intents. `TIMELORD_CONFIG_PINNED`
+  locks named keys to the property layer. The console gets its own
+  listener (1965, private by default) with SEC-4 auth; the admin
+  endpoints move off 1963.
 - TLS 1.3 (rustls) on every listener in v1, mTLS intra-cluster in v2
   (SEC-3 — "TLS 3.0" in conversation means TLS 1.3). Certs are short-TTL
   (~24 h) and hot-rotated: file-watch + ArcSwap resolver, validate-before-
@@ -90,7 +104,28 @@ This project is inspired by the following projects.
   states the posture, including that `/api/sql` can `COPY … TO` files as
   the (root) server process. Known engine hardening: manifest replay
   should skip non-`.json` files.
-- Status: **Retention GUI SHIPPED** (2026-08-09): FR-7 is runtime-managed —
+- Status: **SEC-4 admin auth SHIPPED** (2026-08-09, drill
+  `bench/results/sec4-auth-drill.log`). New `timelord-auth` crate:
+  roles viewer<operator<admin, Argon2id, sessions (cookie or bearer,
+  30 min idle / 12 h absolute), CSRF double-submit + Origin on cookie
+  mutations, per-principal login backoff; principals persist at
+  `catalog/config/principals.json` via the Store (so encrypted). Every
+  `/admin/*` route is guarded — closes SECURITY exposure 3a.
+  **First run seeds admin/admin, QUARANTINED**: the only route that
+  answers is POST /admin/password; everything else 403
+  `password_change_required`. Rotation kills all that principal's
+  sessions (including the one that rotated). Policy: ≥8 chars, not the
+  username, not "admin". `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` avoids the
+  well-known default. This REVERSES the bootstrap-token design — cost
+  and mitigations recorded in docs/CONSOLE.md §4.2, REQUIREMENTS SEC-4
+  amended. Retention authz follows the data: grow=operator,
+  shrink/introduce/remove=admin. Console `/admin/ui` is now
+  sign-in → forced rotation → manage. Metrics:
+  timelord_admin_default_credential_active (ALERT ON THIS),
+  _logins_total, _login_failures_total. **Data plane deliberately still
+  open** so Telegraf/Grafana/bench work — that migration is its own
+  milestone. Tests: 6 auth unit + 19 server integration.
+- Previous: **Retention GUI SHIPPED** (2026-08-09): FR-7 is runtime-managed —
   `GET/PUT /admin/retention`, `DELETE /admin/retention/{table}`, GUI at
   `/admin/ui` (self-contained HTML in `crates/api/src/admin_ui.html`,
   site palette). Policies persist at `catalog/config/retention.json`

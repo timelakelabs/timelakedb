@@ -11,6 +11,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 timelord-api = { path = "../api" }
+timelord-auth = { path = "../auth" }
 timelord-ingest = { path = "../ingest" }
 timelord-wal = { path = "../wal" }
 timelord-buffer = { path = "../buffer" }

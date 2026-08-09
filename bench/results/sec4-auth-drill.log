@@ -1,0 +1,66 @@
+SEC-4 drill — admin authentication with a forced first-run rotation
+2026-08-09 · live against the compose node on :1963
+================================================================================
+
+Startup log, verbatim (the risk is stated where an operator will see it):
+  WARN timelord_auth: SEC-4: no principals existed, so the admin console
+  was seeded with the DEFAULT CREDENTIAL admin/admin. It can do nothing
+  but change its own password, and every other admin route refuses until
+  it does — but until then anyone who can reach this port can take the
+  console. Log in and change it now, or set
+  TIMELORD_ADMIN_BOOTSTRAP_PASSWORD. Alert on
+  timelord_admin_default_credential_active.
+
+ 1. Anonymous GET /admin/retention
+    -> 401 {"code":"unauthenticated"}          [exposure 3a CLOSED]
+ 2. POST /admin/session admin/hunter2
+    -> 401 {"code":"invalid_credentials"}
+ 3. POST /admin/session admin/admin
+    -> 200 {"role":"admin","must_change_password":true, csrf:…}
+ 4. GET /admin/retention with that session
+    -> 403 {"code":"password_change_required"}
+ 5. PUT /admin/retention {"table":"pipeline_events","duration":"1s"}
+    with a VALID session and a VALID CSRF token
+    -> 403 {"code":"password_change_required"}
+    The seeded credential cannot destroy data. This is the property the
+    whole quarantine exists for.
+    (An earlier attempt with a missing CSRF token returned
+     403 {"code":"csrf"} — the guard checks CSRF before the lockout, so
+     an unauthorised mutation is refused for the first reason it hits.)
+ 6. POST /admin/password new_password=admin
+    -> 400 {"code":"password_rejected","error":"password must be at
+            least 8 characters"}   (also refused: the username, "admin")
+ 7. POST /admin/password -> "a proper console password"
+    -> 200 {"status":"password changed","reauthenticate":true}
+ 8. The session that performed the rotation, reused
+    -> 401 unauthenticated
+    A cookie captured during the default window dies with the password.
+ 9. POST /admin/session admin/admin  -> 401   (old credential is dead)
+    POST /admin/session admin/<new>  -> 200 {"must_change_password":false}
+10. GET /admin/retention            -> 200 {"policies":[],"role":"admin"}
+11. PUT /admin/retention 30d on a table with no policy
+    -> 200 {"destructive":true,…}
+    Introducing a window is flagged destructive and needs `admin`;
+    growing an existing one needs only `operator`.
+12. /metrics after the drill:
+      timelord_admin_default_credential_active 0    (alarm cleared)
+      timelord_admin_logins_total 3
+      timelord_admin_login_failures_total 2
+13. DATA PLANE UNCHANGED — the point of scoping SEC-4 to /admin:
+      POST /api/v3/write_lp -> 204
+      POST /api/sql         -> 200 [{"n":1}]
+    Telegraf, Grafana and the bench adapter need no credentials.
+
+Workspace gate: cargo test --workspace green — 6 new timelord-auth unit
+tests, 19 server integration tests including
+admin_surface_requires_auth_and_forces_the_first_password_change_sec4
+(the nine-step story above, in process) and
+console_page_is_public_and_the_default_credential_is_alarmable.
+clippy 0 warnings, fmt clean.
+
+Residual risk, stated plainly (docs/CONSOLE.md §4.2, SECURITY.md 3a):
+the window between a node's first start and its first password change is
+a window in which a reachable attacker owns the console. Quarantine,
+session invalidation, the WARN, the banner and the metric narrow and
+illuminate it; they do not remove it. Bind privately or set
+TIMELORD_ADMIN_BOOTSTRAP_PASSWORD before a fresh node is reachable.
