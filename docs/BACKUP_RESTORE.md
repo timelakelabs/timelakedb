@@ -37,6 +37,23 @@ those up with your configuration management. A restore into a node configured
 differently — a different retention specification in particular — will apply
 the new configuration to the old data.
 
+**If encryption at rest is enabled (SEC-1):** everything under `objects/`
+in the archive is ciphertext — the backup is exactly as safe to store as
+the volume was, and `verify`'s entry counts still work because file names
+and layout are unchanged. Two consequences to plan for:
+
+- A restore only serves if the restored node is configured with the
+  **same `TIMELORD_ENCRYPTION_KEY`** the archive was written under. The
+  wrong key is a named refusal at startup (`DEK unwrap failed`), not
+  garbage data. The key is part of your configuration backup — kept
+  *separately* from the archives, or the encryption was theater.
+- **Losing every copy of the key is losing every backup at once.** That
+  is crypto-shredding when you mean it and catastrophe when you don't.
+
+The WAL in the archive is plaintext regardless (SEC-1 covers the object
+store only), so archives of an encrypted node still contain up to a few
+minutes of readable recent writes — store them accordingly.
+
 ## Why a live backup is safe
 
 A backup taken under sustained ingest restores exactly. Three engine

@@ -305,10 +305,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
     <section id="security">
       <h2>Security</h2>
       <p>
-        The honest version: one security control is finished and drilled — TLS
-        1.3 with hot certificate rotation — and everything else is network
-        isolation. Plan the deployment around that rather than around what a
-        database of this shape usually offers.
+        The honest version: transport encryption (TLS 1.3 with hot rotation),
+        encryption at rest, and row visibility labels are finished and
+        drilled — but <strong>authentication is not</strong>, so access
+        control is still network isolation, and visibility authorizations are
+        claims any client can assert. Plan the deployment around that rather
+        than around what a database of this shape usually offers.
       </p>
 
       <div class="note warn">
@@ -331,8 +333,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td>Client certificates / mTLS</td><td>Not implemented — server-side TLS only; mutual TLS is v2</td></tr>
             <tr><td>Authentication</td><td>Not implemented — token auth is scoped for v1</td></tr>
             <tr><td>Authorization</td><td>Not implemented</td></tr>
-            <tr><td>Encryption at rest</td><td>Not implemented — a v1 design constraint (one narrow object-I/O layer), a v2 feature</td></tr>
-            <tr><td>Row visibility labels</td><td>Not implemented — a v1 design constraint (one predicate injection point)</td></tr>
+            <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELORD_ENCRYPTION_KEY</code> and every stored object (data and manifests) is envelope-encrypted, AES-256-GCM per object, range-read compatible; the local WAL is not covered</td></tr>
+            <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan; authorizations are unauthenticated claims until token auth lands</td></tr>
             <tr><td>Audit logging</td><td>Not implemented — there is no principal to attribute a write to</td></tr>
             <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure</td></tr>
           </tbody>
@@ -358,6 +360,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <li>Query errors are returned verbatim, disclosing table and column names.</li>
         <li>There is no per-client rate limit; one client can consume the whole
             admission budget.</li>
+        <li>Visibility authorizations are self-asserted — with no
+            authentication, <code>X-Timelord-Authorizations: admin</code> is a
+            claim, not a credential. Real isolation needs an authenticating
+            proxy that sets (and strips inbound) that header.</li>
+        <li>Encryption at rest protects the store's media, not the query
+            surface: anyone who can reach <code>/api/sql</code> reads
+            decrypted data, and the local WAL holds recent writes in
+            plaintext until flush.</li>
       </ul>
 
       <h3>Deploying it safely</h3>
@@ -367,8 +377,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <li>If remote access is needed, front it with something that
             authenticates. Flight SQL is gRPC over HTTP/2, so a proxy in front of
             port 1964 must speak HTTP/2.</li>
-        <li>Enable TLS even on a private network. It is the one control that is
-            finished, and rotation costs no downtime.</li>
+        <li>Enable TLS even on a private network — rotation costs no downtime —
+            and set <code>TIMELORD_ENCRYPTION_KEY</code> so a lost volume or
+            leaked bucket is ciphertext. Keep the key out of the data volume,
+            and treat losing it as losing the data.</li>
         <li>Give it a dedicated volume and a container memory limit.</li>
       </ul>
       <p>
@@ -451,9 +463,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <ul>
         <li>The catalog is an append-only manifest log designed to take
             compare-and-swap commits — the seam a second writer needs.</li>
-        <li>All object I/O passes through one narrow store interface, so remote
-            object storage (and, later, Parquet modular encryption) is one
-            implementation rather than a rewrite.</li>
+        <li>All object I/O passes through one narrow store interface — which is
+            how encryption at rest arrived as a decorator rather than a
+            rewrite, and how remote object storage (and, later, Parquet
+            modular encryption) will too.</li>
         <li>Node discovery is a trait: a static backend now, Consul as a supported
             option later. Discovery may never carry correctness — that stays in the
             catalog.</li>

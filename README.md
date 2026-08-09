@@ -21,11 +21,13 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
-> **Security:** TimelordDB has **no authentication and no authorization**. Any
-> client that can reach port 1963 or 1964 can read and write everything on the
-> node — network isolation is the only access control it has today. TLS 1.3 is
-> implemented and drilled; token auth is scoped for v1 and not written yet.
-> Read `SECURITY.md` before deploying anything.
+> **Security:** TimelordDB has **no authentication**. Any client that can
+> reach port 1963 or 1964 can read and write everything on the node — network
+> isolation is the only access control it has today. TLS 1.3, encryption at
+> rest, and row visibility labels are implemented and drilled, but visibility
+> authorizations are **unauthenticated claims** until token auth (scoped for
+> v1, not written yet) fronts them. Read `SECURITY.md` before deploying
+> anything.
 
 ## Website
 
@@ -35,7 +37,35 @@ publishes the directory on every push that touches it; enable it once per
 repository under **Settings → Pages → Source: GitHub Actions**. Every figure
 on the site traces to a run under `bench/results/`.
 
-## Status: SEC-3 — TLS 1.3 with hot cert rotation, AT-7 passed
+## Status: SEC-1 + SEC-2 — encryption at rest and row visibility labels
+
+- **SEC-1, encryption at the store chokepoint:** set
+  `TIMELORD_ENCRYPTION_KEY` (64 hex chars, or `_KEY_FILE`) and every
+  object — Parquet data, catalog manifests, checkpoints — is
+  envelope-encrypted: a fresh AES-256-GCM data key per object, wrapped by
+  your key, in 64 KiB authenticated chunks so the range-read path
+  (bloom probes, footer loads) keeps working. The engine can't tell: the
+  decorator wraps the one `Store` trait all object I/O flows through.
+  A wrong key is a named startup refusal, never silent plaintext.
+  Chose envelope over Parquet Modular Encryption (covers manifests, no
+  arrow-rs dependency); PME per-column keys remain open at the same seam.
+- **SEC-2, Accumulo-style row visibility:** a `_visibility` tag holds a
+  label expression per row — `(ops&audit)|admin` — evaluated against the
+  session's authorizations (`X-Timelord-Authorizations` header, or Flight
+  SQL metadata) *inside the scan*, below user predicates and before
+  aggregation, so a `COUNT(*)` cannot count a hidden row. Unlabeled rows
+  are public; malformed labels are visible to no one. Labels are ordinary
+  dictionary tags: no write-path ceremony, FR-2 economics.
+- **Drill** (`bench/results/sec12-drill.log`): HTTP and Flight SQL
+  enforce identically on buffer and Parquet paths; everything at rest is
+  ciphertext (data *and* manifests); restart recovers through encrypted
+  manifests; the smoke suite on the same image is unchanged (0 errors,
+  exact counts).
+
+Remaining before v1: **token authentication** (turns SEC-2 claims into
+authorization), in-network bench re-baseline, CI on a remote.
+
+### Previous: SEC-3 — TLS 1.3 with hot cert rotation, AT-7 passed
 
 - **TLS 1.3 (rustls) on both listeners** — HTTPS (writes, /api/sql) and
   Flight SQL — from one shared `ArcSwap<CertifiedKey>` resolver
@@ -54,9 +84,6 @@ on the site traces to a run under `bench/results/`.
   watcher alone. A deliberately corrupt renewal was rejected 422 with
   the named `SEC3_CERT_RENEWAL_FAILED` alarm while the last-good pair
   kept serving; the next good renewal restored health.
-
-Remaining before v1: streaming/range-read execution (ingest-contention
-carve-out), CI on a remote.
 
 ### Previous: M5 — acceptance drills complete
 
