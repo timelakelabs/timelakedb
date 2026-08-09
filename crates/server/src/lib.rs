@@ -549,16 +549,7 @@ impl Engine {
         db: &str,
         query: &str,
     ) -> Result<Vec<timelord_query::QueryBatch>, String> {
-        // gather table names from buffer AND catalog
-        let mut names: Vec<String> = {
-            let dbs = self.dbs.read().expect("dbs lock");
-            dbs.get(db).map(|t| t.keys().cloned().collect()).unwrap_or_default()
-        };
-        for t in self.catalog.tables_for(db) {
-            if !names.contains(&t) {
-                names.push(t);
-            }
-        }
+        let names = self.table_names(db);
         if names.is_empty() {
             return Err(format!("database '{db}' does not exist (write to it first)"));
         }
@@ -578,8 +569,7 @@ impl Engine {
                 continue;
             }
             // merged schema: registry (covers files + past flushes) ∪ buffer
-            let key = (db.to_string(), name.clone());
-            let mut schema = self.schemas.read().expect("schemas lock").get(&key).cloned();
+            let mut schema = self.table_schema(db, &name);
             if let Some(b) = buffer.first() {
                 schema = Some(timelord_query::schema_union(schema, b.schema())?);
             }
@@ -600,7 +590,65 @@ impl Engine {
         }
 
         let session = QuerySession::default();
-        timelord_query::run_sql_env(&self.query_env, &session, tables, query).await
+        timelord_query::run_sql_env(&self.query_env, &session, db, tables, query).await
+    }
+
+    /// Databases that hold data — live buffers plus anything the catalog
+    /// knows about. Flight SQL reports each one as a catalog.
+    pub fn databases(&self) -> Vec<String> {
+        let mut names: Vec<String> = {
+            let dbs = self.dbs.read().expect("dbs lock");
+            dbs.keys().cloned().collect()
+        };
+        for db in self.catalog.databases() {
+            if !names.contains(&db) {
+                names.push(db);
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Tables in one database, from the buffer AND the catalog — a table
+    /// that has been written but not yet flushed exists only in the former,
+    /// one that has been flushed and drained only in the latter.
+    pub fn table_names(&self, db: &str) -> Vec<String> {
+        let mut names: Vec<String> = {
+            let dbs = self.dbs.read().expect("dbs lock");
+            dbs.get(db)
+                .map(|t| t.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for t in self.catalog.tables_for(db) {
+            if !names.contains(&t) {
+                names.push(t);
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Merged schema for one table: the registry (files and past flushes)
+    /// unioned with whatever the live buffer has added since.
+    pub fn table_schema(&self, db: &str, table: &str) -> Option<timelord_query::QuerySchema> {
+        let key = (db.to_string(), table.to_string());
+        let registered = self
+            .schemas
+            .read()
+            .expect("schemas lock")
+            .get(&key)
+            .cloned();
+        let buffered = {
+            let dbs = self.dbs.read().expect("dbs lock");
+            dbs.get(db)
+                .and_then(|t| t.get(table))
+                .filter(|b| b.row_count() > 0)
+                .map(|b| b.schema_only())
+        };
+        match buffered {
+            Some(b) => timelord_query::schema_union(registered, b).ok(),
+            None => registered,
+        }
     }
 
     /// Attach the TLS rotator so /metrics exports cert health (SEC-3).
@@ -665,6 +713,18 @@ impl Engine {
 impl timelord_flight::SqlBackend for Engine {
     fn query_batches<'a>(&'a self, db: String, sql: String) -> timelord_flight::SqlFuture<'a> {
         Box::pin(async move { self.sql_batches(&db, &sql).await })
+    }
+
+    fn databases(&self) -> Vec<String> {
+        Engine::databases(self)
+    }
+
+    fn tables(&self, db: &str) -> Vec<String> {
+        self.table_names(db)
+    }
+
+    fn table_schema(&self, db: &str, table: &str) -> Option<timelord_query::QuerySchema> {
+        Engine::table_schema(self, db, table)
     }
 }
 

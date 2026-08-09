@@ -60,6 +60,7 @@ impl QueryEnv {
 pub async fn run_sql_env(
     env: &QueryEnv,
     session: &QuerySession,
+    db: &str,
     tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
@@ -70,7 +71,15 @@ pub async fn run_sql_env(
         .await
         .map_err(|_| "query admission closed".to_string())?;
 
-    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), env.runtime.clone());
+    // information_schema powers SHOW TABLES / DESCRIBE and is what SQL and BI
+    // tools use to discover a schema. Naming the default catalog after the
+    // database makes the three-part names those tools generate resolve —
+    // Flight SQL reports each database as a catalog, so `poc.public.events`
+    // has to mean something here.
+    let config = SessionConfig::new()
+        .with_information_schema(true)
+        .with_default_catalog_and_schema(db, "public");
+    let ctx = SessionContext::new_with_config_rt(config, env.runtime.clone());
     for (name, provider) in tables {
         // SEC-2: the hook is on the path for every table, every query.
         let _restriction = mandatory_predicate(session, &name);
@@ -228,7 +237,10 @@ pub async fn run_sql(
         .with_memory_pool(Arc::new(GreedyMemoryPool::new(mem_limit_bytes)))
         .build_arc()
         .map_err(|e| e.to_string())?;
-    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_information_schema(true),
+        runtime,
+    );
 
     for (name, batches) in tables {
         // SEC-2: the hook is on the path for every table, every query.

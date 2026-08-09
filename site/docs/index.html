@@ -233,8 +233,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         The response is a JSON array of row objects. SQL is DataFusion's dialect —
         the <a href="reference.html#sql">SQL reference</a> lists what is supported,
-        what is not (no <code>INSERT</code>/<code>DELETE</code>, no
-        <code>SHOW TABLES</code>), and how each type is encoded on the wire.
+        what is not (no <code>INSERT</code>/<code>DELETE</code>; data leaves only by
+        retention), and how each type is encoded on the wire.
+        <code>SHOW TABLES</code>, <code>DESCRIBE</code> and
+        <code>information_schema</code> all work for schema discovery.
       </p>
 
       <h3>Flight SQL</h3>
