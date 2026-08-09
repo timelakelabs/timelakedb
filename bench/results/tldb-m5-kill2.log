@@ -17,5 +17,5 @@ tsdb-bench run: timelorddb-tldb-m5-kill2-20260808-155546
 [15:56:05] INGEST done: 3,656,634 lines in 12.7s (286,957 lines/s, 0 errors)
 
 Run complete in 22s
-  C:\project-time-lord-db\TimelordDB\bench\results\timelorddb-tldb-m5-kill2-20260808-155546\run.json
-  compare runs with: python bench.py compare C:\project-time-lord-db\TimelordDB\bench\results\*\run.json
+  <repo>\bench\results\timelorddb-tldb-m5-kill2-20260808-155546\run.json
+  compare runs with: python bench.py compare <repo>\bench\results\*\run.json

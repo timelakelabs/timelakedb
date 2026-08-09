@@ -9,8 +9,9 @@
 set -e
 CONTAINER="$1"; LABEL="$2"; SCALE="$3"; shift 3
 export MSYS_NO_PATHCONV=1
+BENCH=$(cd "$(dirname "$0")" && pwd)
 exec docker run --rm --network "container:${CONTAINER}" \
-  -v /c/project-time-lord-db/TimeLakeDB/bench:/bench -w /bench \
+  -v "$BENCH":/bench -w /bench \
   tldb-bench:perf \
   python bench.py run --backend timelakedb --url http://localhost:1963 \
     --container none --scale "$SCALE" --label "$LABEL" "$@"

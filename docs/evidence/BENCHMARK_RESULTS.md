@@ -1,4 +1,4 @@
-> **Evidence snapshot** — copied 2026-08-08 from the `project-time-lord-db` evaluation repo; paths mentioned inside refer to that repo's layout.
+> **Evidence snapshot** — copied 2026-08-08 from the original evaluation repository; paths mentioned inside refer to that repo's layout.
 
 # InfluxDB 3 Evaluation — Benchmark Results
 

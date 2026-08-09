@@ -140,7 +140,7 @@ the influxdb3 reference as described above.
 
 ## Provenance
 
-Vendored into TimeLakeDB from the `project-time-lord-db` evaluation repo
+Vendored into TimeLakeDB from the original evaluation repository
 (tsdb-bench), where it benchmarked five engines on this exact workload.
 The recorded InfluxDB 3 baselines in `results/` are the numbers TimeLakeDB
 must beat (`../REQUIREMENTS.md` §10). The workload generator is
