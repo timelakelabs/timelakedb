@@ -64,16 +64,18 @@ The runtime stage of `Dockerfile` must track the builder's glibc. When
 ## The workspace
 
 Thirteen crates, each with a single job. Boundaries are load-bearing —
-particularly `store` (the one object-I/O chokepoint, which is where SEC-1
-encryption slots in) and `query` (the one place a mandatory visibility
-predicate can be injected for SEC-2). Do not route I/O around them.
+particularly `store` (the one object-I/O chokepoint, where SEC-1
+encryption lives as the `EncryptingStore` decorator) and `query` (the one
+mandatory-predicate injection point, where SEC-2 visibility labels are
+enforced inside the scan). Do not route I/O around them, and do not add
+a second enforcement point.
 
 | Crate | Job |
 |---|---|
 | `ingest` | Line-protocol parser (FR-1). No heavy dependencies. |
 | `wal` | Write-ahead log with generations; fsync before the 204 (RR-3). |
 | `buffer` | Mutable per-table buffer with immutable Arrow snapshots (PR-9). |
-| `store` | **The single chokepoint for all object I/O** (SEC-1 seam). |
+| `store` | **The single chokepoint for all object I/O**, including SEC-1 envelope encryption. |
 | `catalog` | The manifest log that makes the object store the source of truth (CL-1). |
 | `compact` | Merges a partition's L0 files into one settled file (PR-6). |
 | `retention` | Per-table retention as whole-file drops (FR-7). |
