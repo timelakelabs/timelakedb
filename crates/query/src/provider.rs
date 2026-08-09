@@ -445,8 +445,168 @@ pub fn stats_keep_row_groups(
     keep
 }
 
+/// Decode ONE candidate file: prune its row groups, fetch the survivors,
+/// decode them. Split out of [`load_pruned`] because files are independent
+/// — nothing here reads another file's state, which is what lets the loads
+/// run concurrently.
+///
+/// `Ok(None)` means the file was pruned away entirely and never read.
+fn load_one_file(
+    meta: &FileMeta,
+    store: &Arc<dyn Store>,
+    pruning: &Pruning,
+    needed: Option<&[String]>,
+    meta_cache: &Arc<MetaCache>,
+    reservation: &std::sync::Mutex<datafusion::execution::memory_pool::MemoryReservation>,
+) -> Result<Option<Vec<RecordBatch>>, String> {
+    // file-level time pruning (catalog bounds)
+    if let Some(min) = pruning.min_ts_ns
+        && meta.max_ts_ns < min
+    {
+        return Ok(None);
+    }
+    if let Some(max) = pruning.max_ts_ns
+        && meta.min_ts_ns > max
+    {
+        return Ok(None);
+    }
+
+    // metadata-cache fast path: on a warm footer, decide row-group
+    // pruning WITHOUT fetching the file — only survivors get read
+    let cached_md = meta_cache
+        .lock()
+        .expect("meta cache lock")
+        .get(&meta.path)
+        .cloned();
+    // Range-read handle: only the footer and the surviving row groups
+    // ever leave the store.
+    use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    let mut file = StoreFile::with_len(store.clone(), &meta.path, meta.size_bytes);
+
+    let md: Arc<_> = match cached_md {
+        Some(md) => md,
+        None => {
+            // footer only — a range read, not the file
+            let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
+                .map_err(|e| e.to_string())?;
+            let md = loaded.metadata().clone();
+            let mut cache = meta_cache.lock().expect("meta cache lock");
+            if cache.len() > 4096 {
+                cache.clear(); // crude bound; files are few post-compaction
+            }
+            cache.insert(meta.path.clone(), md.clone());
+            md
+        }
+    };
+
+    let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
+        (0..md.num_row_groups()).collect()
+    } else {
+        // statistics first (free — already in the footer), then blooms
+        // for whatever survives. On fresh L0 data statistics prune
+        // nothing, because an unclustered group's min/max spans the
+        // whole entity space; the bloom is what actually excludes.
+        let by_stats = stats_keep_row_groups(&md, &pruning.tag_equals);
+        bloom_keep_row_groups(&file, &md, &pruning.tag_equals, by_stats)
+    };
+    if keep.is_empty() {
+        return Ok(None);
+    }
+
+    // fetch just those groups, then decode from memory
+    file.prefetch_row_groups(&md, &keep)?;
+    let arrow_md = ArrowReaderMetadata::try_new(md, ArrowReaderOptions::default())
+        .map_err(|e| e.to_string())?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_md);
+
+    // projection pushdown: decode only the columns the plan needs
+    let builder = match needed {
+        None => builder,
+        Some(names) => {
+            let descr = builder.parquet_schema().clone();
+            let idx: Vec<usize> = (0..descr.num_columns())
+                .filter(|i| names.iter().any(|n| n == descr.column(*i).name()))
+                .collect();
+            let mask = datafusion::parquet::arrow::ProjectionMask::roots(&descr, idx);
+            builder.with_projection(mask)
+        }
+    };
+
+    // decode-time row filtering (PR-3's last mile): for tag equality
+    // literals, only MATCHING rows materialize — a journey pulls its
+    // ~20 rows out of each kept row group instead of all 64K
+    let builder = if pruning.tag_equals.is_empty() {
+        builder
+    } else {
+        use datafusion::parquet::arrow::ProjectionMask;
+        use datafusion::parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+        let descr = builder.parquet_schema().clone();
+        let mut predicates: Vec<Box<dyn datafusion::parquet::arrow::arrow_reader::ArrowPredicate>> =
+            Vec::new();
+        for (col, val) in pruning.tag_equals.clone() {
+            let Some(idx) = (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
+            else {
+                continue;
+            };
+            let mask = ProjectionMask::roots(&descr, [idx]);
+            predicates.push(Box::new(ArrowPredicateFn::new(mask, move |batch| {
+                use datafusion::arrow::array::StringArray;
+                use datafusion::arrow::compute::kernels::cmp::eq;
+                let scalar = StringArray::new_scalar(val.clone());
+                eq(batch.column(0), &scalar)
+            })));
+        }
+        if predicates.is_empty() {
+            builder
+        } else {
+            builder.with_row_filter(RowFilter::new(predicates))
+        }
+    };
+
+    // one batch per row group: small default batches would each
+    // carry (and re-count) the whole shared dictionary buffer
+    let reader = builder
+        .with_row_groups(keep)
+        .with_batch_size(1_048_576)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for b in reader {
+        let b = b.map_err(|e| e.to_string())?;
+        // RR-1 still guards every batch, on whichever thread produced it:
+        // the reservation is what rejects an oversized candidate set
+        // BEFORE memory blows up, so it must stay inside the decode loop
+        // rather than being applied after the join.
+        reservation
+            .lock()
+            .expect("scan reservation lock")
+            .try_grow(b.get_array_memory_size())
+            .map_err(|e| format!("query memory budget exceeded at {}: {e}", meta.path))?;
+        out.push(b);
+    }
+    Ok(Some(out))
+}
+
+/// How many threads a scan may use to decode its candidate files.
+///
+/// Bounded well below the core count on purpose: the write path and the
+/// maintenance tick share this machine, and the ingest-contention carve-out
+/// says a query that grabs every core is a regression somewhere else.
+fn scan_threads(files: usize) -> usize {
+    const MAX: usize = 8;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    files.min(cores).clamp(1, MAX)
+}
+
 /// The blocking half of scan: runs on the blocking pool, checks the
 /// deadline between files (RR-2 — abandonable, never pins the runtime).
+///
+/// Candidate files are decoded CONCURRENTLY. They are independent — each
+/// one prunes and decodes from its own `StoreFile` — while the aggregation
+/// above the scan was already running ~12-wide on this host, so a serial
+/// load was the one part of a Shape B query pinned to a single core.
 #[allow(clippy::too_many_arguments)]
 fn load_pruned(
     buffer: &[RecordBatch],
@@ -466,11 +626,13 @@ fn load_pruned(
     String,
 > {
     use datafusion::execution::memory_pool::MemoryConsumer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     // RR-1: loads are pool-visible at ACTUAL batch size. Accurate now:
     // with batch_size >= row-group size each batch owns its dictionary
     // (the earlier double-count came from 1024-row batches sharing one
     // RG dictionary). The process must never be OOM-killable by a load.
-    let reservation = MemoryConsumer::new(format!("scan:{table}")).register(pool);
+    let reservation =
+        std::sync::Mutex::new(MemoryConsumer::new(format!("scan:{table}")).register(pool));
     let mut batches = Vec::with_capacity(buffer.len());
     for b in buffer {
         batches.push(match needed {
@@ -485,130 +647,62 @@ fn load_pruned(
         });
     }
 
-    for meta in files {
-        if std::time::Instant::now() >= deadline {
-            return Err("scan load deadline exceeded — query abandoned (RR-2)".to_string());
-        }
-        // file-level time pruning (catalog bounds)
-        if let Some(min) = pruning.min_ts_ns
-            && meta.max_ts_ns < min
-        {
-            continue;
-        }
-        if let Some(max) = pruning.max_ts_ns
-            && meta.min_ts_ns > max
-        {
-            continue;
-        }
+    // Results land in file order regardless of which thread produced them,
+    // so a plan sees exactly the batch sequence it saw when this loop was
+    // serial. Cheap insurance against a "why did the row order change"
+    // hunt later.
+    let slots: Vec<std::sync::Mutex<Option<Vec<RecordBatch>>>> = (0..files.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-        // metadata-cache fast path: on a warm footer, decide row-group
-        // pruning WITHOUT fetching the file — only survivors get read
-        let cached_md = meta_cache
-            .lock()
-            .expect("meta cache lock")
-            .get(&meta.path)
-            .cloned();
-        // Range-read handle: only the footer and the surviving row groups
-        // ever leave the store.
-        use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-        let mut file = StoreFile::with_len(store.clone(), &meta.path, meta.size_bytes);
-
-        let md: Arc<_> = match cached_md {
-            Some(md) => md,
-            None => {
-                // footer only — a range read, not the file
-                let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
-                    .map_err(|e| e.to_string())?;
-                let md = loaded.metadata().clone();
-                let mut cache = meta_cache.lock().expect("meta cache lock");
-                if cache.len() > 4096 {
-                    cache.clear(); // crude bound; files are few post-compaction
+    std::thread::scope(|scope| {
+        for _ in 0..scan_threads(files.len()) {
+            scope.spawn(|| {
+                loop {
+                    if failure.lock().expect("scan failure lock").is_some() {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(meta) = files.get(i) else { return };
+                    // RR-2: the deadline is still checked between files, now
+                    // by every worker, so a slow scan is abandoned rather
+                    // than pinning threads until it finishes.
+                    if std::time::Instant::now() >= deadline {
+                        *failure.lock().expect("scan failure lock") = Some(
+                            "scan load deadline exceeded — query abandoned (RR-2)".to_string(),
+                        );
+                        return;
+                    }
+                    match load_one_file(meta, store, pruning, needed, meta_cache, &reservation) {
+                        Ok(None) => {}
+                        Ok(Some(b)) => {
+                            *slots[i].lock().expect("scan slot lock") = Some(b);
+                        }
+                        Err(e) => {
+                            let mut f = failure.lock().expect("scan failure lock");
+                            if f.is_none() {
+                                *f = Some(e);
+                            }
+                            return;
+                        }
+                    }
                 }
-                cache.insert(meta.path.clone(), md.clone());
-                md
-            }
-        };
-
-        let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
-            (0..md.num_row_groups()).collect()
-        } else {
-            // statistics first (free — already in the footer), then blooms
-            // for whatever survives. On fresh L0 data statistics prune
-            // nothing, because an unclustered group's min/max spans the
-            // whole entity space; the bloom is what actually excludes.
-            let by_stats = stats_keep_row_groups(&md, &pruning.tag_equals);
-            bloom_keep_row_groups(&file, &md, &pruning.tag_equals, by_stats)
-        };
-        if keep.is_empty() {
-            continue;
+            });
         }
+    });
 
-        // fetch just those groups, then decode from memory
-        file.prefetch_row_groups(&md, &keep)?;
-        let arrow_md = ArrowReaderMetadata::try_new(md, ArrowReaderOptions::default())
-            .map_err(|e| e.to_string())?;
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_md);
-
-        // projection pushdown: decode only the columns the plan needs
-        let builder = match needed {
-            None => builder,
-            Some(names) => {
-                let descr = builder.parquet_schema().clone();
-                let idx: Vec<usize> = (0..descr.num_columns())
-                    .filter(|i| names.iter().any(|n| n == descr.column(*i).name()))
-                    .collect();
-                let mask = datafusion::parquet::arrow::ProjectionMask::roots(&descr, idx);
-                builder.with_projection(mask)
-            }
-        };
-
-        // decode-time row filtering (PR-3's last mile): for tag equality
-        // literals, only MATCHING rows materialize — a journey pulls its
-        // ~20 rows out of each kept row group instead of all 64K
-        let builder = if pruning.tag_equals.is_empty() {
-            builder
-        } else {
-            use datafusion::parquet::arrow::ProjectionMask;
-            use datafusion::parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
-            let descr = builder.parquet_schema().clone();
-            let mut predicates: Vec<
-                Box<dyn datafusion::parquet::arrow::arrow_reader::ArrowPredicate>,
-            > = Vec::new();
-            for (col, val) in pruning.tag_equals.clone() {
-                let Some(idx) = (0..descr.num_columns()).find(|i| descr.column(*i).name() == col)
-                else {
-                    continue;
-                };
-                let mask = ProjectionMask::roots(&descr, [idx]);
-                predicates.push(Box::new(ArrowPredicateFn::new(mask, move |batch| {
-                    use datafusion::arrow::array::StringArray;
-                    use datafusion::arrow::compute::kernels::cmp::eq;
-                    let scalar = StringArray::new_scalar(val.clone());
-                    eq(batch.column(0), &scalar)
-                })));
-            }
-            if predicates.is_empty() {
-                builder
-            } else {
-                builder.with_row_filter(RowFilter::new(predicates))
-            }
-        };
-
-        // one batch per row group: small default batches would each
-        // carry (and re-count) the whole shared dictionary buffer
-        let reader = builder
-            .with_row_groups(keep)
-            .with_batch_size(1_048_576)
-            .build()
-            .map_err(|e| e.to_string())?;
-        for b in reader {
-            let b = b.map_err(|e| e.to_string())?;
-            reservation
-                .try_grow(b.get_array_memory_size())
-                .map_err(|e| format!("query memory budget exceeded at {}: {e}", meta.path))?;
-            batches.push(b);
+    if let Some(err) = failure.into_inner().expect("scan failure lock") {
+        return Err(err);
+    }
+    for slot in slots {
+        if let Some(b) = slot.into_inner().expect("scan slot lock") {
+            batches.extend(b);
         }
     }
+
+    let reservation = reservation.into_inner().expect("scan reservation lock");
     tracing::info!(
         table,
         files_total = files.len(),
