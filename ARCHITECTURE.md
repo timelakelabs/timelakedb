@@ -1,4 +1,4 @@
-# TimelordDB — Architecture
+# TimeLakeDB — Architecture
 
 **Status:** Draft v1 · 2026-08-08 · companion to `REQUIREMENTS.md`
 (requirement IDs cited throughout; anything here that can't name its
@@ -26,7 +26,7 @@ flowchart LR
         BH[tsdb-bench]
     end
 
-    subgraph node [timelord-server v1 - single process]
+    subgraph node [timelake-server v1 - single process]
         API[HTTP API<br/>LP write v1/v2/v3, health, ping]
         ING[Ingest<br/>parse - validate - normalize]
         WAL[WAL<br/>segmented, fsync-batched]
@@ -83,7 +83,7 @@ Two invariants shape everything:
 ## 3. Crate workspace
 
 ```
-timelord/
+timelake/
   crates/
     server/      binary: wiring, config, lifecycle, /metrics
     api/         HTTP: /write, /api/v2/write, /api/v3/write_lp,
@@ -108,7 +108,7 @@ timelord/
     admin/       admin listener: console REST API + embedded UI ← SR-5, U0
   tests/
     at/          AT-1..AT-6 harness glue (tsdb-bench adapter lives in
-                 bench/backends/timelorddb.py, not here)
+                 bench/backends/timelakedb.py, not here)
 ```
 
 Consolidating crates later is cheap; splitting a tangle is not. Start
@@ -279,7 +279,7 @@ Three rungs, cheapest first; the harness decides how far to climb:
   `EncryptingStore(inner, kms)` — a decorator on the one object-I/O
   trait; the engine cannot tell. Every object (Parquet, manifest,
   checkpoint) gets a fresh AES-256-GCM data key, wrapped by the KMS
-  (v1: a local KEK from `TIMELORD_ENCRYPTION_KEY[_FILE]`; the `Kms`
+  (v1: a local KEK from `TIMELAKE_ENCRYPTION_KEY[_FILE]`; the `Kms`
   trait is where per-table scoping and real KMS backends arrive).
   Objects are encrypted in 64 KiB chunks, one auth tag each, with the
   header and object path as AAD — chunks cannot be reordered, spliced
@@ -300,14 +300,14 @@ Three rungs, cheapest first; the harness decides how far to climb:
   count a hidden row. v1 restriction: Accumulo-style row visibility —
   a `_visibility` dictionary tag holds expressions like
   `(ops&audit)|admin`, evaluated per distinct label against the
-  session's authorizations (HTTP `X-Timelord-Authorizations` /
+  session's authorizations (HTTP `X-TimeLake-Authorizations` /
   Flight SQL metadata). Unlabeled rows are public; malformed labels are
   visible to no one (fail closed). Retention boundaries and tenant
   scoping arrive as further `Restriction` variants through this same
   hook. Note: until token auth lands (§12), authorizations are claims,
   not credentials — SECURITY.md is explicit about this.
-  Observability: `timelord_visibility_rows_filtered_total`,
-  `timelord_encryption_enabled`.
+  Observability: `timelake_visibility_rows_filtered_total`,
+  `timelake_encryption_enabled`.
 - **TLS 1.3 everywhere, built for daily cert rotation (SEC-3):** one
   rustls `ServerConfig` shared by the HTTP stack (axum/hyper) and Flight
   SQL (tonic), TLS 1.3 with a configurable 1.2 floor. Rotation mechanics:
@@ -370,7 +370,7 @@ PutObject (SSE headers below; multipart when L2 splits exceed single-PUT
 limits), `get_range` → ranged GET (the seam range reads were built for),
 `list` → ListObjectsV2 (lexicographic — exactly what manifest replay
 requires), `size` → catalog-recorded sizes on the hot path, HeadObject
-otherwise. Config: `TIMELORD_OBJECT_STORE=s3://bucket/prefix` (unset =
+otherwise. Config: `TIMELAKE_OBJECT_STORE=s3://bucket/prefix` (unset =
 local directory, as today); `AWS_ENDPOINT_URL` + path-style addressing
 for LocalStack. Per-op request/byte/retry counters feed `/metrics`.
 
@@ -398,13 +398,13 @@ pays one KMS call per object at thousands of objects per day:
   nonce-collision odds near 2⁻⁴⁵. SEC-1's "per-object data keys" is
   hereby amended to "per-window, bounds configurable" — recorded in
   REQUIREMENTS §8. Keys live only in memory; caches are size- and
-  age-bounded. Metrics: `timelord_kms_generate_total`,
-  `timelord_kms_decrypt_total`, cache-hit counters — the drill turns
+  age-bounded. Metrics: `timelake_kms_generate_total`,
+  `timelake_kms_decrypt_total`, cache-hit counters — the drill turns
   "reduces KMS cost" into a measured before/after number.
 - **Server-side:** every PUT carries SSE-KMS headers with
   **S3 Bucket Keys enabled** — S3's own key cache; without it SSE-KMS
   costs a KMS call per object and no client code can help. Key ids:
-  `TIMELORD_KMS_KEY_ID` (client layer) and `TIMELORD_S3_SSE_KEY_ID`
+  `TIMELAKE_KMS_KEY_ID` (client layer) and `TIMELAKE_S3_SSE_KEY_ID`
   (defaults to the same; separate for blast-radius isolation if wanted).
 - Honesty about the money: at reference scale the dollar cost is small
   (~10⁴ calls/day ≈ cents) — the cache's real wins are **latency off the
@@ -429,7 +429,7 @@ instead of a full-log LIST/GET storm. GC grace now protects the whole
 fleet's in-flight queries: it must exceed the maximum query timeout of
 any node, not just the local one.
 
-### 12.4 Roles: one binary, `TIMELORD_ROLE`
+### 12.4 Roles: one binary, `TIMELAKE_ROLE`
 
 `all` (v1 default — today's behavior, bench fixtures unchanged) |
 `router` | `ingester` | `querier` | `compactor`. Same crates throughout.
@@ -474,16 +474,16 @@ ArcSwap machinery SEC-3 shipped.
 
 ### 12.6 LocalStack: the test-and-metrics rig
 
-`bench/compose/timelorddb-s3.yml` (C0: localstack `s3,kms` + an init
+`bench/compose/timelakedb-s3.yml` (C0: localstack `s3,kms` + an init
 container that creates the bucket with default SSE-KMS + Bucket Keys
-and a KMS key + one `TIMELORD_ROLE=all` node) and
-`timelorddb-cluster.yml` (C2: router, ingester×2, querier×2, compactor,
+and a KMS key + one `TIMELAKE_ROLE=all` node) and
+`timelakedb-cluster.yml` (C2: router, ingester×2, querier×2, compactor,
 localstack). Drills recorded in `bench/results/`, in the repo's
 evidence style:
 
 - **C0 gate:** bench smoke against the S3-backed node — counts exact,
   0 errors; the drill log records KMS calls and S3 requests with the
-  cache on vs off (`TIMELORD_KMS_CACHE=off` exists for exactly this
+  cache on vs off (`TIMELAKE_KMS_CACHE=off` exists for exactly this
   measurement), and an at-rest check (`get-object` → TLDE1 magic,
   `head-object` → SSE-KMS fields).
 - **CAS drill:** two engines, one bucket, concurrent flush/compact —
@@ -548,7 +548,7 @@ regardless of the console.
 
 | M | Deliverable | Gate (tsdb-bench) |
 |---|---|---|
-| M0 | Workspace, CI, `timelorddb` bench adapter + compose target (AT-1) | adapter health-checks against a stub |
+| M0 | Workspace, CI, `timelakedb` bench adapter + compose target (AT-1) | adapter health-checks against a stub |
 | M1 | Ingest path: LP endpoints → WAL → buffer; SQL over buffer only | smoke ingest + context counts exact (AT-2) |
 | M2 | Flush → Parquet → catalog; reads union buffer+files; restart recovery | smoke full suite green; kill-during-load recovers ≤30 s |
 | M3 | Compaction + per-table retention; Flight SQL; Grafana renders | laptop scale; dashboards fixture (AT-6 read half) |
@@ -569,8 +569,8 @@ of the C track; U3 needs the C2 role split:
 
 | U | Deliverable | Gate (tsdb-bench + drill) |
 |---|---|---|
-| U0 | Admin listener (1965, TLS, private by default), SEC-4 auth (bootstrap, roles, sessions, tokens), `timelord-config` layered resolver with provenance/revert/pinning, retention rebuilt on it, `/admin/*` off 1963 | full scale green with every tunable set through the console, not the environment; restart with a stale property keeps overrides **and** logs the divergence; unauthenticated admin call = 401 + audit record; `gc_grace_secs ≤ query_timeout_secs` rejected by name |
-| U1 | App-log ring + SSE tail; `timelord-audit` hash-chained sink, `system.audit`, verifier | audit drill: every mutating route emits exactly one record (denials included), chain verifies, a hand-edited record is caught at the right sequence, sink survives SIGKILL, mutations fail closed when the sink is down |
+| U0 | Admin listener (1965, TLS, private by default), SEC-4 auth (bootstrap, roles, sessions, tokens), `timelake-config` layered resolver with provenance/revert/pinning, retention rebuilt on it, `/admin/*` off 1963 | full scale green with every tunable set through the console, not the environment; restart with a stale property keeps overrides **and** logs the divergence; unauthenticated admin call = 401 + audit record; `gc_grace_secs ≤ query_timeout_secs` rejected by name |
+| U1 | App-log ring + SSE tail; `timelake-audit` hash-chained sink, `system.audit`, verifier | audit drill: every mutating route emits exactly one record (denials included), chain verifies, a hand-edited record is caught at the right sequence, sink survives SIGKILL, mutations fail closed when the sink is down |
 | U2 | Missing metrics (§13), 6 h sample ring, Overview/Ingest/Storage/Query/Security views | console numbers match `/metrics` and a run's `run.json` within tolerance; RR-4 idle footprint unchanged with ring + log buffer full; the Query view shows the fresh-vs-settled effect without running the harness |
 | U3 | Cluster view over `Discovery`, drill-in, config convergence, degraded-mode banners | node kill visible ≤ 10 s with role and health; a node held at an old revision is flagged; a stale membership view changes nothing about write/catalog correctness (CL-5 guard, drilled) |
 
@@ -645,13 +645,13 @@ environment (RR-5 says guardrails are never silent), and a `DELETE` whose
 meaning is ambiguous the moment a system property is also in play.
 
 **Configuration.** Three layers resolve — `EngineConfig::default()` <
-`TIMELORD_*` system property < stored override — and the API returns the
+`TIMELAKE_*` system property < stored override — and the API returns the
 whole stack, not just the winner. An override records the property value
 as it stood when written, so a later deployment change is *detectable*:
-banner, `WARN` line, and `timelord_config_divergent_settings`. Overrides
+banner, `WARN` line, and `timelake_config_divergent_settings`. Overrides
 are three-state (absent = inherit, value, explicit-none = off regardless
 of the property), which is what makes "revert to the system property" and
-"keep everything anyway" distinguishable. `TIMELORD_CONFIG_PINNED` locks
+"keep everything anyway" distinguishable. `TIMELAKE_CONFIG_PINNED` locks
 named keys to the property layer for configuration-as-code deployments.
 Cluster-scope settings live at `catalog/config/settings.json` through the
 `Store` (encrypted by SEC-1, shared on S3, revision-stamped; C1's
@@ -659,7 +659,7 @@ Cluster-scope settings live at `catalog/config/settings.json` through the
 settings stay local. Validation runs over the whole proposed config
 because the rules are cross-field — `gc_grace_secs > query_timeout_secs`
 is the AT-3 race expressed as an invariant. Hot application reuses the
-`ArcSwap` snapshot pattern from `timelord-tls`: readers stay lock-free and
+`ArcSwap` snapshot pattern from `timelake-tls`: readers stay lock-free and
 in-flight queries keep the pool and deadline they were admitted with.
 
 **Identity.** SEC-4 introduces authentication and roles (viewer /
@@ -679,7 +679,7 @@ administrative change that leaves no record is worse than one that did not
 happen. Audit retention has a property-pinned floor.
 
 **Observation.** App logs go to a bounded ring plus SSE tail (never
-ingested into TimelordDB — self-ingestion amplifies writes exactly when
+ingested into TimeLakeDB — self-ingestion amplifies writes exactly when
 the server is sick, RR-4). Metrics get the missing query-side series
 (§13) and a 6-hour in-memory sample ring, enough to triage a node with
 nothing else installed. Grafana is not replaced (FR-8): the console

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TimelordDB — High-Performance Time-Series Database</title>
-<meta name="description" content="TimelordDB is a Rust time-series database for high-cardinality event analytics, specified from a five-engine benchmark: 36M events/day, every cross-product query completes, 0.50 GB/day on disk.">
+<title>TimeLakeDB — High-Performance Time-Series Database</title>
+<meta name="description" content="TimeLakeDB is a Rust time-series database for high-cardinality event analytics, specified from a five-engine benchmark: 36M events/day, every cross-product query completes, 0.50 GB/day on disk.">
 <meta name="theme-color" content="#0b1320">
-<meta property="og:title" content="TimelordDB — Time. Stored. Forever.">
+<meta property="og:title" content="TimeLakeDB — Time. Stored. Forever.">
 <meta property="og:description" content="A time-series database specified from evidence: the query that OOM-killed InfluxDB 1.8 returns here in 0.68 s.">
 <meta property="og:type" content="website">
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
@@ -18,7 +18,7 @@
   <div class="shell">
     <a class="brand" href="index.html">
       <img class="mark" src="assets/logo.svg" alt="">
-      <span>Timelord<span class="db">DB</span></span>
+      <span>TimeLake<span class="db">DB</span></span>
     </a>
     <nav>
       <a href="docs/index.html">Docs</a>
@@ -33,9 +33,9 @@
   <div class="shell">
     <div>
       <div class="hero-mark">
-        <img class="mark" src="assets/logo.svg" alt="TimelordDB logo">
+        <img class="mark" src="assets/logo.svg" alt="TimeLakeDB logo">
         <div>
-          <h1 class="wordmark">Timelord<span class="db">DB</span></h1>
+          <h1 class="wordmark">TimeLake<span class="db">DB</span></h1>
           <p class="kicker">Time. Stored. Forever.</p>
         </div>
       </div>
@@ -217,7 +217,7 @@
         </thead>
         <tbody>
           <tr>
-            <td><strong>TimelordDB</strong></td>
+            <td><strong>TimeLakeDB</strong></td>
             <td>365–671K lines/s</td>
             <td>211 ms median</td>
             <td class="good">all complete, 0.68–1.7 s</td>
@@ -269,8 +269,8 @@
     <div class="code">
       <header>Run it <button class="copy" type="button">Copy</button></header>
 <pre><span class="c"># from a clone of the repository</span>
-<span class="k">cd</span> TimelordDB/bench
-docker compose -f compose/timelorddb.yml up -d --build
+<span class="k">cd</span> TimeLakeDB/bench
+docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:<span class="n">1963</span>/health</pre>
     </div>
 
@@ -306,7 +306,7 @@ curl http://localhost:<span class="n">1963</span>/health</pre>
   <div class="shell">
     <div>
       <div class="kicker">Time. Stored. Forever.</div>
-      <div>TimelordDB — Rust · DataFusion · Arrow · Parquet</div>
+      <div>TimeLakeDB — Rust · DataFusion · Arrow · Parquet</div>
     </div>
     <div style="margin-left:auto">
       <a href="docs/index.html">Documentation</a> ·

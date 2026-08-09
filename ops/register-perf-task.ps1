@@ -1,5 +1,5 @@
 <#
-    Register (or remove) the Windows scheduled task that runs a TimelordDB
+    Register (or remove) the Windows scheduled task that runs a TimeLakeDB
     performance cycle every few hours.
 
     Runs as the current user, only while that user is logged on — no stored
@@ -12,7 +12,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$TaskName = 'TimelordDB Perf Cycle',
+    [string]$TaskName = 'TimeLakeDB Perf Cycle',
     [int]$Hours = 3,
     [string]$StartTime = '00:17',
     [switch]$Remove

@@ -4425,64 +4425,64 @@ dependencies = [
 ]
 
 [[package]]
-name = "timelord-api"
+name = "timelake-api"
 version = "0.1.0"
 dependencies = [
  "axum",
  "flate2",
  "serde",
  "serde_json",
- "timelord-auth",
+ "timelake-auth",
  "tokio",
 ]
 
 [[package]]
-name = "timelord-auth"
+name = "timelake-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
  "serde",
  "serde_json",
  "tempfile",
- "timelord-store",
+ "timelake-store",
  "tracing",
 ]
 
 [[package]]
-name = "timelord-buffer"
+name = "timelake-buffer"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "datafusion",
- "timelord-ingest",
+ "timelake-ingest",
 ]
 
 [[package]]
-name = "timelord-catalog"
+name = "timelake-catalog"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "timelord-store",
+ "timelake-store",
 ]
 
 [[package]]
-name = "timelord-compact"
+name = "timelake-compact"
 version = "0.1.0"
 dependencies = [
  "datafusion",
- "timelord-buffer",
- "timelord-ingest",
- "timelord-query",
+ "timelake-buffer",
+ "timelake-ingest",
+ "timelake-query",
 ]
 
 [[package]]
-name = "timelord-discovery"
+name = "timelake-discovery"
 version = "0.1.0"
 
 [[package]]
-name = "timelord-flight"
+name = "timelake-flight"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -4499,31 +4499,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "timelord-ingest"
+name = "timelake-ingest"
 version = "0.1.0"
 
 [[package]]
-name = "timelord-query"
+name = "timelake-query"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
  "datafusion",
  "serde_json",
- "timelord-buffer",
- "timelord-catalog",
- "timelord-ingest",
- "timelord-store",
+ "timelake-buffer",
+ "timelake-catalog",
+ "timelake-ingest",
+ "timelake-store",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "timelord-retention"
+name = "timelake-retention"
 version = "0.1.0"
 
 [[package]]
-name = "timelord-server"
+name = "timelake-server"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -4532,18 +4532,18 @@ dependencies = [
  "http-body-util",
  "serde_json",
  "tempfile",
- "timelord-api",
- "timelord-auth",
- "timelord-buffer",
- "timelord-catalog",
- "timelord-compact",
- "timelord-flight",
- "timelord-ingest",
- "timelord-query",
- "timelord-store",
- "timelord-store-s3",
- "timelord-tls",
- "timelord-wal",
+ "timelake-api",
+ "timelake-auth",
+ "timelake-buffer",
+ "timelake-catalog",
+ "timelake-compact",
+ "timelake-flight",
+ "timelake-ingest",
+ "timelake-query",
+ "timelake-store",
+ "timelake-store-s3",
+ "timelake-tls",
+ "timelake-wal",
  "tokio",
  "tower",
  "tracing",
@@ -4551,7 +4551,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "timelord-store"
+name = "timelake-store"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -4559,20 +4559,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "timelord-store-s3"
+name = "timelake-store-s3"
 version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
  "aws-sdk-s3",
  "tempfile",
- "timelord-store",
+ "timelake-store",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "timelord-tls"
+name = "timelake-tls"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
@@ -4586,7 +4586,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "timelord-wal"
+name = "timelake-wal"
 version = "0.1.0"
 dependencies = [
  "tempfile",

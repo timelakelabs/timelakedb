@@ -8,18 +8,18 @@ this on Windows and macOS).
 
 ```sh
 ./ops/tldb-backup.sh backup                          # live, no downtime
-./ops/tldb-backup.sh verify  -f timelord-backup-*.tgz
-./ops/tldb-backup.sh restore -f timelord-backup-*.tgz --recreate
+./ops/tldb-backup.sh verify  -f timelake-backup-*.tgz
+./ops/tldb-backup.sh restore -f timelake-backup-*.tgz --recreate
 ```
 
 ## What a backup contains
 
-Everything is under `TIMELORD_DATA_DIR` (`/var/lib/timelord/data` in the
-image, the `bench-timelorddb_timelord-data` volume under the bench compose
+Everything is under `TIMELAKE_DATA_DIR` (`/var/lib/timelake/data` in the
+image, the `bench-timelakedb_timelake-data` volume under the bench compose
 file). The whole directory is the backup — there is nothing else to capture:
 
 ```
-$TIMELORD_DATA_DIR/
+$TIMELAKE_DATA_DIR/
 ├── wal/
 │   └── wal.00000111.log                     generation-rotated write-ahead log
 └── objects/
@@ -31,7 +31,7 @@ $TIMELORD_DATA_DIR/
 ```
 
 **Not included, because it does not live there:** the server configuration
-(`TIMELORD_*` environment variables, your compose file) and the TLS
+(`TIMELAKE_*` environment variables, your compose file) and the TLS
 certificate and key, which are mounted from outside the data directory. Back
 those up with your configuration management. A restore into a node configured
 differently — a different retention specification in particular — will apply
@@ -43,7 +43,7 @@ the volume was, and `verify`'s entry counts still work because file names
 and layout are unchanged. Two consequences to plan for:
 
 - A restore only serves if the restored node is configured with the
-  **same `TIMELORD_ENCRYPTION_KEY`** the archive was written under. The
+  **same `TIMELAKE_ENCRYPTION_KEY`** the archive was written under. The
   wrong key is a named refusal at startup (`DEK unwrap failed`), not
   garbage data. The key is part of your configuration backup — kept
   *separately* from the archives, or the encryption was theater.
@@ -70,7 +70,7 @@ properties make that true, and they bound when it stops being true:
    written — which by definition was not acknowledged to a client.
 
 The one window worth naming: a file removed from the catalog is not deleted
-from disk until `TIMELORD_GC_GRACE_SECS` (default 900 s) has passed. So an
+from disk until `TIMELAKE_GC_GRACE_SECS` (default 900 s) has passed. So an
 archive can only contain a dangling reference if more than the grace period
 elapses between the archiver reading the catalog and reading that object.
 **Keep the backup faster than the GC grace and the archive is internally
@@ -91,7 +91,7 @@ non-`.json` files during manifest replay.)
 ./ops/tldb-backup.sh backup                                  # default volume, gzip
 ./ops/tldb-backup.sh backup -v my_volume -o /srv/backups/tldb-$(date -u +%F).tgz
 ./ops/tldb-backup.sh backup --no-compress                    # usually the better trade
-./ops/tldb-backup.sh backup --stop timelorddb                # quiesced, with downtime
+./ops/tldb-backup.sh backup --stop timelakedb                # quiesced, with downtime
 ```
 
 The source volume is mounted read-only, so a backup cannot alter the running
@@ -103,12 +103,12 @@ of real data: gzip saved 15% of the size and cost 2.5× the wall clock.
 ### 2. Verify — always, before you need it
 
 ```sh
-./ops/tldb-backup.sh verify -f timelord-backup-20260808-214500.tgz
+./ops/tldb-backup.sh verify -f timelake-backup-20260808-214500.tgz
 ```
 
 It streams the archive and reports entry count, manifest count, Parquet count
 and WAL segments, failing if there is no manifest log to replay. An archive
-with zero manifests is not a TimelordDB data directory, whatever its name.
+with zero manifests is not a TimeLakeDB data directory, whatever its name.
 
 A verify reads the whole archive, so it takes about as long as the backup did.
 
@@ -118,9 +118,9 @@ Stop anything using the target volume first — the script refuses otherwise,
 because restoring underneath a live server corrupts the catalog.
 
 ```sh
-docker compose -f bench/compose/timelorddb.yml down
-./ops/tldb-backup.sh restore -f timelord-backup-20260808-214500.tgz --recreate
-docker compose -f bench/compose/timelorddb.yml up -d
+docker compose -f bench/compose/timelakedb.yml down
+./ops/tldb-backup.sh restore -f timelake-backup-20260808-214500.tgz --recreate
+docker compose -f bench/compose/timelakedb.yml up -d
 ```
 
 `--recreate` deletes and recreates the volume so the restore lands on empty
@@ -153,12 +153,12 @@ The same rules apply to a data directory on a filesystem; only the mechanics
 change:
 
 ```sh
-tar cf /srv/backups/tldb-$(date -u +%F).tar -C /var/lib/timelord/data .   # server may stay up
-systemctl stop timelorddb
-rm -rf /var/lib/timelord/data && mkdir -p /var/lib/timelord/data
-tar xf /srv/backups/tldb-2026-08-08.tar -C /var/lib/timelord/data
-find /var/lib/timelord/data -name '*.tmp-write' -delete
-systemctl start timelorddb
+tar cf /srv/backups/tldb-$(date -u +%F).tar -C /var/lib/timelake/data .   # server may stay up
+systemctl stop timelakedb
+rm -rf /var/lib/timelake/data && mkdir -p /var/lib/timelake/data
+tar xf /srv/backups/tldb-2026-08-08.tar -C /var/lib/timelake/data
+find /var/lib/timelake/data -name '*.tmp-write' -delete
+systemctl start timelakedb
 ```
 
 ## Scheduling
@@ -169,7 +169,7 @@ a systemd timer, keep the archives on different storage from the volume, and
 verify at least the newest one:
 
 ```cron
-17 3 * * *  cd /opt/TimelordDB && ./ops/tldb-backup.sh backup --no-compress \
+17 3 * * *  cd /opt/TimeLakeDB && ./ops/tldb-backup.sh backup --no-compress \
               -o /srv/backups/tldb-$(date -u +\%F).tar >> /var/log/tldb-backup.log 2>&1
 ```
 

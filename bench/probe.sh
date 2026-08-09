@@ -3,5 +3,5 @@
 set -e
 export MSYS_NO_PATHCONV=1
 exec docker run --rm --network container:tldb-perf \
-  -v /c/project-time-lord-db/TimelordDB/bench:/bench -w /bench \
+  -v /c/project-time-lord-db/TimeLakeDB/bench:/bench -w /bench \
   tldb-bench:perf python probe.py "$1" "${2:-20}"

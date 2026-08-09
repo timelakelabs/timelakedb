@@ -1,10 +1,10 @@
 ﻿[package]
-name = "timelord-buffer"
+name = "timelake-buffer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 datafusion.workspace = true
-timelord-ingest = { path = "../ingest" }
+timelake-ingest = { path = "../ingest" }
 bytes.workspace = true

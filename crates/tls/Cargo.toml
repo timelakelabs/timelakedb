@@ -1,5 +1,5 @@
 ﻿[package]
-name = "timelord-tls"
+name = "timelake-tls"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -20,7 +20,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit}
 use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use timelord_ingest::{FieldValue, ParsedLine};
+use timelake_ingest::{FieldValue, ParsedLine};
 
 const TZ: &str = "+00:00";
 
@@ -515,7 +515,7 @@ pub mod flush {
 mod tests {
     use super::*;
     use datafusion::arrow::array::Array;
-    use timelord_ingest::parse_lines;
+    use timelake_ingest::parse_lines;
 
     #[test]
     fn append_snapshot_counts_and_schema_evolution() {

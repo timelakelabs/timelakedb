@@ -1,5 +1,5 @@
 ﻿[package]
-name = "timelord-server"
+name = "timelake-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,18 +10,18 @@ axum.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-timelord-api = { path = "../api" }
-timelord-auth = { path = "../auth" }
-timelord-ingest = { path = "../ingest" }
-timelord-wal = { path = "../wal" }
-timelord-buffer = { path = "../buffer" }
-timelord-query = { path = "../query" }
-timelord-store = { path = "../store" }
-timelord-store-s3 = { path = "../store-s3" }
-timelord-catalog = { path = "../catalog" }
-timelord-compact = { path = "../compact" }
-timelord-flight = { path = "../flight" }
-timelord-tls = { path = "../tls" }
+timelake-api = { path = "../api" }
+timelake-auth = { path = "../auth" }
+timelake-ingest = { path = "../ingest" }
+timelake-wal = { path = "../wal" }
+timelake-buffer = { path = "../buffer" }
+timelake-query = { path = "../query" }
+timelake-store = { path = "../store" }
+timelake-store-s3 = { path = "../store-s3" }
+timelake-catalog = { path = "../catalog" }
+timelake-compact = { path = "../compact" }
+timelake-flight = { path = "../flight" }
+timelake-tls = { path = "../tls" }
 axum-server.workspace = true
 
 [dev-dependencies]

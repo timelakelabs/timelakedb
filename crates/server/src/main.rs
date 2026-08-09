@@ -12,12 +12,12 @@ async fn main() {
         )
         .init();
 
-    let addr = std::env::var("TIMELORD_ADDR").unwrap_or_else(|_| "0.0.0.0:1963".to_string());
-    let data_dir = timelord_server::data_dir_from_env();
-    let cfg = timelord_server::config_from_env();
+    let addr = std::env::var("TIMELAKE_ADDR").unwrap_or_else(|_| "0.0.0.0:1963".to_string());
+    let data_dir = timelake_server::data_dir_from_env();
+    let cfg = timelake_server::config_from_env();
 
-    tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelorddb M3 starting");
-    let engine = timelord_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
+    tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelakedb M3 starting");
+    let engine = timelake_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
 
     // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
     // every 30 s, retention every 60 s — sequential on one blocking task
@@ -55,23 +55,23 @@ async fn main() {
     });
 
     // Flight SQL (FR-8) on its own gRPC port
-    let flight_addr: std::net::SocketAddr = std::env::var("TIMELORD_FLIGHT_ADDR")
+    let flight_addr: std::net::SocketAddr = std::env::var("TIMELAKE_FLIGHT_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:1964".to_string())
         .parse()
-        .expect("TIMELORD_FLIGHT_ADDR must be host:port");
-    let flight_backend: Arc<dyn timelord_flight::SqlBackend> = engine.clone();
+        .expect("TIMELAKE_FLIGHT_ADDR must be host:port");
+    let flight_backend: Arc<dyn timelake_flight::SqlBackend> = engine.clone();
 
     // SEC-3: TLS on BOTH listeners when cert+key are configured; the
     // fixtures and bench stay plaintext by simply not setting these.
-    let tls_cert = std::env::var("TIMELORD_TLS_CERT").ok();
-    let tls_key = std::env::var("TIMELORD_TLS_KEY").ok();
+    let tls_cert = std::env::var("TIMELAKE_TLS_CERT").ok();
+    let tls_key = std::env::var("TIMELAKE_TLS_KEY").ok();
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
-            let rot = timelord_tls::RotatingCert::load(cert.as_ref(), key.as_ref())
+            let rot = timelake_tls::RotatingCert::load(cert.as_ref(), key.as_ref())
                 .expect("initial TLS cert load must succeed (no last-good yet)");
             engine.set_tls(Arc::clone(&rot));
-            // Floor is TLS 1.3; TIMELORD_TLS_MIN=1.2 lowers it (SEC-3).
-            let allow_tls12 = std::env::var("TIMELORD_TLS_MIN").as_deref() == Ok("1.2");
+            // Floor is TLS 1.3; TIMELAKE_TLS_MIN=1.2 lowers it (SEC-3).
+            let allow_tls12 = std::env::var("TIMELAKE_TLS_MIN").as_deref() == Ok("1.2");
             tracing::info!(
                 expires_in_secs = rot.expires_in_secs(),
                 min_version = if allow_tls12 { "1.2" } else { "1.3" },
@@ -107,7 +107,7 @@ async fn main() {
             let flight_tls = rot.server_config(allow_tls12, &[b"h2".as_slice()]);
             tokio::spawn(async move {
                 if let Err(e) =
-                    timelord_flight::serve_tls(flight_backend, flight_addr, flight_tls).await
+                    timelake_flight::serve_tls(flight_backend, flight_addr, flight_tls).await
                 {
                     tracing::error!(error = %e, "flight sql (TLS) server exited");
                 }
@@ -118,8 +118,8 @@ async fn main() {
             let http_tls = rot.server_config(allow_tls12, &[b"h2".as_slice(), b"http/1.1"]);
             let sock_addr: std::net::SocketAddr = addr
                 .parse()
-                .expect("TIMELORD_ADDR must be host:port under TLS");
-            let app = timelord_server::app_with_tls_admin(engine, rot);
+                .expect("TIMELAKE_ADDR must be host:port under TLS");
+            let app = timelake_server::app_with_tls_admin(engine, rot);
             axum_server::bind_rustls(
                 sock_addr,
                 axum_server::tls_rustls::RustlsConfig::from_config(http_tls),
@@ -130,15 +130,15 @@ async fn main() {
         }
         (None, None) => {
             tokio::spawn(async move {
-                if let Err(e) = timelord_flight::serve(flight_backend, flight_addr).await {
+                if let Err(e) = timelake_flight::serve(flight_backend, flight_addr).await {
                     tracing::error!(error = %e, "flight sql server exited");
                 }
             });
             let listener = TcpListener::bind(&addr).await.expect("bind listen address");
-            axum::serve(listener, timelord_server::app(engine))
+            axum::serve(listener, timelake_server::app(engine))
                 .await
                 .expect("server error");
         }
-        _ => panic!("TIMELORD_TLS_CERT and TIMELORD_TLS_KEY must be set together"),
+        _ => panic!("TIMELAKE_TLS_CERT and TIMELAKE_TLS_KEY must be set together"),
     }
 }

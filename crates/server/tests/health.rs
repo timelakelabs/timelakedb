@@ -9,8 +9,8 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-fn engine_cfg(retention: Vec<(String, u64)>) -> timelord_server::EngineConfig {
-    timelord_server::EngineConfig {
+fn engine_cfg(retention: Vec<(String, u64)>) -> timelake_server::EngineConfig {
+    timelake_server::EngineConfig {
         query_mem_bytes: 256 * 1024 * 1024,
         flush_rows: 1_000_000, // no auto-trigger; tests flush explicitly
         flush_age_secs: u64::MAX,
@@ -23,8 +23,8 @@ fn engine_cfg(retention: Vec<(String, u64)>) -> timelord_server::EngineConfig {
     }
 }
 
-fn engine(dir: &std::path::Path) -> Arc<timelord_server::Engine> {
-    timelord_server::Engine::open(dir, engine_cfg(Vec::new())).unwrap()
+fn engine(dir: &std::path::Path) -> Arc<timelake_server::Engine> {
+    timelake_server::Engine::open(dir, engine_cfg(Vec::new())).unwrap()
 }
 
 fn now_ns() -> i64 {
@@ -76,7 +76,7 @@ async fn sql(app: &axum::Router, db: &str, q: &str) -> (StatusCode, serde_json::
 #[tokio::test]
 async fn health_payload_is_the_adapter_contract() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let res = app
         .oneshot(Request::get("/health").body(Body::empty()).unwrap())
         .await
@@ -84,17 +84,17 @@ async fn health_payload_is_the_adapter_contract() {
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // bench/backends/timelorddb.py healthy() needs 2xx; version() reads
+    // bench/backends/timelakedb.py healthy() needs 2xx; version() reads
     // .version — wire contract, do not rename.
     assert_eq!(v["status"], "pass");
-    assert_eq!(v["name"], "timelorddb");
+    assert_eq!(v["name"], "timelakedb");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]
 async fn ping_and_metrics_shapes() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
 
     let res = app
         .clone()
@@ -103,7 +103,7 @@ async fn ping_and_metrics_shapes() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        res.headers()["x-timelorddb-version"],
+        res.headers()["x-timelakedb-version"],
         env!("CARGO_PKG_VERSION")
     );
 
@@ -115,13 +115,13 @@ async fn ping_and_metrics_shapes() {
     let text =
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(text.starts_with('#'));
-    assert!(text.contains("timelord_lines_written_total"));
+    assert!(text.contains("timelake_lines_written_total"));
 }
 
 #[tokio::test]
 async fn write_then_query_exact_counts_mini_at2() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let t = now_ns();
 
     let lp = format!(
@@ -167,7 +167,7 @@ async fn write_then_query_exact_counts_mini_at2() {
 #[tokio::test]
 async fn v1_precision_and_v2_gzip_telegraf_contract() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let secs = now_ns() / 1_000_000_000;
 
     // v1 endpoint with precision=s
@@ -209,7 +209,7 @@ async fn v1_precision_and_v2_gzip_telegraf_contract() {
 #[tokio::test]
 async fn errors_are_400_with_line_context_and_never_wal_d() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
 
     let code = write_lp(
         &app,
@@ -239,7 +239,7 @@ async fn errors_are_400_with_line_context_and_never_wal_d() {
     // the rejected write must not have been made durable: nothing replays
     drop(app);
     let (_, rows_after) = {
-        let app = timelord_server::app(engine(dir.path()));
+        let app = timelake_server::app(engine(dir.path()));
         sql(&app, "poc", "SELECT 1 AS one").await
     };
     // db 'poc' never got a successful write, so it should not exist
@@ -251,7 +251,7 @@ async fn flush_parquet_union_restart_and_dedup_m2() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
 
     // rows across two different hours -> two partitions; one duplicate PK
     let h = 3_600_000_000_000i64;
@@ -298,7 +298,7 @@ async fn flush_parquet_union_restart_and_dedup_m2() {
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
     assert_eq!(
         rows[0]["n"], 4,
@@ -319,7 +319,7 @@ async fn compaction_merges_files_and_completes_fr5_m3() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
 
     // write + flush, then RETRY the same PK with a new value + flush again:
     // the duplicate now lives across two files
@@ -355,7 +355,7 @@ async fn compaction_merges_files_and_completes_fr5_m3() {
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
     assert_eq!(rows[0]["n"], 2);
 }
@@ -365,12 +365,12 @@ async fn retention_drops_expired_partitions_fr7() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     let day = 86_400_000_000_000i64;
-    let eng = timelord_server::Engine::open(
+    let eng = timelake_server::Engine::open(
         dir.path(),
         engine_cfg(vec![("short_lived".into(), 86_400)]), // keep 1 day
     )
     .unwrap();
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
 
     let lp = format!(
         "short_lived,k=a v=1.0 {old}\nshort_lived,k=b v=2.0 {new}\nkept,k=a v=3.0 {old}",
@@ -395,8 +395,8 @@ async fn memory_pool_rejects_cleanly_never_kills_rr1() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = engine_cfg(Vec::new());
     cfg.query_mem_bytes = 2 * 1024 * 1024; // 2 MB pool: tiny on purpose
-    let eng = timelord_server::Engine::open(dir.path(), cfg).unwrap();
-    let app = timelord_server::app(eng.clone());
+    let eng = timelake_server::Engine::open(dir.path(), cfg).unwrap();
+    let app = timelake_server::app(eng.clone());
 
     let t = now_ns();
     let mut lp = String::new();
@@ -434,7 +434,7 @@ async fn wal_replay_survives_restart_rr3() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     {
-        let app = timelord_server::app(engine(dir.path()));
+        let app = timelake_server::app(engine(dir.path()));
         let lp = format!("pipeline_events,product_id=p1,step=01-download,event=start value=1i {t}");
         assert_eq!(
             write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
@@ -442,7 +442,7 @@ async fn wal_replay_survives_restart_rr3() {
         );
     } // engine dropped — "crash"
 
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM pipeline_events").await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(rows[0]["n"], 1, "a 204'd write must survive restart");
@@ -456,7 +456,7 @@ async fn a_query_pruned_to_nothing_returns_empty_not_an_error() {
     // case, not a corner.
     let dir = tempfile::tempdir().unwrap();
     let engine_ref = engine(dir.path());
-    let app = timelord_server::app(Arc::clone(&engine_ref));
+    let app = timelake_server::app(Arc::clone(&engine_ref));
     let t = now_ns();
     for i in 0..20 {
         let lp = format!("ev,pid=p{i} v=1i {}", t + i);
@@ -497,7 +497,7 @@ async fn schema_is_discoverable_over_sql() {
     // Without information_schema, SHOW TABLES failed outright and every
     // BI tool that starts by enumerating a schema was locked out.
     let dir = tempfile::tempdir().unwrap();
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let t = now_ns();
     for lp in [
         format!("pipeline_events,product_id=p1,step=01 value=1i {t}"),
@@ -554,7 +554,7 @@ async fn a_rejected_write_cannot_poison_the_table_or_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     let engine_ref = engine(dir.path());
-    let app = timelord_server::app(Arc::clone(&engine_ref));
+    let app = timelake_server::app(Arc::clone(&engine_ref));
 
     assert_eq!(
         write_lp(
@@ -619,7 +619,7 @@ async fn a_rejected_write_cannot_poison_the_table_or_the_engine() {
     // and the poison does not come back from the WAL after a restart
     drop(app);
     drop(engine_ref);
-    let app = timelord_server::app(engine(dir.path()));
+    let app = timelake_server::app(engine(dir.path()));
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
     assert_eq!(code, StatusCode::OK, "restart must not replay the poison");
     assert_eq!(rows[0]["n"], 2);
@@ -634,7 +634,7 @@ async fn sql_as(
 ) -> (StatusCode, serde_json::Value) {
     let req = Request::post("/api/sql")
         .header("content-type", "application/json")
-        .header("x-timelord-authorizations", auths)
+        .header("x-timelake-authorizations", auths)
         .body(Body::from(
             serde_json::json!({"db": db, "sql": q}).to_string(),
         ))
@@ -653,7 +653,7 @@ async fn visibility_labels_gate_the_http_surface_sec2() {
     let dir = tempfile::tempdir().unwrap();
     let t = now_ns();
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
 
     // labels are ordinary tags: no write-path ceremony (FR-2 economics)
     let lp = format!(
@@ -713,28 +713,28 @@ async fn visibility_labels_gate_the_http_surface_sec2() {
     // enforcement is visible, not silent (RR-5 spirit)
     assert!(
         eng.metrics_text_impl()
-            .contains("timelord_visibility_rows_filtered_total"),
+            .contains("timelake_visibility_rows_filtered_total"),
         "filtered-rows counter must be exported"
     );
 }
 
 #[tokio::test]
 async fn encrypted_store_serves_and_survives_restart_sec1() {
-    use timelord_store::{EncryptingStore, LocalKek, LocalStore, Store};
+    use timelake_store::{EncryptingStore, LocalKek, LocalStore, Store};
     let dir = tempfile::tempdir().unwrap();
-    let kek = timelord_store::key_from_hex(&"5a".repeat(32)).unwrap();
+    let kek = timelake_store::key_from_hex(&"5a".repeat(32)).unwrap();
     let open_encrypted = || {
         let store: Arc<dyn Store> = Arc::new(EncryptingStore::new(
             LocalStore::new(&dir.path().join("objects")).unwrap(),
             Arc::new(LocalKek::new(kek)),
         ));
-        timelord_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, true)
+        timelake_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, true)
             .unwrap()
     };
 
     let t = now_ns();
     let eng = open_encrypted();
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let lp: String = (0..500)
         .map(|i| format!("sec,pid=p{i:03} v={i}i {}\n", t - 1000 - i as i64))
         .collect();
@@ -752,7 +752,7 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     assert_eq!(rows[0]["v"], 42);
     assert!(
         eng.metrics_text_impl()
-            .contains("timelord_encryption_enabled 1")
+            .contains("timelake_encryption_enabled 1")
     );
 
     // at rest, NOTHING under objects/ is readable: not the parquet (no
@@ -779,7 +779,7 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     drop(app);
     drop(eng);
     let eng = open_encrypted();
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM sec").await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(rows[0]["n"], 500);
@@ -852,7 +852,7 @@ async fn admin_json(
     let mut req = Request::builder().method(method).uri(path);
     if !session.cookie.is_empty() {
         req = req.header("cookie", &session.cookie);
-        req = req.header("x-timelord-csrf", &session.csrf);
+        req = req.header("x-timelake-csrf", &session.csrf);
     }
     let b = match body {
         Some(v) => {
@@ -879,7 +879,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     let t = now_ns();
     let day = 86_400_000_000_000i64;
     let eng = engine(dir.path()); // NO env seed — everything via the API
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let session = admin_ready(&app).await;
 
     let (code, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
@@ -927,7 +927,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let (code, session) = login(&app, "admin", "test console password").await;
     assert_eq!(
         code,
@@ -944,7 +944,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng);
+    let app = timelake_server::app(eng);
     let (_, session) = login(&app, "admin", "test console password").await;
     let (_, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
     assert_eq!(v["policies"].as_array().map(Vec::len), Some(0));
@@ -956,7 +956,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
 async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     let anon = AdminSession::default();
 
     // 1. unauthenticated: the deletion control is closed (exposure 3a)
@@ -1065,7 +1065,7 @@ async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4()
     drop(app);
     drop(eng);
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
     assert_eq!(
         login(&app, "admin", "admin").await.0,
         StatusCode::UNAUTHORIZED
@@ -1076,7 +1076,7 @@ async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4()
     );
     assert!(
         eng.metrics_text_impl()
-            .contains("timelord_admin_default_credential_active 0"),
+            .contains("timelake_admin_default_credential_active 0"),
         "the default-credential alarm must clear once rotated"
     );
 
@@ -1102,7 +1102,7 @@ async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4()
 async fn console_page_is_public_and_the_default_credential_is_alarmable() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
-    let app = timelord_server::app(eng.clone());
+    let app = timelake_server::app(eng.clone());
 
     let res = app
         .oneshot(Request::get("/admin/ui").body(Body::empty()).unwrap())
@@ -1116,7 +1116,7 @@ async fn console_page_is_public_and_the_default_credential_is_alarmable() {
 
     assert!(
         eng.metrics_text_impl()
-            .contains("timelord_admin_default_credential_active 1"),
+            .contains("timelake_admin_default_credential_active 1"),
         "a fresh node must raise the default-credential alarm"
     );
 }
@@ -1127,7 +1127,7 @@ async fn console_page_is_public_and_the_default_credential_is_alarmable() {
 /// must stay visible across the whole upload window.
 #[tokio::test]
 async fn rows_stay_visible_while_a_slow_flush_uploads() {
-    use timelord_store::{LocalStore, Store};
+    use timelake_store::{LocalStore, Store};
 
     struct SlowStore {
         inner: LocalStore,
@@ -1160,12 +1160,12 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn timelord_store::Store> = Arc::new(SlowStore {
+    let store: Arc<dyn timelake_store::Store> = Arc::new(SlowStore {
         inner: LocalStore::new(&dir.path().join("objects")).unwrap(),
         delay: std::time::Duration::from_millis(150),
     });
     let eng =
-        timelord_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, false)
+        timelake_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, false)
             .unwrap();
 
     let t = now_ns();
@@ -1176,7 +1176,7 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
         t - 3000
     );
     assert!(
-        timelord_api::Engine::write_lp(&*eng, "poc", lp.as_bytes(), None).is_ok(),
+        timelake_api::Engine::write_lp(&*eng, "poc", lp.as_bytes(), None).is_ok(),
         "write must land"
     );
 
@@ -1193,7 +1193,7 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
             .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
             .await
             .expect("mid-flush query must not fail");
-        let n = timelord_query::batches_to_json(&batches)[0]["n"].as_i64();
+        let n = timelake_query::batches_to_json(&batches)[0]["n"].as_i64();
         assert_eq!(n, Some(3), "acked rows vanished mid-flush");
         probes += 1;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1206,7 +1206,7 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
         .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
         .await
         .unwrap();
-    assert_eq!(timelord_query::batches_to_json(&batches)[0]["n"], 3);
+    assert_eq!(timelake_query::batches_to_json(&batches)[0]["n"], 3);
 }
 
 fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {

@@ -13,7 +13,7 @@
 //! (RR-5: failures are loud and named, never silent).
 //!
 //! This crate is runtime-free: the file watcher and admin endpoint that
-//! *trigger* [`RotatingCert::reload`] live in timelord-server.
+//! *trigger* [`RotatingCert::reload`] live in timelake-server.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,7 +95,7 @@ fn load_pair(
         .ok_or(TlsError::Missing("private key"))?;
 
     // Leaf expiry: reject an already-expired renewal outright; the epoch
-    // feeds the timelord_tls_cert_expiry_seconds gauge.
+    // feeds the timelake_tls_cert_expiry_seconds gauge.
     let (_, parsed) = x509_parser::parse_x509_certificate(certs[0].as_ref())
         .map_err(|e| TlsError::Invalid(format!("x509 parse: {e}")))?;
     let not_after_epoch = parsed.validity().not_after.timestamp();

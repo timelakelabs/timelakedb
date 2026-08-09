@@ -15,7 +15,7 @@
 //!   one entry.
 //!
 //! Keys live only in process memory, bounded by the caps. Turning the
-//! cache off (`TIMELORD_KMS_CACHE=off`) restores strict per-object keys
+//! cache off (`TIMELAKE_KMS_CACHE=off`) restores strict per-object keys
 //! — which is also how the drill measures what the cache is worth.
 
 use std::collections::HashMap;

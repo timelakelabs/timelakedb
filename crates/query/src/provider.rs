@@ -26,8 +26,8 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
-use timelord_catalog::FileMeta;
-use timelord_store::Store;
+use timelake_catalog::FileMeta;
+use timelake_store::Store;
 
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -881,8 +881,8 @@ mod tests {
 
     #[test]
     fn stats_prune_clustered_row_groups() {
-        use timelord_buffer::{TableBuffer, flush};
-        use timelord_ingest::parse_lines;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
 
         let t = 1_786_179_600_000_000_000i64;
         let lp: String = (0..2000)
@@ -994,8 +994,8 @@ mod tests {
 
     #[test]
     fn a_pruned_scan_reads_ranges_not_the_whole_file() {
-        use timelord_buffer::{TableBuffer, flush};
-        use timelord_ingest::parse_lines;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
 
         // one entity-clustered file, small row groups
         let t = 1_786_179_600_000_000_000i64;
@@ -1059,8 +1059,8 @@ mod tests {
 
     #[test]
     fn a_bloom_miss_skips_the_file_without_reading_it() {
-        use timelord_buffer::{TableBuffer, flush};
-        use timelord_ingest::parse_lines;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
 
         // unclustered, one row group — the shape of a fresh L0 file, where
         // row-group statistics span every entity and prune nothing
@@ -1132,8 +1132,8 @@ mod tests {
     #[tokio::test]
     async fn scan_enforces_visibility_even_for_count_star() {
         use datafusion::prelude::SessionContext;
-        use timelord_buffer::{TableBuffer, flush};
-        use timelord_ingest::parse_lines;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
 
         let t = 1_786_179_600_000_000_000i64;
         let lp: String = (0..100)

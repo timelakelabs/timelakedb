@@ -13,9 +13,9 @@
 //! change its own password — and nothing else in the admin surface
 //! answers until it does. The known-default window is real, so it is
 //! made loud rather than quiet: a WARN at every start, a banner in the
-//! console, and `timelord_admin_default_credential_active 1` in
+//! console, and `timelake_admin_default_credential_active 1` in
 //! `/metrics` so it can be alerted on. Operators who want no default at
-//! all set `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD` and the seed uses that
+//! all set `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` and the seed uses that
 //! instead, still flagged for rotation.
 //!
 //! Credentials are Argon2id PHC strings, never reversible. Principals
@@ -34,7 +34,7 @@ use argon2::Argon2;
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use serde::{Deserialize, Serialize};
-use timelord_store::Store;
+use timelake_store::Store;
 
 /// Where the principal store lives in the object store.
 pub const PRINCIPALS_PATH: &str = "catalog/config/principals.json";
@@ -185,7 +185,7 @@ fn random_token() -> String {
 impl Auth {
     /// Load principals from the store, seeding the first administrator
     /// when there are none. `bootstrap_password` (the server passes
-    /// `TIMELORD_ADMIN_BOOTSTRAP_PASSWORD`) replaces the well-known
+    /// `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD`) replaces the well-known
     /// default for automated provisioning; either way the seeded
     /// credential is flagged for rotation. Env lookup stays at the edge
     /// so this is deterministic under test.
@@ -235,7 +235,7 @@ impl Auth {
                 tracing::info!(
                     user = DEFAULT_USER,
                     "SEC-4: seeded the first administrator from \
-                     TIMELORD_ADMIN_BOOTSTRAP_PASSWORD; it must be changed at first login"
+                     TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD; it must be changed at first login"
                 );
             } else {
                 tracing::warn!(
@@ -243,8 +243,8 @@ impl Auth {
                      the DEFAULT CREDENTIAL admin/admin. It can do nothing but change its \
                      own password, and every other admin route refuses until it does — \
                      but until then anyone who can reach this port can take the console. \
-                     Log in and change it now, or set TIMELORD_ADMIN_BOOTSTRAP_PASSWORD. \
-                     Alert on timelord_admin_default_credential_active."
+                     Log in and change it now, or set TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD. \
+                     Alert on timelake_admin_default_credential_active."
                 );
             }
         }
@@ -258,7 +258,7 @@ impl Auth {
     }
 
     /// True while any principal still holds the seeded password — drives
-    /// the console banner and `timelord_admin_default_credential_active`.
+    /// the console banner and `timelake_admin_default_credential_active`.
     pub fn default_credential_active(&self) -> bool {
         self.principals
             .read()
@@ -456,7 +456,7 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use timelord_store::LocalStore;
+    use timelake_store::LocalStore;
 
     fn auth_on(dir: &std::path::Path) -> Arc<Auth> {
         let store: Arc<dyn Store> = Arc::new(LocalStore::new(dir).unwrap());

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documentation — TimelordDB</title>
-<meta name="description" content="TimelordDB documentation: ingestion over line protocol, SQL and Flight SQL querying, per-table retention, scaling, API reference and operational practice.">
+<title>Documentation — TimeLakeDB</title>
+<meta name="description" content="TimeLakeDB documentation: ingestion over line protocol, SQL and Flight SQL querying, per-table retention, scaling, API reference and operational practice.">
 <meta name="theme-color" content="#0b1320">
 <link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../assets/style.css">
@@ -15,7 +15,7 @@
   <div class="shell">
     <a class="brand" href="../index.html">
       <img class="mark" src="../assets/logo.svg" alt="">
-      <span>Timelord<span class="db">DB</span></span>
+      <span>TimeLake<span class="db">DB</span></span>
     </a>
     <span class="tagline">Time-Series Database Documentation</span>
     <nav>
@@ -69,7 +69,7 @@
     <section id="overview">
       <h2>Overview</h2>
       <p>
-        TimelordDB is a time-series database for high-cardinality event
+        TimeLakeDB is a time-series database for high-cardinality event
         analytics: millions of distinct entities per day, queried across
         their whole journey rather than one series at a time. It is written
         in Rust on Apache DataFusion, Arrow, Parquet and <code>object_store</code>.
@@ -90,7 +90,7 @@
           The <a href="#console">admin surface</a> is the exception — every
           <code>/admin/*</code> route requires a session — but for writes and
           queries, network reachability is still the only access control
-          TimelordDB has. Read <a href="#security">Security</a> before exposing
+          TimeLakeDB has. Read <a href="#security">Security</a> before exposing
           it anywhere.
         </p>
       </div>
@@ -140,10 +140,10 @@
 
       <div class="code">
         <header>Start the server <button class="copy" type="button">Copy</button></header>
-<pre><span class="k">cd</span> TimelordDB/bench
-docker compose -f compose/timelorddb.yml up -d --build
+<pre><span class="k">cd</span> TimeLakeDB/bench
+docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:<span class="n">1963</span>/health
-<span class="c"># {"status":"pass","name":"timelorddb",...}</span></pre>
+<span class="c"># {"status":"pass","name":"timelakedb",...}</span></pre>
       </div>
 
       <div class="code">
@@ -161,7 +161,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <div class="code">
         <header>telegraf.conf <button class="copy" type="button">Copy</button></header>
 <pre>[[outputs.influxdb_v2]]
-  urls = [<span class="s">"http://timelorddb:1963"</span>]
+  urls = [<span class="s">"http://timelakedb:1963"</span>]
   token = <span class="s">"anything-auth-is-off"</span>
   organization = <span class="s">"poc"</span>
   bucket = <span class="s">"poc"</span></pre>
@@ -170,7 +170,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Grafana</h3>
       <p>
         Add the stock InfluxDB datasource, choose <strong>SQL</strong> as the query
-        language, and point it at <code>http://timelorddb:1964</code> — Grafana's
+        language, and point it at <code>http://timelakedb:1964</code> — Grafana's
         Flight SQL client connects unmodified. The provisioned dashboards under
         <code>fixtures/grafana/</code> are the compatibility fixture and render as-is.
       </p>
@@ -204,7 +204,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <li><strong>204 No Content</strong> means the batch is durable in the WAL, not merely buffered.</li>
         <li><strong>400</strong> identifies the offending line and field rather than failing the batch silently.</li>
         <li><strong>429</strong> with <code>Retry-After</code> is backpressure: the WAL has reached
-            <code>TIMELORD_WAL_MAX_BYTES</code> and flushing needs to catch up. It is a
+            <code>TIMELAKE_WAL_MAX_BYTES</code> and flushing needs to catch up. It is a
             named, visible limit — writes are never dropped quietly.</li>
       </ul>
 
@@ -291,7 +291,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
       <div class="code">
         <header>Per-table retention <button class="copy" type="button">Copy</button></header>
-<pre>TIMELORD_RETENTION=<span class="s">"pipeline_events=365d,host_metrics=90d,disk_metrics=72h"</span></pre>
+<pre>TIMELAKE_RETENTION=<span class="s">"pipeline_events=365d,host_metrics=90d,disk_metrics=72h"</span></pre>
       </div>
       <ul>
         <li>Durations take <code>d</code> (days), <code>h</code> (hours), or a bare number of seconds.</li>
@@ -299,9 +299,9 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             value keeps everything.</li>
         <li>Enforcement drops whole <code>(table, hour)</code> partitions on the maintenance
             tick — it is a catalog operation, not a row-by-row delete.</li>
-        <li>Removed files are deleted only after <code>TIMELORD_GC_GRACE_SECS</code>
+        <li>Removed files are deleted only after <code>TIMELAKE_GC_GRACE_SECS</code>
             (default 900 s) so a long-running query's catalog snapshot can never
-            dangle. Keep the grace longer than <code>TIMELORD_QUERY_TIMEOUT_SECS</code>.</li>
+            dangle. Keep the grace longer than <code>TIMELAKE_QUERY_TIMEOUT_SECS</code>.</li>
       </ul>
       <p>
         Background maintenance runs on one sequential task: flush checks every
@@ -344,9 +344,9 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <ul>
         <li>The new password must be at least 8 characters, and cannot be the
             username or the word <code>admin</code>.</li>
-        <li>Set <code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code> to provision a
+        <li>Set <code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code> to provision a
             real password at first start instead of the well-known default.</li>
-        <li>Alert on <code>timelord_admin_default_credential_active</code> — a
+        <li>Alert on <code>timelake_admin_default_credential_active</code> — a
             <code>1</code> means the seeded credential is still live.</li>
       </ul>
 
@@ -372,13 +372,13 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         Per-table retention (FR-7): the active policies, a set/remove form with
         table-name completion, the live
-        <code>timelord_retention_drops_total</code> counter, and an explicit
+        <code>timelake_retention_drops_total</code> counter, and an explicit
         warning that shrinking a window deletes data on the next enforcement
-        pass — permanently once <code>TIMELORD_GC_GRACE_SECS</code> elapses.
+        pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses.
         Changes persist through the object store
         (<code>catalog/config/retention.json</code>, encrypted with everything
         else) and survive a restart, so the stored policy outlives a stale
-        <code>TIMELORD_RETENTION</code> in your compose file.
+        <code>TIMELAKE_RETENTION</code> in your compose file.
       </p>
       <p>
         Layered configuration with visible provenance, application and audit
@@ -399,14 +399,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         </table>
       </div>
       <p>
-        Both listeners move together: <code>TIMELORD_ADDR</code> and
-        <code>TIMELORD_FLIGHT_ADDR</code> set the bind addresses, and TLS
-        (<code>TIMELORD_TLS_CERT</code>&nbsp;/&nbsp;<code>_KEY</code>) covers both
+        Both listeners move together: <code>TIMELAKE_ADDR</code> and
+        <code>TIMELAKE_FLIGHT_ADDR</code> set the bind addresses, and TLS
+        (<code>TIMELAKE_TLS_CERT</code>&nbsp;/&nbsp;<code>_KEY</code>) covers both
         at once. There is no way to bind the console somewhere different from the
-        write API yet, so <code>TIMELORD_ADDR=127.0.0.1:1963</code> plus an
+        write API yet, so <code>TIMELAKE_ADDR=127.0.0.1:1963</code> plus an
         authenticating proxy is the way to reach it remotely — and a proxy in
         front of the console must forward cookies and the
-        <code>X-Timelord-CSRF</code> header.
+        <code>X-TimeLake-CSRF</code> header.
       </p>
       <p>
         <strong>Planned (U0):</strong> the admin plane gets its own listener on
@@ -454,7 +454,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td>Client certificates / mTLS</td><td>Not implemented — server-side TLS only; mutual TLS is v2</td></tr>
             <tr><td>Authentication</td><td><strong>Implemented on the admin surface</strong> — sessions (cookie or bearer) with Argon2id credentials, 30 min idle / 12 h absolute expiry, CSRF and origin checks on cookie mutations, per-principal login backoff. <strong>Not on the data plane</strong> — writes, <code>/api/sql</code>, Flight SQL and <code>/metrics</code> stay open</td></tr>
             <tr><td>Authorization</td><td><strong>Implemented on the admin surface</strong> — ordered roles <code>viewer</code> &lt; <code>operator</code> &lt; <code>admin</code>, with destructive retention changes requiring <code>admin</code>. No per-table or per-database permissions</td></tr>
-            <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELORD_ENCRYPTION_KEY</code> and every stored object (data and manifests) is envelope-encrypted, AES-256-GCM per object, range-read compatible; the local WAL is not covered</td></tr>
+            <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELAKE_ENCRYPTION_KEY</code> and every stored object (data and manifests) is envelope-encrypted, AES-256-GCM per object, range-read compatible; the local WAL is not covered</td></tr>
             <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan; authorizations remain unauthenticated claims until the <em>data plane</em> requires a session — admin authentication does not cover them</td></tr>
             <tr><td>Audit logging</td><td>Not implemented — administrative actions now have a principal to attribute, and a tamper-evident trail is specified (SR-6, phase U1), but nothing is recorded yet</td></tr>
             <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure</td></tr>
@@ -481,12 +481,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             (1963), and a deployment that never rotates the seeded
             <code>admin</code>/<code>admin</code> credential is one guess from
             an <code>admin</code> role that can delete history. Alert on
-            <code>timelord_admin_default_credential_active</code>.</li>
+            <code>timelake_admin_default_credential_active</code>.</li>
         <li>Query errors are returned verbatim, disclosing table and column names.</li>
         <li>There is no per-client rate limit; one client can consume the whole
             admission budget.</li>
         <li>Visibility authorizations are self-asserted — with no
-            authentication, <code>X-Timelord-Authorizations: admin</code> is a
+            authentication, <code>X-TimeLake-Authorizations: admin</code> is a
             claim, not a credential. Real isolation needs an authenticating
             proxy that sets (and strips inbound) that header.</li>
         <li>Encryption at rest protects the store's media, not the query
@@ -497,20 +497,20 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>Deploying it safely</h3>
       <ul>
-        <li>Bind to localhost or a private network — <code>TIMELORD_ADDR=127.0.0.1:1963</code>
+        <li>Bind to localhost or a private network — <code>TIMELAKE_ADDR=127.0.0.1:1963</code>
             — and publish nothing to an untrusted network. That address carries
             the console as well as the write API, so it is the only lever over
             who can reach either.</li>
         <li>If remote access is needed, front it with something that
             authenticates. Flight SQL is gRPC over HTTP/2, so a proxy in front of
             port 1964 must speak HTTP/2; a proxy in front of the console must
-            forward cookies and the <code>X-Timelord-CSRF</code> header.</li>
+            forward cookies and the <code>X-TimeLake-CSRF</code> header.</li>
         <li>Provision the first administrator with
-            <code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code> rather than letting
+            <code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code> rather than letting
             the seeded <code>admin</code>/<code>admin</code> exist at all, and
-            alert on <code>timelord_admin_default_credential_active</code>.</li>
+            alert on <code>timelake_admin_default_credential_active</code>.</li>
         <li>Enable TLS even on a private network — rotation costs no downtime —
-            and set <code>TIMELORD_ENCRYPTION_KEY</code> so a lost volume or
+            and set <code>TIMELAKE_ENCRYPTION_KEY</code> so a lost volume or
             leaked bucket is ciphertext. Keep the key out of the data volume,
             and treat losing it as losing the data.</li>
         <li>Give it a dedicated volume and a container memory limit.</li>
@@ -525,7 +525,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
     <section id="operations">
       <h2>Backup &amp; Restore</h2>
       <p>
-        The whole database is one directory — <code>TIMELORD_DATA_DIR</code>,
+        The whole database is one directory — <code>TIMELAKE_DATA_DIR</code>,
         holding the write-ahead log, the Parquet objects and the manifest-log
         catalog. Copying it is the backup. <code>ops/tldb-backup.sh</code> does
         that through a throwaway helper container, so Docker is the only
@@ -535,8 +535,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <div class="code">
         <header>Back up, verify, restore <button class="copy" type="button">Copy</button></header>
 <pre>./ops/tldb-backup.sh backup                     <span class="c"># live, no downtime</span>
-./ops/tldb-backup.sh verify  -f timelord-backup-20260808-214500.tgz
-./ops/tldb-backup.sh restore -f timelord-backup-20260808-214500.tgz --recreate</pre>
+./ops/tldb-backup.sh verify  -f timelake-backup-20260808-214500.tgz
+./ops/tldb-backup.sh restore -f timelake-backup-20260808-214500.tgz --recreate</pre>
       </div>
 
       <h3>Why a live backup is safe</h3>
@@ -550,7 +550,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             segment mid-append costs at most the frame being written — which was
             never acknowledged to a client.</li>
         <li>A file removed from the catalog is deleted only after
-            <code>TIMELORD_GC_GRACE_SECS</code>, so the archive is internally
+            <code>TIMELAKE_GC_GRACE_SECS</code>, so the archive is internally
             consistent as long as the backup finishes inside the grace period.
             A 25 s backup against a 900 s default has 36× of headroom.</li>
       </ul>
@@ -609,7 +609,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Sizing guidance</h3>
       <p>
         Set a container memory limit and keep
-        <code>TIMELORD_QUERY_MEM_BYTES × TIMELORD_MAX_CONCURRENT_QUERIES</code>
+        <code>TIMELAKE_QUERY_MEM_BYTES × TIMELAKE_MAX_CONCURRENT_QUERIES</code>
         inside it. The reference benchmark configuration used a 3.5 GB pool with
         2 admitted queries under an 8 GB cap.
       </p>
@@ -660,21 +660,21 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <table>
           <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
           <tbody>
-            <tr><td><code>TIMELORD_ADDR</code></td><td><code>0.0.0.0:1963</code></td><td>HTTP listener</td></tr>
-            <tr><td><code>TIMELORD_FLIGHT_ADDR</code></td><td><code>0.0.0.0:1964</code></td><td>Flight SQL listener</td></tr>
-            <tr><td><code>TIMELORD_DATA_DIR</code></td><td><code>/var/lib/timelord/data</code></td><td>WAL, objects and catalog</td></tr>
-            <tr><td><code>TIMELORD_QUERY_MEM_BYTES</code></td><td>1 GiB</td><td>Shared query memory pool</td></tr>
-            <tr><td><code>TIMELORD_MAX_CONCURRENT_QUERIES</code></td><td>6</td><td>Admission limit; the rest queue</td></tr>
-            <tr><td><code>TIMELORD_QUERY_TIMEOUT_SECS</code></td><td>600</td><td>Server-side query deadline</td></tr>
-            <tr><td><code>TIMELORD_FLUSH_ROWS</code></td><td>50000</td><td>Rows in a table buffer before flushing</td></tr>
-            <tr><td><code>TIMELORD_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
-            <tr><td><code>TIMELORD_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>
-            <tr><td><code>TIMELORD_COMPACT_MIN_FILES</code></td><td>4</td><td>Files in a partition before compaction</td></tr>
-            <tr><td><code>TIMELORD_RETENTION</code></td><td>empty</td><td>Per-table retention specification; seeds the policy at first start, after which the stored policy from the console wins</td></tr>
-            <tr><td><code>TIMELORD_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
-            <tr><td><code>TIMELORD_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
-            <tr><td><code>TIMELORD_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths)</td></tr>
-            <tr><td><code>TIMELORD_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
+            <tr><td><code>TIMELAKE_ADDR</code></td><td><code>0.0.0.0:1963</code></td><td>HTTP listener</td></tr>
+            <tr><td><code>TIMELAKE_FLIGHT_ADDR</code></td><td><code>0.0.0.0:1964</code></td><td>Flight SQL listener</td></tr>
+            <tr><td><code>TIMELAKE_DATA_DIR</code></td><td><code>/var/lib/timelake/data</code></td><td>WAL, objects and catalog</td></tr>
+            <tr><td><code>TIMELAKE_QUERY_MEM_BYTES</code></td><td>1 GiB</td><td>Shared query memory pool</td></tr>
+            <tr><td><code>TIMELAKE_MAX_CONCURRENT_QUERIES</code></td><td>6</td><td>Admission limit; the rest queue</td></tr>
+            <tr><td><code>TIMELAKE_QUERY_TIMEOUT_SECS</code></td><td>600</td><td>Server-side query deadline</td></tr>
+            <tr><td><code>TIMELAKE_FLUSH_ROWS</code></td><td>50000</td><td>Rows in a table buffer before flushing</td></tr>
+            <tr><td><code>TIMELAKE_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
+            <tr><td><code>TIMELAKE_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>
+            <tr><td><code>TIMELAKE_COMPACT_MIN_FILES</code></td><td>4</td><td>Files in a partition before compaction</td></tr>
+            <tr><td><code>TIMELAKE_RETENTION</code></td><td>empty</td><td>Per-table retention specification; seeds the policy at first start, after which the stored policy from the console wins</td></tr>
+            <tr><td><code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
+            <tr><td><code>TIMELAKE_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
+            <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths)</td></tr>
+            <tr><td><code>TIMELAKE_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
           </tbody>
         </table>
       </div>
@@ -683,21 +683,21 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         Types, meanings and suggested alerts are in the
         <a href="reference.html#metrics">metrics reference</a>. The series are:
-        <code>timelord_lines_written_total</code>, <code>timelord_flushes_total</code>,
-        <code>timelord_compactions_total</code>, <code>timelord_retention_drops_total</code>,
-        <code>timelord_parquet_files</code>, <code>timelord_buffer_rows</code>,
-        <code>timelord_wal_bytes</code>, <code>timelord_databases</code>,
-        <code>timelord_tables</code>. With TLS enabled,
-        <code>timelord_tls_cert_expiry_seconds</code> and
-        <code>timelord_tls_last_reload_ok</code> are added. The admin surface adds
-        <code>timelord_admin_default_credential_active</code>,
-        <code>timelord_admin_logins_total</code> and
-        <code>timelord_admin_login_failures_total</code>.
+        <code>timelake_lines_written_total</code>, <code>timelake_flushes_total</code>,
+        <code>timelake_compactions_total</code>, <code>timelake_retention_drops_total</code>,
+        <code>timelake_parquet_files</code>, <code>timelake_buffer_rows</code>,
+        <code>timelake_wal_bytes</code>, <code>timelake_databases</code>,
+        <code>timelake_tables</code>. With TLS enabled,
+        <code>timelake_tls_cert_expiry_seconds</code> and
+        <code>timelake_tls_last_reload_ok</code> are added. The admin surface adds
+        <code>timelake_admin_default_credential_active</code>,
+        <code>timelake_admin_logins_total</code> and
+        <code>timelake_admin_login_failures_total</code>.
       </p>
 
       <h3>TLS and certificate rotation</h3>
       <p>
-        Setting <code>TIMELORD_TLS_CERT</code> and <code>TIMELORD_TLS_KEY</code> puts TLS 1.3
+        Setting <code>TIMELAKE_TLS_CERT</code> and <code>TIMELAKE_TLS_KEY</code> puts TLS 1.3
         on both listeners. Certificates are designed to be short-lived: overwrite
         the files (a certbot deploy hook, a sidecar, anything) and a watcher picks
         the change up within seconds, or call <code>POST /admin/tls/reload</code>.
@@ -707,7 +707,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         established connections or in-flight queries. A bad renewal keeps the
         last-good pair serving and logs the named alarm
         <code>SEC3_CERT_RENEWAL_FAILED</code> while
-        <code>timelord_tls_last_reload_ok</code> drops to 0.
+        <code>timelake_tls_last_reload_ok</code> drops to 0.
       </p>
     </section>
 
@@ -731,8 +731,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>Alert on certificate health, not on the calendar</h3>
       <p>
-        Page on <code>timelord_tls_last_reload_ok == 0</code> and on
-        <code>timelord_tls_cert_expiry_seconds</code> falling below roughly two
+        Page on <code>timelake_tls_last_reload_ok == 0</code> and on
+        <code>timelake_tls_cert_expiry_seconds</code> falling below roughly two
         renewal periods. The server will keep serving on the last-good
         certificate, which is exactly why a silent failure would otherwise go
         unnoticed until expiry.
@@ -753,7 +753,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         Administration is authenticated; the data plane is not. Until that
         changes, whoever can reach 1963 or 1964 owns the data — and because the
         console answers on 1963 too, that port also decides who can reach the
-        management surface. Bind to a private interface, keep TimelordDB off any
+        management surface. Bind to a private interface, keep TimeLakeDB off any
         network you do not control, rotate the seeded credential, and read
         <a href="#security">Security</a> in full before a deployment —
         particularly the note that <code>/api/sql</code> can write files as the
@@ -763,7 +763,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Prove changes with the harness</h3>
       <p>
         <code>bench/</code> is the executable specification. Run
-        <code>python bench.py run --backend timelorddb --scale laptop</code> and compare
+        <code>python bench.py run --backend timelakedb --scale laptop</code> and compare
         against the recorded baselines in <code>bench/results/</code> rather than
         inventing a new measurement each time; that is how every claim on this
         site was produced.
@@ -776,7 +776,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
   <div class="shell">
     <div>
       <div class="kicker">Time. Stored. Forever.</div>
-      <div>TimelordDB — Rust · DataFusion · Arrow · Parquet</div>
+      <div>TimeLakeDB — Rust · DataFusion · Arrow · Parquet</div>
     </div>
     <div style="margin-left:auto">
       <a href="../index.html">Home</a> ·

@@ -6,7 +6,7 @@ measures it against a paired baseline, and records the outcome here —
 the paths already explored so the next cycle does not walk them again.
 
 The harness is the referee. Every number below comes from
-`bench.py run --backend timelorddb`, never from an ad-hoc measurement, and
+`bench.py run --backend timelakedb`, never from an ad-hoc measurement, and
 every entry names the run labels so the raw records in `bench/results/` can be
 re-read.
 
@@ -442,7 +442,7 @@ experiment, because the mechanism is sound and only the I/O layer defeats it.
 
 Three things about the measurement rig, for whoever runs the next cycle:
 
-- **Laptop scale never compacts.** `timelord_compactions_total` was 0 with 114
+- **Laptop scale never compacts.** `timelake_compactions_total` was 0 with 114
   L0 files — the whole run finishes in ~20 s and the compaction tick is 30 s. It
   is therefore a clean measurement of the fresh-data path and completely blind to
   anything about compaction. Use it deliberately, or drive compaction explicitly.

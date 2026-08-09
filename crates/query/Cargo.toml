@@ -1,5 +1,5 @@
 ﻿[package]
-name = "timelord-query"
+name = "timelake-query"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,10 +11,10 @@ tokio.workspace = true
 async-trait = "0.1"
 tracing.workspace = true
 bytes.workspace = true
-timelord-store = { path = "../store" }
-timelord-catalog = { path = "../catalog" }
+timelake-store = { path = "../store" }
+timelake-catalog = { path = "../catalog" }
 
 [dev-dependencies]
-timelord-buffer = { path = "../buffer" }
-timelord-ingest = { path = "../ingest" }
+timelake-buffer = { path = "../buffer" }
+timelake-ingest = { path = "../ingest" }
 

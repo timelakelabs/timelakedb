@@ -11,8 +11,8 @@
 
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::record_batch::RecordBatch;
-use timelord_buffer::flush;
-use timelord_query::align;
+use timelake_buffer::flush;
+use timelake_query::align;
 
 pub struct MergeResult {
     pub bytes: Vec<u8>,
@@ -75,8 +75,8 @@ pub fn merge_files(batch_sets: Vec<Vec<RecordBatch>>) -> Result<MergeResult, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use timelord_buffer::TableBuffer;
-    use timelord_ingest::parse_lines;
+    use timelake_buffer::TableBuffer;
+    use timelake_ingest::parse_lines;
 
     fn batch(lp: &str) -> RecordBatch {
         let mut buf = TableBuffer::default();

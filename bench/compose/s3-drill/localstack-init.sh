@@ -6,17 +6,17 @@
 set -euo pipefail
 
 KEY_ID=$(awslocal kms create-key \
-    --description "timelord envelope + SSE key" \
+    --description "timelake envelope + SSE key" \
     --query KeyMetadata.KeyId --output text)
-awslocal kms create-alias --alias-name alias/timelord --target-key-id "$KEY_ID"
+awslocal kms create-alias --alias-name alias/timelake --target-key-id "$KEY_ID"
 
-awslocal s3api create-bucket --bucket timelord-data
-awslocal s3api put-bucket-encryption --bucket timelord-data \
+awslocal s3api create-bucket --bucket timelake-data
+awslocal s3api put-bucket-encryption --bucket timelake-data \
     --server-side-encryption-configuration '{
       "Rules": [{
         "ApplyServerSideEncryptionByDefault": {
           "SSEAlgorithm": "aws:kms",
-          "KMSMasterKeyID": "alias/timelord"
+          "KMSMasterKeyID": "alias/timelake"
         },
         "BucketKeyEnabled": true
       }]
@@ -24,6 +24,6 @@ awslocal s3api put-bucket-encryption --bucket timelord-data \
 
 # a second bucket for the cargo integration tests, so drill data and
 # test data never mix
-awslocal s3api create-bucket --bucket timelord-it
+awslocal s3api create-bucket --bucket timelake-it
 
-echo "timelord init: KMS alias/timelord -> $KEY_ID; buckets timelord-data, timelord-it"
+echo "timelake init: KMS alias/timelake -> $KEY_ID; buckets timelake-data, timelake-it"
