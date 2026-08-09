@@ -350,11 +350,59 @@ impl LazyTable {
     }
 }
 
+/// Does any row group's bloom filter positively exclude a tag literal?
+///
+/// A bloom answers "definitely not here" exactly, and "maybe" otherwise, so
+/// one negative for any literal means the group cannot match. Statistics
+/// only bound a range; on unclustered L0 data every range spans everything
+/// and prunes nothing, which is precisely where this earns its keep.
+///
+/// Returns the groups that survive. Reads one small range per group per
+/// literal — cheap against the alternative of decoding the group.
+fn bloom_keep_row_groups(
+    file: &StoreFile,
+    md: &datafusion::parquet::file::metadata::ParquetMetaData,
+    tag_equals: &[(String, String)],
+    candidates: Vec<usize>,
+) -> Vec<usize> {
+    use datafusion::parquet::bloom_filter::Sbbf;
+    let descr = md.file_metadata().schema_descr_ptr();
+    let cols: Vec<(usize, &str)> = tag_equals
+        .iter()
+        .filter_map(|(col, val)| {
+            (0..descr.num_columns())
+                .find(|i| descr.column(*i).name() == col)
+                .map(|i| (i, val.as_str()))
+        })
+        .collect();
+    if cols.is_empty() {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|&rg| {
+            let group = md.row_group(rg);
+            // keep unless a bloom says the value is definitely absent
+            !cols.iter().any(|(idx, val)| {
+                let chunk = group.column(*idx);
+                if chunk.bloom_filter_offset().is_none() {
+                    return false; // no bloom written: cannot exclude
+                }
+                match Sbbf::read_from_column_chunk(chunk, file) {
+                    Ok(Some(sbbf)) => !sbbf.check(*val),
+                    _ => false,
+                }
+            })
+        })
+        .collect()
+}
+
 /// Row groups whose column-chunk statistics ADMIT every tag literal.
 /// Settled files are entity-clustered by compaction, so these ranges are
 /// tight; a group is skipped only when a literal falls outside its
-/// min/max (bloom filters would be sharper, but the arrow writer emits
-/// none for dictionary columns — proven by test).
+/// min/max. Bloom filters (see [`bloom_keep_row_groups`]) are sharper and
+/// work on unclustered data too.
 pub fn stats_keep_row_groups(
     metadata: &datafusion::parquet::file::metadata::ParquetMetaData,
     tag_equals: &[(String, String)],
@@ -467,7 +515,12 @@ fn load_pruned(
         let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
             (0..md.num_row_groups()).collect()
         } else {
-            stats_keep_row_groups(&md, &pruning.tag_equals)
+            // statistics first (free — already in the footer), then blooms
+            // for whatever survives. On fresh L0 data statistics prune
+            // nothing, because an unclustered group's min/max spans the
+            // whole entity space; the bloom is what actually excludes.
+            let by_stats = stats_keep_row_groups(&md, &pruning.tag_equals);
+            bloom_keep_row_groups(&file, &md, &pruning.tag_equals, by_stats)
         };
         if keep.is_empty() {
             continue;
@@ -848,6 +901,74 @@ mod tests {
             "read {read} of {file_len} bytes — pruning must not fetch the whole file"
         );
         // measured at ~8% of the file when this landed
+    }
+
+    #[test]
+    fn a_bloom_miss_skips_the_file_without_reading_it() {
+        use timelord_buffer::{TableBuffer, flush};
+        use timelord_ingest::parse_lines;
+
+        // unclustered, one row group — the shape of a fresh L0 file, where
+        // row-group statistics span every entity and prune nothing
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..20_000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", i, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
+        let bytes = flush::to_parquet_bytes(&parts[0].1).unwrap();
+        let file_len = bytes.len() as u64;
+
+        let path = "poc/m/data/2026080809/f.parquet";
+        let store = CountingStore::with(path, bytes);
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let meta = FileMeta {
+            db: "poc".into(),
+            table: "m".into(),
+            partition: "2026080809".into(),
+            path: path.into(),
+            rows: 20_000,
+            size_bytes: file_len,
+            min_ts_ns: t,
+            max_ts_ns: t + 20_000,
+        };
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let scan = |pid: &str| {
+            let pruning = Pruning {
+                tag_equals: vec![("pid".into(), pid.into())],
+                ..Default::default()
+            };
+            load_pruned(
+                &[],
+                std::slice::from_ref(&meta),
+                &store_dyn,
+                &pruning,
+                None,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                &pool,
+                "m",
+                &Arc::new(MetaCache::default()),
+            )
+            .expect("scan")
+        };
+
+        // an entity that is not in the file: the bloom says so, and the
+        // data is never touched
+        let (batches, _r) = scan("definitely-absent");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+        let missed = store.read();
+        assert!(
+            missed < file_len / 4,
+            "bloom miss read {missed} of {file_len} bytes — it should skip the data entirely"
+        );
+
+        // and one that IS present still returns its row
+        let (batches, _r) = scan("p00042");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
     #[test]
