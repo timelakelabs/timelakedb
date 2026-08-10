@@ -13,6 +13,36 @@ here.
 
 ## [Unreleased]
 
+### Added — C2 phase 2: CL-2 ingester WAL replication (2026-08-10)
+
+- **Zero acknowledged-write loss on a single node failure** — the first
+  step of P1-1 that actually delivers "survives node loss." Two ingesters
+  pair up (`TIMELAKE_ROLE=ingester`, peer from `TIMELAKE_PEERS`): each
+  write is replicated to the peer's durable **replica WAL** before the
+  204, so an acknowledged write is durable on two nodes.
+- **Degraded mode, loudly (PR-7).** A down peer does not fail writes — the
+  node keeps accepting on local durability, raises `CL2_REPLICATION_DEGRADED`
+  once, sets `timelake_cl2_degraded`, and clears it when the peer returns.
+  The alarm states the cost honestly: while degraded, a second failure can
+  lose the un-replicated writes.
+- **Recovery** replays the peer's replica WAL into the engine and flushes;
+  overlap with rows the dead peer already flushed is safe because LWW
+  dedup (FR-5) makes it idempotent. The replica frames are dormant (not
+  applied) in steady state, so a node never double-flushes its peer's live
+  rows, and the replica WAL survives the recovering node's own restart.
+- New: the `internal_router` (an ingester's private listener on
+  `TIMELAKE_CLUSTER_ADDR`: `/internal/v1/replicate`, `/recover`, `/health`)
+  and a `Replicator` seam. Transport is plaintext HTTP at C2, moving to
+  required-mTLS at C3 (the verifier is shipped). Metrics
+  `timelake_cl2_{replicated,degraded,degraded_events,replica_frames,recovered}_*`.
+- **`role=all` is byte-for-byte unchanged** — a lone node has no peer, so
+  no replicator, no replica WAL, no internal listener, no CL-2 metrics.
+  Pinned by a unit test and a live smoke.
+- 135 tests (+4 in-process replication); drilled live 12/12 — degraded
+  mode and SIGKILL-an-ingester-zero-loss (`bench/results/cl2-replication-drill.log`).
+- Deferred: automatic health-triggered failover (recovery is explicit
+  here); the router (C2 phase 3).
+
 ### Added — C2 phase 1: cluster roles + discovery seam (2026-08-10)
 
 - New `timelake-cluster` crate: the `Role` enum (`TIMELAKE_ROLE`, default

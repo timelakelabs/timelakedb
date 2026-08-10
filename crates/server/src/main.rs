@@ -58,6 +58,56 @@ async fn main() {
     tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelakedb M3 starting");
     let engine = timelake_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
 
+    // CL-2: an ingester replicates every write to its paired ingester before
+    // the ack, and holds the peer's frames in a durable replica WAL. The
+    // pairing comes from discovery (the other `ingester` node). `all` never
+    // reaches here, so its write path stays unchanged.
+    if role == timelake_cluster::Role::Ingester {
+        use timelake_cluster::Discovery;
+        engine
+            .enable_replica_wal(&data_dir.join("replica-wal"))
+            .expect("open replica WAL");
+        match discovery
+            .peers_with_role(timelake_cluster::Role::Ingester)
+            .first()
+        {
+            Some(peer) => {
+                tracing::info!(peer = %peer.id, addr = %peer.address, "CL2 replication peer");
+                engine.set_replicator(timelake_server::replication::Replicator::new(
+                    &peer.id,
+                    &peer.address,
+                ));
+            }
+            None => tracing::warn!(
+                "ingester has no peer in discovery (TIMELAKE_PEERS) — running WITHOUT \
+                 replication; a single failure can lose acknowledged writes"
+            ),
+        }
+        let cluster_addr = discovery.this_node().address.clone();
+        if cluster_addr.is_empty() {
+            eprintln!(
+                "TIMELAKE_ROLE=ingester requires TIMELAKE_CLUSTER_ADDR (this node's \
+                 internal replication listener, e.g. 0.0.0.0:1965)"
+            );
+            std::process::exit(2);
+        }
+        let internal = timelake_server::internal_router(Arc::clone(&engine));
+        let listen = cluster_addr.clone();
+        tokio::spawn(async move {
+            let l = match TcpListener::bind(&listen).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(addr = %listen, error = %e, "internal listener bind failed");
+                    return;
+                }
+            };
+            tracing::info!(addr = %listen, "CL2 internal replication listener up");
+            if let Err(e) = axum::serve(l, internal).await {
+                tracing::error!(error = %e, "internal replication listener exited");
+            }
+        });
+    }
+
     // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
     // every 30 s, retention every 60 s — sequential on one blocking task
     // so background work never stacks up on itself.

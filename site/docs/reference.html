@@ -640,6 +640,11 @@
             <tr><td><code>timelake_retention_drops_total</code></td><td>counter</td><td>Files dropped by per-table retention</td></tr>
             <tr><td><code>timelake_parquet_files</code></td><td>gauge</td><td>Files currently in the catalog</td></tr>
             <tr><td><code>timelake_catalog_commit_conflicts_total</code></td><td>counter</td><td>Catalog commits that lost a CAS race and retried. 0 on a single writer; climbing means real multi-writer contention on one bucket</td></tr>
+            <tr><td><code>timelake_cl2_replicated_total</code></td><td>counter</td><td>Frames an ingester replicated to its peer before ack (ingester role only)</td></tr>
+            <tr><td><code>timelake_cl2_degraded</code></td><td>gauge</td><td>1 while the replication peer is unreachable — writes continue on local durability alone. Alert on this</td></tr>
+            <tr><td><code>timelake_cl2_degraded_events_total</code></td><td>counter</td><td>Times the ingester entered degraded mode — a flapping peer without log-diving</td></tr>
+            <tr><td><code>timelake_cl2_replica_frames_total</code></td><td>counter</td><td>Frames received from the peer into this node's durable replica WAL</td></tr>
+            <tr><td><code>timelake_cl2_recovered_total</code></td><td>counter</td><td>Peer frames replayed on recovery after the peer died</td></tr>
             <tr><td><code>timelake_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
             <tr><td><code>timelake_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELAKE_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelake_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>
@@ -686,6 +691,9 @@
         <li><code>timelake_data_requests_anonymous_total</code> increasing while
             <code>timelake_data_auth_mode == 2</code> (required) — something is
             reaching the data plane without a token; it must stay flat at zero.</li>
+        <li><code>timelake_cl2_degraded == 1</code> — an ingester's replication
+            peer is down; writes still land but on one node only, so a second
+            failure now can lose the un-replicated writes.</li>
         <li><code>timelake_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
         <li><code>timelake_admin_default_credential_active == 1</code> — the

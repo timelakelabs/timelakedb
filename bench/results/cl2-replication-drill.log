@@ -1,0 +1,70 @@
+C2 phase 2 — CL-2 ingester WAL replication: zero acknowledged loss on a node death
+2026-08-10 · ingester-a + ingester-b (bench/compose/timelakedb-cluster.yml)
+================================================================================
+
+THE PROPERTY (P1-1). A single instance is a single point of failure. Two
+ingesters pair up: each write is replicated to the peer's durable replica
+WAL BEFORE the 204, so an acknowledged write is durable on two nodes and
+survives either one dying. This is the phase that makes "survives node
+loss" true.
+
+Drilled on a real ingester pair (each the other's TIMELAKE_PEERS peer;
+writes go to A directly — the router that will front them is C2 phase 3):
+
+  12/12 checks passed
+
+LEG 1 — DEGRADED MODE (peer down must not fail writes; PR-7)
+  Stop ingester-b, keep writing to A:
+    - 4000 lines still acked (204) on LOCAL durability — writes did not fail
+    - timelake_cl2_degraded == 1 (gauge)
+    - timelake_cl2_degraded_events_total == 1 (entered degraded once)
+    - the named alarm CL2_REPLICATION_DEGRADED logged exactly once (not per
+      write — a flapping peer stays legible)
+  Start ingester-b again, write once more:
+    - timelake_cl2_degraded back to 0 — the node left degraded on its own
+
+  The honest cost, stated in the alarm: while degraded, a second failure
+  can lose the un-replicated writes. Availability over the second replica
+  when the pair is already half up — the deliberate trade, made loud.
+
+LEG 2 — ZERO ACKNOWLEDGED LOSS on a node death
+  Both healthy. Write 20,000 lines to A:
+    - A has all 20,000
+    - A replicated to B (timelake_cl2_replicated_total = 5 frames = 5 batches)
+    - A is NOT degraded
+    - B received the frames into its replica WAL (replica_frames_total = 5)
+    - B has NOT applied them — the replica frames are DORMANT, so B does not
+      double-flush its peer's live rows (a query on B sees 0)
+  SIGKILL ingester-a. Recover on B (POST /internal/v1/recover):
+    - {"recovered":5}
+    - B now serves all 20,000 lines A had acknowledged — ZERO LOSS, exact
+    - timelake_cl2_recovered_total reflects the replay
+
+WHAT MAKES IT WORK
+  - Replicate-before-ack: the write path appends the local WAL, ships the
+    frame to the peer's internal listener, and only then applies + 204s.
+    A down peer degrades (availability), never fails the write.
+  - The peer holds frames in a DURABLE replica WAL (its own fsync'd log),
+    dormant until recovery — so no double-flush in steady state, and the
+    copy survives the recovering node's own restart (unit-tested).
+  - Recovery replays the replica WAL into the engine and flushes. Overlap
+    with rows the dead peer already flushed to S3 is safe: LWW dedup (FR-5)
+    collapses it at compaction. Recovery is idempotent.
+
+role=all IS UNCHANGED. A lone node has no peer, so no replicator, no
+replica WAL, no internal listener, and no CL-2 metrics — the write path is
+byte-for-byte today's. Pinned by the unit test
+`a_lone_node_has_no_replicator_and_writes_normally` and the full suite.
+
+SCOPE / NOT YET
+  - Recovery is an EXPLICIT operation here (the drill, or an operator / the
+    router on a confirmed peer death). Automatic health-triggered failover
+    is a later cluster phase (needs the router + health).
+  - The router (hash → ingester pair) is C2 phase 3; this drill writes to an
+    ingester directly.
+  - Intra-cluster transport is plaintext HTTP on TIMELAKE_CLUSTER_ADDR;
+    required-mTLS is C3 (the verifier is already shipped).
+  - Cost: replication adds one peer round-trip per batch to the write path
+    (ARCHITECTURE risk 9) — expected, and the reason degraded mode exists.
+
+WORKSPACE: 135 tests (+4 in-process replication), clippy clean, fmt clean.

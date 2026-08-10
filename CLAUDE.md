@@ -122,7 +122,29 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **C2 phase 1 SHIPPED — cluster roles + Discovery seam**
+- Status: **C2 phase 2 SHIPPED — CL-2 ingester WAL replication** (2026-08-10,
+  drill `bench/results/cl2-replication-drill.log`). ZERO ACKED LOSS on a
+  node death: `TIMELAKE_ROLE=ingester` + peer from `TIMELAKE_PEERS` →
+  each write replicated to peer's durable **replica WAL** BEFORE the 204.
+  `crates/server/src/replication.rs` `Replicator` (blocking reqwest, one
+  peer RTT/batch); engine `replica_wal` + `enable_replica_wal` +
+  `replicate_receive` (dormant, NOT applied → no double-flush) +
+  `recover_from_replica` (replay+flush, LWW-idempotent). `internal_router`
+  on `TIMELAKE_CLUSTER_ADDR`: `/internal/v1/{replicate,recover,health}`
+  (plaintext HTTP now, required-mTLS at C3). Degraded mode (PR-7): peer
+  down → keep serving on local durability, `CL2_REPLICATION_DEGRADED`
+  alarm once + `timelake_cl2_degraded` gauge, clears on peer return.
+  Metrics `timelake_cl2_{replicated,degraded,degraded_events,replica_frames,
+  recovered}`. **role=all UNCHANGED** (no peer→no replicator→no cl2
+  metrics; unit + live pinned). 135 tests (+4 replication), clippy/fmt
+  clean; live drill 12/12 (degraded + SIGKILL-A-recover-on-B-zero-loss).
+  DEFERRED: auto health-triggered failover (recovery is explicit — drill/
+  operator/router calls `/recover`); reqwest added to server deps
+  (rustls, blocking). **C2 phasing:** (1) roles+discovery ✓ → (2) CL-2
+  ingester replication ✓ DONE → (3) router (hash→ingester pair, forwards
+  SQL/Flight to queriers) → (4) CL-3 querier + live-buffer snapshot → (5)
+  compactor+lease. Design: ARCHITECTURE §12.4.
+- Previous: **C2 phase 1 SHIPPED — cluster roles + Discovery seam**
   (2026-08-10). Working P1-1 (replication/HA) ONE PHASE AT A TIME (user
   preference [[phase-by-phase-workflow]]): each phase ends with regression
   + unit tests + doc updates. New `timelake-cluster` crate: `Role` enum

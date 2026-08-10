@@ -28,6 +28,10 @@ rustls-pemfile = "2"
 arc-swap = "1"
 x509-parser = "0.17"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Intra-cluster HTTP client (CL-2 WAL replication). rustls, no OpenSSL,
+# matching the rest of the tree; the `blocking` client is called from the
+# sync write path (which already runs under spawn_blocking).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 
 

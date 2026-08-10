@@ -478,14 +478,27 @@ compactor.
   writes, forwards SQL/Flight to queriers; it is the single endpoint the
   bench adapter, Telegraf, and Grafana keep seeing (FR-8/FR-9 contracts
   intact, adapter untouched).
-- **Ingester (CL-2)** — write path per §5 plus: append the WAL frame to
-  the paired ingester over gRPC before the 204 ("replicated"). Peer
+- **Ingester (CL-2) — shipped (C2 phase 2).** Write path per §5 plus:
+  ship the WAL frame to the paired ingester **before the 204**
+  ("replicated"), so an acknowledged write is durable on two nodes. Peer
   down ⇒ **degraded mode, loudly**: keep accepting on local durability
-  with a named alarm and gauge (RR-5) rather than failing writes (PR-7
-  outranks replication when a pair is half up). A dead ingester's rows
-  recover from its peer's WAL copy; replay overlap is safe because LWW
-  dedup (FR-5) makes it idempotent. Each ingester flushes its own
-  buffers to S3 and commits via catalog CAS.
+  with the `CL2_REPLICATION_DEGRADED` alarm and the
+  `timelake_cl2_degraded` gauge rather than failing writes (PR-7 outranks
+  replication when a pair is half up); the gauge clears when the peer
+  returns. The peer holds frames in a durable **replica WAL**, dormant
+  (not applied) in steady state so it does not double-flush the peer's
+  live rows. A dead ingester's rows recover by replaying that replica WAL
+  and flushing; overlap with rows the dead peer already flushed is safe
+  because LWW dedup (FR-5) makes it idempotent. Drilled: SIGKILL an
+  ingester, recover on the peer, zero acknowledged loss, exact count
+  (`bench/results/cl2-replication-drill.log`). **Deliberately deferred:**
+  recovery is explicit here (operator / the router on a confirmed peer
+  death); automatic health-triggered failover is a later phase.
+  Transport is plaintext HTTP on `TIMELAKE_CLUSTER_ADDR` at C2, behind a
+  `Replicator` seam, moving to required-mTLS (and possibly a streaming
+  gRPC/Flight wire if the per-batch round-trip becomes the bottleneck) at
+  C3. Each ingester flushes its own buffers to S3 and commits via catalog
+  CAS.
 - **Querier (CL-3)** — stateless: replays the catalog from S3, then
   tails the manifest log (~1 s poll of the list past its head — cheap).
   **Freshness is not optional:** AT-2 demands exact counts seconds after

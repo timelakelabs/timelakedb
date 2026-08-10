@@ -1,0 +1,45 @@
+# CL-2 ingester-pair drill (ARCHITECTURE §12.4). Two ingesters, each the
+# other's replication peer, on one network. Plaintext intra-cluster (C2);
+# required-mTLS is C3. No router yet (C2 phase 3) — the drill writes to an
+# ingester directly.
+#
+#   docker compose -f compose/timelakedb-cluster.yml up -d --build
+#   sh cluster-drill/cl2_drill.sh
+name: bench-timelakedb-cluster
+services:
+  ingester-a:
+    build: ../..
+    container_name: ingester-a
+    hostname: ingester-a
+    ports:
+      - "5963:1963"   # public data port (writes/queries)
+    environment:
+      TIMELAKE_ROLE: ingester
+      TIMELAKE_NODE_ID: ingester-a
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965     # this node's internal listener
+      TIMELAKE_PEERS: ingester-b=ingester@ingester-b:1965
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  ingester-b:
+    build: ../..
+    container_name: ingester-b
+    hostname: ingester-b
+    ports:
+      - "5964:1963"
+      - "5965:1965"   # internal listener (recover endpoint) for the host drill
+    environment:
+      TIMELAKE_ROLE: ingester
+      TIMELAKE_NODE_ID: ingester-b
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
+      TIMELAKE_PEERS: ingester-a=ingester@ingester-a:1965
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
