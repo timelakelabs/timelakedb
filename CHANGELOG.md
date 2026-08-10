@@ -13,6 +13,36 @@ here.
 
 ## [Unreleased]
 
+### Added — SEC-3 (v2): optional client certificates in want mode (2026-08-10)
+
+- `TIMELAKE_TLS_CLIENT_CA` turns on client-certificate verification in
+  **want mode**: both listeners request a certificate, verify one if
+  offered, and serve the connection either way. Grafana, Telegraf and
+  the bench harness connect unchanged with no configuration.
+- Trust anchors sit behind the same `ArcSwap` as the serving
+  certificate and hot-rotate on the same trigger, with **dual-CA
+  overlap** — a bundle carrying both outgoing and incoming anchors, so
+  a CA roll does not require every client to change at one instant. A
+  bundle that will not parse leaves the last-good anchors serving and
+  raises the named alarm, exactly as a bad server renewal does.
+- **The identity is the point, not the encryption.** A verified client
+  certificate's common name reaches the query session over Flight SQL,
+  where `QuerySession::resolve` intersects the caller's claimed SEC-2
+  authorizations with what that identity is granted. Anonymous callers
+  keep today's documented behaviour, so this narrows without breaking:
+  the fix for SECURITY.md exposure 7 is additive rather than a flag day.
+- Metrics: `timelake_tls_client_ca_anchors`,
+  `timelake_tls_client_ca_last_reload_ok`,
+  `timelake_tls_client_auth_mode`.
+- **AT-7 remains 19/19** with client auth enabled
+  (`bench/results/sec3-mtls-want-mode.log`). The drill itself needed a
+  fix — it called `/admin/tls/reload` anonymously and SEC-4 had put that
+  behind a session — so it now logs in and rotates the seeded credential,
+  exercising the authenticated path instead of routing around it.
+- Not done: `/api/sql` does not yet carry the identity; axum-server owns
+  that accept loop and needs a custom `Accept` to surface peer
+  certificates.
+
 ### Changed — renamed TimelordDB → TimeLakeDB (2026-08-09)
 
 The project is now **TimeLakeDB**, and the name says what the architecture

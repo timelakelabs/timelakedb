@@ -43,7 +43,7 @@ needs access.
 | Control | Status |
 |---|---|
 | Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELAKE_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
-| Client certificate / mTLS | Not implemented — server-side TLS only. Mutual TLS is v2 (SEC-3 intra-cluster). |
+| Client certificate / mTLS | **Implemented, opt-in, WANT mode.** Set `TIMELAKE_TLS_CLIENT_CA` and both listeners request a client certificate, verify one if presented, and serve the connection either way — so Grafana, Telegraf and the harness need no change. A verified identity narrows that session's SEC-2 authorizations to what it is granted (Flight SQL; `/api/sql` identity is still to come). Trust anchors hot-rotate with dual-CA overlap. Want mode is not itself a control — see exposure 9. |
 | Authentication | **Admin surface only (SEC-4).** `/admin/*` requires a session: Argon2id credentials, cookie sessions (HttpOnly, SameSite=Strict, idle 30 min / absolute 12 h) or bearer tokens, CSRF + Origin checks on mutations, per-principal backoff on failed logins. **The data plane is still open** — write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything. |
 | Authorization | **Roles on the admin surface.** `viewer` (read), `operator` (non-destructive changes, *growing* a retention window), `admin` (shrinking/removing retention, principal management). No per-database/table permissions on the data plane. |
 | First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelake_admin_default_credential_active`. |
@@ -104,6 +104,17 @@ follow from "no authentication" and are listed so you can design around them.
    client can make. Until token auth lands, SEC-2 is a correct enforcement
    mechanism behind an honor-system front door: real isolation requires an
    authenticating proxy that *sets* (and strips inbound) that header.
+
+9. **Want-mode client authentication is optional by design, so it
+   grants nothing on its own.** An attacker simply declines to present a
+   certificate and takes the anonymous path, which still behaves exactly
+   as it did before. Its value is that an *authenticated* caller can be
+   held to less: a verified identity's SEC-2 claims are intersected with
+   its grants. Making the anonymous path more restricted is a separate,
+   deliberate decision — and
+   `timelake_tls_client_ca_anchors` plus the authenticated/anonymous
+   split are what tell you when a deployment has migrated far enough to
+   take it.
 
 8. **Encryption at rest does not cover the local WAL**, which holds recent
    line-protocol bytes until flush, nor does it protect data from anyone who

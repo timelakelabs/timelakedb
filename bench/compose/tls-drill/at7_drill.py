@@ -39,6 +39,44 @@ def check(ok: bool, label: str, detail: str = ""):
     print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"  ({detail})" if detail else ""))
 
 
+# SEC-4: /admin/tls/reload authenticates now. A fresh node seeds
+# admin/admin, quarantined until the password is changed, so the drill
+# rotates it once and then uses the session — exercising the real
+# authenticated path rather than routing around it.
+ADMIN_SESSION = {}
+
+
+def admin_login():
+    """Return headers carrying a usable admin session, rotating the
+    seeded credential first if this node has never been logged into."""
+    if ADMIN_SESSION:
+        return ADMIN_SESSION
+    s = requests.Session()
+    r = s.post(f"{BASE}/admin/session", json={"username": "admin", "password": "admin"},
+               verify=CA, timeout=10)
+    if r.status_code == 200 and r.json().get("must_change_password"):
+        csrf = r.json()["csrf"]
+        s.post(f"{BASE}/admin/password",
+               json={"current_password": "admin", "new_password": "at7 drill password"},
+               headers={"x-timelake-csrf": csrf}, verify=CA, timeout=10)
+        r = s.post(f"{BASE}/admin/session",
+                   json={"username": "admin", "password": "at7 drill password"},
+                   verify=CA, timeout=10)
+    elif r.status_code != 200:
+        r = s.post(f"{BASE}/admin/session",
+                   json={"username": "admin", "password": "at7 drill password"},
+                   verify=CA, timeout=10)
+    r.raise_for_status()
+    ADMIN_SESSION["session"] = s
+    ADMIN_SESSION["headers"] = {"x-timelake-csrf": r.json()["csrf"]}
+    return ADMIN_SESSION
+
+
+def admin_post(path):
+    a = admin_login()
+    return a["session"].post(f"{BASE}{path}", headers=a["headers"], verify=CA, timeout=10)
+
+
 def serving_serial(port: int) -> str:
     """Open a NEW TLS connection and return the presented cert's serial."""
     ctx = ssl.create_default_context(cafile=CA)
@@ -256,7 +294,7 @@ def main():
             break
     if new_serial is None:
         trigger = "admin endpoint (watcher missed bind-mount mtime)"
-        rr = requests.post(f"{BASE}/admin/tls/reload", verify=CA, timeout=10)
+        rr = admin_post("/admin/tls/reload")
         check(rr.status_code == 200, "admin reload accepted", rr.text[:120])
         new_serial = serving_serial(2963)
     check(new_serial != serial_http_0, f"new HTTPS connections present the renewed cert [{trigger}]",
@@ -291,7 +329,7 @@ def main():
     writer2.start()
     (CERTS / "server.crt").write_text("-----BEGIN GARBAGE-----\nzzzz\n-----END GARBAGE-----\n")
     time.sleep(4)  # give the watcher a chance to trip the alarm too
-    rr = requests.post(f"{BASE}/admin/tls/reload", verify=CA, timeout=10)
+    rr = admin_post("/admin/tls/reload")
     body = rr.json() if rr.headers.get("content-type", "").startswith("application/json") else {}
     check(rr.status_code == 422 and body.get("alarm") == "SEC3_CERT_RENEWAL_FAILED",
           "admin reload rejects corrupt pair with named alarm", f"HTTP {rr.status_code} {body}")

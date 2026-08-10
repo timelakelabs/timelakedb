@@ -39,7 +39,21 @@ elif [ "$1" = "renewal" ]; then
     -CAcreateserial -out certs/renewal.crt -days 1 -copy_extensions copy
   rm -f certs/renewal.csr
   echo "renewal: $(openssl x509 -in certs/renewal.crt -noout -serial -enddate)"
+elif [ "$1" = "client" ]; then
+  # A CLIENT certificate from the same CA (SEC-3 want mode). Its CN is
+  # the identity the server reads out of the verified chain, and what a
+  # principal's grants are matched on.
+  CN="${2:-tributary-node-1}"
+  openssl ecparam -name prime256v1 -genkey -noout -out "certs/client-$CN.key"
+  openssl req -new -key "certs/client-$CN.key" -out "certs/client-$CN.csr" \
+    -subj "/CN=$CN"
+  printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature\n' > certs/client.ext
+  openssl x509 -req -in "certs/client-$CN.csr" -CA certs/ca.crt -CAkey certs/ca.key \
+    -CAcreateserial -out "certs/client-$CN.crt" -days 1 \
+    -extfile certs/client.ext
+  rm -f "certs/client-$CN.csr" certs/client.ext
+  echo "client: $(openssl x509 -in "certs/client-$CN.crt" -noout -subject -enddate)"
 else
-  echo "usage: $0 initial|renewal" >&2
+  echo "usage: $0 initial|renewal|client [CN]" >&2
   exit 2
 fi

@@ -386,6 +386,59 @@ pub async fn serve(
 /// `timelake_tls::RotatingCert::server_config` — its cert resolver is
 /// consulted per handshake, so cert rotation needs no listener restart
 /// and never touches established gRPC streams.
+/// The identity of a peer that presented a verified client certificate.
+/// `None` means anonymous — served exactly as before (SEC-3 want mode).
+/// Reaches handlers through tonic's connection info.
+#[derive(Debug, Clone, Default)]
+pub struct PeerIdentity(pub Option<String>);
+
+/// Wraps the TLS stream so the verified identity travels with the
+/// connection: tonic reads `connect_info` once per connection and puts
+/// it in every request's extensions.
+pub struct IdentifiedStream {
+    inner: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    identity: PeerIdentity,
+}
+
+impl tonic::transport::server::Connected for IdentifiedStream {
+    type ConnectInfo = PeerIdentity;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.identity.clone()
+    }
+}
+
+impl tokio::io::AsyncRead for IdentifiedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for IdentifiedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub async fn serve_tls(
     backend: Arc<dyn SqlBackend>,
     addr: std::net::SocketAddr,
@@ -405,7 +458,23 @@ pub async fn serve_tls(
             match listener.accept().await {
                 Ok((tcp, peer)) => match acceptor.accept(tcp).await {
                     Ok(tls_stream) => {
-                        return Some((Ok::<_, std::io::Error>(tls_stream), (listener, acceptor)));
+                        // Want mode: the peer may or may not have offered
+                        // a certificate, and either way it is served. If
+                        // it did, rustls has already verified it against
+                        // the rotating bundle; this only reads out who.
+                        let identity = PeerIdentity(timelake_tls::identity_of(
+                            tls_stream.get_ref().1.peer_certificates(),
+                        ));
+                        if let Some(who) = &identity.0 {
+                            tracing::debug!(%peer, identity = %who, "flight client authenticated");
+                        }
+                        return Some((
+                            Ok::<_, std::io::Error>(IdentifiedStream {
+                                inner: tls_stream,
+                                identity,
+                            }),
+                            (listener, acceptor),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(%peer, error = %e, "flight TLS handshake failed");

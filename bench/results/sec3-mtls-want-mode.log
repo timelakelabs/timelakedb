@@ -1,0 +1,93 @@
+SEC-3 (v2) — optional client-certificate verification, WANT mode
+2026-08-10 · timelakedb-tls, TLS 1.3 on both listeners, client CA
+configured via TIMELAKE_TLS_CLIENT_CA
+================================================================================
+
+THE CLAIM: the server requests a client certificate, verifies one if
+presented, and serves the connection either way — so Grafana, Telegraf
+and the bench harness are untouched while an agent that presents a
+certificate is identified.
+
+Startup, verbatim:
+  SEC-3: client certificate verification enabled in WANT mode - a client
+  that presents a certificate is identified, one that does not is still
+  served   ca=/certs/ca.crt anchors=1
+
+BOTH PATHS, HTTPS (run in-network; see the rig note below)
+  anonymous, no client certificate      -> 200  {"status":"pass",...}
+  with a verified client certificate    -> 200  {"status":"pass",...}
+  anonymous line-protocol write         -> 204
+  mTLS line-protocol write              -> 204
+  query afterwards                      -> 2 rows (both writes landed)
+
+BOTH PATHS, FLIGHT SQL
+  anonymous (the Grafana shape)         -> connected, server answered
+  with a client certificate             -> connected, server answered
+
+  And the identity reached the server, which is the entire point:
+    DEBUG timelake_flight: flight client authenticated
+          peer=172.31.0.1:40132 identity=tributary-node-1
+
+METRICS
+  timelake_tls_client_ca_anchors 1
+  timelake_tls_client_ca_last_reload_ok 1
+  timelake_tls_client_auth_mode 1
+
+  The anchor count is what makes a dual-CA roll observable: during an
+  overlap it reads 2, and an operator can see the old anchor leave.
+
+AT-7 REGRESSION: 19/19, unchanged with client auth enabled
+  Certificate rotation under sustained load still passes every check —
+  both listeners rotate in lockstep, an in-flight 19-second Flight SQL
+  query completes correctly across the swap with an exact result, zero
+  write errors, Telegraf over TLS logs no output errors, a corrupt
+  renewal is rejected with the named alarm while the last-good pair
+  keeps serving, and a good renewal restores health.
+
+  The drill needed fixing, not the server. Its first run scored 18/19
+  with "admin reload rejects corrupt pair" failing on
+  HTTP 401 unauthenticated — because SEC-4 put /admin/tls/reload behind
+  a session and the drill still called it anonymously. The behaviour
+  itself was fine (the file-watcher path proved the alarm, the last-good
+  serving and the recovery). The drill now logs in, rotates the seeded
+  admin/admin credential, and uses the session, so it exercises the real
+  authenticated path instead of routing around it.
+
+WHAT THIS IS AND IS NOT
+  Want mode is NOT by itself a security control. An attacker declines to
+  present a certificate and takes the anonymous path. Its value is
+  entirely in what the two paths may then do differently:
+
+    QuerySession::resolve()
+      no certificate      claims trusted as asserted   (UNCHANGED)
+      verified identity   claims INTERSECTED with grants
+
+  So authenticating can only ever narrow what a caller sees, never widen
+  it, and the anonymous path is exactly as it was. That makes the fix for
+  SECURITY.md exposure 7 additive rather than a flag day. Four tests pin
+  the rule, including that an identity with no grant policy recorded
+  keeps its claims — `None` must mean "no policy" and not "deny all", or
+  presenting a certificate would break a working client, which is the
+  opposite of an additive migration.
+
+RIG NOTE
+  Windows curl links schannel, which refuses a private CA with
+  "revocation status is unknown" (exit 60) and will not load a client
+  certificate from PEM. Every check above therefore runs from a Linux
+  container on the compose network — the same in-network discipline the
+  performance work uses, for a different reason.
+
+WORKSPACE
+  95 tests, 0 failures, clippy clean, fmt clean.
+  +5 client_auth tests: bundle loading and anchor counting, dual-CA
+  overlap expressible, a bad bundle keeping last-good anchors with the
+  alarm, an empty bundle refused rather than trusting nothing, and
+  anonymous peers having no identity.
+  +4 session tests for the intersection rule above.
+
+NOT DONE YET
+  HTTP /api/sql does not yet attach the identity: axum-server owns that
+  accept loop, so it needs a custom Accept implementation to carry peer
+  certificates into request extensions. Flight SQL — the path Grafana
+  and the read side use — is wired. Named here rather than left to look
+  finished.

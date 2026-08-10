@@ -70,6 +70,18 @@ async fn main() {
             let rot = timelake_tls::RotatingCert::load(cert.as_ref(), key.as_ref())
                 .expect("initial TLS cert load must succeed (no last-good yet)");
             engine.set_tls(Arc::clone(&rot));
+
+            // SEC-3 want mode: with a client CA bundle configured the
+            // listeners REQUEST a client certificate and identify anyone
+            // who presents one — while still serving anyone who does not,
+            // so Grafana, Telegraf and the bench harness are unaffected.
+            let client_ca = std::env::var("TIMELAKE_TLS_CLIENT_CA").ok().map(|p| {
+                timelake_tls::RotatingClientCa::load(p.as_ref())
+                    .expect("initial client CA bundle must load")
+            });
+            if let Some(ca) = &client_ca {
+                engine.set_client_ca(Arc::clone(ca));
+            }
             // Floor is TLS 1.3; TIMELAKE_TLS_MIN=1.2 lowers it (SEC-3).
             let allow_tls12 = std::env::var("TIMELAKE_TLS_MIN").as_deref() == Ok("1.2");
             tracing::info!(
@@ -81,6 +93,7 @@ async fn main() {
             // File watcher: certbot-style renewals just overwrite the
             // files; poll mtimes (2 s), debounce, reload. A failed reload
             // alarms and keeps last-good — it must NOT stop the watcher.
+            let ca_watcher = client_ca.clone();
             let watcher = Arc::clone(&rot);
             tokio::spawn(async move {
                 let mut last = watcher.mtimes();
@@ -96,6 +109,12 @@ async fn main() {
                         let settled = watcher.mtimes();
                         let w = Arc::clone(&watcher);
                         let _ = tokio::task::spawn_blocking(move || w.reload()).await;
+                        // Roll the trust anchors on the same trigger:
+                        // dual-CA overlap means the bundle changes during
+                        // a CA roll while clients keep connecting.
+                        if let Some(ca) = ca_watcher.clone() {
+                            let _ = tokio::task::spawn_blocking(move || ca.reload()).await;
+                        }
                         last = settled;
                     } else {
                         last = now;
@@ -104,7 +123,11 @@ async fn main() {
             });
 
             // Flight SQL over TLS (gRPC wants ALPN h2).
-            let flight_tls = rot.server_config(allow_tls12, &[b"h2".as_slice()]);
+            let flight_tls = rot.server_config_with_client_ca(
+                allow_tls12,
+                &[b"h2".as_slice()],
+                client_ca.clone(),
+            );
             tokio::spawn(async move {
                 if let Err(e) =
                     timelake_flight::serve_tls(flight_backend, flight_addr, flight_tls).await
@@ -115,7 +138,11 @@ async fn main() {
 
             // HTTP over TLS. axum-server drives hyper over our rustls
             // config; the resolver inside it is the rotation point.
-            let http_tls = rot.server_config(allow_tls12, &[b"h2".as_slice(), b"http/1.1"]);
+            let http_tls = rot.server_config_with_client_ca(
+                allow_tls12,
+                &[b"h2".as_slice(), b"http/1.1"],
+                client_ca.clone(),
+            );
             let sock_addr: std::net::SocketAddr = addr
                 .parse()
                 .expect("TIMELAKE_ADDR must be host:port under TLS");
