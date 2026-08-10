@@ -70,11 +70,12 @@ follow from "no authentication" and are listed so you can design around them.
    request because each query gets a fresh session — but do not rely on that as
    a boundary. **Treat SQL access as filesystem-write access to the container.**
 
-3. **`POST /admin/tls/reload` is unauthenticated** when TLS is enabled. Impact
-   is limited by design — it only re-reads the already-configured cert and key
-   paths, validates before swapping, and keeps the last-good pair on failure —
-   so the realistic worst case is forced log/alarm noise rather than a
-   downgrade. It is still an unauthenticated administrative endpoint.
+3. **~~`POST /admin/tls/reload` is unauthenticated.~~ CLOSED (SEC-4).**
+   It now sits behind the same session guard as the rest of `/admin/*`
+   and requires the `admin` role. The behaviour that limited its impact
+   is unchanged — it only re-reads the already-configured cert and key
+   paths, validates before swapping, and keeps the last-good pair on
+   failure.
 
 3a. **~~`/admin/retention` is an unauthenticated deletion control.~~
    CLOSED (SEC-4).** `/admin/*` now authenticates every request. What
@@ -99,22 +100,15 @@ follow from "no authentication" and are listed so you can design around them.
    keep a query from killing the server, but nothing stops one client from
    consuming the whole admission budget.
 
-7. **Visibility authorizations are self-asserted.** There is no
-   authentication, so `X-TimeLake-Authorizations: admin` is a claim any
-   client can make. Until token auth lands, SEC-2 is a correct enforcement
-   mechanism behind an honor-system front door: real isolation requires an
-   authenticating proxy that *sets* (and strips inbound) that header.
-
-9. **Want-mode client authentication is optional by design, so it
-   grants nothing on its own.** An attacker simply declines to present a
-   certificate and takes the anonymous path, which still behaves exactly
-   as it did before. Its value is that an *authenticated* caller can be
-   held to less: a verified identity's SEC-2 claims are intersected with
-   its grants. Making the anonymous path more restricted is a separate,
-   deliberate decision — and
-   `timelake_tls_client_ca_anchors` plus the authenticated/anonymous
-   split are what tell you when a deployment has migrated far enough to
-   take it.
+7. **Visibility authorizations are self-asserted on the anonymous path.**
+   `X-TimeLake-Authorizations: admin` is a claim any client can make.
+   A client certificate now changes this *for callers that present one*
+   over Flight SQL — their claims are intersected with what that identity
+   is granted — but presenting one is optional (exposure 9), so an
+   attacker declines and keeps the honor-system front door. Real isolation
+   still requires either an authenticating proxy that *sets* (and strips
+   inbound) that header, or a deployment that has migrated far enough to
+   restrict the anonymous path.
 
 8. **Encryption at rest does not cover the local WAL**, which holds recent
    line-protocol bytes until flush, nor does it protect data from anyone who
@@ -122,6 +116,16 @@ follow from "no authentication" and are listed so you can design around them.
    object store's media: a stolen volume, a decommissioned disk, an S3
    bucket leak. Key material is held in process memory and sourced from the
    environment.
+
+9. **Want-mode client authentication is optional by design, so it
+   grants nothing on its own.** An attacker simply declines to present a
+   certificate and takes the anonymous path, which still behaves exactly
+   as it did before. Its value is that an *authenticated* caller can be
+   held to less: a verified identity's SEC-2 claims are intersected with
+   its grants. Making the anonymous path more restricted is a separate,
+   deliberate decision — and `timelake_tls_client_ca_anchors` plus the
+   authenticated/anonymous split are what tell you when a deployment has
+   migrated far enough to take it.
 
 ## Deploying it safely today
 
@@ -150,7 +154,8 @@ follow from "no authentication" and are listed so you can design around them.
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
 | Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
 | Data-plane authentication | SEC-4 (phased) | Not started — the piece that turns SEC-2 claims into authorization; breaks every existing client, so it is its own migration |
-| Mutual TLS, intra-cluster | SEC-3 (v2) | Not started |
+| Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session over Flight SQL. AT-7 still 19/19 with it enabled. `/api/sql` identity outstanding. |
+| Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |
 | Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |
 
