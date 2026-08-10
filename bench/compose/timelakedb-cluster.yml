@@ -17,7 +17,7 @@ services:
       TIMELAKE_ROLE: ingester
       TIMELAKE_NODE_ID: ingester-a
       TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965     # this node's internal listener
-      TIMELAKE_PEERS: ingester-b=ingester@ingester-b:1965
+      TIMELAKE_PEERS: ingester-b=ingester@ingester-b:1965|ingester-b:1963
     mem_limit: 2g
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
@@ -36,8 +36,31 @@ services:
       TIMELAKE_ROLE: ingester
       TIMELAKE_NODE_ID: ingester-b
       TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
-      TIMELAKE_PEERS: ingester-a=ingester@ingester-a:1965
+      TIMELAKE_PEERS: ingester-a=ingester@ingester-a:1965|ingester-a:1963
     mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  router:
+    build: ../..
+    container_name: router
+    hostname: router
+    ports:
+      - "5962:1963"   # the single public write endpoint
+    environment:
+      TIMELAKE_ROLE: router
+      TIMELAKE_NODE_ID: router
+      # The router forwards to the ingesters' PUBLIC data ports (1963).
+      TIMELAKE_PEERS: >-
+        ingester-a=ingester@ingester-a:1965|ingester-a:1963,
+        ingester-b=ingester@ingester-b:1965|ingester-b:1963
+    mem_limit: 512m
+    depends_on:
+      - ingester-a
+      - ingester-b
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
       interval: 3s

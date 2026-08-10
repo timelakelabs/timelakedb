@@ -1,0 +1,59 @@
+C2 phase 3 — the router: stateless write sharding
+2026-08-10 · router + ingester-a + ingester-b (bench/compose/timelakedb-cluster.yml)
+================================================================================
+
+THE ROUTER is the single public write endpoint (FR-8/FR-9) — clients point
+at one address and never at specific nodes. It holds NO data. It shards each
+line-protocol body by (db, measurement) across the ingesters and forwards
+each shard to the ingester that owns that table; that ingester becomes the
+table's primary and replicates to its CL-2 peer (phase 2), so durability is
+unchanged. The router adds distribution, not a new failure mode.
+
+Drilled: router in front of the ingester pair, 12 tables x 500 lines all
+written through the single router endpoint.
+
+  8/8 checks passed
+
+  - Every table lives on exactly ONE primary — the other ingester holds a
+    dormant replica (0 queryable), so no double-count.
+  - Exact accounting: all 6,000 acked lines present once — no loss, no dup.
+  - DISTRIBUTED: 6 tables landed primary on A, 6 on B. The hash actually
+    spreads load; the router is not a pass-through to one node.
+  - The router forwarded a mixed body to >1 shard in one request
+    (forwarded_total counts sub-requests: one body touching both ingesters
+    = 2 forwards).
+  - timelake_router_ingesters = 2.
+
+  ATOMICITY PRESERVED across sharding. A body with a poison line returned
+  400 at the router and wrote NOTHING — the router validates the whole body
+  before forwarding anything, so a bad line never leaves part of the batch
+  written on one shard. (An infrastructure failure of one shard is returned
+  to the client instead; the retry is safe because writes are idempotent
+  under LWW dedup.)
+
+  QUERIES ARE NOT ROUTED. /api/sql on the router returns 501. In a sharded
+  cluster a query is only correct once a querier unions every shard from the
+  shared object store; forwarding a query to one ingester would return wrong
+  counts. Query routing arrives with the querier (CL-3, C2 phase 4).
+
+HOW SHARDING WORKS
+  - shard_of(db, measurement) = FNV-1a over `db\0measurement` mod N. Stable
+    across processes/restarts (not the randomized default hasher), and the
+    router sorts ingesters by id, so a table always lands on the same node.
+  - The router hashes to ANY ingester — there is no fixed primary/replica.
+    A table's primary is whichever ingester its hash selects; that node
+    replicates to its own CL-2 peer. So the two-node pair already shows real
+    distribution: some tables primary on A (replica on B), some the reverse.
+
+role=all AND role=ingester ARE UNCHANGED — the router is a separate code
+path (main.rs branches before the engine is even created; a router opens no
+engine, no WAL, no store). Pinned by the full suite and a role=all smoke.
+
+SCOPE / NOT YET
+  - Query and Flight forwarding: phase 4 (needs the querier).
+  - Automatic failover of a dead ingester's shard: later (needs health).
+  - Intra-cluster/forward transport is plaintext HTTP at C2; mTLS at C3.
+
+WORKSPACE: 141 tests (+5 router unit: measurement extraction incl. escaping,
+deterministic + distributing hash, stable target ordering; +1 cluster peer
+data-address), clippy clean, fmt clean.
