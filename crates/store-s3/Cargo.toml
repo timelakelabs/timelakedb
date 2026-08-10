@@ -14,3 +14,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The two-writer CAS drill (P0-4) exercises the real Catalog commit loop
+# over the real S3 If-None-Match, not just the local hard-link path.
+timelake-catalog = { path = "../catalog" }

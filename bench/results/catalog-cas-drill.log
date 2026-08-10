@@ -1,0 +1,61 @@
+P0-4 — catalog commits are atomic against a second writer (CAS)
+2026-08-10 · timelake-catalog + timelake-store-s3, LocalStack S3
+================================================================================
+
+THE BUG. Catalog.commit picked the next manifest sequence from an
+in-process atomic counter, then wrote catalog/manifest/{seq}.json with a
+plain put. Two writers pointed at one object store both replay the same
+log, both compute the same next seq, both write the same key — and the
+second put silently overwrites the first. The overwritten writer's data
+files are still in the store but referenced by no manifest: orphaned,
+invisible to every query, and eventually GC'd. Silent data loss, latent
+on a single node and active the moment a second writer appears (a botched
+restore, a stray second container, or day one of clustering).
+
+THE FIX. commit is now a compare-and-swap on the next sequence key
+(put_if_absent: S3 If-None-Match, local File::create_new). The loser of a
+race replays whatever was appended past its head, folds those files into
+its own state, and retries at the new head. The manifest log becomes a
+true total order — every seq slot has exactly one writer.
+
+PROVEN ON BOTH CAS MECHANISMS, because they are genuinely different code:
+
+  local hard-link (crates/catalog, cargo test -p timelake-catalog):
+    two_writers_on_one_store_lose_nothing   two Catalogs, one LocalStore,
+      both at head 0 -> distinct seqs, B records a conflict, a cold
+      replay sees all four files, file_count == 4 (none orphaned)
+    the_loser_learns_the_winners_files      after colliding, B's own
+      in-memory view contains the winner's file, not just the store's
+    removals_survive_a_cas_retry            a compaction (add new, remove
+      old) that loses a race still applies its removal on retry
+
+  real S3 If-None-Match (crates/store-s3, LocalStack, --ignored):
+    two_catalogs_on_one_bucket_lose_no_commits_p04
+      two Catalogs on one bucket, both at head 0:
+        writer A commit -> seq 1
+        writer B commit -> seq 1 REFUSED by If-None-Match -> catch up,
+                           retry -> seq 2
+        B.commit_conflicts() >= 1
+      interleave two more each; cold replay of the bucket:
+        {a.parquet, a2.parquet, b.parquet, b2.parquet}  — all four, none lost
+      -> ok. 1 passed
+
+VISIBILITY. timelake_catalog_commit_conflicts_total counts every lost
+race. It is 0 on a single-writer deployment; a climbing value is real
+multi-writer contention — surfaced as a metric rather than inferred,
+the same discipline the auth/mTLS splits use.
+
+BOUND. A commit retries at most 100 times; because each retry first
+catches up to the true head, honest contention converges in a few
+rounds, and the cap turns a pathological loop into a loud ResourceBusy
+error rather than a hang.
+
+SCOPE. This makes concurrent commits SAFE (no loss); it does not make
+concurrent reads FRESH. A node folds in another writer's entries when it
+collides on a commit — background polling for external commits is a
+separate concern (C2/C3). Config objects (principals/tokens/retention)
+still use plain put: last-writer-wins by design for admin actions, out of
+scope for P0-4.
+
+WORKSPACE: 124 tests (+3 catalog) + 1 S3-gated CAS drill, clippy clean,
+fmt clean.

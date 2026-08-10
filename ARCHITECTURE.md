@@ -186,10 +186,13 @@ Object-store layout (all access through `store`):
 - **Catalog = manifest log in the object store** (Iceberg-style, decided
   over embedded-DB-as-truth): each commit (flush, compaction, retention
   drop, schema add) appends a manifest entry; checkpoints bound replay.
-  v1 is single-writer so commits are trivially safe; CL-2/3 upgrade to
-  conditional-put CAS on the manifest head — a catalog-impl change, not
-  an engine change. A local embedded cache (redb) accelerates lookups and
-  is disposable (CL-1).
+  commits are **conditional-put CAS on the next sequence key** (P0-4,
+  shipped): a writer claims `catalog/manifest/{seq}.json` with
+  `put_if_absent`, and the loser of a race replays the winner's entry and
+  retries at the new head, so two writers on one bucket cannot lose each
+  other's commits. `timelake_catalog_commit_conflicts_total` makes the
+  contention visible. A local embedded cache (redb) accelerates lookups
+  and is disposable (CL-1).
 - **Retention (FR-7):** enforcer walks per-table policies, drops whole
   partitions past their window via catalog commit; physical deletion is
   async garbage collection (and later, SEC-1 crypto-shredding).
@@ -430,15 +433,25 @@ pays one KMS call per object at thousands of objects per day:
 
 ### 12.3 Catalog: CAS on the manifest head + checkpoints
 
-The v1 manifest log is already sequence-keyed
+**The CAS commit is shipped (P0-4).** The manifest log is sequence-keyed
 (`catalog/manifest/{seq:012}.json`), so two writers racing commit seq N
 collide on the **same object key** — `put_if_absent` makes exactly one
-win. Commit becomes a loop: propose seq = head+1 → `put_if_absent` →
-on loss, list-and-replay entries past the local head, **re-validate the
-commit against the new state** (a compaction whose inputs were
-concurrently retention-dropped must abort, not commit; its orphan
-output falls to GC), re-propose. Bounded retries with jitter; commits
-are small and rare, contention is negligible at this fleet size.
+win. Commit is a loop: propose seq = head+1 → `put_if_absent` → on loss,
+list-and-replay entries past the local head, fold them into memory,
+re-propose at the new head. Bounded (100 attempts → `ResourceBusy`);
+commits are small and rare, contention negligible at this fleet size;
+`timelake_catalog_commit_conflicts_total` counts the races. Drilled on
+both the local hard-link and the real S3 `If-None-Match`
+(`bench/results/catalog-cas-drill.log`).
+
+One refinement is deferred to C2 with the role split: **re-validating
+the commit against the new state on conflict** — a compaction whose
+inputs were concurrently retention-dropped should abort rather than
+resurrect dropped data in its output (the orphan output then falls to
+GC). It is safe to defer because maintenance (the only source of
+compaction/retention commits) is single-node until C2, so a compaction
+and a retention drop cannot race today. The retry loop already re-applies
+removals correctly; what C2 adds is the abort decision.
 **Checkpoints** (`catalog/checkpoint/{seq}.json`, every 512 entries,
 also via `put_if_absent`) bound boot to newest-checkpoint + tail replay
 instead of a full-log LIST/GET storm. GC grace now protects the whole

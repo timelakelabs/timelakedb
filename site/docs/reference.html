@@ -639,6 +639,7 @@
             <tr><td><code>timelake_compactions_total</code></td><td>counter</td><td>Partitions merged L0 → L1</td></tr>
             <tr><td><code>timelake_retention_drops_total</code></td><td>counter</td><td>Files dropped by per-table retention</td></tr>
             <tr><td><code>timelake_parquet_files</code></td><td>gauge</td><td>Files currently in the catalog</td></tr>
+            <tr><td><code>timelake_catalog_commit_conflicts_total</code></td><td>counter</td><td>Catalog commits that lost a CAS race and retried. 0 on a single writer; climbing means real multi-writer contention on one bucket</td></tr>
             <tr><td><code>timelake_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
             <tr><td><code>timelake_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELAKE_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelake_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>

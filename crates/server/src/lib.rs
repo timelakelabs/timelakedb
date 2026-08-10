@@ -1173,6 +1173,8 @@ impl Engine {
              timelake_lines_written_total {}\n\
              # TYPE timelake_flushes_total counter\ntimelake_flushes_total {}\n\
              # TYPE timelake_parquet_files gauge\ntimelake_parquet_files {}\n\
+             # TYPE timelake_catalog_commit_conflicts_total counter\n\
+             timelake_catalog_commit_conflicts_total {}\n\
              # TYPE timelake_databases gauge\ntimelake_databases {}\n\
              # TYPE timelake_tables gauge\ntimelake_tables {}\n\
              # TYPE timelake_buffer_rows gauge\ntimelake_buffer_rows {}\n\
@@ -1191,6 +1193,7 @@ impl Engine {
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
+            self.catalog.commit_conflicts(),
             n_dbs,
             n_tables,
             n_rows,
