@@ -63,6 +63,124 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-10 19:45 — Stream the scan into the plan instead of materialising it   [REJECTED]
+
+**Hypothesis.** Every previous cycle attacked what the scan *costs*. This one
+attacked when it is *paid*. `LazyTable::scan` awaits the whole load and hands
+the finished batches to a `MemorySourceConfig`, so a warm query is load **plus**
+plan, strictly serial — and the 11:40 entry's own probe table proves it is
+exactly additive, five queries out of five:
+
+| Query (baseline, settled) | Load | Plan | Load+Plan | Whole, measured |
+|---|---|---|---|---|
+| B1_funnel_24h | 12.2 | 11.5 | 23.7 | **23.8** |
+| B2_funnel_48h | 18.5 | 25.1 | 43.6 | **43.6** |
+| B3_inflight_24h | 12.6 | 3.1 | 15.7 | **15.7** |
+| B4_hourly_throughput_48h | 17.2 | 5.3 | 22.5 | **22.5** |
+| B5_route_rollup_24h | 13.7 | 15.8 | 29.5 | **29.5** |
+
+Overlap them and the floor becomes `max(load, plan)` instead of the sum: best
+case B1 −49%, B2 −42%, B5 −46%, B3 −20%, B4 −24%. Realistically about half of
+that, because the final aggregate still cannot emit before the last batch
+lands. Predicted 15–25 ms off a ~137 ms suite; Shape A untouched, since it
+prunes to almost nothing. This is precisely the part of the standing
+streaming-exec lead that the 11:40 cycle left open when it closed scan
+parallelism: *"Overlapping decode with execution may still win by starting the
+plan earlier."* No probe was needed to put the cost on the critical path — the
+table above already does, and it is stronger than a percentage, because
+additivity means **none** of the load is hidden.
+
+**Change.** `crates/query/src/provider.rs`, one file. `scan` no longer awaits
+the load: it creates `target_partitions` `RecordBatchReceiverStreamBuilder`
+channels (depth 2), returns them as a `StreamingTableExec` over one
+`ScanPartition` each, and spawns the decode on its own thread. `load_pruned`
+became `stream_pruned` — same worker pool, same file cursor, same RR-2 deadline
+between files — but each decoded batch goes to an `emit` closure instead of a
+slot vector, and `load_one_file` yields per row group rather than returning a
+`Vec`. Everything that used to run *after* the load moved into `Prepare`,
+applied on the decode worker: SEC-2 `apply_restriction`, the `COUNT(*)`
+empty-batch rewrite, `align_to`. RR-1's reservation now measures what the scan
+actually holds (grow before handoff, shrink after) because the candidate set is
+never resident at once — the accounting bound became a structural one, queue
+depth × partitions. A failure is delivered as an `Err` down partition 0 once the
+workers stop, so a short stream can never be mistaken for a complete one.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network, 100
+Shape A samples. Two baselines and **three** candidates, all five clean (ingest
+733–780 K lines/s) and all five settled to **62 parquet files / 69 MB** (`du`,
+not the harness metric). A fourth candidate was **discarded unread** — see the
+lesson, it matters. Labels `perf-base1/2`, `perf-cand1/3/4`, warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 24, 25 | 26, 26, 25 |
+| B2_funnel_48h | 46, 43 | *50, 51, 52* |
+| B3_inflight_24h | 16, 15 | 14, 15, 15 |
+| B4_hourly_throughput_48h | 22, 20 | *26, 29, 27* |
+| B5_route_rollup_24h | 32, 31 | **27, 27, 27** |
+| **Shape B suite, warm total** | **140, 134 ms** | **143, 148, 146 ms** |
+| Shape A median | 3, 3 ms | 3, 3, 3 ms |
+| Ingest | 734K, 758K | 780K, 749K, 751K |
+
+Row counts match in both arms (10/10/10/475–476/40) and Shape A reports zero
+errors. 141 workspace tests pass, 0 failures — including
+`memory_pool_rejects_cleanly_never_kills_rr1`, which still returns a clean 400;
+`cargo fmt --all --check` clean; `clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Rejected — a 7% regression, and not a marginal one. The suite goes
+137 ms to 146 ms, and the per-query sets separate cleanly rather than smearing:
+B2 43–46 → 50–52 and B4 20–22 → 26–29, **no overlap**, three candidate repeats
+each; B5 31–32 → 27,27,27, no overlap the other way; B1 and B3 move about a
+millisecond. **The split is not the one the hypothesis predicted, and it is not
+about load/plan ratio at all.** B2 had the most to gain (18.5 ms of load hidden
+behind a 25.1 ms plan) and lost the most. What actually separates the two groups
+is the time window: **B2 and B4 are the 48-hour queries, and they are the only
+two that regress. Every 24-hour query is neutral or better.** Twice the hours is
+twice the files and twice the batches, so what this change added scales with
+**batch count**, not with query cost.
+
+**Lesson.**
+
+- **Overlap is real but small, and a per-batch handoff cost eats it.** B5 −4.5
+  ms and B3 −1 ms are the overlap showing up, on the two 24 h queries with the
+  least to hand over. Against that, each batch now crosses a bounded channel and
+  a task wakeup on its way to the plan, where before it was already sitting in a
+  `Vec` when the plan was built. At 24 h the two roughly cancel; at 48 h the
+  handoff wins outright. **The unit of the cost is the batch, and this engine's
+  batches are enormous** — `with_batch_size(1_048_576)` means one batch per row
+  group, so 24 partitions × depth 2 is a queue measured in hundreds of MB and a
+  worker blocks on a *specific* partition even when 23 others have room.
+- **Which names the retry, if there is one.** Do not retry this as written. The
+  two things to vary are the handoff granularity and the blocking discipline: a
+  single shared queue that any consumer can pull from (rather than round-robin
+  into 24 private ones, where one slow consumer stalls all eight decoders), and
+  a queue depth chosen against batch *bytes* rather than batch count. Both are
+  changes to the channel, not to the streaming idea — the streaming idea
+  measured as worth roughly 4 ms on the queries it can help.
+- **`max(load, plan)` is the wrong model for a plan that must see every row.**
+  The prediction assumed hiding the load behind the plan converts directly into
+  wall time. It does not: B1/B2/B5 end in a final aggregate that cannot emit its
+  first row until the last batch has arrived, so the load is not hidden *behind*
+  the plan, it is interleaved *with* it and both get slower per batch. The
+  additivity in the probe table is real, but additive does not imply separable.
+  **Three cycles have now assumed a scan-side saving converts into query time
+  (11:40, 13:45, 16:45, and now this one — four); none has.**
+- **The discard rule earned its keep again, and for a second reason.** `cand2`
+  ingested at **271 K lines/s** and was thrown away unread. It reported the
+  **fastest suite of the entire cycle — 127 ms**, better than either baseline;
+  read as data it would have turned this rejection into an adoption. It also
+  settled to **110 parquet files instead of 62**, because the slow ingest
+  changed what the flush tick produced. So there were two independent reasons to
+  refuse it, and the ingest number caught it first. **Check the settled file
+  count as well as the ingest rate before believing a pair** — `perf-cycle.sh`
+  prints both, and they failed together here.
+- **Cost of the cycle, honestly.** The change is ~340 lines against ~220, and it
+  moves SEC-2 enforcement and RR-1 accounting onto the decode workers. It was
+  reverted whole. Anything reaching for `StreamingTableExec` again should note
+  that the plumbing itself was not the problem: it built, all 141 tests passed
+  first time including the RR-1 hog, and the row counts never moved. The
+  measurement is the only thing that rejected it.
+
 ### 2026-08-10 16:45 — Override the decode for LOW-cardinality tags only   [REJECTED]
 
 **Hypothesis.** The previous entry closed by naming this cycle and calling it
