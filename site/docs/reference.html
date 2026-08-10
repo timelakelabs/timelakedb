@@ -432,9 +432,11 @@
           <strong>Want mode is not by itself an access control.</strong> An
           attacker declines to present a certificate and takes the anonymous
           path. Its value is that authenticated callers can be held to less.
-          Watch <code>timelake_tls_client_ca_anchors</code> and the
-          authenticated/anonymous split to know when a deployment has migrated
-          far enough to restrict the anonymous path.
+          Watch <code>timelake_flight_connections_authenticated_total</code>
+          against <code>timelake_flight_connections_anonymous_total</code> to
+          know when a deployment has migrated far enough to restrict the
+          anonymous path — that decision should rest on a measurement, not a
+          guess.
         </p>
       </div>
 
@@ -591,6 +593,8 @@
             <tr><td><code>timelake_tls_client_auth_mode</code></td><td>gauge</td><td>0 = client certificates not requested, 1 = requested but optional (want mode)</td></tr>
             <tr><td><code>timelake_tls_client_ca_anchors</code></td><td>gauge</td><td>Trust anchors in the client CA bundle — reads 2 during a dual-CA overlap, which is how you watch an old anchor leave</td></tr>
             <tr><td><code>timelake_tls_client_ca_last_reload_ok</code></td><td>gauge</td><td>1 if the last client-CA bundle reload validated, 0 if it was rejected and the last-good anchors are still serving</td></tr>
+            <tr><td><code>timelake_flight_connections_authenticated_total</code></td><td>counter</td><td>Flight SQL connections that presented a verified client certificate</td></tr>
+            <tr><td><code>timelake_flight_connections_anonymous_total</code></td><td>counter</td><td>Flight SQL connections that presented none. The ratio of these two is the measurement behind any decision to require certificates</td></tr>
             <tr><td><code>timelake_admin_default_credential_active</code></td><td>gauge</td><td>1 while the seeded <code>admin</code>/<code>admin</code> password is still in place (SEC-4)</td></tr>
             <tr><td><code>timelake_admin_logins_total</code></td><td>counter</td><td>Successful admin sign-ins since start</td></tr>
             <tr><td><code>timelake_admin_login_failures_total</code></td><td>counter</td><td>Rejected sign-in attempts since start</td></tr>

@@ -1,0 +1,25 @@
+# AT-6 read half under SEC-3 want mode. The whole point of this fixture
+# is what it does NOT configure: there is no client certificate here.
+# Grafana trusts the drill CA so it can verify the SERVER, and then the
+# server asks it for a certificate and it has none to give. It must
+# still connect and render — that is want mode's entire justification.
+#
+# uid stays "influxdb3" because the fixture dashboards reference it and
+# FR-8's bar is that they render unchanged beyond the datasource URL.
+apiVersion: 1
+
+datasources:
+  - name: TimeLakeDB-SQL
+    uid: influxdb3
+    type: influxdb
+    access: proxy
+    url: https://timelakedb-tls:1964
+    isDefault: true
+    jsonData:
+      version: SQL
+      dbName: poc
+      httpMode: POST
+      insecureGrpc: false
+      tlsAuthWithCACert: true
+    secureJsonData:
+      tlsCACert: $__file{/certs/ca.crt}

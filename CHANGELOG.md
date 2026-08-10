@@ -33,7 +33,20 @@ here.
   the fix for SECURITY.md exposure 7 is additive rather than a flag day.
 - Metrics: `timelake_tls_client_ca_anchors`,
   `timelake_tls_client_ca_last_reload_ok`,
-  `timelake_tls_client_auth_mode`.
+  `timelake_tls_client_auth_mode`, and the split that makes want mode
+  observable at all — `timelake_flight_connections_authenticated_total`
+  against `timelake_flight_connections_anonymous_total`. Without those
+  two, both paths return 200 and nothing tells an operator whether any
+  client presents a certificate yet, so the decision to *require* one
+  would have to be a guess.
+- **AT-6 re-drilled under want mode** and extended into a real gate
+  (`bench/results/at6-grafana-want-mode.log`, 11/11): the TLS compose
+  stack gained a `grafana` profile whose datasource deliberately
+  configures no client certificate, and all **58 panel queries** from
+  the four fixture dashboards execute and return data through Grafana's
+  own Flight SQL plugin while the server is asking every client for a
+  certificate. A certificate-bearing client connects in the same run and
+  is counted separately (1 authenticated vs 58 anonymous).
 - **AT-7 remains 19/19** with client auth enabled
   (`bench/results/sec3-mtls-want-mode.log`). The drill itself needed a
   fix — it called `/admin/tls/reload` anonymously and SEC-4 had put that

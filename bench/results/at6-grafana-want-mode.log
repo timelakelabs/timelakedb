@@ -1,0 +1,62 @@
+AT-6 under SEC-3 want mode — stock Grafana with NO client certificate
+2026-08-10 · timelakedb-tls + grafana/grafana:latest, client CA configured
+================================================================================
+
+THE QUESTION: does asking every client for a certificate break the
+clients that do not have one? For this project that is not academic —
+FR-8/FR-9 make stock Grafana and Telegraf first-class, and a required-
+mTLS server would fail every panel below.
+
+  python bench/compose/tls-drill/at6_grafana_mtls.py
+  11/11 checks passed
+
+WHAT WAS ACTUALLY DRIVEN
+  Grafana's OWN Flight SQL datasource, through /api/ds/query — not a
+  Python client imitating it. That is the same code path a rendering
+  browser takes, so a plugin-level TLS incompatibility could not hide.
+
+  datasource: https://timelakedb-tls:1964, insecureGrpc=false,
+              CA pinned, secureJsonFields = []  <- no client cert, none
+  server:     timelake_tls_client_auth_mode 1   <- asking for one anyway
+
+  ALL 58 PANEL QUERIES from the four fixture dashboards executed and
+  returned data. 58/58 non-empty. Zero failures.
+    host_metrics (fleet), host_detail (single host, $host bound),
+    pipeline_funnel (24 h funnel, DISTINCT product counts),
+    product_journey ($product_id bound)
+
+BOTH PATHS, SAME LISTENER, SAME RUN
+  A pyarrow Flight SQL client presenting client-tributary-node-1.crt
+  connected and got its rows back, in the same container run in which
+  Grafana connected with nothing. The server told them apart:
+
+    timelake_flight_connections_authenticated_total 1
+    timelake_flight_connections_anonymous_total     58
+
+  THOSE TWO COUNTERS ARE THE POINT, and they did not exist before this
+  drill was written. Want mode is otherwise invisible: both paths return
+  200, so nothing tells an operator whether anybody is presenting
+  certificates yet. Flipping a listener to require them without knowing
+  that ratio is how an outage happens. 58-to-1 says this deployment has
+  not migrated, and the drill asserts exactly that.
+
+  (The identity also appears in the log — "flight client authenticated
+  peer=... identity=tributary-node-1" — but that line is debug-level,
+  so asserting on it would measure RUST_LOG rather than behaviour. The
+  drill asserts on the counters instead.)
+
+AT-7 NON-REGRESSION: still 19/19 after the accept loop changed
+  Threading the counters through the accept loop touched the same
+  `unfold` that carries the TLS acceptor, so rotation was re-drilled:
+  both listeners rotate in lockstep, a 19.1 s in-flight Flight SQL query
+  completes across the swap with an exact result, 132 writes acked and
+  132 queryable, Telegraf over TLS clean, corrupt renewal rejected with
+  SEC3_CERT_RENEWAL_FAILED while the last-good pair keeps serving.
+
+RIG
+  bench/compose/timelakedb-tls.yml gained a `grafana` profile whose
+  datasource deliberately configures NO client certificate — if that
+  service ever needs one to work, want mode has regressed into required
+  mode and this drill fails.
+
+  docker compose -f compose/timelakedb-tls.yml --profile grafana up -d

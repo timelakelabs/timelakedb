@@ -33,6 +33,29 @@ services:
       retries: 12
     restart: unless-stopped
 
+  # AT-6 read half over TLS, deliberately WITHOUT a client certificate:
+  # the server requests one, Grafana has none, and the dashboards must
+  # render anyway. If this service ever needs a cert to work, want mode
+  # has regressed into required mode.
+  #   docker compose -f compose/timelakedb-tls.yml --profile grafana up -d
+  grafana:
+    image: grafana/grafana:latest
+    container_name: timelake-grafana-tls
+    profiles: ["grafana"]
+    ports:
+      - "3004:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana-datasource-tls:/etc/grafana/provisioning/datasources:ro
+      - ../../fixtures/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../../fixtures/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./tls-drill/certs:/certs:ro
+    restart: unless-stopped
+    depends_on:
+      - timelakedb-tls
+
   telegraf:
     image: telegraf:latest
     container_name: timelake-telegraf-tls
