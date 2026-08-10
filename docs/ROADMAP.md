@@ -97,8 +97,8 @@ cold storage. **Do not give this up casually** — it is the positioning.
 
 | | v1 | v2 | v3 Core | QuestDB | VM | T |
 |---|---|---|---|---|---|---|
-| Data-plane authn | basic | tokens | tokens | ✓ | ✗ (vmauth) | **WIP** (P0-3) |
-| RBAC / scopes | ◐ | ✓ | Ent. | Ent. | Ent. | WIP scopes + db scoping |
+| Data-plane authn | basic | tokens | tokens | ✓ | ✗ (vmauth) | **✓ tokens (SEC-4 phased)** |
+| RBAC / scopes | ◐ | ✓ | Ent. | Ent. | Ent. | ✓ scopes + db scoping |
 | **Row-level visibility** | ✗ | ✗ | ✗ | ✗ | ✗ | **✓ SEC-2** |
 | **Encryption at rest, OSS** | ✗ | ✗ | ✗ | ✗ | ✗ | **✓ SEC-1** |
 | TLS hot rotation | ✗ | ✗ | ◐ | ✗ | ✗ | ✓ AT-7 drilled |
@@ -171,7 +171,7 @@ P0 is unchanged from `PRODUCTION_READINESS.md` — nothing competitive
 outranks "do not deploy this yet":
 
 > **P0-1** push + CI on a real runner · **P0-2** `/api/sql` sandbox +
-> non-root container · **P0-3** data-plane tokens (in progress,
+> non-root container ✓ (done 2026-08-10) · **P0-3** data-plane tokens (in progress,
 > mechanism fixed by the client probe) · **P0-4** catalog CAS ·
 > **P0-5** Tributary presents the token
 

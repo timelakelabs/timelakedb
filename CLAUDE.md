@@ -84,9 +84,10 @@ This project is inspired by the following projects.
 - Reference docs: `site/docs/reference.html` (line protocol, SQL dialect,
   HTTP + Flight SQL surface, InfluxDB compatibility matrix, metrics,
   glossary) — verified against a running server, keep it true.
-  Known gaps it records: `CREATE`/`DROP TABLE` return `[]` but do
-  nothing (fresh session per query); no prepared statements or DoPut
-  over Flight. Schema discovery works both ways now —
+  Known gaps it records: no prepared statements or DoPut over Flight.
+  (`CREATE`/`DROP TABLE` no longer silently return `[]` — the read-only
+  SQL guard (P0-2) refuses all DDL/DML/COPY explicitly.) Schema
+  discovery works both ways now —
   `with_information_schema(true)` plus a default catalog named after the
   db (so `poc.public.t` resolves and planner errors say `poc.public.…`),
   and Flight SQL answers GetCatalogs/GetDbSchemas/GetTables/
@@ -102,11 +103,13 @@ This project is inspired by the following projects.
   host bind mount; `--recreate` for the destroyed-volume case; drops
   `*.tmp-write` on restore). **Auth: `/admin/*` sessions (SEC-4) + data
   plane by token (SEC-4 phased, default off) — see the status entry
-  below.** SECURITY.md states the full posture, including that
-  `/api/sql` can still `COPY … TO` files as the (root) server process
-  regardless of auth (P0-2, the one that a read token must NOT become a
-  filesystem primitive for). Known engine hardening: manifest replay
-  should skip non-`.json` files.
+  below.** SECURITY.md states the full posture. **P0-2 CLOSED**:
+  `/api/sql` + Flight are read-only (plan-level guard
+  `crates/query/src/sql_guard.rs`, drill
+  `bench/results/sql-sandbox-drill.log`) and the container is non-root
+  under a read-only rootfs — the COPY-writes-a-file-as-root exposure is
+  shut twice over. Known engine hardening: manifest replay should skip
+  non-`.json` files.
 - **RENAMED TimelordDB → TimeLakeDB** (2026-08-09). Crates `timelake-*`,
   env `TIMELAKE_*`, metrics `timelake_*`, headers
   `X-TimeLake-Authorizations` / `x-timelake-csrf`, data dir
@@ -119,7 +122,26 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **SEC-4 phased data-plane auth SHIPPED** (2026-08-10, drill
+- Status: **P0-2 SHIPPED — /api/sql read-only + non-root container**
+  (2026-08-10, drill `bench/results/sql-sandbox-drill.log`). The
+  COPY-writes-a-file-as-root exposure (SECURITY.md ex. 2+4, verified: one
+  request wrote /tmp/pwned.parquet owned by root) is shut TWICE:
+  (1) `crates/query/src/sql_guard.rs` `ensure_read_only(&LogicalPlan)`
+  classifies the built plan before execution — SELECT/SHOW/DESCRIBE/
+  EXPLAIN pass, COPY/DDL/DML/Statement refused, walks INTO Explain/Analyze
+  (inputs() treats them as leaves) so COPY can't hide in EXPLAIN ANALYZE.
+  Deny-by-default: exhaustive match on every LogicalPlan variant, NO
+  wildcard, so a new DataFusion node breaks the build. Both surfaces route
+  through `run_sql_env` which builds plan → guard → `execute_logical_plan`
+  (one parse). (2) Dockerfile `USER timelake` uid 1000 + compose
+  `read_only: true` + `tmpfs /tmp` + data volume the only writable mount.
+  Incidental: CREATE/DROP TABLE now REFUSED explicitly (were silent `[]`).
+  **UPGRADE GOTCHA**: non-root uid can't open a root-owned data volume from
+  the old image → panic "open engine (recovery): Permission denied"; chown
+  volume to 1000:1000 or use fresh. 121 tests (+4 sql_guard), clippy/fmt
+  clean. NEXT P0: P0-4 catalog CAS (put_if_absent exists, catalog still
+  plain put), P0-5 Tributary presents token. Roadmap `docs/ROADMAP.md`.
+- Previous: **SEC-4 phased data-plane auth SHIPPED** (2026-08-10, drill
   `bench/results/data-auth-drill.log`). `TIMELAKE_DATA_AUTH=off|optional|
   required` (default off = header not read, today's compat contract).
   Token = 256-bit OS-CSPRNG secret, prefix `tldb_`, stored only as

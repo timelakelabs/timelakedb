@@ -13,6 +13,34 @@ here.
 
 ## [Unreleased]
 
+### Fixed — P0-2: the data-plane SQL surface is read-only, container non-root (2026-08-10)
+
+- **`POST /api/sql` and Flight SQL can no longer write files.** DataFusion's
+  `COPY … TO '<path>'` wrote a Parquet file as the server process — verified
+  against the pre-fix image, a root-owned file outside the data directory
+  from one unauthenticated request. The surface is now read-only, enforced
+  on the **logical plan** (not the query text, which a comment or
+  `EXPLAIN ANALYZE` would defeat): `SELECT`/`SHOW`/`DESCRIBE`/`EXPLAIN` run,
+  `COPY`/DDL/DML/session statements are refused, and the walk reaches inside
+  `EXPLAIN ANALYZE` so a nested `COPY` cannot hide. Deny-by-default — the
+  classifier matches every `LogicalPlan` variant with no wildcard, so a
+  future DataFusion node fails the build rather than slipping through. HTTP
+  and Flight SQL share the one enforcement point.
+- **The container runs non-root under a read-only root filesystem.**
+  `USER timelake` (uid 1000) in the image; the shipped compose sets
+  `read_only: true` with a `tmpfs /tmp` and the data volume as the only
+  writable mount. Defence in depth behind the SQL guard.
+- Incidental fix: `CREATE`/`DROP TABLE` used to parse and return `[]` while
+  doing nothing; they are now refused explicitly, which the roadmap called
+  the correct outcome over silently succeeding at nothing.
+- Drill: `bench/results/sql-sandbox-drill.log` (the exposure reproduced,
+  then closed on both surfaces, nothing written, process non-root, rootfs
+  read-only, reads untouched). +4 tests.
+- **Upgrade note:** switching to uid 1000 means a data volume created under
+  the old root image is root-owned and unwritable; the node exits with
+  `open engine (recovery): Permission denied`. Chown the volume to
+  `1000:1000` once, or start on a fresh volume.
+
 ### Added — SEC-4 phased: data-plane token authentication (2026-08-10)
 
 - `TIMELAKE_DATA_AUTH=off|optional|required` turns on token

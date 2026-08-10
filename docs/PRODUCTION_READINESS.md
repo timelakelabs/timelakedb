@@ -76,7 +76,9 @@ because it changes the epistemic status of everything else.
   stops being a coverage hole.
 - Tag `v0.1.0-alpha` so there is a fixed point to talk about.
 
-### P0-2 · `/api/sql` writes files as root  ⟂ the single worst issue in either product
+### P0-2 · `/api/sql` writes files as root  ⟂ **DONE (2026-08-10)**
+
+**Effort: M. Shipped** — read-only SQL guard at the plan + non-root, read-only-rootfs container; drill `bench/results/sql-sandbox-drill.log`. The original text is kept below for the record.
 
 **Effort: M.** SECURITY.md exposures 2 and 4 **compound into remote code
 execution territory**, and this is verified, not theoretical: a single
