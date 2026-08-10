@@ -1,0 +1,59 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelakedb-perf-cand1-load-20260810-162812",
+  "backend": "timelakedb",
+  "backend_display": "TimeLakeDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:1963",
+    "db": "poc",
+    "container": null,
+    "image": null
+  },
+  "started_at": "2026-08-10T16:28:12+0000",
+  "finished_at": "2026-08-10T16:28:18+0000",
+  "config": {
+    "scale": "laptop",
+    "label": "perf-cand1-load",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 100,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts"
+    ]
+  },
+  "environment": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": null
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 4.7,
+      "lines_per_s": 775749,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 33,
+      "batch_p95_ms": 52,
+      "batch_max_ms": 98
+    },
+    "host_ingest": {
+      "lines": 864000,
+      "wall_s": 1.4,
+      "lines_per_s": 602214,
+      "errors": 0
+    }
+  },
+  "notes": []
+}
