@@ -63,6 +63,114 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-10 16:45 — Override the decode for LOW-cardinality tags only   [REJECTED]
+
+**Hypothesis.** The previous entry closed by naming this cycle and calling it
+"the highest-value thing on this list". Its blanket reader-override made the
+scan 41% cheaper per string column and the suite total moved 130 → 131 ms,
+because the split was exactly `product_id`: B3/B4 never read it and kept a
+3.5 ms win, while B1/B2/B5 read it and gave the win back with interest. The
+stated fix: **force the reader override for low-cardinality columns and keep
+the post-decode cast for high-cardinality ones.** The discriminator needs no
+new `FileMeta` field — the write path emits a bloom filter only above
+`BLOOM_MIN_DISTINCT` (1024) distinct values, so "has a bloom" already means
+"high cardinality" and it sits in the footer this code has open. Predicted:
+B3/B4 hold their 3.5 ms, B1/B2/B5 return to baseline, ~7 ms off a 130 ms suite.
+
+**Change.** `crates/query/src/provider.rs`, one file.
+`view_override_schema(schema, md)` rewrites a `Dictionary<_, Utf8>` field to
+`Utf8View` **only when no row group carries a bloom filter for that column**,
+and returns `None` when the file has nothing to gain. `load_one_file` applies
+it through `ArrowReaderOptions::with_schema`, falling back to the file's own
+schema if the reader refuses the override — a rejected override costs speed,
+never correctness, because `to_view_batch` still converts whatever is left.
+`MetaCache` now holds `ArrowReaderMetadata` instead of the raw footer, so the
+decision (a property of the file, not of the query) is made once per file and
+the per-file-per-query `try_new` disappears. The row filter gained a
+`Utf8View` arm: `event` is low-cardinality, so a predicate on it now meets a
+view column and arrow's comparison kernels reject a mismatched scalar.
+
+**Measurement.** Three paired runs on the isolated instance, harness
+in-network, 100 Shape A samples. All six clean (ingest 756–776 K lines/s) and
+all six settled to **62 parquet files / 69 MB** (`du`, not the harness
+metric). Labels `perf-base1/2/3`, `perf-cand1/2/3`, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 26/23, 25/24, 45/25 | 31/23, 28/24, 26/25 |
+| B2_funnel_48h | 42/41, 48/47, 42/41 | 43/41, 52/49, 47/45 |
+| B3_inflight_24h | 14/15, 15/14, 22/14 | **15/12, 12/11, 12/11** |
+| B4_hourly_throughput_48h | 20/19, 19/19, 20/19 | **18/16, 16/17, 15/15** |
+| B5_route_rollup_24h | 28/29, 28/29, 33/29 | *33/32, 34/33, 31/31* |
+| **Shape B suite, warm total** | **127, 133, 128 ms** | **124, 134, 127 ms** |
+| Shape A median | 3, 4, 3 ms | 3, 3, 3 ms |
+| Ingest | 756K, 774K, 763K | 776K, 757K, 770K |
+
+Row counts match in both arms (10/10/10/476/40) and Shape A reports zero
+errors. 137 workspace tests pass, 0 failures (135 + two new); `cargo fmt --all
+--check` clean; `clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Rejected. **Half the prediction came true exactly** — B1 goes
+23,24,25 → 23,24,25, the +4 ms the blanket override cost it is completely
+gone, and B3 (15,14,14 → 12,11,11) and B4 (19,19,19 → 16,17,15) keep the full
+win with no overlap. But B5 goes 29,29,29 → 32,33,31, also with no overlap,
+and it is **the same regression, the same size, as when `product_id` WAS
+being overridden**. Two queries win ~3 ms, one loses ~3 ms, B2 leans ~2 ms
+worse inside its own spread: 129.3 ms of suite against 128.3. A second
+mechanism that does what it says and arrives at the client as zero.
+
+**Where B5's cost actually is, measured** (`bench/probe-shapeb.py`, new — each
+query hammered alone, n=21, median ms, the same settled data in both arms):
+
+| Isolated query | Baseline | Candidate |
+|---|---|---|
+| `GROUP BY step` — one string key | 10.9 | 11.4 |
+| `GROUP BY route` — one string key | 11.1 | 11.6 |
+| **`GROUP BY route, step` — two string keys** | **13.4** | **14.8** |
+| B5a: two keys + `ORDER BY` | 13.1 | 15.4 |
+| B5b: two keys + `AVG(duration_s)` | 14.1 | 15.9 |
+| B3 | 14.7 | **11.5** |
+| B4 | 20.7 | **15.7** |
+
+**Lesson.**
+
+- **The bloom filter works as a cardinality marker, and that part is
+  keepable.** No new catalog field, no write-path change, decided once per
+  file and cached with the footer; B1's regression disappeared exactly as
+  predicted. The 13:45 diagnosis of *B1* was right to the millisecond.
+- **It was also incomplete, and the missing half is not about cardinality at
+  all.** B5's regression survives with `product_id` back on the cast path,
+  unchanged in size. The table above locates it: one reader-built view group
+  key costs +0.5 ms (noise), two cost +1.4–2.3 ms, consistently, whichever two.
+  **The cost tracks the NUMBER of view group keys built by the parquet
+  reader, not the cardinality of any one column.** B1 and B4 group by one key
+  and win; B5 groups by two and loses. That is the entire split, and it was
+  invisible while `product_id` was confounding it.
+- **This lead is now closed, both halves tried, same ledger each time.**
+  Blanket override: net zero. Cardinality-selective override: net zero, with
+  the winners and losers reshuffled. The only discriminator left is how many
+  string group keys the *query* uses, which the provider cannot see — a
+  planner-level decision, not a file-level one. **Do not spend a fourth cycle
+  on how a `Utf8View` tag column is constructed.**
+- **Isolating a regressed scenario is necessary and was not sufficient.** The
+  standing rule says re-run a regression alone before believing it. Done here,
+  B5 alone reads 31.1–31.3 → 31.7–31.8 — a wash — because full B5 is dominated
+  by `COUNT(DISTINCT product_id)` whose variance (p95 36–41 ms) swallows a
+  2 ms move. The harness, running B5 in suite order, saw the regression
+  cleanly; the isolated median hid it. What exposed the mechanism was
+  *decomposing* B5 into its halves. **Isolate AND decompose — an isolated
+  aggregate can be the less sensitive instrument, not the more.**
+- **`MetaCache` holding `ArrowReaderMetadata` is still worth keeping**, and
+  this is the second cycle to offer it up with a rejected change around it. It
+  is ~6 lines, removes a `try_new` per file per query, and is orthogonal to
+  every decision above.
+- **Rig.** `sh bench/probe-innet.sh tldb-perf probe-shapeb.py 21` — about
+  90 s — prints every Shape B query hammered alone with median/min/p95, plus
+  the B5 half-queries and the one-key/two-key group probes above. It is the
+  tool the "re-run a regressed scenario in isolation" rule has always required
+  and never had; the harness's single cold/warm pair cannot separate 3 ms from
+  noise.
+
 ### 2026-08-10 13:45 — Decode tags straight to `Utf8View`, no cast   [REJECTED]
 
 **Hypothesis.** The 07:45 entry adopted `Utf8View` tags but delivered them by
