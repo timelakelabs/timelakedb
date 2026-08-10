@@ -284,12 +284,85 @@ fn ts_literal(e: &Expr) -> Option<i64> {
 fn str_literal(e: &Expr) -> Option<String> {
     match e {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.clone()),
+        // A predicate against a view column coerces its literal to
+        // Utf8View. Missing this arm does not fail — it silently stops
+        // extracting tag equality, which turns off file pruning and the
+        // bloom filters, i.e. it costs Shape A everything it has.
+        Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(s.clone()),
         Expr::Literal(ScalarValue::Dictionary(_, inner), _) => match inner.as_ref() {
             ScalarValue::Utf8(Some(s)) => Some(s.clone()),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// The schema this provider PRESENTS: dictionary-encoded string columns
+/// become `Utf8View`. Storage, the WAL and the write buffer are untouched,
+/// so FR-2's column economics are unchanged — this is the planner's view
+/// of the table, not the file's.
+///
+/// Why: DataFusion's column-wise group-values path covers `Utf8`,
+/// `Utf8View`, `BinaryView` and the primitives, and NOT `Dictionary`, so
+/// every tag GROUP BY falls into the row-format fallback that materialises
+/// a string per row per key. On this workload that single operator is ~85%
+/// of B2's plan compute (docs/evidence/PERFORMANCE_LOG.md).
+pub fn view_schema(schema: &datafusion::arrow::datatypes::Schema) -> SchemaRef {
+    use datafusion::arrow::datatypes::{DataType, Schema};
+    if !schema.fields().iter().any(|f| is_dict_utf8(f.data_type())) {
+        return Arc::new(schema.clone());
+    }
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if is_dict_utf8(f.data_type()) {
+                Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn is_dict_utf8(t: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(t, DataType::Dictionary(_, v) if **v == DataType::Utf8)
+}
+
+/// Convert one decoded batch's dictionary columns to `Utf8View`.
+///
+/// Called on whichever worker thread decoded the batch, which is the whole
+/// point: arrow builds the views over the dictionary's existing value
+/// buffer and copies no string, so the conversion is cheap — but doing it
+/// on ONE thread after the parallel load has finished is what sank the
+/// first attempt at this idea. It measured as ~50 ms of a 53 ms query,
+/// outside the execution plan entirely.
+fn to_view_batch(b: RecordBatch) -> Result<RecordBatch, String> {
+    use datafusion::arrow::compute::cast;
+    if !b
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| is_dict_utf8(f.data_type()))
+    {
+        return Ok(b);
+    }
+    let schema = view_schema(b.schema_ref());
+    let cols = b
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(c, f)| {
+            if c.data_type() == f.data_type() {
+                Ok(c.clone())
+            } else {
+                cast(c, f.data_type()).map_err(|e| e.to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    RecordBatch::try_new(schema, cols).map_err(|e| e.to_string())
 }
 
 /// Engine-lifetime cache of parquet footers, keyed by object path.
@@ -349,7 +422,7 @@ impl LazyTable {
     ) -> Self {
         LazyTable {
             name,
-            schema,
+            schema: view_schema(&schema),
             buffer,
             files,
             store,
@@ -572,7 +645,9 @@ fn load_one_file(
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for b in reader {
-        let b = b.map_err(|e| e.to_string())?;
+        // Dictionary -> Utf8View HERE, on the decoding worker, so the
+        // conversion is as wide as the load is (see `to_view_batch`).
+        let b = to_view_batch(b.map_err(|e| e.to_string())?)?;
         // RR-1 still guards every batch, on whichever thread produced it:
         // the reservation is what rejects an oversized candidate set
         // BEFORE memory blows up, so it must stay inside the decode loop
@@ -1302,6 +1377,96 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(n, 160, "every batch survives the packing");
+    }
+
+    /// The presented schema is what decides which group-values path
+    /// DataFusion picks, so pin it: tags arrive as views, measurements and
+    /// timestamps are untouched, and a scan's batches actually match.
+    #[tokio::test]
+    async fn tags_are_presented_as_views_for_the_group_by_fast_path() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::prelude::SessionContext;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
+
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..500)
+            .map(|i| format!("m,pid=p{:03},step=s{} v=1.0 {}\n", i, i % 3, t + i as i64))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let snapshot = buf.snapshot().unwrap();
+        // the stored schema is still dictionary-encoded — FR-2 is a
+        // property of the file, not of what the planner is shown
+        assert!(
+            snapshot
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _))),
+        );
+        let parts = flush::prepare(&snapshot).unwrap();
+        let bytes = flush::to_parquet_bytes(&parts[0].1).unwrap();
+        let file_len = bytes.len() as u64;
+        let path = "poc/m/data/2026080809/f.parquet";
+        let store: Arc<dyn Store> = CountingStore::with(path, bytes);
+        let meta = FileMeta {
+            db: "poc".into(),
+            table: "m".into(),
+            partition: "2026080809".into(),
+            path: path.into(),
+            rows: 500,
+            size_bytes: file_len,
+            min_ts_ns: t,
+            max_ts_ns: t + 500,
+        };
+
+        // a BUFFER batch as well as a file: both must reach the plan as
+        // views, by different routes (worker-thread conversion vs align_to)
+        let table = LazyTable::new(
+            "m".into(),
+            snapshot.schema(),
+            vec![snapshot.clone()],
+            vec![meta],
+            store,
+            std::time::Duration::from_secs(60),
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            Arc::new(MetaCache::default()),
+            crate::QuerySession::default(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        for f in table.schema().fields() {
+            let expected = match f.name().as_str() {
+                "pid" | "step" => DataType::Utf8View,
+                "v" => DataType::Float64,
+                _ => f.data_type().clone(),
+            };
+            assert_eq!(f.data_type(), &expected, "field {}", f.name());
+        }
+
+        let ctx = SessionContext::new();
+        ctx.register_table("m", Arc::new(table)).unwrap();
+        // the shape that matters: GROUP BY over two tag columns, with the
+        // tag-equality pruning path exercised by the WHERE clause
+        let batches = ctx
+            .sql("SELECT step, COUNT(DISTINCT pid) AS n FROM m WHERE pid = 'p001' GROUP BY step")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "pruning must not lose the row it is looking for");
+        let n = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1);
     }
 
     #[test]

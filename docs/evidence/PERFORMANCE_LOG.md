@@ -61,6 +61,131 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-10 07:45 — Present tags as `Utf8View`, converted in the DECODE   [ADOPTED]
+
+**Hypothesis.** The last cycle closed with an explicit retry instruction: the
+`Utf8View` win is real, the delivery was wrong, and "the conversion must happen
+inside the decode, not after it." So this cycle changes only *where* the
+conversion happens, and predicts B1/B2 fall 30–45% while B3/B4/B5 — which the
+first attempt made 2–5× slower — return to baseline.
+
+**Proved on the critical path first** (`bench/probe-spill.py`, `EXPLAIN ANALYZE`
+against the settled `perf-base1` instance, compute summed over 24 partitions).
+This re-check mattered, because the previous cycle removed the spilling that had
+been confounding the number:
+
+| Operator | B1 | B2 | B3 |
+|---|---|---|---|
+| `AggregateExec: FinalPartitioned, gby=[step, alias1]` | **167.5 ms** | **483.9 ms** | *absent* |
+| ... its peak memory | 221.6 M | 403.3 M | — |
+| ... its spills | 0 | 0 | — |
+| everything else in the plan | 76 ms | 88 ms | 46 ms |
+| whole query, wall | 49–55 ms | 86–93 ms | 11 ms |
+
+One operator is **85% of B2's plan compute and 69% of B1's**, no longer spilling,
+so what is left is purely the group-key encoding: 1.83 M groups keyed by two
+`Dictionary<Int32, Utf8>` columns, which DataFusion's column-wise
+`GroupValuesColumn` does not accept, so it falls to the row-format fallback that
+materialises a string per row per key. B3 has no such operator and never reads
+`product_id` at all — it is the control.
+
+**Change.** `crates/query`, two files, no format or write-path change:
+
+- `provider.rs::view_schema` rewrites every `Dictionary<_, Utf8>` field to
+  `Utf8View` in the schema `LazyTable` *presents*, applied in `LazyTable::new`.
+  Storage, the WAL and the write buffer are untouched — FR-2 is a property of
+  the file, not of the type the planner is shown.
+- `provider.rs::to_view_batch` does the conversion **inside `load_one_file`, on
+  the worker thread that decoded the batch.** That is the whole change relative
+  to the rejected attempt.
+- `lib.rs::align_to` casts on type mismatch, which now covers only the *write
+  buffer* snapshot — file batches arrive already converted.
+- `str_literal` learned `ScalarValue::Utf8View`; without it a predicate against
+  a view column silently stops yielding tag equality and Shape A loses file
+  pruning and its bloom filters.
+- `apply_restriction` gained a `Utf8View` arm (SEC-2 fails closed, so a labelled
+  table would have errored, not leaked — pinned by the existing COUNT(\*) test).
+
+**Measurement.** Paired runs on the isolated instance, harness in-network, 100
+Shape A samples. All four kept runs settled to **62 parquet files / 69 MB**
+(`du`, not the harness metric). A `perf-base2` run ingested at **246 K lines/s**
+and was **discarded unread** under the ≥500 K rule; the four kept runs ingested
+760–783 K. Labels `perf-base1`/`perf-base3`, `perf-cand1`/`perf-cand2`,
+cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 58/51, 65/48 | **28/24, 27/23** |
+| B2_funnel_48h | 87/91, 103/92 | **44/42, 43/41** |
+| B3_inflight_24h | 11/11, 12/11 | *15/15, 16/15* |
+| B4_hourly_throughput_48h | 16/16, 16/17 | *20/19, 19/19* |
+| B5_route_rollup_24h | 25/24, 25/25 | *30/28, 31/29* |
+| Shape A median | 3, 4 ms | 3, 3 ms |
+| Ingest | 783K, 760K | 776K, 761K |
+| Settled objects | 62 files / 69 MB | 62 files / 69 MB |
+
+Row counts match the baseline in both arms (10/10/10/475–477/40) and Shape A
+reports zero errors. 117 workspace tests pass, 0 failures; `cargo fmt --all
+--check` clean; `clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Adopted, and the regression is real and stated rather than buried.
+B1 warm goes 48–51 → 23–24 and B2 warm 91–92 → 41–42 — **2.1× and 2.2×**, no
+overlap, repeats within 1 ms. B3, B4 and B5 each lose 3–4 ms (**+18% to +36%**),
+equally consistently. The arithmetic is what decides it: across one warm pass of
+the suite the candidate spends **11 ms more on three queries to save 76 ms on
+two**, 190–193 ms → 128–129 ms, about **a third off the whole Shape B suite**.
+The rejected attempt had exactly the opposite balance — +100 ms against −35 ms —
+which is why it was rejected and this is not.
+
+`EXPLAIN ANALYZE` on the candidate confirms the mechanism instead of inferring
+it: B2's final aggregate goes **483.9 → 259.5 ms** of compute and **403.3 →
+294.1 MB** of peak memory, B1's **167.5 → 103.4 ms** and 221.6 → 149.4 MB.
+
+**Lesson.**
+
+- **The group-key change makes the aggregate cheaper *and* lighter.** Every
+  prediction in this log assumed views trade memory for speed — 16 bytes a row
+  against a 4-byte dictionary key. At the operator that matters it is not a
+  trade at all: peak fell 27% alongside the compute, because `GroupValuesRows`
+  was storing whole key strings per group where the column path stores views
+  into one buffer. The row format was costing memory, not saving it.
+- **The 3–4 ms that B3/B4/B5 now lose is located, and it is not in the plan.**
+  B3's own aggregate got *faster* (43.0 → 37.2 ms of compute, peak 10.95 →
+  3.20 MB) while its wall time went 11 → 15 ms. So the residue is scan-side:
+  `to_view_batch` building ~16 bytes a row of views for columns nobody groups
+  by. `step` and `event` have ten distinct values and gain nothing from a view.
+  **That is the remaining cycle, and it is now worth much less than it looked —
+  4 ms a query, not 50.** The enabling ingredient is unchanged: a per-column
+  distinct count in `FileMeta`, written from the count `to_parquet_bytes_rg`
+  already computes for bloom sizing, so only entity-like columns convert.
+  Note the catch that makes it fiddly rather than obvious: `GroupValuesColumn`
+  needs **every** key column supported, so converting `product_id` alone would
+  put B1/B2 straight back on the row format — `step` has to come with it.
+- **The rejected cycle's diagnosis was right to the millisecond.** It attributed
+  ~50 ms of B3's 53 ms to a serial `align_to` pass and predicted the plan itself
+  was fine. Moving the identical conversion onto the decode workers took B3 from
+  53 ms to 15 ms. A rejection that names *where* the cost lives is worth more
+  than the change it rejects, and this is the second time this log has cashed
+  one in.
+- **Discard rules only work if you check the number.** `perf-base2`'s query
+  figures were indistinguishable from `perf-base1`'s and would have passed
+  unnoticed; its ingest was 246 K. It was thrown away on the rule, not on the
+  numbers, which is the only way the rule means anything.
+- **Open risk, and it is a compatibility one, not a performance one.** Query
+  results now carry `Utf8View` columns, and Flight SQL hands those to Grafana
+  (FR-9/AT-6) as Arrow StringView, which older Arrow clients cannot decode. B1
+  was run against this build over Flight SQL from an ADBC client in-network and
+  came back correct — `rows=10, schema=[string_view, int64]`, so the server
+  encodes it and a current client reads it. **Stock Grafana was not drilled,
+  because the running Grafana is the user's and off limits to this cycle.**
+  Drill AT-6 against `fixtures/grafana/` before this reaches a release. If it
+  breaks, the fix is a cast at the result boundary, not a revert — the win is
+  below that seam.
+- **Rig.** `ops/perf-test.sh` runs `cargo` against a named target volume, so the
+  second `cargo test`/`clippy` of a cycle is incremental (seconds, not ~10 min)
+  the way `ops/perf-build.sh` already does for the release build.
+  `ops/wait-image.sh` blocks on a background build finishing.
+
 ### 2026-08-10 01:40 — Stop `FairSpillPool` dividing the pool 145 ways   [ADOPTED]
 
 **Hypothesis.** The last cycle left an unclaimed lead: "Baseline B2's inner

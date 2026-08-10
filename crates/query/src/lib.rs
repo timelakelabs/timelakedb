@@ -171,18 +171,27 @@ pub fn schema_union(
 }
 
 /// Align batches to a FIXED target schema (missing columns become null).
+///
+/// A column whose type differs from the target is cast. That is the WRITE
+/// BUFFER's path: file batches are converted to the presented types on the
+/// scan's worker threads, but a buffer snapshot is still dictionary-encoded
+/// when it gets here. Keep it that way round — a conversion done here is
+/// serial, after the parallel load, and a previous cycle measured exactly
+/// that as ~50 ms of a 53 ms query.
 pub fn align_to(
     schema: Arc<datafusion::arrow::datatypes::Schema>,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, String> {
     use datafusion::arrow::array::new_null_array;
+    use datafusion::arrow::compute::cast;
     let mut aligned = Vec::with_capacity(batches.len());
     for b in batches {
         let cols = schema
             .fields()
             .iter()
             .map(|f| match b.column_by_name(f.name()) {
-                Some(c) => Ok(c.clone()),
+                Some(c) if c.data_type() == f.data_type() => Ok(c.clone()),
+                Some(c) => cast(c, f.data_type()).map_err(|e| e.to_string()),
                 None => Ok(new_null_array(f.data_type(), b.num_rows())),
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -275,7 +284,7 @@ pub fn mandatory_predicate(
 /// session's authorizations do not satisfy — or one that does not parse —
 /// drops its row here, before DataFusion ever sees it.
 pub fn apply_restriction(r: &Restriction, batch: &RecordBatch) -> Result<RecordBatch, String> {
-    use datafusion::arrow::array::{BooleanArray, DictionaryArray, StringArray};
+    use datafusion::arrow::array::{BooleanArray, DictionaryArray, StringArray, StringViewArray};
     use datafusion::arrow::compute::filter_record_batch;
     use datafusion::arrow::datatypes::Int32Type;
 
@@ -323,6 +332,29 @@ pub fn apply_restriction(r: &Restriction, batch: &RecordBatch) -> Result<RecordB
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("checked utf8");
+            let mut memo: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        true
+                    } else {
+                        let s = arr.value(i);
+                        *memo
+                            .entry(s)
+                            .or_insert_with(|| visibility::is_visible(s, &auths))
+                    }
+                })
+                .collect()
+        }
+        // The provider presents tag columns as views, so this is the shape
+        // a label arrives in from a scan. SEC-2 fails CLOSED: without this
+        // arm a labelled table would error rather than leak, but it would
+        // still be broken, so it is pinned by a test.
+        DataType::Utf8View => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("checked utf8view");
             let mut memo: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
             (0..arr.len())
                 .map(|i| {
