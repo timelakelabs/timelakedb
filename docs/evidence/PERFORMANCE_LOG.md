@@ -63,6 +63,136 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-10 13:45 — Decode tags straight to `Utf8View`, no cast   [REJECTED]
+
+**Hypothesis.** The 07:45 entry adopted `Utf8View` tags but delivered them by
+*casting* a decoded `DictionaryArray` on the worker thread, and explicitly
+recorded the other candidate as untried: hand the parquet reader an overridden
+arrow schema (`ArrowReaderOptions::with_schema`) so a BYTE_ARRAY column decodes
+straight to `Utf8View` and the keys array, the intermediate dictionary array and
+the second pass over every value never exist. Predicted 30–50% off the
+per-column decode cost, ~4 ms a query, and — unlike every previous `Utf8View`
+attempt — a win on *all five* Shape B queries, because it removes work rather
+than moving it.
+
+**Two probes ran before any code was written, and the first killed a different
+idea outright.** The 11:40 cycle left "memory bandwidth or allocator contention"
+as the explanation for a load that burns 2.4× the CPU for the same wall time.
+`bench/probe-alloc.sh` (new) samples the server's `/proc/1/stat` either side of
+a hammered load proxy:
+
+| B2 load proxy, n=200, settled `perf-base1` | |
+|---|---|
+| minor page faults **per query** | **25** |
+| system CPU per query | 7.8 ms (**7%** of the query's CPU) |
+| user CPU per query | 99.5 ms, against an 18.2 ms wall (≈550%) |
+
+25 faults a query means the decode reuses its heap and the kernel is not
+zeroing pages for it. **Swapping the global allocator — the obvious reading of
+"not thread-bound" — was refuted for the cost of four minutes and no build.**
+
+`bench/probe-coltype.py` (new) then located the cost by column *type*: same
+scan, same rows, varying only the projection. No tag filter, so no row filter
+and every row materialises.
+
+| Projection | Baseline | Candidate |
+|---|---|---|
+| floor, `COUNT(*)` | 8.1 ms | 8.0 ms |
+| +1 f64 (`duration_s`) | +1.3 | +2.6 |
+| +1 dict (`step`, ~10 distinct) | +5.8 | +2.6 |
+| +1 dict (`route`) | +3.8 | +2.3 |
+| +1 dict (`product_id`, ~200 K) | +3.1 | +2.7 |
+| +2 dict (`step`, `product_id`) | +9.0 | +4.9 |
+| **+3 dict (`step`, `event`, `product_id`)** | **+13.7** | **+8.1** |
+
+A dictionary string column cost ~3.5× what an f64 column cost for identical
+rows. That gap — not "reading bytes" — was the target.
+
+**Change.** `crates/query/src/provider.rs`, one file.
+`view_reader_metadata` rewrites the file's own arrow schema through the
+existing `view_schema` and rebuilds `ArrowReaderMetadata` with
+`ArrowReaderOptions::with_schema`, which switches arrow's column dispatch from
+the dictionary reader to the byte-view reader; it falls back to the file's
+schema if the reader refuses the override, so `to_view_batch` still converts
+and a coercion failure costs speed, never correctness. `MetaCache` now holds
+`ArrowReaderMetadata` instead of the raw footer, so the arrow schema resolves
+once per file rather than once per file per query (this also deletes a
+`try_new` from the per-file path). The row filter gained a `Utf8View` arm —
+it decodes through the same overridden schema, and arrow's comparison kernels
+want both sides one type.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network, 100
+Shape A samples. All four clean (ingest 737–770 K lines/s) and all four settled
+to **62 parquet files / 69 MB** (`du`, not the harness metric). Labels
+`perf-base1`/`perf-base2`, `perf-cand1`/`perf-cand2`, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 33/23, 45/23 | *27/27, 27/27* |
+| B2_funnel_48h | 45/45, 44/43 | 44/44, 51/45 |
+| B3_inflight_24h | 19/15, 21/15 | **12/11, 12/12** |
+| B4_hourly_throughput_48h | 19/19, 25/19 | **16/16, 16/15** |
+| B5_route_rollup_24h | 28/29, 30/29 | *34/33, 33/32* |
+| **Shape B suite, warm total** | **131, 129 ms** | **131, 131 ms** |
+| Shape A median | 3, 3 ms | 3, 3 ms |
+| Ingest | 748K, 763K | 737K, 770K |
+
+Row counts match in both arms (10/10/10/475–476/40) and Shape A reports zero
+errors. 136 workspace tests pass, 0 failures (135 + one new); `cargo fmt --all
+--check` clean; `clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Rejected — and this is the most interesting rejection in the log,
+because the change did more than it promised and bought nothing.
+**The scan got 41% cheaper per string column** (+13.7 → +8.1 ms for B2's three
+columns) and a dictionary column now costs about what an f64 column costs,
+which is the floor. **The suite total moved from 130 ms to 131 ms.** B3 warm
+goes 15,15 → 11,12 and B4 19,19 → 16,15, no overlap; B1 goes 23,23 → 27,27 and
+B5 29,29 → 33,32, equally consistent, equally no overlap. Two queries win ~3.5
+ms, two lose ~3.5 ms, B2 is a wash. A 5.6 ms saving inside the scan arrives at
+the client as zero.
+
+**Lesson.**
+
+- **The split is exactly `product_id`.** B3 and B4 never read it and keep the
+  win; B1, B2 and B5 do and give it back with interest. Same presented schema
+  in both arms — the planner sees `Utf8View` either way, so this is not the
+  group-values fallback re-appearing. What differs is *how the view array is
+  built*: the cast preserves the dictionary's single shared value buffer and
+  emits views into it, while the reader's byte-view path builds its own buffers
+  as it decodes. For 10 distinct values that is free; for 200 K it hands the
+  aggregate above a far more scattered array to walk. **The construction of a
+  `Utf8View` column matters as much as its type.**
+- **This re-opens the cardinality-selective idea the 22:35 entry declared
+  blocked, on new ground.** That cycle could not convert `product_id` alone
+  because `GroupValuesColumn` needs *every* key column supported, so a mixed
+  Dictionary/View key set falls back to the row format. That objection does not
+  apply here: both paths present `Utf8View`, so the fast path is kept either
+  way, and the only choice is per-column construction. **Force the reader
+  override for LOW-cardinality columns and keep the cast for high-cardinality
+  ones** — predicted to hold B3/B4's 3.5 ms while leaving B1/B5 alone. The
+  discriminator needs no new `FileMeta` field either, which is what the 07:45
+  entry assumed: the write path already writes a bloom filter only above
+  `BLOOM_MIN_DISTINCT` (1024) distinct values, so "has a bloom" is a
+  high-cardinality marker already sitting in the footer this code has open.
+  **That is the next cycle, and it is the highest-value thing on this list.**
+- **Scan-load percentages do not convert into query time.** `probe-load.py`
+  called the load 40–75% of a warm Shape B query, and this cycle removed 41% of
+  its per-column cost for a net zero. The load and the plan are not additive:
+  changing what the scan hands upward changes what the plan costs. **Judge a
+  scan change end-to-end, never by the scan probe alone** — and treat the
+  standing "streaming / range reads is the largest known lead" with the
+  scepticism this and the 11:40 entry have now earned it twice over.
+- **`MetaCache` holding `ArrowReaderMetadata` is worth keeping** whenever this
+  is retried — it removes a per-file-per-query `try_new` and is independent of
+  the override decision. It is reverted here only because it arrived with the
+  rest of the change.
+- **Rig.** Two new probes, both about a minute in-network and both kept:
+  `sh bench/probe-alloc.sh tldb-perf 200 b2_load` prints per-query minor faults
+  and the user/system CPU split — the cheap test for "is this allocation or is
+  it work"; `sh bench/probe-innet.sh tldb-perf probe-coltype.py` prints the
+  marginal cost of a decoded column *by type*, which is what turned "the load
+  is expensive" into "the string columns are 3.5× the primitives".
+
 ### 2026-08-10 11:40 — Decode the scan as wide as the plan runs   [REJECTED]
 
 **Hypothesis.** Every per-operator table in this log is blind to the biggest
