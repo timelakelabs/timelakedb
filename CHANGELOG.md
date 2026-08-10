@@ -13,6 +13,42 @@ here.
 
 ## [Unreleased]
 
+### Added — SEC-4 phased: data-plane token authentication (2026-08-10)
+
+- `TIMELAKE_DATA_AUTH=off|optional|required` turns on token
+  authentication on the data plane. **Default `off`** does not examine
+  `Authorization` at all — today's compatibility contract, so a Telegraf
+  migrated from InfluxDB with a leftover token keeps writing unchanged.
+  `optional` serves anonymous callers but refuses a presented-but-invalid
+  token (fail loud on day one); `required` refuses any request without a
+  valid one, on both `:1963` and `:1964`.
+- **One token, three spellings, because that is what stock clients send**
+  (`bench/results/data-auth-client-probe.log`): `Bearer` (Grafana's
+  Flight SQL token field, and Tributary), `Token` (Telegraf
+  `influxdb_v2`), `Basic` with the token as the password (Telegraf v1).
+  Grafana's basic-auth toggle and custom headers are HTTP-only and never
+  reach gRPC, which is *why* the token field is the mechanism rather than
+  a preference.
+- New `crates/auth/src/token.rs` and `guard.rs`: 256-bit OS-CSPRNG
+  secrets stored only as SHA-256 digests (not Argon2id — a token has no
+  brute-force surface, and a memory-hard KDF on the write path would be a
+  self-inflicted RR-1 violation), scopes (`read`/`write`/`read_write`,
+  not a total order — a shipper writes without reading back), database
+  scoping, SEC-2 grants that *intersect* claimed authorizations, expiry
+  and revocation. HTTP and Flight SQL enforce through **one** decision
+  function; Flight re-authenticates at DoGet as well as planning, because
+  a ticket is client-crafted.
+- Console `/admin/tokens` (issue/list/revoke, admin-only, secret shown
+  once and never re-listed) plus a page section.
+- Metrics: `timelake_data_auth_mode` and the split
+  `timelake_data_requests_{authenticated,anonymous,rejected}_total` — an
+  operator flips `optional` → `required` on that measurement, not a
+  guess, exactly as want-mode mTLS did.
+- Drilled live end to end (`bench/results/data-auth-drill.log`) in a
+  container, because in-process router tests cannot reach the Flight
+  accept loop where the gRPC guard runs.
+- Not done: Tributary presenting the token (P0-5).
+
 ### Added — SEC-3 (v2): optional client certificates in want mode (2026-08-10)
 
 - `TIMELAKE_TLS_CLIENT_CA` turns on client-certificate verification in

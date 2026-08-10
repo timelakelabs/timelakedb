@@ -254,9 +254,12 @@
     <section id="http">
       <h2>HTTP API</h2>
       <p>
-        Port 1963, shared by the data plane and the admin plane. Writes,
-        <code>/api/sql</code>, <code>/health</code>, <code>/ping</code> and
-        <code>/metrics</code> take no authentication; every
+        Port 1963, shared by the data plane and the admin plane.
+        <code>/health</code>, <code>/ping</code> and <code>/metrics</code>
+        take no authentication; writes and <code>/api/sql</code>
+        authenticate by token when <code>TIMELAKE_DATA_AUTH</code> is
+        <code>optional</code> or <code>required</code> (default
+        <code>off</code>, see Data-plane tokens below); every
         <code>/admin/*</code> route requires a session (SEC-4). See
         <a href="index.html#security">Security</a> and
         <a href="index.html#console">Admin Console</a>.
@@ -307,9 +310,11 @@
 
       <h3>Admin authentication (SEC-4)</h3>
       <p>
-        Every <code>/admin/*</code> route requires a session; the data plane
-        (writes, <code>/api/sql</code>, Flight SQL, <code>/metrics</code>)
-        does not. Sign in at <code>POST /admin/session</code> to receive an
+        Every <code>/admin/*</code> route requires a session. The data plane
+        (writes, <code>/api/sql</code>, Flight SQL) authenticates separately
+        by token when enabled — see Data-plane tokens below;
+        <code>/metrics</code> always takes none. Sign in at
+        <code>POST /admin/session</code> to receive an
         <code>HttpOnly</code>, <code>SameSite=Strict</code> cookie and a CSRF
         token that every cookie-authenticated mutation must echo in
         <code>X-TimeLake-CSRF</code>; automation may instead send
@@ -440,6 +445,58 @@
         </p>
       </div>
 
+      <h3>Data-plane tokens (SEC-4 phased)</h3>
+      <p>
+        <code>TIMELAKE_DATA_AUTH</code> controls whether the data plane
+        authenticates: <code>off</code> (default — the
+        <code>Authorization</code> header is not examined, so existing
+        clients are untouched), <code>optional</code> (anonymous callers
+        still served, but a presented token that does not verify is
+        refused), and <code>required</code> (no valid token, no access, on
+        both <code>:1963</code> and <code>:1964</code>). The three states
+        are a migration: stage from <code>off</code> to <code>required</code>
+        while watching the request split, rather than flipping blind.
+      </p>
+      <p>
+        Tokens are issued from the console (<code>POST /admin/tokens</code>,
+        admin only) and shown <strong>once</strong> — only a SHA-256 digest
+        is stored. A client presents one on the <code>Authorization</code>
+        header, and TimeLakeDB accepts <strong>three spellings</strong> so
+        every stock client works unmodified:
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Header</th><th>Client</th></tr></thead>
+          <tbody>
+            <tr><td><code>Bearer &lt;token&gt;</code></td><td>Grafana (Flight SQL <em>token</em> field), Tributary</td></tr>
+            <tr><td><code>Token &lt;token&gt;</code></td><td>Telegraf <code>influxdb_v2</code> output</td></tr>
+            <tr><td><code>Basic base64(any:&lt;token&gt;)</code></td><td>Telegraf <code>influxdb</code> (v1) output — token as the password</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Each token carries a <strong>scope</strong> (<code>read</code>,
+        <code>write</code>, or <code>read_write</code> — a shipping agent
+        can be given <code>write</code> alone, so a leaked shipper
+        credential cannot read the database back), an optional
+        <strong>database allowlist</strong>, and optional <strong>SEC-2
+        grants</strong> that intersect the caller's claimed authorizations
+        — so a token can only ever narrow what its holder sees. A token
+        with no grants recorded leaves claims untouched (no policy is not
+        deny-all). Revocation is immediate and a tombstone: the record
+        stays so an operator can still see the credential existed.
+      </p>
+      <div class="note warn">
+        <p>
+          <strong>A bearer token on a plaintext connection is a password
+          in the clear.</strong> If you rely on data-plane auth over a
+          network, enable TLS. And in <code>required</code> mode,
+          <code>timelake_data_requests_anonymous_total</code> must stay at
+          zero — any increase means something still reaches the data plane
+          without a token.
+        </p>
+      </div>
+
       <h3>Encryption at rest (SEC-1)</h3>
       <p>
         Set <code>TIMELAKE_ENCRYPTION_KEY</code> (64 hex characters) or
@@ -485,7 +542,7 @@
         <table>
           <thead><tr><th>Call</th><th>State</th></tr></thead>
           <tbody>
-            <tr><td><code>Handshake</code></td><td>Accepts anything and returns an empty token — there is no authentication</td></tr>
+            <tr><td><code>Handshake</code></td><td>Accepts anything and returns an empty token. The credential rides the <code>authorization</code> metadata on each call (SEC-4 phased), not the handshake — that is where <code>Bearer &lt;token&gt;</code> and client identity are read</td></tr>
             <tr><td><code>GetFlightInfo(CommandStatementQuery)</code></td><td>Implemented</td></tr>
             <tr><td><code>DoGet(ticket)</code></td><td>Implemented — streams Arrow batches natively</td></tr>
             <tr><td><code>CommandGetCatalogs</code></td><td>Implemented — one row per database</td></tr>
@@ -598,6 +655,10 @@
             <tr><td><code>timelake_admin_default_credential_active</code></td><td>gauge</td><td>1 while the seeded <code>admin</code>/<code>admin</code> password is still in place (SEC-4)</td></tr>
             <tr><td><code>timelake_admin_logins_total</code></td><td>counter</td><td>Successful admin sign-ins since start</td></tr>
             <tr><td><code>timelake_admin_login_failures_total</code></td><td>counter</td><td>Rejected sign-in attempts since start</td></tr>
+            <tr><td><code>timelake_data_auth_mode</code></td><td>gauge</td><td>Data-plane auth mode: 0 off, 1 optional, 2 required (SEC-4 phased)</td></tr>
+            <tr><td><code>timelake_data_requests_authenticated_total</code></td><td>counter</td><td>Data-plane requests that presented a valid token</td></tr>
+            <tr><td><code>timelake_data_requests_anonymous_total</code></td><td>counter</td><td>Data-plane requests served without a token (only possible in off/optional). In <code>required</code> this must stay 0</td></tr>
+            <tr><td><code>timelake_data_requests_rejected_total</code></td><td>counter</td><td>Data-plane requests refused — missing token in <code>required</code>, invalid token, or a scope/database violation</td></tr>
           </tbody>
         </table>
       </div>
@@ -617,6 +678,9 @@
             anchors keep verifying, which is exactly why it can go unnoticed
             until the anchors themselves expire and every client-certificate
             handshake starts failing at once.</li>
+        <li><code>timelake_data_requests_anonymous_total</code> increasing while
+            <code>timelake_data_auth_mode == 2</code> (required) — something is
+            reaching the data plane without a token; it must stay flat at zero.</li>
         <li><code>timelake_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
         <li><code>timelake_admin_default_credential_active == 1</code> — the

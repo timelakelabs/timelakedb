@@ -26,26 +26,32 @@ so please size your disclosure timeline accordingly.
 
 ## Current security posture — read this before deploying
 
-**The data plane has no authentication.** Any client that can open a TCP
-connection to port 1963 or 1964 has full read and write access to every
-database on the node. The *administrative* surface (`/admin/*`) does
-authenticate as of SEC-4, which closes the remote-deletion exposure, but
-it does not protect the data: reads, writes and `/api/sql` remain open by
-design until the data-plane migration (a deliberate breaking change for
-Telegraf, Grafana and every existing client). Network reachability is
-still the only access control over your data.
+**The data plane can now authenticate, but ships `off` by default.** As
+of SEC-4 (phased), `TIMELAKE_DATA_AUTH=optional|required` turns on token
+authentication on the data plane — issue tokens from the console, and
+Grafana, Telegraf and Tributary present them on the `Authorization`
+header (`Bearer`/`Token`/`Basic`, whichever the client speaks). Until an
+operator sets that, **the default is `off`: any client reaching port
+1963 or 1964 has full read and write access to every database**, exactly
+as before, because turning it on is a breaking change for any client not
+yet configured with a token. The three-mode migration (`off` →
+`optional` → `required`) exists so that flip can be staged on a measured
+split rather than taken blind. On a default (`off`) deployment, network
+reachability is still the only access control over your data.
 
-Treat a TimeLakeDB port as equivalent to an unauthenticated shell into the
-data. Bind it to localhost or a private network segment, and put an
-authenticating proxy in front of it if anything other than your own agents
-needs access.
+Until you set `TIMELAKE_DATA_AUTH`, treat a TimeLakeDB port as equivalent
+to an unauthenticated shell into the data: bind it to localhost or a
+private segment, and front it with an authenticating proxy if anything
+but your own agents needs access. Setting `required` (with tokens issued
+and clients configured) removes that constraint — it is the intended way
+to expose a port beyond a trusted segment.
 
 | Control | Status |
 |---|---|
 | Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELAKE_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
 | Client certificate / mTLS | **Implemented, opt-in, WANT mode.** Set `TIMELAKE_TLS_CLIENT_CA` and both listeners request a client certificate, verify one if presented, and serve the connection either way — so Grafana, Telegraf and the harness need no change. A verified identity narrows that session's SEC-2 authorizations to what it is granted (Flight SQL; `/api/sql` identity is still to come). Trust anchors hot-rotate with dual-CA overlap. Want mode is not itself a control — see exposure 9. |
-| Authentication | **Admin surface only (SEC-4).** `/admin/*` requires a session: Argon2id credentials, cookie sessions (HttpOnly, SameSite=Strict, idle 30 min / absolute 12 h) or bearer tokens, CSRF + Origin checks on mutations, per-principal backoff on failed logins. **The data plane is still open** — write endpoints accept any `Authorization` token and ignore it; Flight SQL's handshake accepts anything. |
-| Authorization | **Roles on the admin surface.** `viewer` (read), `operator` (non-destructive changes, *growing* a retention window), `admin` (shrinking/removing retention, principal management). No per-database/table permissions on the data plane. |
+| Authentication | **Admin surface (SEC-4) + data plane (SEC-4 phased).** `/admin/*` requires a session (Argon2id, cookie/bearer, CSRF + Origin, backoff). The **data plane** authenticates by token when `TIMELAKE_DATA_AUTH` is `optional` or `required`: one token on the `Authorization` header, accepted as `Bearer` (Grafana Flight SQL / Tributary), `Token` (Telegraf v2) or `Basic` (Telegraf v1, token as password). **Default is `off`** — the header is not examined and the data plane is open, as it always was. HTTP and Flight SQL enforce through one decision function. |
+| Authorization | **Roles on the admin surface; scopes + grants on data tokens.** Admin roles: `viewer`/`operator`/`admin`. Data tokens carry a scope (`read`, `write`, `read_write` — deliberately not a total order, so a shipper can write without being able to read back), an optional database allowlist, and optional SEC-2 grants that *intersect* a caller's claimed authorizations. No per-column permissions. |
 | First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelake_admin_default_credential_active`. |
 | Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
 | Encryption at rest | **Implemented, opt-in.** Set `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or `TIMELAKE_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough); the local WAL is **not** encrypted. |
@@ -58,9 +64,16 @@ needs access.
 These are verified properties of the current build, not hypotheticals. They
 follow from "no authentication" and are listed so you can design around them.
 
-1. **Unauthenticated ingest and query** on `:1963` (line protocol, `/api/sql`)
-   and `:1964` (Flight SQL). Anyone reachable can write arbitrary data, read
-   all data, and enumerate the schema.
+1. **Ingest and query are unauthenticated by default** on `:1963` (line
+   protocol, `/api/sql`) and `:1964` (Flight SQL): anyone reachable can
+   write arbitrary data, read all data, and enumerate the schema. This is
+   the `off` default. Setting `TIMELAKE_DATA_AUTH=required` closes it —
+   both ports then refuse any request without a valid token — but that is
+   a deliberate opt-in, because it breaks every client not yet holding
+   one. `optional` is the migration state between the two: anonymous
+   still served, invalid tokens refused, and the
+   `timelake_data_requests_*` split shows how much traffic would break at
+   the flip.
 
 2. **`POST /api/sql` executes arbitrary DataFusion SQL, including `COPY … TO`,
    which writes files as the server process.** Verified: a single unauthenticated
@@ -102,13 +115,16 @@ follow from "no authentication" and are listed so you can design around them.
 
 7. **Visibility authorizations are self-asserted on the anonymous path.**
    `X-TimeLake-Authorizations: admin` is a claim any client can make.
-   A client certificate now changes this *for callers that present one*
-   over Flight SQL — their claims are intersected with what that identity
-   is granted — but presenting one is optional (exposure 9), so an
-   attacker declines and keeps the honor-system front door. Real isolation
-   still requires either an authenticating proxy that *sets* (and strips
-   inbound) that header, or a deployment that has migrated far enough to
-   restrict the anonymous path.
+   Two credentials now change this *for callers that present one*: a
+   verified client certificate (exposure 9), and — new — a data-plane
+   token whose grants intersect the caller's claims. Both only *narrow*
+   what a caller sees, and both are optional under the `off`/`optional`
+   defaults, so an attacker declines and keeps the honor-system front
+   door. Under `TIMELAKE_DATA_AUTH=required` the door is shut: every
+   caller holds a token, and a token with recorded grants cannot claim
+   beyond them. Short of that, real isolation still needs an
+   authenticating proxy that *sets* (and strips inbound) the header, or a
+   deployment migrated far enough to run `required`.
 
 8. **Encryption at rest does not cover the local WAL**, which holds recent
    line-protocol bytes until flush, nor does it protect data from anyone who
@@ -133,12 +149,15 @@ follow from "no authentication" and are listed so you can design around them.
 - **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
   (`TIMELAKE_ADDR=127.0.0.1:1963`) or to a private Docker/Kubernetes network,
   and publish nothing.
-- **Front it with something that authenticates** if remote access is needed — a
-  reverse proxy doing mTLS or token checks, or a VPN/overlay network. Note that
-  Flight SQL is gRPC over HTTP/2, so any proxy in front of `:1964` must speak
-  HTTP/2.
-- **Enable TLS** (`TIMELAKE_TLS_CERT`/`_KEY`) even on a private network; it is
-  the one security control that is finished and drilled.
+- **Turn on data-plane auth** (`TIMELAKE_DATA_AUTH=required`) once tokens are
+  issued and clients hold them — this is the native way to make a port safe to
+  expose. Stage it through `optional`, watching `timelake_data_requests_*`, so
+  you flip to `required` only when the anonymous count has reached zero. Or
+  **front it with a proxy that authenticates** — note Flight SQL is gRPC over
+  HTTP/2, so a proxy before `:1964` must speak HTTP/2.
+- **Enable TLS** (`TIMELAKE_TLS_CERT`/`_KEY`) — and if you rely on token auth
+  over a network, TLS is not optional, because a `Bearer` token on a plaintext
+  connection is a password in the clear.
 - **Set a container memory limit.** `mem_limit` is not optional in practice —
   an unbounded engine took down an entire Docker VM during development.
 - **Run it on a dedicated volume** with nothing else of value on the filesystem,
@@ -147,6 +166,10 @@ follow from "no authentication" and are listed so you can design around them.
   `timelake_tls_cert_expiry_seconds` below two renewal periods. A failed
   renewal keeps serving on the last-good pair, which is exactly why it can go
   unnoticed until expiry.
+- **Alert on `timelake_data_requests_anonymous_total` in `required` mode.**
+  It must stay flat at zero; any increase means something is still reaching
+  the data plane without a token — a misrouted client, or a gap you have not
+  closed.
 
 ## Roadmap
 
@@ -154,7 +177,7 @@ follow from "no authentication" and are listed so you can design around them.
 |---|---|---|
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
 | Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
-| Data-plane authentication | SEC-4 (phased) | Not started — the piece that turns SEC-2 claims into authorization; breaks every existing client, so it is its own migration |
+| Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`bench/results/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presenting the token (P0-5) is the remaining half. |
 | Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session over Flight SQL. AT-7 still 19/19 with it enabled. `/api/sql` identity outstanding. |
 | Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |

@@ -117,7 +117,38 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **SEC-3 v2 client certificates SHIPPED — WANT mode** (2026-08-10,
+- Status: **SEC-4 phased data-plane auth SHIPPED** (2026-08-10, drill
+  `bench/results/data-auth-drill.log`). `TIMELAKE_DATA_AUTH=off|optional|
+  required` (default off = header not read, today's compat contract).
+  Token = 256-bit OS-CSPRNG secret, prefix `tldb_`, stored only as
+  SHA-256 digest (NOT Argon2id — no brute-force surface, and a ~50ms KDF
+  on a 100k-line/s write path breaks RR-1; reasoning in
+  `crates/auth/src/token.rs` header). `crates/auth/src/guard.rs` =
+  the ONE `decide()`; both HTTP and Flight route through
+  `Engine::authenticate_data_impl` → `Auth::decide_data` → `guard::decide`
+  so policy can't fork. **Mechanism fixed by measurement**
+  (`bench/results/data-auth-client-probe.log`): Grafana Flight SQL
+  forwards only the token field as `Bearer`; its basic-auth toggle +
+  custom headers are HTTP-only, never reach gRPC. So: one token, three
+  spellings — `Bearer` (Grafana/Tributary), `Token` (Telegraf v2),
+  `Basic` w/ token as password (Telegraf v1). Scope read|write|read_write
+  is NOT a total order (shipper writes without reading back); +database
+  allowlist +SEC-2 grants that INTERSECT claimed auths (narrow only;
+  `None` grants = no policy ≠ deny-all). Flight re-auths at DoGet AND
+  planning (ticket is client-crafted). Console `/admin/tokens`
+  issue/list/revoke (admin-only, secret shown ONCE, digest never listed),
+  page section added. Metrics `timelake_data_auth_mode` +
+  `timelake_data_requests_{authenticated,anonymous,rejected}_total` (flip
+  optional→required on the split, not a guess; anon must be 0 in
+  required). Tokens persist `catalog/config/tokens.json` via Store (so
+  SEC-1 encrypted). DRILLED LIVE in container (in-proc tests can't reach
+  Flight accept loop): required locks both doors, token works Bearer+
+  Token on HTTP + Flight, write-only token refused Flight read (403),
+  revoke immediate, metrics column-0 valid. 116 tests (auth 6→20, +7
+  server data_auth), clippy/fmt clean. **NOT DONE: Tributary presenting
+  the token (P0-5)**; console page not browser-drilled (API is).
+  Roadmap: `docs/ROADMAP.md` (competitive) + `docs/PRODUCTION_READINESS.md`.
+- Previous: **SEC-3 v2 client certificates SHIPPED — WANT mode** (2026-08-10,
   drill `bench/results/sec3-mtls-want-mode.log`). `TIMELAKE_TLS_CLIENT_CA`
   = PEM bundle → both listeners request a client cert, verify one if
   presented, serve either way. `crates/tls/src/client_auth.rs`:
