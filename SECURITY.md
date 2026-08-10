@@ -123,9 +123,10 @@ follow from "no authentication" and are listed so you can design around them.
    as it did before. Its value is that an *authenticated* caller can be
    held to less: a verified identity's SEC-2 claims are intersected with
    its grants. Making the anonymous path more restricted is a separate,
-   deliberate decision — and `timelake_tls_client_ca_anchors` plus the
-   authenticated/anonymous split are what tell you when a deployment has
-   migrated far enough to take it.
+   deliberate decision, and it should rest on a measurement rather than a
+   guess: `timelake_flight_connections_authenticated_total` against
+   `timelake_flight_connections_anonymous_total` says how much of your
+   traffic would break if you required a certificate today.
 
 ## Deploying it safely today
 

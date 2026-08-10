@@ -296,6 +296,7 @@ pub struct Engine {
     tls: RwLock<Option<Arc<timelake_tls::RotatingCert>>>,
     /// SEC-3 want mode: the rotating client-CA bundle, when configured.
     client_ca: RwLock<Option<Arc<timelake_tls::RotatingClientCa>>>,
+    client_auth_counts: RwLock<Option<Arc<timelake_flight::ClientAuthCounts>>>,
 }
 
 impl Engine {
@@ -401,6 +402,7 @@ impl Engine {
             s3_stats,
             tls: RwLock::new(None),
             client_ca: RwLock::new(None),
+            client_auth_counts: RwLock::new(None),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -1028,6 +1030,12 @@ impl Engine {
         *self.client_ca.write().expect("client ca lock") = Some(ca);
     }
 
+    /// Attach the connection counters the Flight accept loop increments,
+    /// so /metrics can report how many peers actually authenticate.
+    pub fn set_client_auth_counts(&self, c: Arc<timelake_flight::ClientAuthCounts>) {
+        *self.client_auth_counts.write().expect("auth counts lock") = Some(c);
+    }
+
     pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
@@ -1095,6 +1103,22 @@ impl Engine {
             ),
             None => String::new(),
         };
+        let auth_split_lines = match self
+            .client_auth_counts
+            .read()
+            .expect("auth counts lock")
+            .as_ref()
+        {
+            Some(c) => format!(
+                "# TYPE timelake_flight_connections_authenticated_total counter\n\
+                 timelake_flight_connections_authenticated_total {}\n\
+                 # TYPE timelake_flight_connections_anonymous_total counter\n\
+                 timelake_flight_connections_anonymous_total {}\n",
+                c.authenticated.load(Ordering::Relaxed),
+                c.anonymous.load(Ordering::Relaxed),
+            ),
+            None => String::new(),
+        };
         let tls_lines = match self.tls.read().expect("tls lock").as_ref() {
             Some(t) => format!(
                 "# TYPE timelake_tls_cert_expiry_seconds gauge\n\
@@ -1125,7 +1149,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1145,6 +1169,7 @@ impl Engine {
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
             client_ca_lines,
+            auth_split_lines,
             kms_lines,
             s3_lines,
             tls_lines,

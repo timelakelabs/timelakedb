@@ -79,6 +79,11 @@ async fn main() {
                 timelake_tls::RotatingClientCa::load(p.as_ref())
                     .expect("initial client CA bundle must load")
             });
+            // The anonymous/authenticated split (see Engine::metrics):
+            // one counter, shared by the accept loop that increments it
+            // and the metrics handler that reports it.
+            let auth_counts = Arc::new(timelake_flight::ClientAuthCounts::default());
+            engine.set_client_auth_counts(Arc::clone(&auth_counts));
             if let Some(ca) = &client_ca {
                 engine.set_client_ca(Arc::clone(ca));
             }
@@ -130,7 +135,8 @@ async fn main() {
             );
             tokio::spawn(async move {
                 if let Err(e) =
-                    timelake_flight::serve_tls(flight_backend, flight_addr, flight_tls).await
+                    timelake_flight::serve_tls(flight_backend, flight_addr, flight_tls, auth_counts)
+                        .await
                 {
                     tracing::error!(error = %e, "flight sql (TLS) server exited");
                 }

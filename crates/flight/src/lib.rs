@@ -11,6 +11,7 @@
 //! server at the security milestone.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -392,6 +393,20 @@ pub async fn serve(
 #[derive(Debug, Clone, Default)]
 pub struct PeerIdentity(pub Option<String>);
 
+/// How many connections took each path.
+///
+/// Want mode's whole problem is that it is invisible: the anonymous and
+/// authenticated paths both return 200, so nothing tells an operator
+/// whether anyone is actually presenting certificates yet. Flipping a
+/// listener to *require* one without knowing that ratio is how you take
+/// an outage. These two counters are the measurement that decision
+/// should rest on.
+#[derive(Debug, Default)]
+pub struct ClientAuthCounts {
+    pub authenticated: AtomicU64,
+    pub anonymous: AtomicU64,
+}
+
 /// Wraps the TLS stream so the verified identity travels with the
 /// connection: tonic reads `connect_info` once per connection and puts
 /// it in every request's extensions.
@@ -443,6 +458,7 @@ pub async fn serve_tls(
     backend: Arc<dyn SqlBackend>,
     addr: std::net::SocketAddr,
     tls: Arc<rustls::ServerConfig>,
+    counts: Arc<ClientAuthCounts>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
@@ -453,38 +469,49 @@ pub async fn serve_tls(
     // serialization here is not a bottleneck at this milestone. A failed
     // handshake (scanner, plaintext probe) is logged and skipped — it
     // must never take the listener down.
-    let incoming = futures::stream::unfold((listener, acceptor), |(listener, acceptor)| async {
-        loop {
-            match listener.accept().await {
-                Ok((tcp, peer)) => match acceptor.accept(tcp).await {
-                    Ok(tls_stream) => {
-                        // Want mode: the peer may or may not have offered
-                        // a certificate, and either way it is served. If
-                        // it did, rustls has already verified it against
-                        // the rotating bundle; this only reads out who.
-                        let identity = PeerIdentity(timelake_tls::identity_of(
-                            tls_stream.get_ref().1.peer_certificates(),
-                        ));
-                        if let Some(who) = &identity.0 {
-                            tracing::debug!(%peer, identity = %who, "flight client authenticated");
+    let incoming = futures::stream::unfold(
+        (listener, acceptor, counts),
+        |(listener, acceptor, counts)| async {
+            loop {
+                match listener.accept().await {
+                    Ok((tcp, peer)) => match acceptor.accept(tcp).await {
+                        Ok(tls_stream) => {
+                            // Want mode: the peer may or may not have offered
+                            // a certificate, and either way it is served. If
+                            // it did, rustls has already verified it against
+                            // the rotating bundle; this only reads out who.
+                            let identity = PeerIdentity(timelake_tls::identity_of(
+                                tls_stream.get_ref().1.peer_certificates(),
+                            ));
+                            match &identity.0 {
+                                Some(who) => {
+                                    counts.authenticated.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!(
+                                        %peer, identity = %who, "flight client authenticated"
+                                    );
+                                }
+                                None => {
+                                    counts.anonymous.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            return Some((
+                                Ok::<_, std::io::Error>(IdentifiedStream {
+                                    inner: tls_stream,
+                                    identity,
+                                }),
+                                (listener, acceptor, counts),
+                            ));
                         }
-                        return Some((
-                            Ok::<_, std::io::Error>(IdentifiedStream {
-                                inner: tls_stream,
-                                identity,
-                            }),
-                            (listener, acceptor),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(%peer, error = %e, "flight TLS handshake failed");
-                        continue;
-                    }
-                },
-                Err(e) => return Some((Err(e), (listener, acceptor))),
+                        Err(e) => {
+                            tracing::warn!(%peer, error = %e, "flight TLS handshake failed");
+                            continue;
+                        }
+                    },
+                    Err(e) => return Some((Err(e), (listener, acceptor, counts))),
+                }
             }
-        }
-    });
+        },
+    );
 
     tonic::transport::Server::builder()
         .add_service(FlightServiceServer::new(TimeLakeFlight::new(backend)))
