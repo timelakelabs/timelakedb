@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use timelake_auth::{Auth, Role, SessionInfo};
+use timelake_auth::{Action, Auth, Decision, Role, Scope, SessionInfo, TokenError};
 
 /// Errors the write path can surface over the wire.
 pub enum WriteError {
@@ -51,6 +51,19 @@ pub trait Engine: Send + Sync + 'static {
         query: String,
         authorizations: Vec<String>,
     ) -> impl std::future::Future<Output = Result<Value, String>> + Send;
+
+    /// Authenticate a data-plane request (SEC-4 phased).
+    ///
+    /// The router does not decide policy — it hands over the raw
+    /// `Authorization` header and is told yes or no. That keeps HTTP and
+    /// Flight SQL on one implementation of the rule instead of two that
+    /// drift.
+    fn authenticate_data(
+        &self,
+        authorization: Option<&str>,
+        action: Action,
+        db: &str,
+    ) -> Result<Decision, TokenError>;
 
     /// Prometheus exposition text (SR-4).
     fn metrics_text(&self) -> String;
@@ -148,6 +161,14 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
             get(session_show::<E>).delete(session_logout::<E>),
         )
         .route("/admin/password", post(change_password::<E>))
+        .route(
+            "/admin/tokens",
+            get(tokens_list::<E>).post(tokens_issue::<E>),
+        )
+        .route(
+            "/admin/tokens/{id}",
+            axum::routing::delete(tokens_revoke::<E>),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_guard::<E>,
@@ -627,6 +648,11 @@ async fn write_common<E: Engine>(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
+    if let Err(e) =
+        engine.authenticate_data(authorization_of(&headers).as_deref(), Action::Write, &db)
+    {
+        return deny_response(e);
+    }
     let body = match maybe_gunzip(&headers, body) {
         Ok(b) => b,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &format!("bad gzip body: {e}")),
@@ -676,6 +702,38 @@ struct SqlRequest {
 /// Parse a comma-separated authorizations header value. Claims, not
 /// credentials, while the surface has no authn (SECURITY.md posture);
 /// the seam is what SEC-2 mandates, and a token layer slots in front.
+/// Refuse a data-plane request the way each stock client expects.
+///
+/// 401 carries `WWW-Authenticate: Bearer`, which is what makes a bare
+/// `curl -u` or a browser prompt behave sensibly, and what tells a
+/// client library it should attach a credential rather than give up.
+fn deny_response(e: TokenError) -> axum::response::Response {
+    let code = match e {
+        TokenError::Missing | TokenError::Invalid => StatusCode::UNAUTHORIZED,
+        TokenError::Forbidden => StatusCode::FORBIDDEN,
+    };
+    let body = Json(json!({ "code": e.code(), "error": e.message() }));
+    match code {
+        StatusCode::UNAUTHORIZED => (
+            code,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                "Bearer realm=\"timelake\"",
+            )],
+            body,
+        )
+            .into_response(),
+        _ => (code, body).into_response(),
+    }
+}
+
+fn authorization_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 fn auths_from_headers(headers: &HeaderMap) -> Vec<String> {
     headers
         .get("x-timelake-authorizations")
@@ -696,15 +754,144 @@ async fn sql<E: Engine>(
     Json(req): Json<SqlRequest>,
 ) -> axum::response::Response {
     let db = req.db.unwrap_or_else(|| "poc".to_string());
+    let decision =
+        match engine.authenticate_data(authorization_of(&headers).as_deref(), Action::Read, &db) {
+            Ok(d) => d,
+            Err(e) => return deny_response(e),
+        };
     let mut auths = auths_from_headers(&headers);
     for a in req.authorizations {
         if !auths.contains(&a) {
             auths.push(a);
         }
     }
+    // SEC-2: a credential can only ever NARROW what its holder sees. An
+    // anonymous caller keeps today's behaviour (claims as asserted),
+    // which is what lets this ship without a flag day.
+    if let Some(granted) = &decision.granted {
+        auths.retain(|claimed| granted.iter().any(|g| g == claimed));
+    }
     match engine.sql(db, req.sql, auths).await {
         Ok(rows) => Json(rows).into_response(),
         Err(msg) => err_response(StatusCode::BAD_REQUEST, &msg),
+    }
+}
+
+// ---- data-plane tokens (SEC-4 phased) ----------------------------------
+
+/// The list view never includes the hash: it is not secret, but it is
+/// also not useful to an operator, and excluding it makes "the console
+/// cannot leak a credential" true by construction.
+fn token_view(r: &timelake_auth::TokenRecord) -> serde_json::Value {
+    json!({
+        "id": r.id,
+        "description": r.description,
+        "scope": r.scope.as_str(),
+        "databases": r.databases,
+        "authorizations": r.authorizations,
+        "created_by": r.created_by,
+        "created_at_secs": r.created_at_secs,
+        "expires_at_secs": r.expires_at_secs,
+        "revoked": r.revoked,
+        "last_used_secs": r.last_used_secs,
+    })
+}
+
+async fn tokens_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Operator) {
+        return deny;
+    }
+    let tokens: Vec<_> = state.auth.tokens().iter().map(token_view).collect();
+    Json(json!({ "tokens": tokens })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TokenIssueRequest {
+    description: String,
+    /// "read" | "write" | "read_write"
+    scope: String,
+    #[serde(default)]
+    databases: Vec<String>,
+    /// SEC-2 authorizations GRANTED to this token; a caller's claims are
+    /// intersected with these. Empty = no policy = claims pass through.
+    #[serde(default)]
+    authorizations: Vec<String>,
+    #[serde(default)]
+    expires_in_secs: Option<u64>,
+}
+
+async fn tokens_issue<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    // Issuing a credential is granting access: admin, no exceptions.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let issue: TokenIssueRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    if issue.description.trim().is_empty() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "description must not be empty — six months from now someone              has to know what this token is before revoking it",
+        );
+    }
+    let Some(scope) = Scope::parse(&issue.scope) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            &format!("scope {:?} is not read, write, or read_write", issue.scope),
+        );
+    };
+    let expires_at_secs = issue.expires_in_secs.map(|n| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + n
+    });
+    match state.auth.issue_token(
+        &issue.description,
+        scope,
+        issue.databases,
+        issue.authorizations,
+        expires_at_secs,
+        &session.username,
+    ) {
+        Ok((secret, record)) => Json(json!({
+            // Shown exactly once. Only the digest is stored, so there is
+            // no "show me again" — losing it means issuing a new one.
+            "secret": secret,
+            "token": token_view(&record),
+        }))
+        .into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn tokens_revoke<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    match state.auth.revoke_token(&id) {
+        Ok(true) => Json(json!({ "id": id, "status": "revoked" })).into_response(),
+        Ok(false) => err_response(StatusCode::NOT_FOUND, "no such token, or already revoked"),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 

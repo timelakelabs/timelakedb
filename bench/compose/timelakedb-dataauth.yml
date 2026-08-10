@@ -1,0 +1,22 @@
+# SEC-4 phased data-plane auth drill. Plaintext (no TLS) to isolate the
+# token mechanism from the certificate one — a token travels on the
+# Authorization header either way, and mixing both would blur which
+# control a failure implicates.
+name: bench-timelakedb-dataauth
+services:
+  timelakedb-da:
+    build: ../..
+    container_name: timelakedb-da
+    ports:
+      - "4963:1963"
+      - "4964:1964"
+    environment:
+      TIMELAKE_DATA_AUTH: required
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+volumes: {}

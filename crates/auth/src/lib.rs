@@ -36,8 +36,19 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use serde::{Deserialize, Serialize};
 use timelake_store::Store;
 
+pub mod guard;
+pub mod token;
+pub use guard::{Action, Decision, decide};
+pub use token::{
+    DataAuthCounts, DataAuthMode, Scope, TokenError, TokenIdentity, TokenIndex, TokenRecord,
+    generate_secret, hash_token, token_from_authorization,
+};
+
 /// Where the principal store lives in the object store.
 pub const PRINCIPALS_PATH: &str = "catalog/config/principals.json";
+/// Data-plane tokens live beside the principals, so they inherit SEC-1
+/// envelope encryption and the C0 S3 sharing story for free.
+pub const TOKENS_PATH: &str = "catalog/config/tokens.json";
 /// The seeded username and its seeded password.
 pub const DEFAULT_USER: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admin";
@@ -154,6 +165,7 @@ struct Failures {
 pub struct Auth {
     store: Arc<dyn Store>,
     principals: RwLock<BTreeMap<String, Principal>>,
+    tokens: RwLock<TokenIndex>,
     sessions: RwLock<HashMap<String, Session>>,
     failures: Mutex<HashMap<String, Failures>>,
     /// Successful and failed logins, for /metrics.
@@ -201,9 +213,21 @@ impl Auth {
             Err(e) => return Err(e),
         };
 
+        let tokens: Vec<TokenRecord> = match store.get(TOKENS_PATH) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{TOKENS_PATH}: {e}"),
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
         let auth = Auth {
             store,
             principals: RwLock::new(principals),
+            tokens: RwLock::new(TokenIndex::from_records(tokens)),
             sessions: RwLock::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             logins_total: AtomicU64::new(0),
@@ -249,6 +273,110 @@ impl Auth {
             }
         }
         Ok(Arc::new(auth))
+    }
+
+    fn persist_tokens(&self) -> Result<()> {
+        let t = self.tokens.read().expect("tokens lock");
+        let bytes = serde_json::to_vec_pretty(&t.records()).expect("tokens json");
+        self.store.put(TOKENS_PATH, &bytes)
+    }
+
+    /// Issue a data-plane token. The secret is returned exactly once and
+    /// only its digest is kept — an operator who loses it issues another,
+    /// which is what makes revocation mean something.
+    pub fn issue_token(
+        &self,
+        description: &str,
+        scope: Scope,
+        databases: Vec<String>,
+        authorizations: Vec<String>,
+        expires_at_secs: Option<u64>,
+        created_by: &str,
+    ) -> Result<(String, TokenRecord)> {
+        let secret = generate_secret();
+        let now = now_secs();
+        let record = TokenRecord {
+            id: format!("tok-{now}-{}", &hash_token(&secret)[..8]),
+            description: description.trim().to_string(),
+            hash: hash_token(&secret),
+            scope,
+            databases,
+            authorizations,
+            created_by: created_by.to_string(),
+            created_at_secs: now,
+            expires_at_secs,
+            revoked: false,
+            last_used_secs: None,
+        };
+        self.tokens
+            .write()
+            .expect("tokens lock")
+            .insert(record.clone());
+        self.persist_tokens()?;
+        tracing::info!(
+            id = %record.id, description = %record.description, scope = record.scope.as_str(),
+            by = created_by, "SEC-4: data-plane token issued"
+        );
+        Ok((secret, record))
+    }
+
+    pub fn tokens(&self) -> Vec<TokenRecord> {
+        self.tokens.read().expect("tokens lock").records()
+    }
+
+    /// Revoking is a tombstone rather than a delete: the record stays so
+    /// an operator can still see that the credential existed and when it
+    /// was withdrawn.
+    pub fn revoke_token(&self, id: &str) -> Result<bool> {
+        {
+            let mut t = self.tokens.write().expect("tokens lock");
+            match t.by_id_mut(id) {
+                Some(r) if !r.revoked => r.revoked = true,
+                Some(_) => return Ok(false),
+                None => return Ok(false),
+            }
+        }
+        self.persist_tokens()?;
+        tracing::info!(id = %id, "SEC-4: data-plane token revoked");
+        Ok(true)
+    }
+
+    /// Verify a presented secret. Hot path: a digest and a map lookup,
+    /// no KDF (see token.rs for why that is the right call rather than a
+    /// shortcut).
+    pub fn verify_token(&self, secret: &str) -> std::result::Result<TokenIdentity, TokenError> {
+        self.tokens
+            .read()
+            .expect("tokens lock")
+            .verify(secret, now_secs())
+    }
+
+    /// The one entry point for data-plane authentication. HTTP and
+    /// Flight SQL both route here, so the policy cannot fork: header →
+    /// token extraction (three spellings) → verification → [`decide`].
+    ///
+    /// In `Off` the header is not examined at all — see the rules on
+    /// [`guard::decide`] for why that is a compatibility promise rather
+    /// than a shortcut.
+    pub fn decide_data(
+        &self,
+        mode: DataAuthMode,
+        authorization: Option<&str>,
+        action: Action,
+        db: &str,
+    ) -> std::result::Result<Decision, TokenError> {
+        let presented = if mode == DataAuthMode::Off {
+            None
+        } else {
+            authorization.map(|h| match token_from_authorization(h) {
+                Some(secret) => self.verify_token(&secret),
+                // An Authorization header in a scheme we don't speak
+                // (Digest, Negotiate…) is a presented-but-unusable
+                // credential, not an anonymous request.
+                None => Err(TokenError::Invalid),
+            })
+        };
+        guard::decide(mode, presented, action, db)
     }
 
     fn persist(&self) -> Result<()> {

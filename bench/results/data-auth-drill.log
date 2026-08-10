@@ -1,0 +1,87 @@
+SEC-4 phased — data-plane token authentication, live end to end
+2026-08-10 · timelakedb-da (plaintext, TIMELAKE_DATA_AUTH=required)
+================================================================================
+
+THE CLAIM: one token, issued from the console, authenticates a request
+on BOTH data-plane doors (HTTP line protocol + /api/sql, and Flight SQL
+over the tonic accept loop), under the three header spellings stock
+clients send. In `required` mode a request without a valid token is
+refused on every path. The mechanism was fixed by measurement first —
+see data-auth-client-probe.log — not chosen.
+
+Run in a real container, because the in-process router tests cannot
+exercise the Flight SQL accept loop where the gRPC guard actually runs.
+
+REQUIRED MODE, NO CREDENTIAL — every door locked
+  POST /api/v3/write_lp        401
+  POST /api/sql                401
+  Flight SQL GetFlightInfo     REFUSED "authentication required" (Unauthenticated)
+
+WITH A CONSOLE-ISSUED read_write TOKEN
+  issued via POST /admin/tokens (admin session), secret shown once,
+  prefix tldb_
+  POST /api/v3/write_lp  Bearer   204
+  POST /api/sql          Bearer   [{"n":2}]
+  POST /api/sql          Token    200   (Telegraf influxdb_v2 spelling)
+  Flight SQL             Bearer   OK rows=1  (through the accept loop)
+
+SCOPE SEPARATES SHIPPING FROM READING
+  A write-only token attempting a Flight SQL read:
+    REFUSED "token is not permitted to do that" (permission_denied / 403)
+  This is the property that lets Tributary hold a credential that can
+  ship but cannot read the database back — the reason Scope is not a
+  total order.
+
+THE SPLIT IS MEASURED (valid Prometheus, column-0)
+  timelake_data_auth_mode 2                              (0=off 1=optional 2=required)
+  timelake_data_requests_authenticated_total 1
+  timelake_data_requests_anonymous_total     0
+  timelake_data_requests_rejected_total       1
+
+  Same lesson as want-mode mTLS: an operator flips optional -> required
+  on this measured split, not on a guess. In `required` the anonymous
+  counter must stay 0; a non-zero value means something is still
+  connecting without a credential and the flip was premature.
+
+WHY THE THREE SPELLINGS
+  Bearer  — Grafana (Flight SQL token field), Tributary
+  Token   — Telegraf influxdb_v2 output
+  Basic   — Telegraf influxdb v1 output (token as the password)
+  All three carry ONE token on the Authorization header. This is also
+  what InfluxDB accepts, so the compatibility matrix keeps its shape.
+
+MODES AS A MIGRATION, NOT A SWITCH
+  off       the data plane does not read Authorization at all — today's
+            documented contract, so a Telegraf carrying a leftover
+            InfluxDB token keeps writing unmodified. Verified: a garbage
+            token in off mode is ignored, not refused.
+  optional  anonymous still served; a PRESENTED-but-invalid token is
+            refused (fail loud on day one, not on flip day); a valid one
+            is identified and its grants applied.
+  required  no valid token, no access — both doors.
+
+ENFORCEMENT IS ONE DECISION, NOT TWO
+  HTTP and Flight SQL both call Engine::authenticate_data_impl ->
+  Auth::decide_data -> guard::decide. A token that cannot read over
+  Flight cannot read over /api/sql, because there is one implementation
+  of the rule. Flight re-authenticates at DoGet as well as at planning,
+  because a ticket is client-crafted bytes — planning-time auth alone
+  would be a door with no lock on the second entrance.
+
+SECRETS
+  256-bit OS-CSPRNG secret, stored only as a SHA-256 digest (not
+  Argon2id — a token has no brute-force surface to slow, and a ~50 ms
+  KDF on the write path would be a self-inflicted RR-1 violation).
+  Shown once at issue; revocation is a tombstone and takes effect on the
+  next request, verified live.
+
+WORKSPACE
+  116 tests (auth 20, +7 server data_auth integration, flight/api wired),
+  clippy clean, fmt clean.
+
+NOT DELIVERED HERE (named, not left looking done)
+  - Tributary presenting the token (P0-5) — the shipper side.
+  - The /admin/tokens console page is built but not yet drilled through
+    a browser; the API surface it calls is drilled above.
+  - Token last_used_secs is stored but not yet updated per request
+    (a coarse stamp would still cost a store write; deferred).
