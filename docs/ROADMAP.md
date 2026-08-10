@@ -173,7 +173,7 @@ outranks "do not deploy this yet":
 > **P0-1** push + CI on a real runner · **P0-2** `/api/sql` sandbox +
 > non-root container ✓ (done 2026-08-10) · **P0-3** data-plane tokens (in progress,
 > mechanism fixed by the client probe) · **P0-4** catalog CAS ✓ (done 2026-08-10) ·
-> **P0-5** Tributary presents the token
+> **P0-5** Tributary presents the token ✓ (done 2026-08-10)
 
 The competitive analysis adds and re-ranks the rest:
 

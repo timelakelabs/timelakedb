@@ -155,7 +155,9 @@ clustering all qualify.
 
 This is C1 in `ARCHITECTURE.md` §12 and it gates everything in P2.
 
-### P0-5 · Tributary cannot authenticate  ⟂ gated on P0-3
+### P0-5 · Tributary cannot authenticate  ⟂ **DONE (2026-08-10)**
+
+**Shipped** (Tributary repo) — `TRIBUTARY_TOKEN`/`token_file`, redacted two ways, a 401 spools rather than drops, drilled 10/10 against a required-mode node (`bench/results/p05-data-auth.log`). Original text below.
 
 **Effort: S once P0-3 lands.** The moment TimeLakeDB can require a
 credential, a shipper that cannot present one is not deployable.
