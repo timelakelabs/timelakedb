@@ -474,10 +474,21 @@ node logs its role, id, and resolved peers at boot. Phases still to
 land: ingester WAL replication (CL-2), router, querier (CL-3),
 compactor.
 
-- **Router** — stateless: hashes (db, table) → an ingester pair for LP
-  writes, forwards SQL/Flight to queriers; it is the single endpoint the
-  bench adapter, Telegraf, and Grafana keep seeing (FR-8/FR-9 contracts
-  intact, adapter untouched).
+- **Router — shipped (C2 phase 3), writes.** Stateless, holds no data,
+  opens no engine. It hashes each line's `(db, measurement)` → one
+  ingester and forwards that shard; the chosen ingester becomes the
+  table's primary and replicates to its CL-2 peer, so durability is
+  unchanged. It is the single write endpoint the bench adapter, Telegraf
+  and Grafana keep seeing (FR-8/FR-9). Atomicity holds: the whole body is
+  validated before any shard is forwarded, so a poison line writes zero;
+  a shard forward that fails for infrastructure reasons is returned for an
+  idempotent retry (LWW dedup). **Query/Flight forwarding is deferred to
+  phase 4** — a query is only correct once a querier unions every shard
+  from the shared store, so `/api/sql` on the router returns 501 until
+  then. Sharding is FNV-1a over `db\0measurement` mod N (stable across
+  restarts), with the ingester list sorted so a table always lands on the
+  same node. Metrics `timelake_router_{forwarded,forward_errors,rejected,
+  ingesters}`.
 - **Ingester (CL-2) — shipped (C2 phase 2).** Write path per §5 plus:
   ship the WAL frame to the paired ingester **before the 204**
   ("replicated"), so an acknowledged write is durable on two nodes. Peer

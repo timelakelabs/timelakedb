@@ -122,7 +122,28 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **C2 phase 2 SHIPPED — CL-2 ingester WAL replication** (2026-08-10,
+- Status: **C2 phase 3 SHIPPED — the router (write sharding)** (2026-08-10,
+  drill `bench/results/router-sharding-drill.log`). `TIMELAKE_ROLE=router`:
+  stateless, holds NO data, opens NO engine (main.rs branches before engine
+  creation, `return`s). Hashes each line's `(db,measurement)` →
+  `crates/server/src/router.rs` `shard_of` (FNV-1a over `db\0measurement`
+  mod N, deterministic; ingesters sorted by id) → forwards that shard to the
+  ingester's public write port; that ingester becomes the table's primary +
+  replicates to its CL-2 peer (durability unchanged). ATOMICITY held: whole
+  body validated before ANY forward (poison line → 400, writes zero); infra
+  failure of a shard → returned for idempotent retry (LWW). QUERIES NOT
+  routed → `/api/sql` returns 501 (needs querier to union shards, phase 4);
+  query an ingester directly for now. `NodeInfo.data_address` added (public
+  write port), carried in `TIMELAKE_PEERS` as `id=role@cluster_addr|data_addr`.
+  Metrics `timelake_router_{forwarded,forward_errors,rejected,ingesters}`.
+  role=all/ingester UNCHANGED (separate main branch). 141 tests (+5 router
+  +1 cluster), clippy/fmt clean; live 8/8 (12 tables sharded 6/6 across the
+  pair, exact accounting, distribution, atomic poison reject, 501 queries).
+  **C2 phasing:** (1) roles+discovery ✓ → (2) CL-2 ingester replication ✓ →
+  (3) router ✓ DONE → (4) CL-3 querier (stateless, unions live-buffer
+  snapshots from ingesters + shared S3; enables query routing on the router)
+  → (5) compactor+lease. Design: ARCHITECTURE §12.4.
+- Previous: **C2 phase 2 SHIPPED — CL-2 ingester WAL replication** (2026-08-10,
   drill `bench/results/cl2-replication-drill.log`). ZERO ACKED LOSS on a
   node death: `TIMELAKE_ROLE=ingester` + peer from `TIMELAKE_PEERS` →
   each write replicated to peer's durable **replica WAL** BEFORE the 204.

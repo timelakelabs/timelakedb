@@ -52,6 +52,33 @@ async fn main() {
     }
 
     let addr = std::env::var("TIMELAKE_ADDR").unwrap_or_else(|_| "0.0.0.0:1963".to_string());
+
+    // The router (C2 phase 3) holds NO data — it is a stateless write
+    // forwarder. It never opens an engine; it shards line protocol across the
+    // ingesters from discovery and forwards. Runs here and returns.
+    if role == timelake_cluster::Role::Router {
+        use timelake_cluster::Discovery;
+        let ingesters: Vec<(String, String)> = discovery
+            .peers_with_role(timelake_cluster::Role::Ingester)
+            .into_iter()
+            .filter(|n| !n.data_address.is_empty())
+            .map(|n| (n.id, n.data_address))
+            .collect();
+        if ingesters.is_empty() {
+            eprintln!(
+                "TIMELAKE_ROLE=router needs ingesters with public data addresses in \
+                 TIMELAKE_PEERS (id=ingester@cluster_addr|data_addr)"
+            );
+            std::process::exit(2);
+        }
+        let state = Arc::new(timelake_server::router::RouterState::new(ingesters));
+        tracing::info!(ingesters = ?state.target_ids(), %addr, "router up (write sharding)");
+        let app = timelake_server::router::router_app(state);
+        let listener = TcpListener::bind(&addr).await.expect("router bind");
+        axum::serve(listener, app).await.expect("router serve");
+        return;
+    }
+
     let data_dir = timelake_server::data_dir_from_env();
     let cfg = timelake_server::config_from_env();
 

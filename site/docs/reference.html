@@ -645,6 +645,10 @@
             <tr><td><code>timelake_cl2_degraded_events_total</code></td><td>counter</td><td>Times the ingester entered degraded mode — a flapping peer without log-diving</td></tr>
             <tr><td><code>timelake_cl2_replica_frames_total</code></td><td>counter</td><td>Frames received from the peer into this node's durable replica WAL</td></tr>
             <tr><td><code>timelake_cl2_recovered_total</code></td><td>counter</td><td>Peer frames replayed on recovery after the peer died</td></tr>
+            <tr><td><code>timelake_router_forwarded_total</code></td><td>counter</td><td>Write shards a router forwarded to an ingester (router role only)</td></tr>
+            <tr><td><code>timelake_router_forward_errors_total</code></td><td>counter</td><td>Shard forwards that failed (ingester down or rejected)</td></tr>
+            <tr><td><code>timelake_router_rejected_total</code></td><td>counter</td><td>Bodies the router rejected before forwarding (malformed lines)</td></tr>
+            <tr><td><code>timelake_router_ingesters</code></td><td>gauge</td><td>Ingesters the router is sharding across</td></tr>
             <tr><td><code>timelake_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
             <tr><td><code>timelake_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELAKE_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelake_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>

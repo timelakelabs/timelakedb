@@ -53,10 +53,11 @@ impl Role {
 
     /// Whether this role's behaviour exists yet. Roles are enabled one C2
     /// phase at a time; selecting an unbuilt role is a startup refusal, not
-    /// a silent half-node. `all` (foundation) and `ingester` (CL-2, WAL
-    /// replication) are built; `router`/`querier`/`compactor` are not yet.
+    /// a silent half-node. `all` (foundation), `ingester` (CL-2, WAL
+    /// replication) and `router` (write sharding) are built;
+    /// `querier`/`compactor` are not yet.
     pub fn implemented(self) -> bool {
-        matches!(self, Role::All | Role::Ingester)
+        matches!(self, Role::All | Role::Ingester | Role::Router)
     }
 }
 
@@ -66,10 +67,13 @@ pub struct NodeInfo {
     /// Stable identity, unique in the cluster (log lines, peer selection).
     pub id: String,
     pub role: Role,
-    /// `host:port` for the intra-cluster gRPC/Flight links (replication,
-    /// buffer snapshots, router forwarding). Empty for a lone `all` node
-    /// with no peers.
+    /// `host:port` for the intra-cluster links (an ingester's replication
+    /// listener). Empty for a lone `all` node with no peers.
     pub address: String,
+    /// `host:port` of the node's PUBLIC data port (line-protocol writes /
+    /// `/api/sql`). What the router forwards client writes to. Empty when
+    /// not applicable or not configured.
+    pub data_address: String,
 }
 
 #[derive(Debug)]
@@ -145,7 +149,16 @@ impl StaticDiscovery {
             Ok(v) => parse_peers(&v)?,
             Err(_) => Vec::new(),
         };
-        Ok(StaticDiscovery::new(NodeInfo { id, role, address }, peers))
+        let data_address = std::env::var("TIMELAKE_DATA_ADDR").unwrap_or_default();
+        Ok(StaticDiscovery::new(
+            NodeInfo {
+                id,
+                role,
+                address,
+                data_address,
+            },
+            peers,
+        ))
     }
 }
 
@@ -158,9 +171,12 @@ impl Discovery for StaticDiscovery {
     }
 }
 
-/// Parse `TIMELAKE_PEERS`: a comma-separated list of `id=role@host:port`.
-/// Blank entries (a trailing comma) are skipped; a duplicate id keeps the
-/// last, so a generated config that repeats a node does not fan out.
+/// Parse `TIMELAKE_PEERS`: a comma-separated list of
+/// `id=role@cluster_addr` with an optional public data address after a
+/// pipe: `id=role@cluster_addr|data_addr` (the router needs the latter to
+/// forward writes). Blank entries (a trailing comma) are skipped; a
+/// duplicate id keeps the last, so a generated config that repeats a node
+/// does not fan out.
 pub fn parse_peers(s: &str) -> Result<Vec<NodeInfo>, ClusterError> {
     let mut by_id: BTreeMap<String, NodeInfo> = BTreeMap::new();
     for raw in s.split(',') {
@@ -175,15 +191,18 @@ pub fn parse_peers(s: &str) -> Result<Vec<NodeInfo>, ClusterError> {
 }
 
 fn parse_peer(entry: &str) -> Result<NodeInfo, ClusterError> {
-    // id=role@host:port
+    // id=role@cluster_addr[|data_addr]
     let (id, rest) = entry
         .split_once('=')
         .ok_or_else(|| ClusterError::MalformedPeer(entry.to_string()))?;
-    let (role_s, address) = rest
+    let (role_s, addrs) = rest
         .split_once('@')
         .ok_or_else(|| ClusterError::MalformedPeer(entry.to_string()))?;
+    let (address, data_address) = match addrs.split_once('|') {
+        Some((a, d)) => (a.trim(), d.trim()),
+        None => (addrs.trim(), ""),
+    };
     let id = id.trim();
-    let address = address.trim();
     if id.is_empty() || address.is_empty() {
         return Err(ClusterError::MalformedPeer(entry.to_string()));
     }
@@ -191,6 +210,7 @@ fn parse_peer(entry: &str) -> Result<NodeInfo, ClusterError> {
         id: id.to_string(),
         role: Role::parse(role_s)?,
         address: address.to_string(),
+        data_address: data_address.to_string(),
     })
 }
 
@@ -212,10 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn implemented_roles_are_all_and_ingester() {
+    fn implemented_roles_are_all_ingester_and_router() {
         assert!(Role::All.implemented());
         assert!(Role::Ingester.implemented(), "CL-2 shipped the ingester");
-        for r in [Role::Router, Role::Querier, Role::Compactor] {
+        assert!(Role::Router.implemented(), "phase 3 shipped the router");
+        for r in [Role::Querier, Role::Compactor] {
             assert!(!r.implemented(), "{} should not be built yet", r.as_str());
         }
     }
@@ -237,6 +258,16 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_can_carry_a_public_data_address_for_the_router() {
+        let peers = parse_peers("ing-a=ingester@ing-a:1965|ing-a:1963").unwrap();
+        assert_eq!(peers[0].address, "ing-a:1965", "intra-cluster addr");
+        assert_eq!(peers[0].data_address, "ing-a:1963", "public data addr");
+        // Omitting the data address leaves it empty, not an error.
+        let bare = parse_peers("ing-b=ingester@ing-b:1965").unwrap();
+        assert_eq!(bare[0].data_address, "");
+    }
+
+    #[test]
     fn malformed_peers_are_a_loud_error_not_a_silent_drop() {
         assert!(parse_peers("no-at-sign").is_err());
         assert!(parse_peers("id=ingester@").is_err(), "empty address");
@@ -250,6 +281,7 @@ mod tests {
             id: "ing-a".into(),
             role: Role::Ingester,
             address: "ing-a:1965".into(),
+            data_address: "ing-a:1963".into(),
         };
         let peers = parse_peers("ing-b=ingester@ing-b:1965, qry=querier@qry:1966").unwrap();
         let d = StaticDiscovery::new(this, peers);
@@ -268,6 +300,7 @@ mod tests {
                 id: "node-local".into(),
                 role: Role::All,
                 address: String::new(),
+                data_address: String::new(),
             },
             Vec::new(),
         );

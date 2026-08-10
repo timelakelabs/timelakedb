@@ -32,6 +32,7 @@ use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::Wal;
 
 pub mod replication;
+pub mod router;
 use replication::Replicator;
 
 #[derive(Clone, Debug)]
