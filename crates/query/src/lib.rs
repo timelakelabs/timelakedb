@@ -30,7 +30,6 @@ pub use datafusion::datasource::TableProvider as DfTableProvider;
 pub mod provider;
 pub mod visibility;
 
-use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnv;
 
 /// Shared query environment (RR-1/RR-2 hardening, M4):
@@ -47,8 +46,23 @@ pub struct QueryEnv {
 
 impl QueryEnv {
     pub fn new(total_mem_bytes: usize, max_concurrent: usize, timeout_secs: u64) -> Self {
+        // The pool is GREEDY, not fair, and the difference is measured.
+        // `FairSpillPool` hands each *spillable consumer* an even slice —
+        // `(pool_size - unspillable) / num_spill` — and a DataFusion plan
+        // registers one such consumer per partition per aggregate, per
+        // partition per repartition, and one per sort. A funnel query on a
+        // 24-core host registers ~145 of them, so a 1 GiB pool becomes a
+        // ~7 MB budget per operator: the final aggregate spilled 39.5 MB to
+        // disk with 800 MB of the pool still free. That divisor grows with
+        // core count, so the engine spilled *more* the bigger the machine.
+        //
+        // RR-1 is unaffected — the cap that matters is the total, and a
+        // greedy pool enforces exactly the same one, returning a clean
+        // error (or a spill) when the whole pool is gone rather than when
+        // 1/145th of it is. Concurrency is bounded where it was designed to
+        // be bounded: the admission semaphore below.
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(total_mem_bytes)))
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(total_mem_bytes)))
             .build_arc()
             .expect("runtime env");
         QueryEnv {
