@@ -122,7 +122,24 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **P0-5 SHIPPED — Tributary presents the data-plane token**
+- Status: **C2 phase 1 SHIPPED — cluster roles + Discovery seam**
+  (2026-08-10). Working P1-1 (replication/HA) ONE PHASE AT A TIME (user
+  preference [[phase-by-phase-workflow]]): each phase ends with regression
+  + unit tests + doc updates. New `timelake-cluster` crate: `Role` enum
+  (`TIMELAKE_ROLE`, default `all`), `Discovery` trait + `StaticDiscovery`
+  (`TIMELAKE_NODE_ID`, `TIMELAKE_CLUSTER_ADDR`, `TIMELAKE_PEERS` =
+  `id=role@host:port`). `all` = unchanged whole-stack default (bench
+  untouched). Non-`all` roles REFUSE at startup (`exit 2`, "not yet
+  implemented") — no half-built nodes. CL-5 guard: discovery carries NO
+  correctness (commits go through catalog CAS, C1); nothing on write/commit
+  path consults it. Server main.rs reads role at the edge, logs
+  role/node/peers. 7 cluster unit tests; 131 total, clippy/fmt clean;
+  role=all live-drilled (write/read unchanged), ingester+typo refuse.
+  **C2 phasing:** (1) roles+discovery ✓ DONE → (2) CL-2 ingester WAL
+  replication (next: gRPC frame ship before 204, degraded mode, SIGKILL
+  zero-loss drill) → (3) router → (4) CL-3 querier + live-buffer snapshot
+  → (5) compactor+lease. Design: ARCHITECTURE §12.4/12.5.
+- Previous: **P0-5 SHIPPED — Tributary presents the data-plane token**
   (2026-08-10, in the TRIBUTARY repo: `bench/results/p05-data-auth.log`,
   drill `bench/drill-p05.sh`). Tributary `crates/tributary/src/auth.rs`
   `Secret` (redacting Debug/Display, `.expose()` the only door) +

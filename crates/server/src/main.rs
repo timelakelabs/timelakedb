@@ -12,6 +12,45 @@ async fn main() {
         )
         .init();
 
+    // Cluster role + topology (CL-1/CL-5). `all` is the default and does
+    // everything, as it always has. A role whose C2 phase has not landed is
+    // refused here rather than started half-built.
+    let role = match std::env::var("TIMELAKE_ROLE") {
+        Ok(v) => timelake_cluster::Role::parse(&v).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }),
+        Err(_) => timelake_cluster::Role::All,
+    };
+    if !role.implemented() {
+        eprintln!(
+            "TIMELAKE_ROLE={} is not yet implemented — the cluster roles land \
+             one C2 phase at a time (ARCHITECTURE §12.4). Use `all` (the \
+             default) for a single-node deployment.",
+            role.as_str()
+        );
+        std::process::exit(2);
+    }
+    let discovery = timelake_cluster::StaticDiscovery::from_env(role).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    {
+        use timelake_cluster::Discovery;
+        let peers: Vec<String> = discovery
+            .peers()
+            .iter()
+            .map(|n| format!("{}={}@{}", n.id, n.role.as_str(), n.address))
+            .collect();
+        tracing::info!(
+            role = role.as_str(),
+            node = %discovery.this_node().id,
+            cluster_addr = %discovery.this_node().address,
+            peers = %peers.join(","),
+            "cluster role selected"
+        );
+    }
+
     let addr = std::env::var("TIMELAKE_ADDR").unwrap_or_else(|_| "0.0.0.0:1963".to_string());
     let data_dir = timelake_server::data_dir_from_env();
     let cfg = timelake_server::config_from_env();

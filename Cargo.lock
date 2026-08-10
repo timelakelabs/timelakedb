@@ -4470,6 +4470,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "timelake-cluster"
+version = "0.1.0"
+
+[[package]]
 name = "timelake-compact"
 version = "0.1.0"
 dependencies = [
@@ -4540,6 +4544,7 @@ dependencies = [
  "timelake-auth",
  "timelake-buffer",
  "timelake-catalog",
+ "timelake-cluster",
  "timelake-compact",
  "timelake-flight",
  "timelake-ingest",
