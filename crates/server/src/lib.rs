@@ -50,6 +50,10 @@ pub struct EngineConfig {
     /// only after this grace (must exceed query_timeout so an in-flight
     /// query's catalog snapshot never dangles — the AT-3 race).
     pub gc_grace_secs: u64,
+    /// SEC-4 phased: how the data plane treats credentials.
+    /// `Off` (default) does not read `Authorization` at all — the
+    /// documented compatibility contract. See `timelake_auth::guard`.
+    pub data_auth: timelake_auth::DataAuthMode,
 }
 
 impl Default for EngineConfig {
@@ -64,6 +68,7 @@ impl Default for EngineConfig {
             max_concurrent_queries: 6,
             query_timeout_secs: 600,
             gc_grace_secs: 900,
+            data_auth: timelake_auth::DataAuthMode::Off,
         }
     }
 }
@@ -257,6 +262,10 @@ pub struct Engine {
     schemas: RwLock<HashMap<(String, String), timelake_query::QuerySchema>>,
     /// SEC-4 principals and sessions for the admin surface.
     auth: Arc<timelake_auth::Auth>,
+    /// The data-plane split: how many requests authenticated, came
+    /// anonymous, or were rejected. The measurement an operator flips
+    /// `optional` → `required` on — same lesson as the mTLS counters.
+    data_auth_counts: timelake_auth::DataAuthCounts,
     /// FR-7 policies, runtime-mutable (the /admin/retention surface).
     /// Seeded from `TIMELAKE_RETENTION`; changes persist to
     /// [`RETENTION_CONFIG_PATH`] through the store — encrypted like any
@@ -380,6 +389,7 @@ impl Engine {
         let engine = Engine {
             dbs: RwLock::new(HashMap::new()),
             ingest_gate: RwLock::new(()),
+            data_auth_counts: timelake_auth::DataAuthCounts::default(),
             wal: Mutex::new(wal),
             store,
             catalog,
@@ -830,6 +840,15 @@ impl Engine {
 }
 
 impl timelake_api::Engine for Engine {
+    fn authenticate_data(
+        &self,
+        authorization: Option<&str>,
+        action: timelake_auth::Action,
+        db: &str,
+    ) -> Result<timelake_auth::Decision, timelake_auth::TokenError> {
+        self.authenticate_data_impl(authorization, action, db)
+    }
+
     fn write_lp(
         &self,
         db: &str,
@@ -1103,6 +1122,25 @@ impl Engine {
             ),
             None => String::new(),
         };
+        let (da_auth, da_anon, da_rej) = self.data_auth_counts.snapshot();
+        let data_auth_lines = format!(
+            "# TYPE timelake_data_auth_mode gauge\n\
+             timelake_data_auth_mode {}\n\
+             # TYPE timelake_data_requests_authenticated_total counter\n\
+             timelake_data_requests_authenticated_total {}\n\
+             # TYPE timelake_data_requests_anonymous_total counter\n\
+             timelake_data_requests_anonymous_total {}\n\
+             # TYPE timelake_data_requests_rejected_total counter\n\
+             timelake_data_requests_rejected_total {}\n",
+            match self.cfg.data_auth {
+                timelake_auth::DataAuthMode::Off => 0,
+                timelake_auth::DataAuthMode::Optional => 1,
+                timelake_auth::DataAuthMode::Required => 2,
+            },
+            da_auth,
+            da_anon,
+            da_rej,
+        );
         let auth_split_lines = match self
             .client_auth_counts
             .read()
@@ -1149,7 +1187,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1169,6 +1207,7 @@ impl Engine {
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
             client_ca_lines,
+            data_auth_lines,
             auth_split_lines,
             kms_lines,
             s3_lines,
@@ -1181,9 +1220,57 @@ impl Engine {
     pub fn config(&self) -> EngineConfig {
         self.cfg.clone()
     }
+
+    /// The one data-plane authentication path. Both the HTTP router and
+    /// Flight SQL land here, so HTTP and Flight cannot drift into two
+    /// policies — and the counters see every request whichever door it
+    /// came through.
+    fn authenticate_data_impl(
+        &self,
+        authorization: Option<&str>,
+        action: timelake_auth::Action,
+        db: &str,
+    ) -> Result<timelake_auth::Decision, timelake_auth::TokenError> {
+        let result = self
+            .auth
+            .decide_data(self.cfg.data_auth, authorization, action, db);
+        match &result {
+            Ok(d) if d.is_authenticated() => {
+                self.data_auth_counts
+                    .authenticated
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(_) => {
+                self.data_auth_counts
+                    .anonymous
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.data_auth_counts
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    code = e.code(),
+                    action = ?action,
+                    db,
+                    "data-plane request refused"
+                );
+            }
+        }
+        result
+    }
 }
 
 impl timelake_flight::SqlBackend for Engine {
+    fn authenticate_read(
+        &self,
+        authorization: Option<&str>,
+        db: &str,
+    ) -> Result<Option<Vec<String>>, timelake_auth::TokenError> {
+        self.authenticate_data_impl(authorization, timelake_auth::Action::Read, db)
+            .map(|d| d.granted)
+    }
+
     fn query_batches<'a>(
         &'a self,
         db: String,
@@ -1287,6 +1374,13 @@ pub fn config_from_env() -> EngineConfig {
         max_concurrent_queries: env("TIMELAKE_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
         query_timeout_secs: env("TIMELAKE_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
         gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
+        // A typo here must refuse to start, not silently disable
+        // authentication — the same posture as a malformed encryption key.
+        data_auth: match std::env::var("TIMELAKE_DATA_AUTH") {
+            Ok(v) => timelake_auth::DataAuthMode::parse(&v)
+                .unwrap_or_else(|| panic!("TIMELAKE_DATA_AUTH={v:?} is not off|optional|required")),
+            Err(_) => d.data_auth,
+        },
     }
 }
 

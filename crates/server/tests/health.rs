@@ -20,6 +20,9 @@ fn engine_cfg(retention: Vec<(String, u64)>) -> timelake_server::EngineConfig {
         max_concurrent_queries: 4,
         query_timeout_secs: 120,
         gc_grace_secs: 0, // tests exercise immediate GC via run_gc()
+        // data_auth stays Off here: these tests pin the unauthenticated
+        // contracts. The authenticated ones live in data_auth.rs.
+        ..Default::default()
     }
 }
 

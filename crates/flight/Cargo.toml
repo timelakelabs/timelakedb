@@ -15,6 +15,7 @@ tracing.workspace = true
 tokio = { workspace = true }
 rustls.workspace = true
 tokio-rustls.workspace = true
+timelake-auth = { path = "../auth" }
 timelake-tls = { path = "../tls" }
 
 [dev-dependencies]

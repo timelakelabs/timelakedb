@@ -48,6 +48,19 @@ const TABLE_TYPE: &str = "BASE TABLE";
 
 /// The seam to the engine (implemented by `timelake_server::Engine`).
 pub trait SqlBackend: Send + Sync + 'static {
+    /// Authenticate one read call from the raw `Authorization` metadata
+    /// value (SEC-4 phased). `Ok(None)` — proceed, claims untouched
+    /// (anonymous, or a token with no grant policy). `Ok(Some(grants))`
+    /// — proceed, and intersect the caller's claimed SEC-2
+    /// authorizations with `grants`. The implementation is the same
+    /// `decide` the HTTP router uses, so the two doors cannot drift
+    /// into different policies.
+    fn authenticate_read(
+        &self,
+        authorization: Option<&str>,
+        db: &str,
+    ) -> Result<Option<Vec<String>>, timelake_auth::TokenError>;
+
     /// `authorizations` are the session's visibility authorizations
     /// (SEC-2), from `x-timelake-authorizations` request metadata.
     fn query_batches<'a>(
@@ -104,6 +117,41 @@ fn auths_from_metadata(md: &tonic::metadata::MetadataMap) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn authorization_from_metadata(md: &tonic::metadata::MetadataMap) -> Option<String> {
+    md.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A refusal, in the grammar gRPC clients understand. Grafana surfaces
+/// `Unauthenticated` as a datasource auth failure rather than a query
+/// error, which is exactly the prompt an operator needs.
+fn deny(e: timelake_auth::TokenError) -> Status {
+    match e {
+        timelake_auth::TokenError::Forbidden => Status::permission_denied(e.message()),
+        _ => Status::unauthenticated(e.message()),
+    }
+}
+
+/// Authenticate one call and fold the token's grants into the claimed
+/// authorizations. Every handler passes through here — including DoGet,
+/// because a ticket is an opaque handle a client can craft: planning-time
+/// authentication alone would let a forged ticket skip the door.
+fn resolve_auths<B: SqlBackend + ?Sized>(
+    backend: &B,
+    md: &tonic::metadata::MetadataMap,
+    db: &str,
+    mut claimed: Vec<String>,
+) -> Result<Vec<String>, Status> {
+    let granted = backend
+        .authenticate_read(authorization_from_metadata(md).as_deref(), db)
+        .map_err(deny)?;
+    if let Some(granted) = granted {
+        claimed.retain(|c| granted.iter().any(|g| g == c));
+    }
+    Ok(claimed)
 }
 
 /// Every metadata command answers GetFlightInfo the same way: a ticket that
@@ -181,7 +229,12 @@ impl FlightSqlService for TimeLakeFlight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let db = db_from_metadata(request.metadata());
-        let auths = auths_from_metadata(request.metadata());
+        let auths = resolve_auths(
+            self.backend.as_ref(),
+            request.metadata(),
+            &db,
+            auths_from_metadata(request.metadata()),
+        )?;
         let handle =
             serde_json::json!({ "db": db, "sql": query.query, "auths": auths }).to_string();
         let ticket = TicketStatementQuery {
@@ -226,6 +279,11 @@ impl FlightSqlService for TimeLakeFlight {
                 auths.push(a);
             }
         }
+        // Re-authenticate at execution: the ticket is client-crafted
+        // bytes, so planning-time auth alone is a door with no lock on
+        // the second entrance. Narrowing the union again is idempotent
+        // for honest clients and decisive for forged tickets.
+        let auths = resolve_auths(self.backend.as_ref(), request.metadata(), &db, auths)?;
 
         let batches = self
             .backend
@@ -313,6 +371,7 @@ impl FlightSqlService for TimeLakeFlight {
             .clone()
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| db_from_metadata(request.metadata()));
+        resolve_auths(self.backend.as_ref(), request.metadata(), &db, vec![])?;
 
         let mut builder = query.into_builder();
         for table in self.backend.tables(&db) {
@@ -532,6 +591,17 @@ mod tests {
     struct StubBackend;
 
     impl SqlBackend for StubBackend {
+        fn authenticate_read(
+            &self,
+            _authorization: Option<&str>,
+            _db: &str,
+        ) -> Result<Option<Vec<String>>, timelake_auth::TokenError> {
+            // The stub is a mode-off node: anonymous proceeds, claims
+            // untouched. The mode matrix itself is pinned in the auth
+            // crate and in the server's data_auth integration tests.
+            Ok(None)
+        }
+
         fn query_batches<'a>(
             &'a self,
             _db: String,

@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 timelake-store = { path = "../store" }
 argon2 = "0.5"
+sha2 = "0.10"
+subtle = "2"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

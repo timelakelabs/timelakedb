@@ -122,6 +122,42 @@
       once the GC grace elapses. Growing a window needs <b>operator</b>;
       shrinking, introducing, or removing one needs <b>admin</b>.</div>
     </div>
+
+    <div class="card">
+      <h2>Data-plane tokens</h2>
+      <table id="tokens"><thead>
+        <tr><th>Description</th><th>Scope</th><th>Databases</th><th>Grants</th><th>Status</th><th></th></tr>
+      </thead><tbody></tbody></table>
+      <div class="stat" id="tokenstat"></div>
+    </div>
+
+    <div class="card">
+      <h2>Issue a token</h2>
+      <form id="tokenform">
+        <label>Description
+          <input id="tk-desc" placeholder="grafana-prod" required>
+        </label>
+        <label>Scope
+          <select id="tk-scope">
+            <option value="read" selected>read</option>
+            <option value="write">write</option>
+            <option value="read_write">read + write</option>
+          </select>
+        </label>
+        <label>Databases <input id="tk-dbs" placeholder="poc (blank = all)"></label>
+        <label>Granted authorizations <input id="tk-auths" placeholder="ops,audit (blank = no policy)"></label>
+        <button type="submit">Issue</button>
+      </form>
+      <div class="msg" id="tk-msg"></div>
+      <div class="warn danger" id="tk-secret" hidden></div>
+      <div class="warn">The secret is shown <b>once</b>, right here — only its
+      digest is stored, so there is no way to see it again. Paste it into the
+      client now (Grafana's <i>token</i> field; Telegraf v2 <i>token</i>;
+      Telegraf v1 <i>password</i>) or revoke it and issue another. Granted
+      authorizations <b>intersect</b> a caller's claimed SEC-2 labels — a
+      token can only narrow what its holder sees, never widen it. Issuing and
+      revoking need <b>admin</b>.</div>
+    </div>
   </section>
 </div>
 <script>
@@ -160,7 +196,7 @@ async function refresh() {
   $('#me-user').textContent = body.username;
   $('#me-role').textContent = body.role;
   $('#defaultbanner').hidden = !body.default_credential_active;
-  loadPolicies(); loadTables(); loadDrops();
+  loadPolicies(); loadTokens(); loadTables(); loadDrops();
 }
 
 $('#loginform').onsubmit = async (e) => {
@@ -219,6 +255,58 @@ async function loadPolicies() {
     tb.appendChild(tr);
   }
 }
+
+async function loadTokens() {
+  const { ok, body } = await api('GET', '/admin/tokens');
+  if (!ok) return;
+  const tb = $('#tokens tbody');
+  tb.innerHTML = '';
+  if (!body.tokens.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="empty">No tokens — the data plane answers per TIMELAKE_DATA_AUTH (anonymous in off/optional).</td></tr>';
+    return;
+  }
+  for (const k of body.tokens) {
+    const tr = document.createElement('tr');
+    const scope = k.scope === 'read_write' ? 'read+write' : k.scope;
+    const status = k.revoked ? 'revoked'
+      : (k.expires_at_secs && k.expires_at_secs * 1000 < Date.now()) ? 'expired' : 'active';
+    tr.innerHTML = `<td>${k.description}</td><td class="mono">${scope}</td>` +
+      `<td class="mono">${k.databases.length ? k.databases.join(', ') : 'all'}</td>` +
+      `<td class="mono">${k.authorizations.length ? k.authorizations.join(', ') : '—'}</td>` +
+      `<td>${status}</td><td style="text-align:right"></td>`;
+    if (status === 'active') {
+      const rev = document.createElement('button');
+      rev.className = 'ghost'; rev.textContent = 'revoke';
+      rev.onclick = async () => {
+        if (!confirm(`Revoke "${k.description}"? Every client holding it fails on its next request.`)) return;
+        const res = await api('DELETE', '/admin/tokens/' + encodeURIComponent(k.id));
+        if (!res.ok) alert(res.body?.error || 'failed');
+        loadTokens();
+      };
+      tr.lastElementChild.appendChild(rev);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+$('#tokenform').onsubmit = async (e) => {
+  e.preventDefault();
+  const csv = (v) => v.split(',').map(s => s.trim()).filter(Boolean);
+  const { ok, body } = await api('POST', '/admin/tokens', {
+    description: $('#tk-desc').value.trim(),
+    scope: $('#tk-scope').value,
+    databases: csv($('#tk-dbs').value),
+    authorizations: csv($('#tk-auths').value),
+  });
+  const m = $('#tk-msg');
+  if (!ok) { m.className = 'msg err'; m.textContent = body?.error || 'failed'; return; }
+  m.className = 'msg'; m.textContent = '';
+  const s = $('#tk-secret');
+  s.hidden = false;
+  s.innerHTML = `<b>Copy this now — it will not be shown again.</b><br><code class="mono">${body.secret}</code>`;
+  $('#tokenform').reset();
+  loadTokens();
+};
 
 async function loadTables() {
   try {
