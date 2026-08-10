@@ -140,7 +140,9 @@ mTLS used, and for the same reason: flipping straight to `required`
 without a measured split of who is actually presenting credentials is
 how a fleet goes down at once.
 
-### P0-4 · Catalog commits are not atomic against a second writer
+### P0-4 · Catalog commits are not atomic against a second writer  ⟂ **DONE (2026-08-10)**
+
+**Effort: M. Shipped** — CAS on the next manifest sequence (`put_if_absent`), catch-up-and-retry on conflict, `timelake_catalog_commit_conflicts_total`; drilled on local hard-link and real S3 If-None-Match (`bench/results/catalog-cas-drill.log`). Original text below.
 
 **Effort: M.** The CAS primitive exists — `Store::put_if_absent`, S3
 `If-None-Match`, local hard-link publish, built during C0 — but **catalog

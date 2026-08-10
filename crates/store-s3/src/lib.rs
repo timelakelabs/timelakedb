@@ -570,6 +570,65 @@ mod tests {
         s.delete("cas/000001.json").unwrap();
     }
 
+    /// P0-4 over REAL S3 semantics: two catalogs on one bucket, the same
+    /// two-writer race the local test covers, but driven through
+    /// `If-None-Match` rather than a local hard-link. This is the mechanism
+    /// that actually runs in a cluster, so it gets its own drill.
+    #[test]
+    #[ignore = "needs LocalStack/AWS: see it_env()"]
+    fn two_catalogs_on_one_bucket_lose_no_commits_p04() {
+        use timelake_catalog::{Catalog, FileMeta};
+        let (ctx, bucket, _) = it_env().expect("TLDB_S3_TEST_BUCKET not set");
+        // A fresh prefix per run so a previous run's manifest never seeds
+        // the head (the whole point is both writers start believing head 0).
+        let prefix = format!("p04-{}", std::process::id());
+        let store = || S3Store::new(ctx.clone(), &format!("s3://{bucket}/{prefix}"), None).unwrap();
+        let meta = |path: &str| FileMeta {
+            db: "poc".into(),
+            table: "t".into(),
+            partition: "2026081000".into(),
+            path: path.into(),
+            rows: 1,
+            size_bytes: 1,
+            min_ts_ns: 1,
+            max_ts_ns: 2,
+        };
+
+        let a = Catalog::load(store()).unwrap();
+        let b = Catalog::load(store()).unwrap();
+        let sa = a.commit_add(vec![meta("a.parquet")]).unwrap();
+        let sb = b.commit_add(vec![meta("b.parquet")]).unwrap();
+        assert_ne!(
+            sa, sb,
+            "If-None-Match must force the two onto distinct slots"
+        );
+        assert!(
+            b.commit_conflicts() >= 1,
+            "B lost the seq-1 race and retried"
+        );
+
+        a.commit_add(vec![meta("a2.parquet")]).unwrap();
+        b.commit_add(vec![meta("b2.parquet")]).unwrap();
+
+        let fresh = Catalog::load(store()).unwrap();
+        let paths: std::collections::BTreeSet<String> = fresh
+            .files_for("poc", "t")
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["a.parquet", "a2.parquet", "b.parquet", "b2.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(paths, expected, "a committed file was lost on S3");
+
+        // Clean the manifest objects this run wrote (best-effort).
+        for p in store().list("catalog/manifest").unwrap_or_default() {
+            let _ = store().delete(&p);
+        }
+    }
+
     #[test]
     #[ignore = "needs LocalStack/AWS: see it_env()"]
     fn kms_roundtrip_and_encrypted_store_over_s3() {

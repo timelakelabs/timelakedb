@@ -13,6 +13,35 @@ here.
 
 ## [Unreleased]
 
+### Fixed — P0-4: catalog commits are atomic against a second writer (2026-08-10)
+
+- **Two writers on one object store can no longer lose each other's
+  commits.** `Catalog::commit` picked the next manifest sequence from an
+  in-process counter and wrote `catalog/manifest/{seq}.json` with a plain
+  `put`; two writers replaying the same log computed the same `seq`, and
+  the second `put` silently overwrote the first — its data files left
+  orphaned in the store and invisible to every query. Latent on one node,
+  active the moment a second writer appears (a botched restore, a stray
+  container, day one of clustering).
+- Commit is now **compare-and-swap on the next sequence key**
+  (`put_if_absent`: S3 `If-None-Match`, local `File::create_new`). The
+  loser of a race replays the winner's entries, folds them into memory,
+  and retries at the new head — the manifest log becomes a true total
+  order, every slot with exactly one writer. Bounded at 100 attempts
+  (→ `ResourceBusy`); each retry catches up first, so honest contention
+  converges in a few rounds.
+- Metric `timelake_catalog_commit_conflicts_total` — 0 on a single writer,
+  climbing means real contention, so it is visible rather than inferred.
+- Drilled on **both** CAS mechanisms, which are different code: local
+  hard-link (3 catalog tests, including the two-writer loss scenario and
+  removals-survive-retry) and **real S3 `If-None-Match` via LocalStack**
+  (a two-`Catalog`-on-one-bucket drill, `--ignored`).
+  `bench/results/catalog-cas-drill.log`.
+- Deferred to C2 (safe because maintenance is single-node until the role
+  split): re-validating a commit against the new state on conflict, so a
+  compaction whose inputs were concurrently retention-dropped aborts
+  rather than resurrects dropped data.
+
 ### Fixed — P0-2: the data-plane SQL surface is read-only, container non-root (2026-08-10)
 
 - **`POST /api/sql` and Flight SQL can no longer write files.** DataFusion's

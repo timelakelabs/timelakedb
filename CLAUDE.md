@@ -122,7 +122,27 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **P0-2 SHIPPED — /api/sql read-only + non-root container**
+- Status: **P0-4 SHIPPED — catalog commits are CAS (no multi-writer loss)**
+  (2026-08-10, drill `bench/results/catalog-cas-drill.log`). Was: `commit`
+  picked next seq from an in-process atomic + plain `put` → two writers on
+  one bucket compute same seq, 2nd `put` clobbers 1st, its data files
+  orphaned+invisible. Now `crates/catalog/src/lib.rs` `commit` is a CAS
+  loop: propose seq=head+1 → `put_if_absent(catalog/manifest/{seq}.json)`
+  → on loss, `catch_up()` (list+replay entries past head, fold into
+  memory) → retry at new head. `commit_lock: Mutex<()>` serializes
+  intra-process; CAS handles inter-process. Bounded 100 attempts →
+  ResourceBusy. Metric `timelake_catalog_commit_conflicts_total` (0 single
+  writer). Factored `read_entry`/`apply_entry` helpers. DRILLED on BOTH
+  mechanisms (different code): local hard-link (3 catalog unit tests incl.
+  two-writer-loses-nothing, loser-learns-winner, removals-survive-retry)
+  AND real S3 If-None-Match via LocalStack (store-s3 `#[ignore]`
+  `two_catalogs_on_one_bucket_lose_no_commits_p04`, dev-dep on
+  timelake-catalog). DEFERRED to C2 (safe: maintenance single-node till
+  role-split): re-validate commit on conflict so a compaction whose inputs
+  were retention-dropped aborts vs resurrects (ARCHITECTURE §12.3). 124
+  tests (+3) + 1 S3 drill, clippy/fmt clean. NEXT P0: **P0-5 Tributary
+  presents token** (last P0). Roadmap `docs/ROADMAP.md`.
+- Previous: **P0-2 SHIPPED — /api/sql read-only + non-root container**
   (2026-08-10, drill `bench/results/sql-sandbox-drill.log`). The
   COPY-writes-a-file-as-root exposure (SECURITY.md ex. 2+4, verified: one
   request wrote /tmp/pwned.parquet owned by root) is shut TWICE:

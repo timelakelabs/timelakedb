@@ -4570,6 +4570,7 @@ dependencies = [
  "aws-sdk-kms",
  "aws-sdk-s3",
  "tempfile",
+ "timelake-catalog",
  "timelake-store",
  "tokio",
  "tracing",
