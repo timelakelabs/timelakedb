@@ -1,0 +1,52 @@
+What stock clients can actually send — the constraint that picks the design
+2026-08-10 · grafana/grafana:latest, telegraf:1.39.2
+================================================================================
+
+Data-plane auth breaks every existing client, so the mechanism is not a
+free choice: it has to be something Grafana and Telegraf can already be
+configured to send. Rather than assume, both were pointed at recording
+servers (a pyarrow Flight server and an HTTP handler that log headers
+and refuse) and driven through every auth configuration they offer.
+
+GRAFANA — InfluxDB datasource, SQL/Flight SQL mode
+  Configuration                     What reached the server
+  --------------------------------  ------------------------------------
+  secureJsonData.token              authorization: Bearer <token>   YES
+  basicAuth + basicAuthPassword     (nothing)                       NO
+  httpHeaderName1/httpHeaderValue1  (nothing)                       NO
+
+  Only the `database` header and gRPC's own (:authority, te, user-agent,
+  grpc-*) accompany the call otherwise.
+
+  THIS IS THE WHOLE CONSTRAINT. Grafana's basic-auth toggle and its
+  custom-header escape hatch are HTTP-only — they are not forwarded onto
+  the gRPC path, so neither can carry a credential to Flight SQL. Any
+  design resting on basic auth or a bespoke header (X-TimeLake-Token,
+  say) would work for curl and fail for Grafana, which is the one client
+  FR-8 makes first-class. The token field is the only door.
+
+TELEGRAF — the write half
+  Plugin                Endpoint          Header
+  --------------------  ----------------  ----------------------------
+  outputs.influxdb_v2   /api/v2/write     Authorization: Token <token>
+  outputs.influxdb      /write, /query    Authorization: Basic b64(u:p)
+
+DESIGN FORCED BY THE ABOVE
+  One credential — a token — accepted under three spellings on one
+  header, because three stock clients spell the same thing differently:
+
+    Authorization: Bearer <token>   Grafana (Flight SQL), Tributary
+    Authorization: Token  <token>   Telegraf influxdb_v2
+    Authorization: Basic  <b64>     Telegraf influxdb v1, password=token
+
+  This is also what InfluxDB itself accepts, so the compatibility matrix
+  in the reference stays true rather than gaining an exception.
+
+  Rejected on this evidence: HTTP basic auth as the primary mechanism
+  (invisible to Grafana over Flight), and a custom header such as
+  X-TimeLake-Token (same problem, plus it would need a Grafana plugin
+  fork — FR-8 says stock).
+
+RIG
+  bench/compose/tls-drill/auth_probe.py   Flight SQL metadata recorder
+  bench/compose/tls-drill/http_probe.py   HTTP Authorization recorder
