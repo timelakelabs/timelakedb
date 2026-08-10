@@ -47,7 +47,9 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 - **Streaming / range reads.** `LazyTable` loads whole objects; range reads
   over the store would cut both latency and peak memory. The largest known
-  lead.
+  lead. (Qualified 2026-08-10 11:40: the load really is 40–75% of a warm
+  Shape B query, but it is not thread-bound — widening the decode changed
+  nothing. Whatever streaming wins, it will not be by parallelism.)
 - **Ingest decline under maintenance contention** (intra-run, no cross-run
   decay) — isolation between the maintenance tick and the write path.
 - **Shape A p95 608 ms against a 250 ms target**, even with the metadata
@@ -60,6 +62,119 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 ---
 
 ## Entries
+
+### 2026-08-10 11:40 — Decode the scan as wide as the plan runs   [REJECTED]
+
+**Hypothesis.** Every per-operator table in this log is blind to the biggest
+part of a warm query, and this cycle started by proving it. `LazyTable::scan`
+decodes its candidate files while the plan is being *built* and hands the
+finished batches to a `MemorySourceConfig`, so `EXPLAIN ANALYZE` charges the
+load nothing — the previous entry's B2 table sums 347 ms of plan compute across
+24 partitions (≈14 ms of wall) against a 42 ms query and never asks where the
+other 28 ms went. New probe `bench/probe-load.py` answers that by construction:
+run a proxy query that provokes the *identical* scan (same columns, same
+filters, so the same pruning, row filter and `Utf8View` conversion) under a
+plan that does nothing but a single-group COUNT.
+
+| Query (baseline, `perf-base1` settled) | Whole | Scan-load | Plan | Load share |
+|---|---|---|---|---|
+| B1_funnel_24h | 23.8 ms | **12.2 ms** | 11.5 ms | 48% |
+| B2_funnel_48h | 43.6 ms | **18.5 ms** | 25.1 ms | 40% |
+| B3_inflight_24h | 15.7 ms | **12.6 ms** | 3.1 ms | 75% |
+| B4_hourly_throughput_48h | 22.5 ms | **17.2 ms** | 5.3 ms | 72% |
+| B5_route_rollup_24h | 29.5 ms | **13.7 ms** | 15.8 ms | 43% |
+
+So the load is 40–75% of every warm Shape B query. And `scan_threads` capped it
+at a constant 8 while every operator above it fans out to `target_partitions` —
+24 on this host. `bench/probe-cpu.sh` confirmed the machine was idle underneath
+it: **500–650% CPU** on 24 cores while a load-dominated query ran. Predicted:
+raise the decode width to `target_partitions` and the load falls ~2–2.5×, taking
+25–45% off each Shape B query; Shape A is untouched because it prunes to few
+files and `files.min(..)` still bounds the pool.
+
+**Change.** One file, `crates/query/src/provider.rs`. `scan_threads(files)`
+became `scan_threads(files, target_partitions)` —
+`files.min(cores).min(target_partitions).max(1)` instead of
+`files.min(cores).clamp(1, 8)` — with `target_partitions` read once in `scan`
+and threaded through `load_pruned`, and reused for the partition packing below
+it. Plus a unit test pinning that the width follows the plan, not a constant.
+
+**Measurement.** Paired runs on the isolated instance, harness in-network, 100
+Shape A samples. All four clean (ingest 716–776 K lines/s) and all four settled
+to **62 parquet files / 69 MB** (`du`, not the harness metric). Labels
+`perf-base1`/`perf-base2`, `perf-cand1`/`perf-cand2`, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 33/27, 27/24 | 43/29, 32/25 |
+| B2_funnel_48h | 60/50, 45/44 | 61/53, 50/47 |
+| B3_inflight_24h | 15/15, 15/15 | 16/15, 14/14 |
+| B4_hourly_throughput_48h | 22/22, 19/19 | 21/21, 20/19 |
+| B5_route_rollup_24h | 31/30, 29/29 | 32/34, 29/30 |
+| Shape A median | 4, 3 ms | 5, 4 ms |
+| Ingest | 745K, 776K | 759K, 716K |
+
+125 workspace tests pass, 0 failures; `cargo fmt --all --check` clean;
+`clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Rejected, and not because the change failed to do what it said —
+because doing it bought nothing. The candidate leans slower on four of five
+queries and no query improves. The mechanism check is what makes this
+unambiguous rather than a shrug at noise: hammering the B2 load proxy 400×
+in-network,
+
+| | Baseline | Candidate |
+|---|---|---|
+| Server CPU during the load | 500–650% | **1318–1518%** |
+| Proxy query, n=400 | median 19 ms (min 18, p95 23) | median 20 ms (min 18, p95 23) |
+
+**2.4× the CPU for the same wall time.** The threads were spawned, they were
+busy, and they finished no sooner. (Checked that the change was real and not a
+no-op: `pipeline_events` holds 48 of the 62 settled files, so this genuinely
+moved 8 workers to 24, not 8 to 8.) Burning three times the cores to stand still
+is a regression even where the clock is a wash — those cores are what the
+aggregation above the scan, the write path and the maintenance tick run on.
+
+**Lesson.**
+
+- **The scan-load is 40–75% of a warm Shape B query, and it is NOT
+  thread-bound.** That is the finding, and it retires the most obvious reading
+  of the streaming-exec lead. Overlapping decode with execution may still win by
+  starting the plan earlier, but "the load is serialised at 8 threads and the
+  box has 24" was the intuitive explanation for its cost and it is now measured
+  false. Do not spend another cycle on scan parallelism.
+- **What the load is actually bound by, measured** (`bench/probe-scan-floor.py`,
+  new): a scan that visits all 48 files and decodes **none** of them — the bloom
+  excludes an absent entity — costs **3.6 ms**. Footers, bloom probes, thread
+  spawn and the serial tail are therefore ~3.6 ms of an 18 ms load. Each decoded
+  column then adds ~4.7 ms, linearly: 1 column 14.0 ms, 2 columns 18.2, 3
+  columns 24.2, 4 columns 27.8. **The cost is per-column decode work that more
+  threads do not accelerate** — which points at memory bandwidth or allocator
+  contention inside the parquet decode plus `to_view_batch`, not at scheduling.
+  The next cycle should attack the *work*, not its width: decode fewer bytes
+  (the projection is already minimal, so this means encoding), or skip the
+  `Utf8View` conversion for columns that gain nothing from it (the open
+  selective-view lead — and this probe now gives it a per-column number to beat
+  instead of a whole-query one).
+- **`EXPLAIN ANALYZE` is systematically blind here, and every operator table in
+  this log inherits that.** `DataSourceExec` reports near-zero elapsed_compute
+  because its batches were decoded before the plan existed. Two entries above
+  reasoned about "the whole query" from plan sums that could not see 40–75% of
+  it. `bench/probe-load.py` is the correction and costs about a minute; run it
+  before trusting a plan-derived percentage again.
+- **A CPU-utilisation gap is evidence of idleness, not of a bottleneck.** 650%
+  on a 24-core box looked like a starved parallel section and was really a
+  section that had run out of parallelisable work. The cheap test that would
+  have settled it before the build — and did settle it after — is to compare
+  wall time *and* CPU across the two widths: if CPU rises and wall does not
+  move, the width was never the constraint.
+- **Rig.** Both probes are committed and take about a minute each in-network:
+  `sh bench/probe-innet.sh tldb-perf probe-load.py` splits any Shape B query
+  into scan-load and plan, `probe-scan-floor.py` gives the fixed per-scan floor
+  and the marginal cost of a decoded column. `tldb-bench:perf` did not exist at
+  the start of this cycle — `docker build -t tldb-bench:perf -f
+  bench/perf-runner.Dockerfile bench/` rebuilds it in seconds, and every
+  in-network script needs it.
 
 ### 2026-08-10 07:45 — Present tags as `Utf8View`, converted in the DECODE   [ADOPTED]
 
