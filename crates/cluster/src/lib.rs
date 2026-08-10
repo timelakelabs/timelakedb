@@ -51,12 +51,12 @@ impl Role {
         }
     }
 
-    /// Whether this role's behaviour exists yet. Only `All` is built in the
-    /// foundation phase; each subsequent C2 phase flips its own role on.
-    /// Selecting an unbuilt role is a startup refusal, not a silent
-    /// half-node — nobody should deploy an ingester that does not replicate.
+    /// Whether this role's behaviour exists yet. Roles are enabled one C2
+    /// phase at a time; selecting an unbuilt role is a startup refusal, not
+    /// a silent half-node. `all` (foundation) and `ingester` (CL-2, WAL
+    /// replication) are built; `router`/`querier`/`compactor` are not yet.
     pub fn implemented(self) -> bool {
-        matches!(self, Role::All)
+        matches!(self, Role::All | Role::Ingester)
     }
 }
 
@@ -212,9 +212,10 @@ mod tests {
     }
 
     #[test]
-    fn only_all_is_implemented_in_the_foundation_phase() {
+    fn implemented_roles_are_all_and_ingester() {
         assert!(Role::All.implemented());
-        for r in [Role::Router, Role::Ingester, Role::Querier, Role::Compactor] {
+        assert!(Role::Ingester.implemented(), "CL-2 shipped the ingester");
+        for r in [Role::Router, Role::Querier, Role::Compactor] {
             assert!(!r.implemented(), "{} should not be built yet", r.as_str());
         }
     }

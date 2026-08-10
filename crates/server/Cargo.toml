@@ -24,6 +24,7 @@ timelake-compact = { path = "../compact" }
 timelake-flight = { path = "../flight" }
 timelake-tls = { path = "../tls" }
 axum-server.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

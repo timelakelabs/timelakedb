@@ -31,6 +31,9 @@ use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, Local
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::Wal;
 
+pub mod replication;
+use replication::Replicator;
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub query_mem_bytes: usize,
@@ -306,6 +309,16 @@ pub struct Engine {
     /// SEC-3 want mode: the rotating client-CA bundle, when configured.
     client_ca: RwLock<Option<Arc<timelake_tls::RotatingClientCa>>>,
     client_auth_counts: RwLock<Option<Arc<timelake_flight::ClientAuthCounts>>>,
+    /// CL-2 replication (ingester role only; `None` on a lone `all` node,
+    /// which is why that path is byte-for-byte unchanged). The client to
+    /// this ingester's peer, set by main from discovery.
+    replicator: RwLock<Option<Replicator>>,
+    /// The durable copy of the PEER's frames — what recovers the peer's
+    /// acknowledged writes if it dies. Distinct from the local `wal`.
+    replica_wal: Mutex<Option<Wal>>,
+    replica_wal_dir: RwLock<Option<PathBuf>>,
+    cl2_replica_frames: AtomicU64,
+    cl2_recovered: AtomicU64,
 }
 
 impl Engine {
@@ -413,6 +426,11 @@ impl Engine {
             tls: RwLock::new(None),
             client_ca: RwLock::new(None),
             client_auth_counts: RwLock::new(None),
+            replicator: RwLock::new(None),
+            replica_wal: Mutex::new(None),
+            replica_wal_dir: RwLock::new(None),
+            cl2_replica_frames: AtomicU64::new(0),
+            cl2_recovered: AtomicU64::new(0),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -880,6 +898,13 @@ impl timelake_api::Engine for Engine {
             .expect("wal lock")
             .append(db, mult, body)
             .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
+        // CL-2: replicate the frame to the paired ingester BEFORE the ack, so
+        // an acknowledged write is durable on two nodes. A lone `all` node
+        // has no replicator, so this is a no-op and the path is unchanged.
+        // A down peer degrades (availability holds); it never fails the write.
+        if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
+            r.replicate(db, mult, body);
+        }
         self.apply(db, text, mult, Self::now_ns())
             .map_err(WriteError::BadRequest)
     }
@@ -1055,6 +1080,85 @@ impl Engine {
         *self.client_auth_counts.write().expect("auth counts lock") = Some(c);
     }
 
+    // ---- CL-2 ingester replication --------------------------------------
+
+    /// Attach the replication client to the peer ingester (main, from
+    /// discovery). Once set, every write replicates before its ack.
+    pub fn set_replicator(&self, r: Replicator) {
+        *self.replicator.write().expect("replicator lock") = Some(r);
+    }
+
+    /// Replication stats for `/metrics`, if this node is an ingester.
+    pub fn replication_stats(&self) -> Option<Arc<replication::ReplStats>> {
+        self.replicator
+            .read()
+            .expect("replicator lock")
+            .as_ref()
+            .map(|r| r.stats())
+    }
+
+    /// Open the durable replica WAL — the copy of the peer's frames. Any
+    /// frames already present (a restart with an un-recovered peer) are
+    /// counted so `/metrics` reflects them; they are applied only on an
+    /// explicit `recover_from_replica`, never during normal operation, so
+    /// this node does not double-flush its peer's live rows.
+    pub fn enable_replica_wal(&self, dir: &Path) -> std::io::Result<()> {
+        let (wal, frames) = Wal::open(dir)?;
+        self.cl2_replica_frames
+            .store(frames.len() as u64, Ordering::Relaxed);
+        *self.replica_wal.lock().expect("replica wal lock") = Some(wal);
+        *self.replica_wal_dir.write().expect("replica dir lock") = Some(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Durably record one frame from the peer (called by the internal
+    /// replication listener). fsync before returning, so the peer's 2xx
+    /// means the frame is safe here.
+    pub fn replicate_receive(&self, db: &str, mult: i64, body: &[u8]) -> std::io::Result<()> {
+        let mut g = self.replica_wal.lock().expect("replica wal lock");
+        let wal = g
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("replica WAL not enabled"))?;
+        wal.append(db, mult, body)?;
+        self.cl2_replica_frames.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Recover the peer's acknowledged writes: replay every frame in the
+    /// replica WAL into the engine and flush. Overlap with rows the dead
+    /// peer had already flushed to S3 is safe — LWW dedup (FR-5) collapses
+    /// it at compaction. Idempotent: recovering twice re-applies the same
+    /// rows to the same primary keys. Returns the frame count replayed.
+    ///
+    /// Phase-2 scope: recovery is an explicit operation (the drill and, in
+    /// production, an operator or the router on a confirmed peer death).
+    /// Automatic health-triggered failover is a later cluster phase.
+    pub fn recover_from_replica(&self) -> std::io::Result<usize> {
+        let dir = self
+            .replica_wal_dir
+            .read()
+            .expect("replica dir lock")
+            .clone()
+            .ok_or_else(|| std::io::Error::other("replica WAL not enabled"))?;
+        // Reopen to read the full durable set. The peer is dead in the
+        // recovery scenario, so no new frames race this.
+        let (_wal, frames) = Wal::open(&dir)?;
+        let n = frames.len();
+        for (db, mult, body) in frames {
+            let text = String::from_utf8_lossy(&body);
+            if let Err(e) = self.apply(&db, &text, mult, 0) {
+                tracing::warn!(db, error = %e, "skipping unrecoverable replica frame");
+            }
+        }
+        self.flush_all().map_err(std::io::Error::other)?;
+        self.cl2_recovered.fetch_add(n as u64, Ordering::Relaxed);
+        tracing::info!(
+            frames = n,
+            "CL2 recovery complete: peer's writes replayed and flushed"
+        );
+        Ok(n)
+    }
+
     pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
@@ -1168,6 +1272,32 @@ impl Engine {
             ),
             None => String::new(),
         };
+        // CL-2 lines only on an ingester (replicator set) — a lone `all`
+        // node's /metrics is unchanged.
+        let cl2_lines = match self.replication_stats() {
+            Some(s) => format!(
+                "# TYPE timelake_cl2_replicated_total counter\n\
+                 timelake_cl2_replicated_total {}\n\
+                 # TYPE timelake_cl2_degraded gauge\n\
+                 timelake_cl2_degraded {}\n\
+                 # TYPE timelake_cl2_degraded_events_total counter\n\
+                 timelake_cl2_degraded_events_total {}\n\
+                 # TYPE timelake_cl2_replica_frames_total counter\n\
+                 timelake_cl2_replica_frames_total {}\n\
+                 # TYPE timelake_cl2_recovered_total counter\n\
+                 timelake_cl2_recovered_total {}\n",
+                s.replicated.load(Ordering::Relaxed),
+                if s.degraded.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+                s.degraded_events.load(Ordering::Relaxed),
+                self.cl2_replica_frames.load(Ordering::Relaxed),
+                self.cl2_recovered.load(Ordering::Relaxed),
+            ),
+            None => String::new(),
+        };
         format!(
             "# TYPE timelake_lines_written_total counter\n\
              timelake_lines_written_total {}\n\
@@ -1189,7 +1319,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1215,6 +1345,7 @@ impl Engine {
             kms_lines,
             s3_lines,
             tls_lines,
+            cl2_lines,
         )
     }
 }
@@ -1301,6 +1432,66 @@ impl timelake_flight::SqlBackend for Engine {
 pub fn app(engine: Arc<Engine>) -> axum::Router {
     let auth = engine.auth();
     timelake_api::app(engine, auth, false)
+}
+
+/// The intra-cluster listener for an ingester (CL-2), bound to
+/// `TIMELAKE_CLUSTER_ADDR`. NOT the public data port: it carries only
+/// replication and recovery, and at C3 it moves behind required mTLS. There
+/// is no data-plane auth here — trust is the private network now, the peer
+/// certificate later.
+pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/internal/v1/replicate",
+            axum::routing::post(internal_replicate),
+        )
+        .route(
+            "/internal/v1/recover",
+            axum::routing::post(internal_recover),
+        )
+        .route("/internal/v1/health", axum::routing::get(|| async { "ok" }))
+        .with_state(engine)
+}
+
+/// Receive one replicated frame from the peer and record it durably.
+async fn internal_replicate(
+    axum::extract::State(engine): axum::extract::State<Arc<Engine>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+    let db = headers
+        .get("x-repl-db")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if db.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing x-repl-db".into());
+    }
+    let mult: i64 = headers
+        .get("x-repl-mult")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    // The append fsyncs — do it off the async runtime.
+    match tokio::task::spawn_blocking(move || engine.replicate_receive(&db, mult, &body)).await {
+        Ok(Ok(())) => (StatusCode::OK, String::new()),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(join) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {join}")),
+    }
+}
+
+/// Replay the peer's replica WAL into this node — the recovery a dead
+/// ingester's rows return through.
+async fn internal_recover(
+    axum::extract::State(engine): axum::extract::State<Arc<Engine>>,
+) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+    match tokio::task::spawn_blocking(move || engine.recover_from_replica()).await {
+        Ok(Ok(n)) => (StatusCode::OK, format!("{{\"recovered\":{n}}}")),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(join) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {join}")),
+    }
 }
 
 /// The TLS-enabled router: the api surface plus the explicit rotation
