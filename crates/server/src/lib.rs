@@ -294,6 +294,8 @@ pub struct Engine {
     /// SEC-3: set when the listeners run TLS; feeds the expiry gauge and
     /// renewal-health metric so a failing rotation is visible (RR-5).
     tls: RwLock<Option<Arc<timelake_tls::RotatingCert>>>,
+    /// SEC-3 want mode: the rotating client-CA bundle, when configured.
+    client_ca: RwLock<Option<Arc<timelake_tls::RotatingClientCa>>>,
 }
 
 impl Engine {
@@ -398,6 +400,7 @@ impl Engine {
             kms_stats,
             s3_stats,
             tls: RwLock::new(None),
+            client_ca: RwLock::new(None),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -1019,6 +1022,12 @@ impl Engine {
         *self.tls.write().expect("tls lock") = Some(rot);
     }
 
+    /// Attach the client-CA bundle so /metrics can report anchor count
+    /// and reload health (SEC-3 want mode).
+    pub fn set_client_ca(&self, ca: Arc<timelake_tls::RotatingClientCa>) {
+        *self.client_ca.write().expect("client ca lock") = Some(ca);
+    }
+
     pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
@@ -1069,6 +1078,23 @@ impl Engine {
             ),
             None => String::new(),
         };
+        // The ratio of these two is what tells an operator when a
+        // deployment has finished migrating and it is safe to flip a
+        // listener from want mode to require — a decision that should
+        // come from a measurement, not a guess.
+        let client_ca_lines = match self.client_ca.read().expect("client ca lock").as_ref() {
+            Some(ca) => format!(
+                "# TYPE timelake_tls_client_ca_anchors gauge\n\
+                 timelake_tls_client_ca_anchors {}\n\
+                 # TYPE timelake_tls_client_ca_last_reload_ok gauge\n\
+                 timelake_tls_client_ca_last_reload_ok {}\n\
+                 # TYPE timelake_tls_client_auth_mode gauge\n\
+                 timelake_tls_client_auth_mode 1\n",
+                ca.anchors(),
+                if ca.last_reload_ok() { 1 } else { 0 },
+            ),
+            None => String::new(),
+        };
         let tls_lines = match self.tls.read().expect("tls lock").as_ref() {
             Some(t) => format!(
                 "# TYPE timelake_tls_cert_expiry_seconds gauge\n\
@@ -1099,7 +1125,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1118,6 +1144,7 @@ impl Engine {
             },
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
+            client_ca_lines,
             kms_lines,
             s3_lines,
             tls_lines,

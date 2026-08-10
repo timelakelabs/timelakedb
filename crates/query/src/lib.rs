@@ -196,11 +196,42 @@ pub fn align_to(
 #[derive(Debug, Default, Clone)]
 pub struct QuerySession {
     pub authorizations: Vec<String>,
+    /// The verified client-certificate identity, when the caller
+    /// presented one (SEC-3 want mode). `None` is an anonymous caller —
+    /// served, because Grafana and Telegraf have no certificate.
+    pub identity: Option<String>,
 }
 
 impl QuerySession {
     pub fn with_authorizations(authorizations: Vec<String>) -> QuerySession {
-        QuerySession { authorizations }
+        QuerySession {
+            authorizations,
+            identity: None,
+        }
+    }
+
+    /// Resolve what this session may actually see.
+    ///
+    /// SECURITY.md records that `X-TimeLake-Authorizations` is a
+    /// self-asserted claim: whatever the caller says. A verified client
+    /// certificate is the credential that turns a claim into a grant, and
+    /// want mode is what lets that arrive without a flag day:
+    ///
+    /// | caller | result |
+    /// |---|---|
+    /// | no certificate | claims trusted as asserted — **unchanged**, so Grafana and Telegraf keep working |
+    /// | verified certificate | claims **intersected** with what that identity is granted |
+    ///
+    /// So authenticating can only ever *narrow* what a caller sees, never
+    /// widen it, and an anonymous caller is exactly as (un)restricted as
+    /// it was before this existed. Restricting the anonymous path is a
+    /// separate, deliberate decision — see SECURITY.md exposure 7.
+    pub fn resolve(mut self, granted: Option<&[String]>) -> QuerySession {
+        if let (Some(_), Some(granted)) = (&self.identity, granted) {
+            self.authorizations
+                .retain(|claimed| granted.iter().any(|g| g == claimed));
+        }
+        self
     }
 }
 
@@ -548,6 +579,55 @@ mod tests {
             let rows = batches_to_json(&rows);
             assert_eq!(rows[0]["n"], expect, "auths {auths:?}");
         }
+    }
+
+    #[test]
+    fn an_anonymous_caller_is_unchanged_by_grants() {
+        // The compatibility guarantee: Grafana, Telegraf and the bench
+        // harness present no certificate and must behave exactly as they
+        // did before client auth existed.
+        let s = QuerySession::with_authorizations(vec!["admin".into(), "ops".into()]);
+        assert_eq!(s.identity, None);
+        let resolved = s.resolve(Some(&["ops".to_string()]));
+        assert_eq!(
+            resolved.authorizations,
+            vec!["admin".to_string(), "ops".to_string()],
+            "an anonymous caller's claims are still taken as asserted"
+        );
+    }
+
+    #[test]
+    fn a_verified_identity_narrows_its_claims_to_its_grants() {
+        let mut s =
+            QuerySession::with_authorizations(vec!["admin".into(), "ops".into(), "audit".into()]);
+        s.identity = Some("tributary-node-1".into());
+        let resolved = s.resolve(Some(&["ops".to_string(), "audit".to_string()]));
+        assert_eq!(
+            resolved.authorizations,
+            vec!["ops".to_string(), "audit".to_string()],
+            "claiming admin does not grant admin"
+        );
+    }
+
+    #[test]
+    fn authenticating_can_only_narrow_never_widen() {
+        // A principal granted more than it claimed still only gets what
+        // it asked for — the intersection is not a union.
+        let mut s = QuerySession::with_authorizations(vec!["ops".into()]);
+        s.identity = Some("agent".into());
+        let resolved = s.resolve(Some(&["ops".to_string(), "admin".to_string()]));
+        assert_eq!(resolved.authorizations, vec!["ops".to_string()]);
+    }
+
+    #[test]
+    fn an_identity_with_no_grants_recorded_keeps_its_claims() {
+        // Grants are not yet administered anywhere, so `None` must mean
+        // "no grant policy exists" rather than "deny everything" — the
+        // latter would break an identified client the moment it presented
+        // a certificate, which is the opposite of an additive migration.
+        let mut s = QuerySession::with_authorizations(vec!["ops".into()]);
+        s.identity = Some("agent".into());
+        assert_eq!(s.resolve(None).authorizations, vec!["ops".to_string()]);
     }
 
     #[tokio::test]

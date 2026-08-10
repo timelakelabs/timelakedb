@@ -27,6 +27,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
+pub mod client_auth;
+pub use client_auth::{RotatingClientCa, identity_of};
+
 /// The named alarm string (grep target for operators and for AT-7).
 pub const RENEWAL_ALARM: &str = "SEC3_CERT_RENEWAL_FAILED";
 
@@ -204,22 +207,39 @@ impl RotatingCert {
     /// `allow_tls12` lowers the floor from the default TLS 1.3-only
     /// (SEC-3: 1.3 everywhere, configurable 1.2 floor for old clients).
     pub fn server_config(self: &Arc<Self>, allow_tls12: bool, alpn: &[&[u8]]) -> Arc<ServerConfig> {
+        self.server_config_with_client_ca(allow_tls12, alpn, None)
+    }
+
+    /// As [`Self::server_config`], but additionally *requesting* — never
+    /// requiring — a client certificate when a CA bundle is configured
+    /// (SEC-3 want mode, see [`client_auth`]).
+    pub fn server_config_with_client_ca(
+        self: &Arc<Self>,
+        allow_tls12: bool,
+        alpn: &[&[u8]],
+        client_ca: Option<Arc<RotatingClientCa>>,
+    ) -> Arc<ServerConfig> {
         let versions: &[&rustls::SupportedProtocolVersion] = if allow_tls12 {
             &[&rustls::version::TLS13, &rustls::version::TLS12]
         } else {
             &[&rustls::version::TLS13]
         };
-        let mut cfg = ServerConfig::builder_with_provider(Arc::new(provider().clone()))
+        let builder = ServerConfig::builder_with_provider(Arc::new(provider().clone()))
             .with_protocol_versions(versions)
-            .expect("ring provider supports TLS 1.2/1.3")
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(Resolver(Arc::clone(self))));
+            .expect("ring provider supports TLS 1.2/1.3");
+        let builder = match client_ca {
+            Some(ca) => {
+                builder.with_client_cert_verifier(Arc::new(client_auth::WantClientAuth { ca }))
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let mut cfg = builder.with_cert_resolver(Arc::new(Resolver(Arc::clone(self))));
         cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Arc::new(cfg)
     }
 }
 
-fn provider() -> &'static CryptoProvider {
+pub(crate) fn provider() -> &'static CryptoProvider {
     // One process-wide provider; ring (workspace feature choice).
     static PROVIDER: std::sync::OnceLock<CryptoProvider> = std::sync::OnceLock::new();
     PROVIDER.get_or_init(rustls::crypto::ring::default_provider)

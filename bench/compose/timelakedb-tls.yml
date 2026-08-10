@@ -16,6 +16,10 @@ services:
     environment:
       TIMELAKE_TLS_CERT: /certs/server.crt
       TIMELAKE_TLS_KEY: /certs/server.key
+      # SEC-3 want mode: a client MAY present a certificate and will be
+      # identified if it does; one that does not is still served, which
+      # is what keeps Grafana and Telegraf working unchanged.
+      TIMELAKE_TLS_CLIENT_CA: /certs/ca.crt
     volumes:
       - timelake-tls-data:/var/lib/timelake/data
       # bind mount, read-only: the drill rotates certs by overwriting
