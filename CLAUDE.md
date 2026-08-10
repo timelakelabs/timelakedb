@@ -100,11 +100,13 @@ This project is inspired by the following projects.
   `CODE_OF_CONDUCT.md`, `CHANGELOG.md`. `ops/tldb-backup.sh` +
   `docs/BACKUP_RESTORE.md` make AT-5 runnable (helper-container tar, no
   host bind mount; `--recreate` for the destroyed-volume case; drops
-  `*.tmp-write` on restore). **Auth exists on `/admin/*` only (SEC-4);
-  the data plane is still open** — SECURITY.md states the posture,
-  including that `/api/sql` can `COPY … TO` files as the (root) server
-  process. Known engine hardening: manifest replay should skip
-  non-`.json` files.
+  `*.tmp-write` on restore). **Auth: `/admin/*` sessions (SEC-4) + data
+  plane by token (SEC-4 phased, default off) — see the status entry
+  below.** SECURITY.md states the full posture, including that
+  `/api/sql` can still `COPY … TO` files as the (root) server process
+  regardless of auth (P0-2, the one that a read token must NOT become a
+  filesystem primitive for). Known engine hardening: manifest replay
+  should skip non-`.json` files.
 - **RENAMED TimelordDB → TimeLakeDB** (2026-08-09). Crates `timelake-*`,
   env `TIMELAKE_*`, metrics `timelake_*`, headers
   `X-TimeLake-Authorizations` / `x-timelake-csrf`, data dir
