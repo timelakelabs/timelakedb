@@ -13,6 +13,29 @@ here.
 
 ## [Unreleased]
 
+### Added — C2 phase 1: cluster roles + discovery seam (2026-08-10)
+
+- New `timelake-cluster` crate: the `Role` enum (`TIMELAKE_ROLE`, default
+  `all`) and the `Discovery` seam with a static backend
+  (`TIMELAKE_NODE_ID`, `TIMELAKE_CLUSTER_ADDR`, `TIMELAKE_PEERS` as
+  `id=role@host:port`). This is the foundation the C2 replication phases
+  build on — the first step of P1-1 (replication/HA).
+- **`all` is unchanged**: the whole stack in one process, the default,
+  bench and fixtures untouched. The specialised roles
+  (`router`/`ingester`/`querier`/`compactor`) land one phase at a time,
+  and **a role whose phase has not landed is refused at startup** with a
+  named message rather than run half-built — no one deploys an ingester
+  that does not replicate. A typo'd role is refused too.
+- Design guard (CL-5) baked into the crate docs and its placement:
+  discovery carries **no correctness** — a wrong or stale membership view
+  can misroute or waste work but never corrupt state, because every
+  durable commit goes through catalog CAS (C1). Nothing on the write or
+  commit path consults it.
+- 7 unit tests (role parsing + refusal, peer parsing incl. malformed/
+  duplicate/blank, role-filtered peer selection, lone-node). `role=all`
+  drilled live: writes/reads unchanged, correct boot log; `ingester` and
+  a typo both refuse with `exit 2`.
+
 ### Fixed — P0-4: catalog commits are atomic against a second writer (2026-08-10)
 
 - **Two writers on one object store can no longer lose each other's

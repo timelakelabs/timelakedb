@@ -463,6 +463,17 @@ any node, not just the local one.
 `all` (v1 default — today's behavior, bench fixtures unchanged) |
 `router` | `ingester` | `querier` | `compactor`. Same crates throughout.
 
+**Foundation shipped (C2 phase 1).** The `timelake-cluster` crate holds
+the `Role` enum (`TIMELAKE_ROLE`, default `all`) and the `Discovery`
+seam (§12.5) with a static backend. `all` is unchanged — the whole stack
+in one process, bench and fixtures untouched. The specialised roles are
+built one phase at a time; **a role whose phase has not landed is refused
+at startup** (`exit 2` with a named message) rather than started
+half-built, so no one deploys an ingester that does not replicate. The
+node logs its role, id, and resolved peers at boot. Phases still to
+land: ingester WAL replication (CL-2), router, querier (CL-3),
+compactor.
+
 - **Router** — stateless: hashes (db, table) → an ingester pair for LP
   writes, forwards SQL/Flight to queriers; it is the single endpoint the
   bench adapter, Telegraf, and Grafana keep seeing (FR-8/FR-9 contracts
@@ -491,8 +502,11 @@ any node, not just the local one.
 ### 12.5 Discovery & intra-cluster TLS
 
 Topology from the `Discovery` trait: **static** backend (config/env —
-C0–C2, dev, the drill rig) then **Consul** (registration, health,
-sessions for the compactor lease) at C3. The two standing rules hold:
+C0–C2, dev, the drill rig; **shipped**: `TIMELAKE_NODE_ID`,
+`TIMELAKE_CLUSTER_ADDR`, `TIMELAKE_PEERS` as `id=role@host:port`) then
+**Consul** (registration, health, sessions for the compactor lease) at
+C3. The trait is `Arc<dyn Discovery>` so the backend swaps by config, not
+code. The two standing rules hold:
 discovery informs routing and availability only — a stale membership
 view wastes work but cannot corrupt state, because every commit goes
 through catalog CAS; and leases are advisory, never correctness.

@@ -12,6 +12,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 timelake-api = { path = "../api" }
 timelake-auth = { path = "../auth" }
+timelake-cluster = { path = "../cluster" }
 timelake-ingest = { path = "../ingest" }
 timelake-wal = { path = "../wal" }
 timelake-buffer = { path = "../buffer" }
