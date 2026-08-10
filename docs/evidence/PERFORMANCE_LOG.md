@@ -61,6 +61,108 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-10 01:40 — Stop `FairSpillPool` dividing the pool 145 ways   [ADOPTED]
+
+**Hypothesis.** The last cycle left an unclaimed lead: "Baseline B2's inner
+aggregate spills 95 times for 39.6 MB … no cycle has yet checked whether Shape B
+is spilling because the pool is too small or because the row format is too fat."
+Reading `datafusion-execution-54.1.0`'s `memory_pool/pool.rs` first gave the
+mechanism before any measurement: `FairSpillPool::try_grow` caps every
+*spillable consumer* at `(pool_size - unspillable) / num_spill`, and its own
+doc-comment warns it "will cause spills even when there was sufficient memory".
+A DataFusion plan registers one such consumer per partition per aggregate
+(`aggregates/row_hash.rs:598`), per partition per repartition
+(`repartition/mod.rs:450`), and one per sort — so on a 24-core host a funnel
+query registers ~145 of them and a 1 GiB pool becomes a ~7 MB budget each.
+Predicted: the spills vanish and B1/B2 drop 25–30%; B3/B4/B5 and Shape A are
+untouched, because nothing else in the suite comes near a spill.
+
+**Proved on the critical path before writing code** (`bench/probe-spill.py`,
+`EXPLAIN ANALYZE` on the settled baseline, sums over 24 partitions):
+
+| B2 operator | Baseline |
+|---|---|
+| `AggregateExec: FinalPartitioned, gby=[step, alias1]` | **1.70 s** compute |
+| ... its spills | **85 spills, 39.5 MB, 1.83 M rows** |
+| ... its peak memory | 174.5 M — i.e. **7.3 MB per partition** |
+| whole-plan residency | ~220 MB, of a **1024 MB** pool |
+| B3's deepest aggregate | 0 spills, 11.3 M peak, 12 ms total |
+
+7.3 MB per partition against a predicted `1 GiB / ~145` = 7.4 MB is the
+confirmation: the operator spilled at its *fair share*, with 80% of the pool
+free, and B1/B2 are the only queries in the suite that reach it.
+
+**Change.** One file, `crates/query/src/lib.rs`: `QueryEnv::new` builds a
+`GreedyMemoryPool` instead of a `FairSpillPool`, same `total_mem_bytes`. RR-1 is
+untouched — the cap that matters is the total, and a greedy pool enforces
+exactly the same one, spilling or erroring cleanly when the *whole* pool is gone
+instead of when 1/145th of it is. Concurrency stays bounded where it was
+designed to be bounded, the admission semaphore.
+
+**Measurement.** Three paired runs on the isolated instance, harness in-network,
+100 Shape A samples. All six clean (ingest 733–771 K lines/s) and all six
+settled to **62 parquet files / 69 MB** (`du`, not the harness metric). Labels
+`perf-base1/2/3`, `perf-cand1/2/3`, cold/warm ms:
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 80/71, 79/72, 75/72 | **55/49, 50/46, 58/59** |
+| B2_funnel_48h | 177/142, 165/154, 174/143 | **121/105, 102/92, 111/114** |
+| B3_inflight_24h | 12/10, 14/13, 11/11 | 13/12, 11/11, 16/15 |
+| B4_hourly_throughput_48h | 18/19, 23/23, 18/18 | 20/17, 17/18, 21/23 |
+| B5_route_rollup_24h | 27/28, 31/30, 31/28 | 29/27, 29/27, 34/33 |
+| Shape A median | 3, 3, 3 ms | 3, 3, 4 ms |
+| Ingest | 733K, 771K, 760K | 770K, 757K, 735K |
+
+80 workspace tests pass, 0 failures — including
+`memory_pool_rejects_cleanly_never_kills_rr1`, the 2 MB-pool hog test that pins
+RR-1, which still returns a clean 400. `cargo fmt --all --check` clean; no
+clippy findings.
+
+**Verdict.** Adopted. B1 warm goes 71–80 → 46–59 and B2 warm 142–154 → 92–114,
+**no overlap between the two sets** on either query across three repeats —
+about 28% and 30%. B3/B4/B5 sit inside the baseline spread with no consistent
+direction (the third candidate run is uniformly ~15% slow across all five
+queries, including the two that win, which is host noise, not a mechanism), and
+Shape A, ingest and storage are unmoved. `EXPLAIN ANALYZE` on the candidate
+confirms the mechanism rather than inferring it: B2's final aggregate goes
+1.70 s → **564 ms** of compute and **85 spills → 0**; B1's 716 ms → 187 ms,
+36 spills → 0.
+
+**Lesson.**
+
+- **The bug got worse the bigger the machine.** The divisor is the number of
+  registered spillable consumers, which scales with `target_partitions`, which
+  is core count. The same pool on a 4-core box would have given each operator
+  ~44 MB and never spilled; the 24-core CI/bench host spilled 39.5 MB to disk
+  with 800 MB free. **Any future memory tuning here must be stated per-core, not
+  per-pool** — and a pool figure that looks generous can be starvation.
+- **Peak residency moved from 174 MB to 405 MB for one B2**, because the
+  aggregate now keeps what it used to spill. That is the honest cost, and it
+  sets a real bound: at the default 1 GiB pool two concurrent funnels fit and
+  the third starts spilling again — correctly. The shipped compose already
+  sizes 3.5 GB against `max_concurrent_queries=2`, so production has room, but
+  **`bench/perf-cycle.sh` runs with the 1 GiB default and every number in this
+  log was measured there.** Worth one cycle to measure a production-sized pool.
+- **The dependency's own doc-comment named the defect.** "This pool works best
+  when you know beforehand the query has multiple spillable operators that will
+  likely all need to spill." This engine has one spillable operator family
+  fanned across partitions of the *same* query — fairness between clones of one
+  operator buys nothing and costs a 145× smaller budget. Read the pool choice,
+  not just the pool size.
+- **The Utf8View lead is still open and is now cheaper to judge.** The rejected
+  cycle attributed B2's cost to the row-format group keys; ~1.1 s of that 1.70 s
+  was spilling, not encoding. The remaining 564 ms is the real group-values
+  cost, so a retry (decode-time `Utf8View` on high-cardinality columns only) now
+  has a clean number to beat and no spill confounding it.
+- **Rig, for the next cycle.** `ops/perf-build.sh` compiles into a named target
+  volume and bakes only the binary, so the candidate image is an incremental
+  build (~2 min) instead of a second cold release build (~15 min) — the repo
+  `Dockerfile` compiles inside the image and a one-line source edit invalidates
+  it entirely. `bench/probe-spill.py` + `bench/probe-innet.sh` print the
+  per-operator spill/compute/peak table above in about a minute. Third cycle
+  running where the probe, not the idea, was the valuable part.
+
 ### 2026-08-09 22:35 — Present tags as `Utf8View`, not `Dictionary`   [REJECTED]
 
 **Hypothesis.** The last cycle named the target: B2's remaining cost is the
