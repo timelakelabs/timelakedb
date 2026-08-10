@@ -122,7 +122,23 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **P0-4 SHIPPED — catalog commits are CAS (no multi-writer loss)**
+- Status: **P0-5 SHIPPED — Tributary presents the data-plane token**
+  (2026-08-10, in the TRIBUTARY repo: `bench/results/p05-data-auth.log`,
+  drill `bench/drill-p05.sh`). Tributary `crates/tributary/src/auth.rs`
+  `Secret` (redacting Debug/Display, `.expose()` the only door) +
+  `resolve_token(TRIBUTARY_TOKEN env | token_file, env wins, trimmed)`;
+  ship.rs sends `Authorization: Bearer` (built once, `set_sensitive(true)`),
+  new `ShipError::Unauthorized` (401/403 — NOT bisected, NOT transport;
+  data spools to durable queue, never dropped) + `unauthorized` counter.
+  NO inline token in config (secret-in-committed-TOML = leak). Drilled
+  10/10 vs required-mode node: correct token exact count, wrong token 0
+  rows + spooled + auth-reported, no token authenticated=false, token
+  never in logs. Verify-reads use a separate read token (also proves
+  scope separation). **This closes the whole P0 set except P0-1 (push +
+  CI, the user's action).** Next: P1 (replication/HA longest pole, audit
+  trail, targeted delete R-1, Tributary self-telemetry T-1) — see
+  `docs/ROADMAP.md`.
+- Previous: **P0-4 SHIPPED — catalog commits are CAS (no multi-writer loss)**
   (2026-08-10, drill `bench/results/catalog-cas-drill.log`). Was: `commit`
   picked next seq from an in-process atomic + plain `put` → two writers on
   one bucket compute same seq, 2nd `put` clobbers 1st, its data files
