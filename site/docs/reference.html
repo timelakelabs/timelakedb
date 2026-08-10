@@ -390,11 +390,53 @@
         visible to <em>no one</em> (fail closed); <code>&amp;</code> and
         <code>|</code> may not mix without parentheses. Enforcement happens
         inside the scan, so aggregates cannot count hidden rows.
-        <strong>Until the data plane itself requires authentication,
-        authorizations are claims, not credentials</strong> — the SEC-4 sessions
-        that guard <code>/admin/*</code> do not apply to
-        <code>/api/sql</code> or Flight SQL. See SECURITY.md.
+        <strong>On the anonymous path, authorizations are claims, not
+        credentials</strong> — the SEC-4 sessions that guard
+        <code>/admin/*</code> do not apply to <code>/api/sql</code> or Flight
+        SQL. A client certificate changes that for the caller that presents
+        one; see below. Presenting one is optional, so the honor-system front
+        door remains for anyone who declines. See SECURITY.md.
       </p>
+
+      <h3>Client certificates (SEC-3 v2, want mode)</h3>
+      <p>
+        Set <code>TIMELAKE_TLS_CLIENT_CA</code> to a PEM bundle of trust
+        anchors and both listeners <em>request</em> a client certificate.
+        A client that presents one has its chain verified and its subject
+        common name read as an identity; a client that presents nothing is
+        still served, unchanged. This is <strong>want mode, not required
+        mode</strong> — stock Grafana and Telegraf hold no client certificate
+        and must keep working, so requiring one would be a flag day.
+      </p>
+      <p>
+        A verified identity is what turns a SEC-2 claim into an authorization:
+        the session's claimed authorizations are <strong>intersected</strong>
+        with what that identity is granted, so authenticating can only narrow
+        what a caller sees, never widen it. An identity with no grant policy
+        recorded keeps its claims — <em>no policy</em> is not <em>deny
+        all</em>, or presenting a certificate would break a working client.
+        Identity currently reaches the query session over Flight SQL;
+        <code>/api/sql</code> does not carry it yet.
+      </p>
+      <p>
+        Anchors hot-rotate on the same triggers as the serving certificate
+        (file watch, <code>POST /admin/tls/reload</code>) with the same
+        validate-before-swap rule, and the bundle may carry
+        <strong>two CAs at once</strong> so client and server CAs roll
+        independently. A bundle that will not parse leaves the last-good
+        anchors serving and raises the alarm; an empty bundle is refused
+        rather than silently trusting nothing.
+      </p>
+      <div class="note warn">
+        <p>
+          <strong>Want mode is not by itself an access control.</strong> An
+          attacker declines to present a certificate and takes the anonymous
+          path. Its value is that authenticated callers can be held to less.
+          Watch <code>timelake_tls_client_ca_anchors</code> and the
+          authenticated/anonymous split to know when a deployment has migrated
+          far enough to restrict the anonymous path.
+        </p>
+      </div>
 
       <h3>Encryption at rest (SEC-1)</h3>
       <p>
@@ -546,6 +588,9 @@
             <tr><td><code>timelake_s3_read_bytes_total</code> / <code>timelake_s3_write_bytes_total</code></td><td>counter</td><td>Bytes moved to/from S3 (S3 backend only)</td></tr>
             <tr><td><code>timelake_tls_cert_expiry_seconds</code></td><td>gauge</td><td>Seconds until the serving certificate expires (TLS mode only)</td></tr>
             <tr><td><code>timelake_tls_last_reload_ok</code></td><td>gauge</td><td>1 if the last certificate reload validated, 0 if it was rejected (TLS mode only)</td></tr>
+            <tr><td><code>timelake_tls_client_auth_mode</code></td><td>gauge</td><td>0 = client certificates not requested, 1 = requested but optional (want mode)</td></tr>
+            <tr><td><code>timelake_tls_client_ca_anchors</code></td><td>gauge</td><td>Trust anchors in the client CA bundle — reads 2 during a dual-CA overlap, which is how you watch an old anchor leave</td></tr>
+            <tr><td><code>timelake_tls_client_ca_last_reload_ok</code></td><td>gauge</td><td>1 if the last client-CA bundle reload validated, 0 if it was rejected and the last-good anchors are still serving</td></tr>
             <tr><td><code>timelake_admin_default_credential_active</code></td><td>gauge</td><td>1 while the seeded <code>admin</code>/<code>admin</code> password is still in place (SEC-4)</td></tr>
             <tr><td><code>timelake_admin_logins_total</code></td><td>counter</td><td>Successful admin sign-ins since start</td></tr>
             <tr><td><code>timelake_admin_login_failures_total</code></td><td>counter</td><td>Rejected sign-in attempts since start</td></tr>
@@ -563,6 +608,11 @@
         <li><code>timelake_tls_last_reload_ok == 0</code> — a renewal was rejected and
             the node is serving on the last-good certificate.</li>
         <li><code>timelake_tls_cert_expiry_seconds</code> below two renewal periods.</li>
+        <li><code>timelake_tls_client_ca_last_reload_ok == 0</code> — a client CA
+            bundle was rejected. Nothing is broken yet, because the last-good
+            anchors keep verifying, which is exactly why it can go unnoticed
+            until the anchors themselves expire and every client-certificate
+            handshake starts failing at once.</li>
         <li><code>timelake_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
         <li><code>timelake_admin_default_credential_active == 1</code> — the

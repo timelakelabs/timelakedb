@@ -320,11 +320,26 @@ Three rungs, cheapest first; the harness decides how far to climb:
   named alarm + `tls_cert_expiry_seconds` metric fire (RR-5). Because
   rustls consults the resolver only at handshake, established
   connections and in-flight Flight streams are structurally unaffected
-  by rotation — no draining logic exists to get wrong. v2 mTLS puts the
-  client-cert verifier's `RootCertStore` behind the same ArcSwap with
-  dual-CA overlap for independent client/server rolls. Pure-Rust rustls
+  by rotation — no draining logic exists to get wrong. Pure-Rust rustls
   keeps OpenSSL out of the build. AT-6 exercises Telegraf/Grafana over
   TLS; AT-7 is the rotation-under-load drill.
+- **Client certificates in WANT mode (SEC-3 v2, shipped):** the
+  client-cert verifier's `RootCertStore` sits behind the same ArcSwap
+  and the same validate-before-swap reload as the serving pair, with
+  **dual-CA overlap** so client and server CAs roll independently. The
+  verifier is deliberately non-mandatory: it reports
+  `client_auth_mandatory() = false` and implements
+  `allow_unauthenticated()`, so a client that presents a certificate is
+  verified and identified while one that does not is still served. That
+  choice is what makes it deployable without a flag day — stock Grafana
+  and Telegraf hold no client certificate and must keep working (FR-8/
+  FR-9/AT-6). The identity earns something rather than merely existing:
+  `QuerySession::resolve` intersects a verified caller's SEC-2 claims
+  with its grants, so authenticating can only narrow what it sees. The
+  anonymous path is unchanged, which is why this is additive.
+  **Requiring** a certificate is a separate decision, and the sensible
+  place for it is the intra-cluster listener at C3, where there is no
+  Grafana to keep working.
 
 ## 12. Clustering v2 on S3 (CL-1..CL-5 + SEC-1 on AWS) — design
 
@@ -470,8 +485,10 @@ view wastes work but cannot corrupt state, because every commit goes
 through catalog CAS; and leases are advisory, never correctness.
 Intra-cluster links (WAL replication, buffer snapshots, router
 forwarding) run plaintext inside the drill network at C2 and move to
-mTLS at C3 — the client-verifier `RootCertStore` behind the same
-ArcSwap machinery SEC-3 shipped.
+mTLS at C3. The verifier itself is already shipped (SEC-3 v2) — what C3
+adds is flipping it from want to **required** on the intra-cluster
+listener, which is safe there precisely because no stock client dials
+it: every peer is a node this deployment issued a certificate to.
 
 ### 12.6 LocalStack: the test-and-metrics rig
 

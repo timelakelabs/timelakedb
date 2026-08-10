@@ -117,7 +117,34 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **SEC-4 admin auth SHIPPED** (2026-08-09, drill
+- Status: **SEC-3 v2 client certificates SHIPPED — WANT mode** (2026-08-10,
+  drill `bench/results/sec3-mtls-want-mode.log`). `TIMELAKE_TLS_CLIENT_CA`
+  = PEM bundle → both listeners request a client cert, verify one if
+  presented, serve either way. `crates/tls/src/client_auth.rs`:
+  `RotatingClientCa` (ArcSwap<RootCertStore>, dual-CA overlap,
+  validate-before-swap, last-good + alarm on a bad bundle, empty bundle
+  REFUSED) + `WantClientAuth` (`client_auth_mandatory()=false`,
+  `allow_unauthenticated()`). Identity = subject CN, extracted in the
+  Flight accept loop (`IdentifiedStream` implements tonic `Connected`,
+  `PeerIdentity` extension). **The identity earns something:**
+  `QuerySession::resolve(granted)` INTERSECTS claimed SEC-2 auths with
+  grants → authenticating can only NARROW, never widen; anonymous path
+  behaves exactly as before, so it's additive, not a flag day. `None`
+  grants = "no policy" = keep claims (NOT deny-all — else presenting a
+  cert breaks a working client). WANT not REQUIRED is the explicit
+  requirement: stock Grafana/Telegraf hold no cert (AT-6). Metrics:
+  `timelake_tls_client_auth_mode`, `_client_ca_anchors` (reads 2 during
+  overlap), `_client_ca_last_reload_ok`. `gen-certs.sh client [CN]`.
+  **AT-7 still 19/19 with client auth on** — its first run was 18/19 and
+  the DRILL was stale, not the server: it called /admin/tls/reload
+  anonymously after SEC-4 guarded it; it now logs in + rotates
+  admin/admin. NOT DONE: `/api/sql` carries no identity (axum-server owns
+  that accept loop → needs a custom `Accept`); requiring mTLS is a C3
+  decision for the intra-cluster listener. SECURITY.md exposure 3 now
+  CLOSED, new exposure 9 states plainly that want mode grants nothing on
+  its own. Windows curl (schannel) can't drive this — drill from a Linux
+  container on the compose network.
+- Previous: **SEC-4 admin auth SHIPPED** (2026-08-09, drill
   `bench/results/sec4-auth-drill.log`). New `timelake-auth` crate:
   roles viewer<operator<admin, Argon2id, sessions (cookie or bearer,
   30 min idle / 12 h absolute), CSRF double-submit + Origin on cookie
