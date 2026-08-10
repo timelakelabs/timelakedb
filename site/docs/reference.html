@@ -208,15 +208,19 @@
       </p>
 
       <h3>What does not</h3>
+      <p>
+        The data-plane SQL surface is <strong>read-only</strong>, enforced on the
+        logical plan: anything that would write a file, change the catalog, or
+        modify data is refused before it runs.
+      </p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Statement</th><th>Behaviour</th></tr></thead>
           <tbody>
-            <tr><td><code>INSERT</code></td><td><code>This feature is not implemented: Insert into not implemented for this table</code> — write with line protocol</td></tr>
-            <tr><td><code>UPDATE</code>, <code>DELETE</code></td><td>Not implemented for these tables. Data leaves only by retention (FR-7)</td></tr>
             <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Supported.</strong> The default catalog is named after the database, so <code>poc.public.events</code> resolves and matches what Flight SQL reports</td></tr>
-            <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td>Parse and return <code>[]</code>, but have <strong>no effect</strong> — the session is discarded with the query. A <code>DROP TABLE</code> that appears to succeed does not delete anything</td></tr>
-            <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td>Works, and writes a file as the server process — see <a href="index.html#security">Security</a></td></tr>
+            <tr><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></td><td><strong>Refused</strong> — the surface is read-only (write with line protocol; data leaves only by retention, FR-7)</td></tr>
+            <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td><strong>Refused</strong> — the read-only guard rejects DDL before it plans, so a <code>DROP TABLE</code> no longer appears to succeed while doing nothing</td></tr>
+            <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td><strong>Refused</strong> — this once wrote a file as the server process; the surface is now read-only, enforced on the plan (even inside <code>EXPLAIN ANALYZE</code>). See <a href="index.html#security">Security</a></td></tr>
           </tbody>
         </table>
       </div>

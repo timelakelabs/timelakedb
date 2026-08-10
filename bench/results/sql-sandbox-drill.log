@@ -1,0 +1,86 @@
+P0-2 — /api/sql is read-only, and the container is no longer root
+2026-08-10 · timelakedb (bench/compose/timelakedb.yml, hardened image)
+================================================================================
+
+THE EXPOSURE, REPRODUCED FIRST so the fix is meaningful. Against the
+pre-fix image, a single unauthenticated request:
+
+  POST /api/sql {"db":"poc",
+    "sql":"COPY (SELECT 1 AS x) TO '/tmp/pwned.parquet' STORED AS PARQUET"}
+  -> [{"count":1}]
+
+  $ docker exec timelakedb ls -la /tmp/pwned.parquet
+    -rw-r--r-- 1 root root 482 ... /tmp/pwned.parquet
+  $ docker exec timelakedb id
+    uid=0(root) gid=0(root)
+
+  DataFusion's COPY … TO wrote a file, as root, inside the container —
+  SECURITY.md exposures 2 and 4 compounding. Data-plane auth does NOT
+  fix this: it only narrows "who" to any holder of a read token, which
+  is every Grafana in the deployment.
+
+THE FIX, TWO LAYERS.
+
+1. Read-only SQL at the PLAN (crates/query/src/sql_guard.rs). The logical
+   plan DataFusion built is classified before execution; anything that is
+   not a pure read is refused. Not a regex on the text — the plan is what
+   actually runs, and the walk reaches into EXPLAIN/ANALYZE so a COPY
+   cannot hide inside EXPLAIN ANALYZE. Deny-by-default: every LogicalPlan
+   variant is matched with no wildcard, so a future DataFusion node fails
+   the build rather than slipping through.
+
+2. Non-root, read-only root filesystem (Dockerfile USER timelake:1000 +
+   compose read_only: true, tmpfs /tmp, data volume the only writable
+   mount). Defence in depth: if a write primitive ever slips layer 1, it
+   runs as an unprivileged uid against a filesystem it cannot write.
+
+AFTER, same node (both surfaces, HTTP and Flight SQL):
+
+  POST /api/sql COPY … TO '/tmp/pwned.parquet'
+    -> {"error":"COPY … TO is not permitted here: this endpoint executes
+        read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN). See SECURITY.md."}
+  POST /api/sql EXPLAIN ANALYZE COPY … TO '/tmp/pwned2.parquet'
+    -> {"error":"COPY … TO is not permitted here: ..."}   (nested, still caught)
+  POST /api/sql CREATE TABLE evil AS SELECT 1
+    -> {"error":"CREATE/DROP (DDL) is not permitted here: ..."}
+  Flight SQL  COPY … TO '/tmp/flight_pwned.parquet'
+    -> REFUSED "COPY … TO is not permitted here: ..."   (same guard, shared path)
+
+  $ docker exec timelakedb ls /tmp/pwned.parquet /tmp/pwned2.parquet /tmp/flight_pwned.parquet
+    No such file or directory   (x3 — nothing was written)
+
+  $ docker exec timelakedb id
+    uid=1000(timelake) gid=1000(timelake)
+  $ docker exec timelakedb touch /rootfs-probe
+    touch: cannot touch '/rootfs-probe': Read-only file system
+
+READS ARE UNTOUCHED:
+  POST /api/sql SELECT COUNT(*) FROM m   -> [{"n":4}]
+  SHOW TABLES / DESCRIBE / information_schema queries all plan and run —
+  they are the console's schema-discovery path (admin_ui SHOW TABLES) and
+  Grafana's, so refusing them would have broken FR-8.
+
+ENFORCEMENT IS ONE PLACE. Both /api/sql and Flight SQL route through
+run_sql_env, which builds the plan, calls ensure_read_only, then executes
+that same plan — one parse, not two, and no way for the two surfaces to
+diverge in what they permit.
+
+WHAT THIS DOES AND DOES NOT CLOSE:
+  Closed: arbitrary file WRITE via COPY, and DDL/DML/session statements
+  on the data plane. The root-owned-anywhere escalation is gone twice
+  over (refused, and non-root under a read-only rootfs).
+  Not this milestone: arbitrary file READ is still not reachable (no
+  read_parquet/read_csv table functions registered, per SECURITY.md),
+  and this does not change that — but the guard means a future
+  registration is not a boundary breach on its own.
+
+WORKSPACE: 121 tests (+4 sql_guard: reads pass, the COPY exposure is
+refused, COPY-in-EXPLAIN-ANALYZE is refused, DDL/DML refused), clippy
+clean, fmt clean.
+
+NOTE ON THE STALE VOLUME: switching to a non-root uid means a data
+volume created under the old root image is root-owned and unwritable by
+uid 1000 — the node panics "open engine (recovery): Permission denied".
+A fresh volume inherits the image's timelake ownership. An UPGRADE of an
+existing deployment therefore needs a one-time chown of the data volume
+to 1000:1000; recorded here so it is not discovered in production.

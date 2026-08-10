@@ -75,13 +75,18 @@ follow from "no authentication" and are listed so you can design around them.
    `timelake_data_requests_*` split shows how much traffic would break at
    the flip.
 
-2. **`POST /api/sql` executes arbitrary DataFusion SQL, including `COPY … TO`,
-   which writes files as the server process.** Verified: a single unauthenticated
-   request wrote a Parquet file outside the data directory. Arbitrary file
-   *reads* are not reachable today — no `read_parquet`/`read_csv`-style table
-   functions are registered, and `CREATE EXTERNAL TABLE` does not survive the
-   request because each query gets a fresh session — but do not rely on that as
-   a boundary. **Treat SQL access as filesystem-write access to the container.**
+2. **~~`POST /api/sql` can `COPY … TO` files as the server process.~~
+   CLOSED (P0-2).** The data-plane SQL surface is now read-only, enforced
+   on the *logical plan* DataFusion built rather than the query text:
+   `SELECT`, `SHOW`, `DESCRIBE` and `EXPLAIN` run; `COPY`, DDL, DML and
+   session statements are refused — including a `COPY` hidden inside
+   `EXPLAIN ANALYZE`. HTTP and Flight SQL share the one enforcement point
+   (`bench/results/sql-sandbox-drill.log`; the same request that wrote a
+   root-owned Parquet file now returns a refusal and writes nothing).
+   Arbitrary file *reads* remain unreachable (no `read_parquet`/`read_csv`
+   table functions registered, and `CREATE EXTERNAL TABLE` is refused by
+   the same guard). The check is deny-by-default: a future DataFusion plan
+   node fails the build rather than slipping through.
 
 3. **~~`POST /admin/tls/reload` is unauthenticated.~~ CLOSED (SEC-4).**
    It now sits behind the same session guard as the rest of `/admin/*`
@@ -101,10 +106,16 @@ follow from "no authentication" and are listed so you can design around them.
    `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` to skip the well-known default
    entirely, or change the password immediately after first start.
 
-4. **The container runs as root.** The image has no `USER` directive, so the
-   server process and every file it writes are root-owned. Combined with (2),
-   a reachable attacker can write root-owned files anywhere the container's
-   filesystem permits.
+4. **~~The container runs as root.~~ CLOSED (P0-2).** The image now runs
+   as an unprivileged user (`USER timelake`, uid 1000), and the shipped
+   compose mounts the root filesystem read-only with the data volume as
+   the only writable path (`read_only: true`, `tmpfs /tmp`). Defence in
+   depth behind (2): a write primitive that ever slipped the SQL guard
+   would run as a non-root uid against a filesystem it cannot write.
+   **Upgrade note:** a data volume created under the old root image is
+   root-owned; uid 1000 cannot open it and the node exits with
+   `open engine (recovery): Permission denied`. Chown the volume to
+   `1000:1000` once, or start on a fresh volume.
 
 5. **Query errors are returned verbatim**, including DataFusion planning errors
    that disclose table and column names.
@@ -160,8 +171,11 @@ follow from "no authentication" and are listed so you can design around them.
   connection is a password in the clear.
 - **Set a container memory limit.** `mem_limit` is not optional in practice —
   an unbounded engine took down an entire Docker VM during development.
-- **Run it on a dedicated volume** with nothing else of value on the filesystem,
-  given exposure (2) and (4).
+- **Keep the shipped container hardening.** The image runs non-root and the
+  compose mounts the root filesystem read-only with the data volume as the
+  only writable path (P0-2). If you write your own deployment manifest,
+  carry `read_only: true`, a `tmpfs` for `/tmp`, and a data volume owned by
+  uid 1000 — do not run it back as root.
 - **Alert on certificate health**: `timelake_tls_last_reload_ok == 0` and
   `timelake_tls_cert_expiry_seconds` below two renewal periods. A failed
   renewal keeps serving on the last-good pair, which is exactly why it can go

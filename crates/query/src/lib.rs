@@ -28,6 +28,7 @@ pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
 pub use datafusion::datasource::TableProvider as DfTableProvider;
 
 pub mod provider;
+pub mod sql_guard;
 pub mod visibility;
 
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -121,7 +122,19 @@ pub async fn run_sql_env(
     }
 
     let work = async {
-        let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+        // Read-only enforcement: classify the built plan before executing
+        // it, so COPY/DDL/DML never run on the data-plane surface. The plan
+        // is reused for execution, so this is one parse, not two.
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| e.to_string())?;
+        sql_guard::ensure_read_only(&plan)?;
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| e.to_string())?;
         df.collect().await.map_err(|e| e.to_string())
     };
     match tokio::time::timeout(env.timeout, work).await {
@@ -469,7 +482,16 @@ pub async fn run_sql(
             .map_err(|e| e.to_string())?;
     }
 
-    let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+    let plan = ctx
+        .state()
+        .create_logical_plan(sql)
+        .await
+        .map_err(|e| e.to_string())?;
+    sql_guard::ensure_read_only(&plan)?;
+    let df = ctx
+        .execute_logical_plan(plan)
+        .await
+        .map_err(|e| e.to_string())?;
     df.collect().await.map_err(|e| e.to_string())
 }
 

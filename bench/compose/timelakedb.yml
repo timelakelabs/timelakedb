@@ -18,6 +18,14 @@ services:
     # A runaway engine must never take the host VM down with it (learned
     # the hard way: an unkillable scan wedged Docker Desktop entirely)
     mem_limit: 8g
+    # SECURITY.md exposure 2/4: the root filesystem is read-only, so even a
+    # write primitive that slipped the read-only SQL guard has nowhere to
+    # land — the data volume is the ONLY writable path, and the process is
+    # already non-root (Dockerfile USER). /tmp is a small tmpfs because
+    # curl (the healthcheck) and transient work need somewhere to write.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
     volumes:
       # named volume: native VM filesystem. A Windows bind mount here cost
       # ~3 s/query in whole-file read overhead (measured); range reads
