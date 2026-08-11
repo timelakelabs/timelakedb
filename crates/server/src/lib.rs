@@ -530,10 +530,29 @@ impl Engine {
 
     /// Flush every non-empty buffer to Parquet. Returns files written.
     pub fn flush_all(&self) -> Result<usize, String> {
-        // 1. atomically: swap out all buffers + rotate the WAL
-        let (owned, sealed_gen) = {
+        // 1. The handover — buffer out, holding area in — is ONE critical
+        // section, and every reader takes the same two locks in the same
+        // order (`dbs`, then `flushing`), so a query observes the rows in
+        // exactly one of the two places. Never neither, which would report
+        // an acknowledged row as missing; never both, which would count it
+        // twice.
+        //
+        // Getting this wrong is not theoretical. Doing the swap and the
+        // insert as two separately-locked steps leaves both defects open,
+        // in opposite directions depending on where a reader lands, and the
+        // slow-store test in `tests/health.rs` reproduces each of them.
+        //
+        // The cost is that `snapshot()` — building the Arrow batch — now
+        // runs under the ingest gate, so writers pause for it rather than
+        // only for the pointer swap. That is a few milliseconds once per
+        // flush interval, and it buys a guarantee the whole read path is
+        // built on. Moving it back out means finding another way to make
+        // the two observations one, not simply reordering these locks.
+        let (snapshots, failed, sealed_gen) = {
             let _gate = self.ingest_gate.write().expect("ingest gate");
             let mut dbs = self.dbs.write().expect("dbs lock");
+            let mut hold = self.flushing.write().expect("flushing lock");
+
             let mut owned: Vec<(String, String, TableBuffer)> = Vec::new();
             for (db, tables) in dbs.iter_mut() {
                 for (table, buf) in tables.iter_mut() {
@@ -551,30 +570,27 @@ impl Engine {
                 .expect("wal lock")
                 .rotate()
                 .map_err(|e| format!("wal rotate: {e}"))?;
-            (owned, sealed)
-        };
 
-        // 1b. snapshot the swapped-out rows into the holding area BEFORE
-        // any upload: from here on, queries serve them from `flushing`
-        // while the (possibly slow, S3-era) object writes proceed. Pure
-        // CPU — the unavoidable swap→holding gap stays sub-millisecond.
-        let mut snapshots: Vec<(String, String, timelake_query::QueryBatch)> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        for (db, table, buf) in owned {
-            match buf.snapshot() {
-                Ok(batch) => {
-                    self.flushing
-                        .write()
-                        .expect("flushing lock")
-                        .insert((db.clone(), table.clone()), batch.clone());
-                    snapshots.push((db, table, batch));
-                }
-                Err(err) => {
-                    tracing::error!(%db, %table, %err, "flush snapshot failed; others continue");
-                    failed.push(format!("{db}.{table}"));
+            // The swapped-out rows land in the holding area before any
+            // upload: from here on queries serve them from `flushing` while
+            // the (possibly slow, S3-era) object writes proceed.
+            let mut snapshots: Vec<(String, String, timelake_query::QueryBatch)> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            for (db, table, buf) in owned {
+                match buf.snapshot() {
+                    Ok(batch) => {
+                        hold.insert((db.clone(), table.clone()), batch.clone());
+                        snapshots.push((db, table, batch));
+                    }
+                    Err(err) => {
+                        tracing::error!(%db, %table, %err, "flush snapshot failed; others continue");
+                        failed.push(format!("{db}.{table}"));
+                    }
                 }
             }
-        }
+            (snapshots, failed, sealed)
+        };
+        let mut failed = failed;
 
         // 2. encode + upload through the Store chokepoint. One table's
         // failure must not discard the others' rows, so each is encoded
@@ -984,21 +1000,26 @@ impl Engine {
             Vec::with_capacity(names.len());
         let mut watermark = 0u64;
         for name in names {
+            // Buffer and holding area under ONE consistent view: both locks
+            // held together, in the order `flush_all` takes them. Reading
+            // them as two separate observations lets a flush land in
+            // between and yield the same rows twice (buffer copy + holding
+            // copy) — or, if it lands the other way, neither.
+            //
+            // Both guards are released before any `.await` below, which the
+            // borrow checker also insists on.
             let mut buffer: Vec<timelake_query::QueryBatch> = {
                 let dbs = self.dbs.read().expect("dbs lock");
-                match dbs.get(db).and_then(|t| t.get(&name)) {
+                let hold = self.flushing.read().expect("flushing lock");
+                let mut batches = match dbs.get(db).and_then(|t| t.get(&name)) {
                     Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
                     _ => Vec::new(),
+                };
+                if let Some(held) = hold.get(&(db.to_string(), name.clone())) {
+                    batches.push(held.clone());
                 }
+                batches
             };
-            if let Some(held) = self
-                .flushing
-                .read()
-                .expect("flushing lock")
-                .get(&(db.to_string(), name.clone()))
-            {
-                buffer.push(held.clone());
-            }
             // CL-3: the ingesters' live rows. All or nothing — an
             // unreachable ingester fails the query rather than shortening
             // it (see `querier`).
@@ -1282,7 +1303,11 @@ impl Engine {
     pub fn live_tables(&self) -> Vec<(String, String, u64)> {
         let mut out: HashMap<(String, String), u64> = HashMap::new();
         {
+            // One view of both, as the read path takes them — otherwise a
+            // flush landing mid-count reports a table's rows twice or not
+            // at all, and a querier decides what to fetch from this.
             let dbs = self.dbs.read().expect("dbs lock");
+            let hold = self.flushing.read().expect("flushing lock");
             for (db, tables) in dbs.iter() {
                 for (table, buf) in tables.iter() {
                     let rows = buf.row_count() as u64;
@@ -1291,9 +1316,9 @@ impl Engine {
                     }
                 }
             }
-        }
-        for ((db, table), batch) in self.flushing.read().expect("flushing lock").iter() {
-            *out.entry((db.clone(), table.clone())).or_default() += batch.num_rows() as u64;
+            for ((db, table), batch) in hold.iter() {
+                *out.entry((db.clone(), table.clone())).or_default() += batch.num_rows() as u64;
+            }
         }
         let mut v: Vec<(String, String, u64)> = out
             .into_iter()
@@ -1313,20 +1338,20 @@ impl Engine {
     /// transient duplicate, never a vanished row.
     pub fn snapshot_ipc(&self, db: &str, table: &str) -> Result<Vec<u8>, String> {
         let mut batches: Vec<timelake_query::QueryBatch> = {
+            // Both locks together, as everywhere else: a querier must not
+            // receive the same rows twice because a flush landed between
+            // this node's two reads.
             let dbs = self.dbs.read().expect("dbs lock");
-            match dbs.get(db).and_then(|t| t.get(table)) {
+            let hold = self.flushing.read().expect("flushing lock");
+            let mut batches = match dbs.get(db).and_then(|t| t.get(table)) {
                 Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
                 _ => Vec::new(),
+            };
+            if let Some(held) = hold.get(&(db.to_string(), table.to_string())) {
+                batches.push(held.clone());
             }
+            batches
         };
-        if let Some(held) = self
-            .flushing
-            .read()
-            .expect("flushing lock")
-            .get(&(db.to_string(), table.to_string()))
-        {
-            batches.push(held.clone());
-        }
         // Two batches of the same table can carry different column sets (a
         // write added a column after the mid-flush batch was taken). One
         // IPC stream has one schema, so widen both to the union rather than

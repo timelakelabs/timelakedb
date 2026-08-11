@@ -1,0 +1,82 @@
+The flush handover: making buffer → holding atomic to a reader
+2026-08-10 · single node, laptop scale (bench/compose/timelakedb.yml)
+================================================================================
+
+FOUND WHILE PREPARING P0-1, not while looking for it. The CI work needed
+`cargo test --workspace` to be trustworthy on a cold runner, and
+`tests/health.rs::rows_stay_visible_while_a_slow_flush_uploads` was not: it
+passed when the test binary ran whole and failed when run alone, and it
+failed once under heavy load in the full suite. A test that depends on
+timing is not a flaky test to be re-run — it is a race in the code it
+tests, reported honestly.
+
+THE RACE. A read observes rows in three places, in order: the live buffer,
+the holding area for rows mid-flush, then the catalog's files. A flush
+moved rows out of the buffer and into holding as two separately-locked
+steps, so a reader could land between them and see the rows in NEITHER —
+not in the buffer they had left, not yet in holding, and not in the catalog
+until the commit some 300 ms later. That is a *vanish*: an acknowledged row
+reported as missing. It is the one failure this database refuses, and it
+was reachable by a plain COUNT(*) at the wrong moment.
+
+Reproduced deterministically with a Store that sleeps 150 ms per put (the
+shape of an object store), which widens the window enough to hit reliably:
+before the fix, the isolated test failed every run with `table not found`.
+
+THE WRONG FIX, RECORDED BECAUSE IT MEASURED WORSE. Holding the holding-area
+write lock across the swap closes the vanish — a reader that got past the
+buffer simply waits and then sees the batch. But a reader that had ALREADY
+read the buffer now waits and then counts the same rows a second time. The
+vanish became a duplicate, 4 runs in 6:
+
+    assertion `left == right` failed: acked rows vanished mid-flush
+      left: Some(6)    right: Some(3)
+
+Both defects are the same bug seen from two sides: the reader takes two
+independent observations, and a flush between them is visible.
+
+THE FIX. One critical section for the whole handover — `ingest_gate`,
+`dbs`, `flushing` — and every reader takes the same locks in the same
+order, holding both while it looks at buffer and holding area together. A
+query then observes the rows in exactly one place: never neither, never
+both. Three read sites were changed to match (`sql_batches`, `live_tables`,
+`snapshot_ipc` — the last two are what a CL-3 querier calls, so the same
+defect was reachable across the cluster wire).
+
+    isolated test, 5 runs      PASS (had never passed before)
+    full health binary, 6 runs PASS, neither failure mode
+    workspace, 173 tests       PASS
+    2-core container, 3 runs   PASS
+
+WHAT IT COSTS, MEASURED RATHER THAN ASSERTED. Building the Arrow snapshot
+now happens under the ingest gate, so writers pause for it instead of only
+for the pointer swap. Laptop scale, clean volume each time, 20 s warm-up:
+
+    before (HEAD, no fix)   604,337 · 605,860 · 588,870 lines/s   ~600k
+    after  (this change)    571,021 · 570,969 lines/s             ~571k
+
+**≈5% of ingest throughput.** Exactness at the price of 5% is the trade
+this project has made everywhere else, and it is stated here rather than
+buried. Two further readings from the same runs: `rows_48h` = 3,756,632
+against 3,756,634 written — the −2 is LWW dedup of source primary-key
+collisions, matching the −8 the M3 laptop baseline recorded on identical
+data — and all five Shape B queries completed, Shape A median 64 ms.
+
+A CHEAPER DESIGN EXISTS, and is deliberately not taken tonight: move the
+`TableBuffer` itself into the holding area rather than a snapshot of it,
+making the swap a pointer move and leaving readers to snapshot it as they
+already snapshot the live buffer. That removes the write-path cost
+entirely. It changes the type the read path and the CL-3 wire both consume,
+which is not a change to make at the end of an evening — recorded as the
+follow-up rather than half-done.
+
+TWO OUTLIERS IN THE RECORDED RUNS, both explained rather than dropped:
+  - 230,294 and 233,099 lines/s appear in the *pre-fix* and *post-fix* sets
+    alike. Both are the first run against a newly created Docker volume
+    after only a ~10 s wait; with a 20–25 s warm-up they do not recur. They
+    measure Docker Desktop, not the database.
+  - `timelakedb-p01-flush-atomicity-*` reports `rows_48h` = 3,831,020,
+    a 74,386-row surplus. That run reused a volume still holding an earlier
+    smoke run's rows. Kept as a caution: `docker compose down` does not
+    remove a named volume, and an exactness number from a dirty volume
+    means nothing.

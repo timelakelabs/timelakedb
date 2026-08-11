@@ -1,5 +1,7 @@
 # TimeLakeDB
 
+[![ci](https://github.com/timelakedb/TimeLakeDB/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakedb/TimeLakeDB/actions/workflows/ci.yml)
+
 A time-series database for high-cardinality event analytics, specified
 from evidence: five engines ran an identical 36M-event workload and their
 measured failures define this one. The survivor (InfluxDB 3) sets the
@@ -21,15 +23,18 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
-> **Security:** the **data plane has no authentication**. Any client that
-> can reach port 1963 or 1964 can read and write everything on the node, so
-> network isolation is still the only access control over your data. The
-> *administrative* surface does authenticate (SEC-4), and TLS 1.3,
-> encryption at rest and row visibility labels are implemented and drilled
-> — but SEC-2 authorizations remain **self-asserted claims** until
-> data-plane auth lands, and a fresh node seeds a quarantined
-> `admin`/`admin` console credential. Read [`SECURITY.md`](SECURITY.md)
-> before deploying anything.
+> **Security:** the data plane **can** authenticate but ships `off`.
+> `TIMELAKE_DATA_AUTH=optional|required` turns on token authentication for
+> writes, `/api/sql` and Flight SQL; until you set it, any client that can
+> reach port 1963 or 1964 reads and writes everything, and network
+> isolation is your only access control. The *administrative* surface
+> always authenticates (SEC-4), and TLS 1.3 with hot rotation, client
+> certificates in want mode, encryption at rest and row visibility labels
+> are implemented and drilled. Two things to know before deploying: a
+> fresh node seeds a quarantined `admin`/`admin` console credential, and
+> SEC-2 authorizations are **self-asserted claims** on the anonymous path
+> — a token or client certificate can only ever narrow them. Read
+> [`SECURITY.md`](SECURITY.md) before deploying anything.
 
 ## Website
 
@@ -39,7 +44,44 @@ publishes the directory on every push that touches it; enable it once per
 repository under **Settings → Pages → Source: GitHub Actions**. Every figure
 on the site traces to a run under `bench/results/`.
 
-## Status: SEC-4 — the admin surface authenticates
+## Status: C2 phase 4 — the cluster reads without losing freshness
+
+Clustering is arriving one role at a time, each ending in a recorded
+drill. Four of the five phases are in: roles and discovery, ingester WAL
+replication, the router, and now the stateless querier.
+
+- **One binary, five roles** (`TIMELAKE_ROLE`): `all` is the default and
+  unchanged — the whole stack in one process. A role whose phase has not
+  landed refuses to start rather than running half-built.
+- **Writes**: the router is the single endpoint clients keep seeing. It
+  shards each line-protocol body by `(db, measurement)` across the
+  ingesters, whole-body-validated first so a poison line writes nothing;
+  the chosen ingester replicates every frame to its pair **before the
+  204**, so an acknowledged write is durable on two nodes. A peer that
+  is down degrades loudly rather than failing writes.
+- **Reads**: a querier owns no data — it replays the catalog from the
+  shared object store and unions the ingesters' *live buffers*, served as
+  Arrow IPC, so counts are exact seconds after ingest rather than after
+  the next flush. Kill one and reads continue; a fresh container with an
+  empty disk rebuilds its whole view from the bucket. If an ingester is
+  unreachable, a querier **refuses the query** instead of returning a
+  quietly short count.
+- **It stays the same database from outside.** The unmodified benchmark
+  drove the whole cluster through the router's single address: 323K
+  lines/s, all five Shape B queries complete, and `rows_48h` = 77,806 —
+  exactly what one node returns.
+- Drills: `bench/results/cl2-replication-drill.log` (12/12),
+  `router-sharding-drill.log` (8/8), `cl3-querier-drill.log` (19/19).
+
+Still to come in C2: the compactor role and its singleton lease.
+
+**Next:** finish C2 with the compactor role, then C3 (Consul discovery and
+required intra-cluster mTLS, `ARCHITECTURE.md` §12); re-baseline the
+benchmark inside the container network, because ~94% of the reported
+Shape A latency is Docker Desktop port forwarding
+(`docs/evidence/PERFORMANCE_LOG.md`).
+
+### Previous: SEC-4 — authentication, admin surface and data plane
 
 - **Every `/admin/*` route requires a session.** Argon2id credentials,
   cookie or bearer sessions (30 min idle / 12 h absolute), CSRF and
@@ -47,8 +89,7 @@ on the site traces to a run under `bench/results/`.
   Roles are ordered `viewer` < `operator` < `admin`, and retention
   authorization follows the data rather than the verb: *growing* a
   window needs `operator`, while *shrinking, introducing or removing*
-  one needs `admin`. This closes what SECURITY.md called an
-  unauthenticated deletion control.
+  one needs `admin`.
 - **First run seeds `admin`/`admin`, quarantined.** It authenticates,
   and then the only route that answers is `POST /admin/password` —
   everything else returns `403 password_change_required`, so the
@@ -57,20 +98,17 @@ on the site traces to a run under `bench/results/`.
   `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` provisions a real password so no
   well-known default ever exists; alert on
   `timelake_admin_default_credential_active`.
-- **The data plane is deliberately still open** — writes, `/api/sql` and
-  Flight SQL need no credentials, so Telegraf, Grafana and the harness
-  keep working. Requiring auth there breaks every existing client and is
-  its own migration.
-- Drill: `bench/results/sec4-auth-drill.log`.
-
-**Next:** the rest of the cluster work — C2's role split is four phases in
-(roles and discovery, CL-2 ingester replication, the router, and the CL-3
-stateless querier: `bench/results/cl3-querier-drill.log`), leaving the
-compactor role and its singleton lease, then C3's Consul and required
-intra-cluster mTLS (`ARCHITECTURE.md` §12);
-re-baselining the benchmark inside the container network, because ~94% of
-the reported Shape A latency is Docker Desktop port forwarding
-(`docs/evidence/PERFORMANCE_LOG.md`); and CI actually running somewhere.
+- **The data plane authenticates by token, in three stages.**
+  `TIMELAKE_DATA_AUTH=off|optional|required` — `off` is the default and
+  the compatibility contract, `optional` is the migration state (anonymous
+  still served, bad tokens refused, and the
+  `timelake_data_requests_*` split measures what a flip would break), and
+  `required` closes both ports. One token, three spellings, because the
+  clients differ: `Bearer` for Grafana's Flight SQL and Tributary, `Token`
+  for Telegraf v2, `Basic` for Telegraf v1 — a mechanism chosen from a
+  recorded client probe rather than from the specifications.
+- Drills: `bench/results/sec4-auth-drill.log`,
+  `bench/results/data-auth-drill.log`.
 
 ### Previous: C0 — S3 object store with KMS envelope encryption
 
@@ -202,7 +240,7 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 ## Quickstart (Docker — no local Rust needed)
 
 ```bash
-git clone https://github.com/TimeLakeLabs/TimeLakeDB.git
+git clone https://github.com/timelakedb/TimeLakeDB.git
 cd TimeLakeDB/bench
 docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health

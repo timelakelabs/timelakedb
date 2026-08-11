@@ -5,8 +5,20 @@ on:
     branches: [master, main]
   pull_request:
 
+# Without this, a second push during a 20-minute Rust build queues a
+# whole second build rather than replacing the first. On a private repo
+# that is billed minutes spent on a commit nobody is waiting for.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   rust:
+    name: fmt · clippy · tests · coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,15 +30,159 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # Two exclusions, both because the code is exercised somewhere CI
-      # is not, rather than because it is untested:
+      # Two exclusions, both because the code is exercised somewhere this
+      # job is not, rather than because it is untested:
       #   main.rs   — socket bind/serve, covered by the container healthcheck.
       #   store-s3  — S3Store/AwsKms need a live S3 and KMS, so their tests
-      #               are #[ignore]d and run against LocalStack in the C0 rig
-      #               (bench/compose/timelakedb-s3.yml). Measured 2026-08-09:
-      #               7.7% here, 82.4% workspace-wide once excluded, against
-      #               76.7% with it counted — i.e. this gate would have failed
-      #               for a file whose tests all pass elsewhere.
-      # The better fix is a LocalStack service container so those tests run
-      # in CI for real; until then this is an honest exclusion, not a lowered bar.
+      #               are #[ignore]d. They are no longer a hole: the
+      #               `store-s3` job below runs them for real against a
+      #               LocalStack service container on every push, so the
+      #               exclusion now means "counted in another job", not
+      #               "not counted". Measured 2026-08-09: 7.7% here, 82.4%
+      #               workspace-wide once excluded, against 76.7% with it
+      #               counted — i.e. this gate would have failed for a file
+      #               whose tests all pass elsewhere.
       - run: cargo llvm-cov --workspace --ignore-filename-regex 'main\.rs|store-s3/src/lib\.rs' --fail-under-lines 80
+
+  store-s3:
+    name: store-s3 · S3 + KMS against LocalStack
+    runs-on: ubuntu-latest
+    # The three #[ignore]d tests in timelake-store-s3 are the only ones that
+    # touch a real object store: the Store contract over S3 (including range
+    # reads), the KMS envelope round-trip, and the P0-4 two-writer catalog
+    # CAS drill over S3's If-None-Match. They are the reason the CAS claim is
+    # about S3 semantics and not just a local hard-link emulation, so they
+    # belong in CI even though they need a service.
+    services:
+      localstack:
+        # Pinned: 4.9 is the last community line carrying s3 + kms and the
+        # conditional-write support the CAS test depends on.
+        image: localstack/localstack:4.9
+        env:
+          SERVICES: s3,kms
+        ports:
+          - 4566:4566
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      TLDB_S3_TEST_BUCKET: timelake-it
+      TLDB_KMS_TEST_KEY: alias/timelake
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Polled from a step rather than declared as a container health check:
+      # this does not assume what is installed inside the image, and a
+      # failure here is legible in the log instead of a silent "unhealthy".
+      - name: Wait for LocalStack
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fs "$AWS_ENDPOINT_URL/_localstack/health" >/dev/null; then
+              echo "LocalStack ready after $((i*2))s"; exit 0
+            fi
+            sleep 2
+          done
+          echo "LocalStack never became healthy"; exit 1
+      - name: Create the test bucket and KMS alias
+        run: |
+          aws --endpoint-url="$AWS_ENDPOINT_URL" s3api create-bucket --bucket "$TLDB_S3_TEST_BUCKET"
+          key=$(aws --endpoint-url="$AWS_ENDPOINT_URL" kms create-key \
+                  --description "timelake CI envelope key" \
+                  --query KeyMetadata.KeyId --output text)
+          aws --endpoint-url="$AWS_ENDPOINT_URL" kms create-alias \
+                  --alias-name "$TLDB_KMS_TEST_KEY" --target-key-id "$key"
+      - run: cargo test -p timelake-store-s3 -- --ignored
+
+  conformance:
+    name: catchment · conformance (tier 1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The default GITHUB_TOKEN is scoped to this repository, so it
+      # cannot read a private Catchment. A GitHub App installation token
+      # can, is short-lived, and is not tied to anyone's account. One-time
+      # setup is in Catchment/CI.md.
+      - name: Mint a cross-repo token
+        uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Catchment
+          token: ${{ steps.app.outputs.token }}
+          path: .catchment
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: docker/setup-buildx-action@v3
+
+      # Built from THIS checkout, never a published tag: the point of the
+      # job is to gate the tree in the pull request. Tagged with the name
+      # compose would have chosen (<project>-<service>) so the run below
+      # can reuse it with --no-build instead of compiling twice.
+      - name: Build the image under test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: bench-timelakedb-timelakedb:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Tier 1 only. Clustered scenarios are nightly in Catchment's own
+      # repo; making every push wait for a five-node cluster is how a
+      # conformance gate gets switched off.
+      - name: Conformance
+        working-directory: .catchment
+        env:
+          CATCHMENT_TIMELAKE_DIR: ${{ github.workspace }}
+        run: |
+          python -m catchment doctor
+          python -m catchment ci --tier 1 --up --no-build
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ github.run_id }}
+          path: .catchment/results/
+          retention-days: 30
+
+  publish:
+    name: publish · ghcr image for downstream conformance
+    runs-on: ubuntu-latest
+    # Only from the default branch, and only once every gate is green.
+    # Tributary's conformance job consumes this image rather than
+    # compiling the database on every one of its pull requests — the one
+    # deliberate exception to "test the working tree, never a published
+    # tag", justified because there the tree under test is Tributary's.
+    needs: [rust, store-s3, conformance]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Private packages are not readable by another private repo by
+      # default. Grant it once: package settings -> Manage Actions access
+      # -> add the Tributary repository with Read.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/timelakedb:main
+            ghcr.io/${{ github.repository_owner }}/timelakedb:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
