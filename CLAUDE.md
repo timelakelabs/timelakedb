@@ -122,7 +122,46 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **C2 phase 4 SHIPPED — the CL-3 stateless querier** (2026-08-10,
+- Status: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
+  (2026-08-10). NOT closed: the push needs GitHub credentials this box does
+  not hold (no `gh`, no remotes). What IS done: every CI step run against a
+  CLEAN target dir in stock `rust:1-slim` (fmt/clippy/173 tests/coverage all
+  pass), plus the LocalStack-gated `store-s3` tests (3 pass) with the exact
+  env the new job sets. **Org decided: `timelakedb`** (was `TimeLakeLabs` in
+  Cargo.toml/README/SECURITY/4 site pages; CLAUDE.md was the correct side) —
+  URLs rewritten in BOTH repos. New `store-s3` CI job (LocalStack service
+  container + bucket/KMS alias creation) so the coverage exclusion means
+  "counted in another job". **Tributary had NO CI at all** — now has
+  fmt/clippy/test (51 tests pass) + a LICENSE file (it declared Apache-2.0
+  with no text) + a README that no longer says "nothing is built yet".
+  `pages.yml` now skips unless the repo is public (Pages is unavailable on
+  a private Free repo → would have been a permanently red badge).
+  Coverage was 80.84% against an 80% gate after CL-3 (was 82.44%) — router
+  forwarding integration tests (`crates/server/tests/router.rs`, 9) brought
+  it to **82.74%** rather than lowering the gate. TimeLakeDB README status
+  section rewritten (it still claimed "data plane has no authentication",
+  false since SEC-4 phased). **NOTE: someone else added `conformance` +
+  `publish` jobs to both workflows** referencing a `Catchment` repo, a
+  GitHub App (`vars.CI_APP_ID` / `secrets.CI_APP_KEY`) and a ghcr image —
+  those are NOT verified by me and have blockers: Catchment has ZERO
+  commits locally, its `CI.md` (referenced in a workflow comment) does not
+  exist, and Tributary's conformance pulls `ghcr.io/<owner>/timelakedb:main`
+  which only exists after TimeLakeDB's `publish` job runs — so push order
+  is Catchment → App+secrets → TimeLakeDB → grant package read → Tributary.
+- Previous: **flush handover made atomic** (2026-08-10, drill
+  `bench/results/flush-handover-atomicity.log`). A reader could see rows in
+  NEITHER the buffer nor the holding area mid-flush — a vanish, reachable by
+  a plain COUNT(*), microseconds on disk but the length of a `put` on S3.
+  Swap + holding-insert are now ONE critical section (`ingest_gate` → `dbs`
+  → `flushing`) and all three read sites (`sql_batches`, `live_tables`,
+  `snapshot_ipc`) hold both locks together in that order. Recorded wrong
+  turn: locking only `flushing` across the swap converts the vanish into a
+  DUPLICATE (4 failures in 6). COST, measured: snapshot now runs under the
+  gate → laptop ingest ~600k → ~571k lines/s (**≈5%**). Cheaper design
+  deliberately deferred: move the `TableBuffer` into holding instead of a
+  snapshot (pointer move; readers snapshot as they already do) — changes the
+  type the read path and CL-3 wire consume.
+- Previous: **C2 phase 4 SHIPPED — the CL-3 stateless querier** (2026-08-10,
   drill `bench/results/cl3-querier-drill.log` 19/19, NEW rig
   `bench/compose/timelakedb-cluster-s3.yml` = router + ingester×2 +
   querier×2 + localstack on ONE bucket; drill

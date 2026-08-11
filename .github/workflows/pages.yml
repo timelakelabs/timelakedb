@@ -23,6 +23,12 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # GitHub Pages is not available on a private repository under the Free
+    # plan, so on one this job would fail on every push that touches site/ —
+    # a permanently red badge caused by the repo's visibility rather than by
+    # anything wrong with the site. Skip instead, and start publishing by
+    # itself the moment the repository becomes public.
+    if: github.event.repository.visibility == 'public'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

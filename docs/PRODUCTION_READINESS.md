@@ -56,24 +56,57 @@ this yet."
 
 ### P0-1 · Push the repos; make CI actually run  ⟂ blocks everything
 
-**Effort: S.** `TimeLakeLabs` was chosen as the org and never created.
-`.github/workflows/ci.yml` — fmt, `clippy -D warnings`, tests, an 80%
-coverage gate — **has never executed on a runner.** Every quality claim
-in this repo rests on runs on one Windows laptop through a Docker
-container.
+**Effort: S. Prepared 2026-08-10 — the push itself is the remaining step,
+and it needs credentials this project's tooling does not hold.**
 
-Coverage was measured locally at 82.44% only after excluding
-`store-s3` (7.69%, because its tests are LocalStack-gated `#[ignore]`).
-That exclusion is defensible but it is also exactly the kind of thing
-that should be visible in a public CI badge rather than a commit message.
+The original problem: `.github/workflows/ci.yml` — fmt, `clippy -D
+warnings`, tests, an 80% coverage gate — **had never executed on a
+runner.** Every quality claim in this repo rested on runs on one Windows
+laptop through a Docker container. That is still true until the push
+happens, so this item is not closed. What has changed is that the
+workflows are no longer *unverified*: each step was run against a clean
+target directory in a stock `rust:1-slim` container, which is the nearest
+local equivalent of a cold runner.
 
-Nothing else on this list can be *trusted* until the gates run somewhere
-that is not the author's machine. Do this first because it is cheap and
-because it changes the epistemic status of everything else.
+Measured that way (2026-08-10):
 
-- Create the org, push both repos, confirm CI green on a clean runner.
-- Add the LocalStack-gated tests as a separate CI job so `store-s3`
-  stops being a coverage hole.
+| Step | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -D warnings` | pass |
+| `cargo test --workspace` | 173 passed, 0 failed |
+| `cargo llvm-cov … --fail-under-lines 80` | pass |
+| `cargo test -p timelake-store-s3 -- --ignored` (LocalStack) | 3 passed |
+| Tributary: fmt · clippy · `cargo test --workspace` | pass, 51 tests |
+
+Decisions and changes made while preparing it:
+
+- **The org is `timelakedb`.** `TimeLakeLabs` appeared in `Cargo.toml`,
+  the README clone URL, the SECURITY.md advisory link and four site
+  pages while `CLAUDE.md` recorded `timelakedb` as the chosen org; the
+  URLs now say `timelakedb` in both repositories.
+- **The `store-s3` coverage hole is closed by a job, not by an
+  exclusion.** A `store-s3` job runs the three `#[ignore]`d tests against
+  a LocalStack service container — the Store contract over S3, the KMS
+  envelope round-trip, and the P0-4 two-writer catalog CAS over
+  `If-None-Match`. The coverage job still excludes the file, but the
+  exclusion now means "counted in another job" rather than "not counted".
+- **Tributary had no CI at all.** It has the same fmt/clippy/test gate now.
+- **`pages.yml` would have failed on a private repository** (Pages is not
+  available there on the Free plan), producing a red badge caused by
+  visibility rather than by the site. It now skips unless the repository
+  is public, and starts publishing by itself when that changes.
+- **Coverage margin is thin.** The CL-3 work took workspace line coverage
+  from 82.44% to 80.84% against an 80% gate. Rather than lower the gate,
+  the router's forwarding surface — previously proven only by a live
+  drill — gained integration tests against stub nodes.
+
+Remaining, and it needs a human with GitHub credentials:
+
+- Create the `timelakedb` org, push both repos **private**, and confirm
+  both workflows are green on a real runner.
+- Flip to public once they are, and enable Settings → Pages → Source:
+  GitHub Actions so the site publishes.
 - Tag `v0.1.0-alpha` so there is a fixed point to talk about.
 
 ### P0-2 · `/api/sql` writes files as root  ⟂ **DONE (2026-08-10)**

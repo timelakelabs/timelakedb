@@ -1,0 +1,181 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelakedb-p01-prefix-baseline-2-20260810-231801",
+  "backend": "timelakedb",
+  "backend_display": "TimeLakeDB",
+  "backend_version": "0.1.0",
+  "target": {
+    "url": "http://localhost:1963",
+    "db": "poc",
+    "container": "timelakedb",
+    "image": "bench-timelakedb-timelakedb"
+  },
+  "started_at": "2026-08-10T23:18:07-0400",
+  "finished_at": "2026-08-10T23:18:37-0400",
+  "config": {
+    "scale": "laptop",
+    "label": "p01-prefix-baseline-2",
+    "products_per_day": 100000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 300,
+    "host_hours": 6.0,
+    "disk_devices": 7,
+    "burst_size": 100000,
+    "batch_size": 10000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts",
+      "query_a",
+      "query_b",
+      "burst",
+      "storage",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322297856
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 3656634,
+      "wall_s": 15.9,
+      "lines_per_s": 230294,
+      "mb_sent": 494.7,
+      "errors": 0,
+      "batch_p50_ms": 64,
+      "batch_p95_ms": 458,
+      "batch_max_ms": 4975
+    },
+    "host_ingest": {
+      "lines": 864000,
+      "wall_s": 1.9,
+      "lines_per_s": 444684,
+      "errors": 0
+    },
+    "query_shape_a": {
+      "n": 20,
+      "errors": 0,
+      "median_ms": 106,
+      "p95_ms": 164,
+      "max_ms": 174
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 125,
+          "warm_ms": 58,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 75,
+          "warm_ms": 81,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 70,
+          "warm_ms": 57,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 55,
+          "warm_ms": 56,
+          "rows": 476,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 83,
+          "warm_ms": 95,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "burst": {
+      "events": 100000,
+      "wall_s": 0.15,
+      "events_per_s": 660650,
+      "errors": 0,
+      "batch_p50_ms": 51,
+      "batch_p95_ms": 86,
+      "batch_max_ms": 95,
+      "concurrent_query_ms": 87,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "storage": {
+      "bytes": 341061586,
+      "gb_total": 0.341,
+      "days_of_data": 2,
+      "gb_per_day": 0.171,
+      "projected_gb_90d": 15.3,
+      "projected_gb_365d": 62.2
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 34,
+        "value": 3756630,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 99,
+        "value": 107700,
+        "error": null
+      },
+      "disk_rows_6h": {
+        "ms": 71,
+        "value": 753900,
+        "error": null
+      }
+    },
+    "resources": {
+      "baseline_mem_mb": 7.1,
+      "settled_mem_mb": 2697.2,
+      "returned_to_baseline": false,
+      "phases": {
+        "baseline": {
+          "peak_mem_mb": 7.3,
+          "peak_cpu_pct": 0.0,
+          "samples": 3
+        },
+        "ingest": {
+          "peak_mem_mb": 472.5,
+          "peak_cpu_pct": 112.9,
+          "samples": 7
+        },
+        "hosts": {
+          "peak_mem_mb": 577.8,
+          "peak_cpu_pct": 110.7,
+          "samples": 1
+        },
+        "query_a": {
+          "peak_mem_mb": 2582.3,
+          "peak_cpu_pct": 142.0,
+          "samples": 2
+        },
+        "storage": {
+          "peak_mem_mb": 2743.4,
+          "peak_cpu_pct": 116.9,
+          "samples": 1
+        },
+        "settle": {
+          "peak_mem_mb": 2805.7,
+          "peak_cpu_pct": 34.1,
+          "samples": 4
+        }
+      }
+    }
+  },
+  "notes": []
+}

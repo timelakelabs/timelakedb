@@ -96,12 +96,40 @@ a second enforcement point.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo llvm-cov --workspace --ignore-filename-regex 'main\.rs' --fail-under-lines 80
+cargo llvm-cov --workspace \
+  --ignore-filename-regex 'main\.rs|store-s3/src/lib\.rs' --fail-under-lines 80
 ```
 
 Clippy warnings are errors, and line coverage may not drop below 80%.
-`main.rs` is excluded from the coverage gate because socket bind/serve is
-exercised by the container healthcheck rather than by unit tests.
+Two files are excluded from the coverage gate, both because they are
+exercised somewhere that job is not: `main.rs` (socket bind and serve —
+covered by the container healthcheck) and `store-s3` (S3 and KMS need a
+live endpoint).
+
+A second job, **`store-s3`**, runs that crate's `#[ignore]`d tests against
+a LocalStack service container on every push — the `Store` contract over
+S3 including range reads, the KMS envelope round-trip, and the two-writer
+catalog CAS over `If-None-Match`. So the exclusion above means "covered by
+another job", not "not covered". To run them yourself, bring up the C0 rig
+(`bench/compose/timelakedb-s3.yml`) and:
+
+```bash
+AWS_ENDPOINT_URL=http://localhost:4566 AWS_REGION=us-east-1 \
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+TLDB_S3_TEST_BUCKET=timelake-it TLDB_KMS_TEST_KEY=alias/timelake \
+cargo test -p timelake-store-s3 -- --ignored
+```
+
+Coverage headroom is thin (80.84% against the 80% gate as of the CL-3
+work), so a change that adds much untested code will fail the gate rather
+than quietly erode it. That is the intent.
+
+One known wrinkle: `crates/server/tests/health.rs`'s
+`rows_stay_visible_while_a_slow_flush_uploads` passes when the test binary
+runs whole — which is how `cargo test` and CI run it — but can fail when
+run alone through a filter, where the timing lets it catch the documented
+sub-millisecond window in `flush_all` between the buffer swap and the
+holding area. If you are bisecting with `--exact`, that is why.
 
 ## Measuring a change
 
