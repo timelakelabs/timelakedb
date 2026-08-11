@@ -63,6 +63,168 @@ Carried from `CLAUDE.md` and the M4/M5 carve-outs, as starting material:
 
 ## Entries
 
+### 2026-08-11 01:50 — Promise tag equality `Exact` so the tag leaves the projection   [REJECTED]
+
+**Hypothesis.** Every cycle so far has tried to make the scan's work *cheaper*.
+This one tried to delete a column from it outright. `supports_filters_pushdown`
+reported every filter `Inexact`, so DataFusion kept a `FilterExec` above the
+scan — and to feed it, the scan had to project the tag column. `EXPLAIN` on
+baseline B2 says it in one line:
+
+```
+FilterExec: event@3 = stop AND time@0 >= 1786238853061441895, projection=[product_id@1, step@2]
+  DataSourceExec: partitions=24, partition_sizes=[2, 2, …]
+```
+
+`event` is decoded, compared once, and projected straight back out. But
+`load_one_file` **already** installs a Parquet row filter for tag equality, so
+non-matching rows never reach a batch: the re-check is redundant. Report such a
+filter `Exact` and `event` should leave the scan's projection entirely.
+
+**Proved on the critical path first, and this is where the cycle went wrong —
+see the lesson.** `bench/probe-coltype.py` on the settled baseline, today's
+host: the marginal cost of one decoded column, same scan, same rows.
+
+| Projection | Median | vs floor |
+|---|---|---|
+| floor: `COUNT(*)` | 8.2 ms | — |
+| +1 f64 (`duration_s`) | 10.2 ms | +2.0 |
+| **+1 dict (`step`, ~10 distinct)** | 13.9 ms | **+5.7** |
+| +1 dict (`route`) | 11.8 ms | +3.6 |
+| +1 dict (`product_id`, ~200 K) | 12.1 ms | +3.9 |
+| +3 dict (`step`, `event`, `product_id`) | 21.5 ms | +13.3 |
+
+`event` is a low-cardinality dictionary column exactly like `step`, so removing
+it from B1/B2/B5 should be worth 4–6 ms each — plus a conjunct off `FilterExec`.
+Predicted ~10% off a 125 ms suite; B3/B4 untouched (no tag equality).
+
+**A different idea was killed before this one, for the cost of one probe.** Per
+query, `run_sql_env` builds a whole `SessionContext`. Timed directly (200
+iterations, release, in Docker): `SessionContext::new_with_config_rt` = **35 µs**,
+`create_logical_plan("SELECT 1")` = **20 µs**. Against a 3 ms Shape A that is
+1%, so pooling or caching sessions is not worth a cycle. Recorded so nobody
+re-derives it.
+
+**Change.** `crates/query/src/provider.rs`, one file. `enforced_equality(expr,
+schema)` recognises *exactly* `column = <string literal>` against a string
+column of the presented schema and nothing else — no `Cast` (its semantics are
+the cast's), no `OR` branch, no negation, no non-string column, pinned by a
+table-driven test. `supports_filters_pushdown` returns `Exact` for those and
+`Inexact` for everything else; `scan` computes the same set with the same
+function, so the promise and the enforcement cannot drift. Time bounds stay
+`Inexact` forever — they prune whole files by catalog bounds and never filter a
+row. Two holes had to be closed before the promise was true: the **write-buffer
+snapshot** had no row filter behind it and was being handed up whole (now
+filtered in `load_pruned`, *before* projection, since the projection no longer
+carries the column), and a **file that lacks the column** would have contributed
+rows that are all NULL for it (now skipped outright — `NULL = 'stop'` is not
+true). `eq_mask` centralises the comparison and folds nulls to false with
+`prep_null_mask_filter`, which only mattered once the `FilterExec` safety net
+was gone.
+
+**Measurement.** Two paired runs on the isolated instance, harness in-network,
+100 Shape A samples. All four clean (ingest 752–769 K lines/s) and all four
+settled to **62–63 parquet files / 69 MB** (`du`, not the harness metric). A
+third baseline was **discarded unread**: 267,800 lines/s *and* 111 files — both
+tripwires at once, exactly as the 19:45 entry predicted they would fail
+together. Labels `perf-base1/2`, `perf-cand1/2`, warm ms — **but see the note
+below: this cycle's `run.json` records did not survive, so unlike every other
+entry these numbers cannot be re-read from `bench/results/`.**
+
+| Metric | Baseline | Candidate |
+|---|---|---|
+| B1_funnel_24h | 23, 24 | *26, 26* |
+| B2_funnel_48h | 41, 46 | 40, 45 |
+| B3_inflight_24h | 14, 15 | 14, 15 |
+| B4_hourly_throughput_48h | 19, 20 | 19, 20 |
+| B5_route_rollup_24h | 28, 28 | 27, 27 |
+| **Shape B suite, warm total** | **125, 133 ms** | **126, 133 ms** |
+| Shape A median / p95 | 3/4, 3/5 ms | 3/5, 3/4 ms |
+| Ingest | 752K, 769K | 755K, 761K |
+
+Row counts match in both arms (10/10/10/475–476/40) and Shape A reports zero
+errors. 167 workspace tests pass, 0 failures (164 + 3 new); `cargo fmt --all
+--check` clean; `clippy -p timelake-query --all-targets` clean.
+
+**Verdict.** Rejected — a wash, with a small consistent regression. The suite is
+125/133 against 126/133. B1 goes 23,24 → 26,26 with no overlap, B5 goes 28,28 →
+27,27 with no overlap the other way, and B2/B3/B4 are identical to the
+millisecond. Nothing here clears noise.
+
+**And the mechanism worked perfectly, which is the whole finding.** `EXPLAIN` on
+the candidate, same query:
+
+```
+TableScan: pipeline_events projection=[time, product_id, step],
+  full_filters=[pipeline_events.event = Utf8View("stop")],
+  partial_filters=[pipeline_events.time >= TimestampNanosecond(…)]
+...
+  FilterExec: time@0 >= 1786239670060616194, projection=[product_id@1, step@2]
+```
+
+`event` is gone from the projection and gone from the filter. The column this
+cycle set out to delete is deleted, and the suite did not move by a millisecond.
+
+**Lesson.**
+
+- **The probe measured the wrong column, and the reason generalises.**
+  `probe-coltype.py` varies the projection *with no tag filter, on purpose* —
+  its docstring says so — so every column it prices is decoded **once**. A
+  column named in the `WHERE` clause is not in that regime: the Parquet row
+  filter must decode it **in full** to evaluate the predicate, whatever the
+  projection says. So `event` was being decoded twice, and removing it from the
+  projection removed the *second, cheaper* decode — arrow reuses the
+  predicate-decoded column for output where it can — not the +5.7 ms the table
+  advertised. **Never price a column with `probe-coltype.py` if the query
+  filters on it; that number is only valid for a column the query merely
+  reads.** This is the single most reusable thing in this entry.
+- **Which also says where the remaining prize is, and that it is not here.**
+  The scan cannot stop decoding a filtered column, because it is the thing
+  being filtered on. The only way `event` gets cheaper is if the predicate is
+  answered without decoding it at all — a dictionary-domain check (is `'stop'`
+  in this row group's dictionary page?) or column-chunk statistics on a
+  low-cardinality column, both of which answer per row group rather than per
+  row. `event` has ~10 distinct values so `BLOOM_MIN_DISTINCT` (1024) correctly
+  writes no bloom for it, and `stats_keep_row_groups` already consults
+  min/max — which admits `'stop'` in every group, because every group contains
+  every event type. **That is a dead end at this cardinality, and it is worth
+  writing down so nobody tries it: a value present in every row group cannot be
+  pruned by any per-group index.**
+- **Five cycles have now assumed a scan-side saving converts into query time,
+  and five have measured zero** (11:40, 13:45, 16:45, 19:45, this one). The
+  earlier four moved work around inside the scan; this one *removed* a column
+  from it outright and still bought nothing. The pattern is strong enough to
+  invert the default: **on this workload, treat "the scan does less work" as
+  predicting no change until a paired run says otherwise.**
+- **B1's +2.5 ms is real but unexplained, and I am not going to pretend
+  otherwise.** Four samples, no overlap, on the one query that ought to have
+  gained most. It is not the file-skip guard (62 files × one name lookup) and
+  not `eq_mask` (a match and a null-count check). The plausible candidate is
+  that dropping the tag from the output projection costs arrow the reuse of its
+  predicate-decoded column, making the two decodes *more* expensive than one
+  decode plus one reuse. `sh bench/probe-innet.sh tldb-perf probe-coltype.py`
+  with a `WHERE event = 'stop'` variant added — pricing a column that is
+  filtered on, which no probe here currently does — would settle it in a minute
+  and is the right first move for anyone who picks this up.
+- **I destroyed this cycle's raw records, and the next cycle should not repeat
+  it.** Reverting a rejected change, I ran `git clean -f bench/` to delete one
+  scratch probe script and it also removed the four untracked
+  `bench/results/timelakedb-perf-*/` directories this cycle had just produced —
+  the run records every other entry in this log can still be re-read from.
+  Every number in the table above is from the run transcript and is reported as
+  measured; none of it is reconstructed. But it is unverifiable, which is
+  exactly what this log's opening promise says it should never be. **Revert
+  with `git restore <paths>` and delete scratch files by name — `git clean` in
+  a directory the harness writes into is not a cleanup command, it is a
+  data-loss command.**
+- **Cost of the cycle, honestly.** ~200 lines against ~90, and the promise it
+  makes is the expensive part: `Exact` means a bug in `enforced_equality`
+  returns *wrong rows* rather than slow ones. Two of the three new tests exist
+  only to hold that promise (buffer filtering, missing column). Reverted whole.
+  Carrying that risk surface for a measured zero is not a trade worth making —
+  but note the mechanism is sound and fully tested, so if a future change ever
+  makes the redundant `FilterExec` conjunct expensive, this is off-the-shelf.
+
 ### 2026-08-10 19:45 — Stream the scan into the plan instead of materialising it   [REJECTED]
 
 **Hypothesis.** Every previous cycle attacked what the scan *costs*. This one
