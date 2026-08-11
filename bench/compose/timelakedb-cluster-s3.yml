@@ -1,0 +1,176 @@
+# The full C2 cluster (ARCHITECTURE §12.4/§12.6): router, ingester pair,
+# querier pair, all on ONE object store.
+#
+# This is the rig phase 4 needs and the earlier phases did not. CL-2
+# replication and router sharding are write-path properties, so
+# `timelakedb-cluster.yml` runs its ingesters on local disks. A querier is
+# only meaningful over a SHARED store: it owns no data, replays the catalog
+# from the bucket, and unions the ingesters' live buffers on top. That also
+# makes this the first rig where two writers commit to one manifest log —
+# the catalog CAS from P0-4, finally under real contention rather than a
+# unit test.
+#
+#   docker compose -f compose/timelakedb-cluster-s3.yml up -d --build
+#   sh cluster-drill/cl3_drill.sh
+#
+# What this rig may claim: correctness, freshness, recovery behaviour.
+# What it may NOT claim: latency — localhost S3 is not S3 (§12.6).
+name: bench-timelakedb-cluster-s3
+
+x-node: &node
+  build: ../..
+  mem_limit: 2g
+  environment: &node-env
+    TIMELAKE_OBJECT_STORE: s3://timelake-cluster/objects
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_REGION: us-east-1
+    # A short flush age so the drill can watch rows cross from memory to
+    # the store inside one run — the exact moment a querier must not lose
+    # them. Production leaves this at the 60 s default.
+    TIMELAKE_FLUSH_AGE_SECS: "15"
+
+services:
+  localstack:
+    # Pinned for the same reason as the C0 rig: 4.9 is the last community
+    # line with the s3 conditional-write support catalog CAS needs.
+    image: localstack/localstack:4.9
+    container_name: timelake-cluster-localstack
+    environment:
+      SERVICES: s3
+    ports:
+      - "4567:4566"
+    volumes:
+      - ./cluster-drill/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      # gate on the bucket, so no node boots against a half-built stack
+      test: ["CMD-SHELL", "awslocal s3api head-bucket --bucket timelake-cluster"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # ---- ingesters: the write path, paired for CL-2 -----------------------
+  ingester-a:
+    <<: *node
+    container_name: cl3-ingester-a
+    hostname: ingester-a
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "5971:1963"   # public data port
+      - "5981:1965"   # internal listener (the drill inspects /internal/v1/live)
+    environment:
+      <<: *node-env
+      TIMELAKE_ROLE: ingester
+      TIMELAKE_NODE_ID: ingester-a
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
+      TIMELAKE_PEERS: ingester-b=ingester@ingester-b:1965|ingester-b:1963
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ingester-b:
+    <<: *node
+    container_name: cl3-ingester-b
+    hostname: ingester-b
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "5972:1963"
+      - "5982:1965"
+    environment:
+      <<: *node-env
+      TIMELAKE_ROLE: ingester
+      TIMELAKE_NODE_ID: ingester-b
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
+      TIMELAKE_PEERS: ingester-a=ingester@ingester-a:1965|ingester-a:1963
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---- queriers: stateless, interchangeable, no volumes -----------------
+  # Deliberately volume-less. A querier that survives `docker compose up
+  # --force-recreate` with an empty disk is the CL-4 property stated as a
+  # fact about the deployment, not just asserted in a doc.
+  querier-a:
+    <<: *node
+    container_name: cl3-querier-a
+    hostname: querier-a
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "5973:1963"
+      - "5983:1964"   # Flight SQL — Grafana points here (FR-8)
+    environment:
+      <<: *node-env
+      TIMELAKE_ROLE: querier
+      TIMELAKE_NODE_ID: querier-a
+      # Ingesters by their INTERNAL address: live buffers travel the
+      # private link, like replication.
+      TIMELAKE_PEERS: >-
+        ingester-a=ingester@ingester-a:1965|ingester-a:1963,
+        ingester-b=ingester@ingester-b:1965|ingester-b:1963
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  querier-b:
+    <<: *node
+    container_name: cl3-querier-b
+    hostname: querier-b
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "5974:1963"
+    environment:
+      <<: *node-env
+      TIMELAKE_ROLE: querier
+      TIMELAKE_NODE_ID: querier-b
+      TIMELAKE_PEERS: >-
+        ingester-a=ingester@ingester-a:1965|ingester-a:1963,
+        ingester-b=ingester@ingester-b:1965|ingester-b:1963
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---- router: the one public endpoint ----------------------------------
+  router:
+    build: ../..
+    container_name: cl3-router
+    hostname: router
+    mem_limit: 512m
+    ports:
+      - "5970:1963"   # writes AND queries — the single address clients keep
+    environment:
+      # Writes shard to the ingesters' public ports; queries go to a
+      # querier, round-robin, falling through if one is down.
+      TIMELAKE_ROLE: router
+      TIMELAKE_NODE_ID: router
+      TIMELAKE_PEERS: >-
+        ingester-a=ingester@ingester-a:1965|ingester-a:1963,
+        ingester-b=ingester@ingester-b:1965|ingester-b:1963,
+        querier-a=querier@querier-a:1963|querier-a:1963,
+        querier-b=querier@querier-b:1963|querier-b:1963
+    depends_on:
+      - ingester-a
+      - ingester-b
+      - querier-a
+      - querier-b
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

@@ -31,6 +31,7 @@ use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, Local
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::Wal;
 
+pub mod querier;
 pub mod replication;
 pub mod router;
 use replication::Replicator;
@@ -264,6 +265,10 @@ pub struct Engine {
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
     schemas: RwLock<HashMap<(String, String), timelake_query::QuerySchema>>,
+    /// Which file each registry entry was last folded from, so a catalog
+    /// tail re-reads a footer only when the newest file for a table has
+    /// actually changed (CL-3 runs this on every manifest advance).
+    schema_source: RwLock<HashMap<(String, String), String>>,
     /// SEC-4 principals and sessions for the admin surface.
     auth: Arc<timelake_auth::Auth>,
     /// The data-plane split: how many requests authenticated, came
@@ -320,6 +325,14 @@ pub struct Engine {
     replica_wal_dir: RwLock<Option<PathBuf>>,
     cl2_replica_frames: AtomicU64,
     cl2_recovered: AtomicU64,
+    /// CL-3: a querier is a read replica. It holds no WAL of its own and
+    /// must not pretend to — a write accepted here would be durable
+    /// nowhere the cluster reads from.
+    read_only: std::sync::atomic::AtomicBool,
+    /// CL-3: the ingesters whose live buffers this node unions into every
+    /// query. `None` on `all`/`ingester`/`router`, which is why those
+    /// paths are unchanged.
+    remote: RwLock<Option<Arc<querier::RemoteBuffers>>>,
 }
 
 impl Engine {
@@ -410,6 +423,7 @@ impl Engine {
             store_encrypted,
             query_env,
             schemas: RwLock::new(HashMap::new()),
+            schema_source: RwLock::new(HashMap::new()),
             auth,
             retention: RwLock::new(retention),
             flushing: RwLock::new(HashMap::new()),
@@ -432,6 +446,8 @@ impl Engine {
             replica_wal_dir: RwLock::new(None),
             cl2_replica_frames: AtomicU64::new(0),
             cl2_recovered: AtomicU64::new(0),
+            read_only: std::sync::atomic::AtomicBool::new(false),
+            remote: RwLock::new(None),
         };
         let n = frames.len();
         for (db, mult, body) in frames {
@@ -440,38 +456,7 @@ impl Engine {
                 tracing::warn!(db, error = %e, "skipping unreplayable WAL frame");
             }
         }
-        // Rebuild the schema registry from the NEWEST file per table
-        // (fullest column set in practice; compaction folds old columns
-        // forward over time). Full-footer sweep is an S3-era refinement.
-        {
-            let mut newest: HashMap<(String, String), String> = HashMap::new();
-            for f in engine.catalog.all_files() {
-                let key = (f.db.clone(), f.table.clone());
-                let e = newest.entry(key).or_default();
-                if f.path > *e {
-                    *e = f.path;
-                }
-            }
-            for ((db, table), path) in newest {
-                match engine
-                    .store
-                    .get(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| {
-                        flush::read_parquet_bytes(b).map(|bs| bs.first().map(|b| b.schema()))
-                    }) {
-                    Ok(Some(schema)) => {
-                        engine
-                            .schemas
-                            .write()
-                            .expect("schemas lock")
-                            .insert((db, table), schema);
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(path, error = %e, "schema bootstrap failed"),
-                }
-            }
-        }
+        engine.refresh_schema_registry();
         tracing::info!(
             frames = n,
             files = engine.catalog.file_count(),
@@ -874,6 +859,15 @@ impl timelake_api::Engine for Engine {
         body: &[u8],
         precision: Option<&str>,
     ) -> Result<usize, WriteError> {
+        // CL-3: a querier takes no writes. Checked before parsing so the
+        // answer costs nothing and cannot depend on the body.
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(WriteError::NotHere(
+                "this node is a querier (TIMELAKE_ROLE=querier) and holds no write path — \
+                 send writes to the router, or to an ingester directly"
+                    .into(),
+            ));
+        }
         let mult = match precision {
             None => 1,
             Some(p) => precision_multiplier(p)
@@ -948,6 +942,28 @@ impl Engine {
         query: &str,
         authorizations: Vec<String>,
     ) -> Result<Vec<timelake_query::QueryBatch>, String> {
+        let remote = self.remote_buffers();
+        if let Some(r) = &remote {
+            // CL-3: ask *before listing*, every query, not just on the tail
+            // tick. A table written a moment ago exists only in an
+            // ingester's memory: it is in no catalog and no local buffer, so
+            // a querier working from a one-second-old view would answer
+            // "table not found" for it — the freshness claim failing at
+            // exactly the moment it matters most (write, then read).
+            //
+            // The head that comes back is read by the ingester AFTER its
+            // buffers, so folding the catalog to it covers anything that has
+            // just LEFT a buffer by being flushed. Together the two make the
+            // table list complete in both directions before it is taken.
+            // In the steady state neither costs a store call.
+            let head = r.refresh_live().await;
+            let before = self.catalog.head();
+            if self.catch_up_catalog(head) > before {
+                r.stats
+                    .catchups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let names = self.table_names(db);
         if names.is_empty() {
             return Err(format!(
@@ -956,8 +972,17 @@ impl Engine {
         }
 
         let session = QuerySession::with_authorizations(authorizations);
-        let mut tables: Vec<(String, Arc<dyn timelake_query::DfTableProvider>)> =
+
+        // PASS 1 — every live row, before any catalog read.
+        //
+        // Buffer-before-catalog is the rule that keeps an acknowledged row
+        // from vanishing mid-flush (see the `flushing` field). It is done
+        // for ALL tables up front, not per table, because a querier's live
+        // rows arrive over the network: interleaving would let a flush
+        // complete between one table's snapshot and another's file list.
+        let mut live: Vec<(String, Vec<timelake_query::QueryBatch>)> =
             Vec::with_capacity(names.len());
+        let mut watermark = 0u64;
         for name in names {
             let mut buffer: Vec<timelake_query::QueryBatch> = {
                 let dbs = self.dbs.read().expect("dbs lock");
@@ -966,9 +991,6 @@ impl Engine {
                     _ => Vec::new(),
                 }
             };
-            // rows mid-flush: MUST be read before the catalog, so the
-            // race with a completing flush errs toward a transient
-            // duplicate, never a vanish (see the `flushing` field)
             if let Some(held) = self
                 .flushing
                 .read()
@@ -977,13 +999,55 @@ impl Engine {
             {
                 buffer.push(held.clone());
             }
+            // CL-3: the ingesters' live rows. All or nothing — an
+            // unreachable ingester fails the query rather than shortening
+            // it (see `querier`).
+            if let Some(r) = &remote {
+                let (mut remote_batches, head) = r.snapshot(db, &name).await?;
+                watermark = watermark.max(head);
+                buffer.append(&mut remote_batches);
+            }
+            live.push((name, buffer));
+        }
+
+        // The freshness watermark: fold the manifest log forward to at
+        // least the highest head any ingester reported BEFORE the snapshots
+        // above were taken. Any batch already gone from a buffer is
+        // committed below that head, so it is now visible as a file. Costs
+        // nothing when the tail loop has already kept up.
+        if remote.is_some() && watermark > self.catalog.head() {
+            let reached = self.catch_up_catalog(watermark);
+            if let Some(r) = &remote {
+                r.stats
+                    .catchups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if reached < watermark {
+                    r.stats
+                        .refusals
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(format!(
+                        "refusing to answer from a stale catalog: an ingester has committed \
+                         up to manifest {watermark} but this querier could only reach \
+                         {reached}. Rows flushed in between would be missing."
+                    ));
+                }
+            }
+        }
+
+        // PASS 2 — the cataloged files, and the providers.
+        let mut tables: Vec<(String, Arc<dyn timelake_query::DfTableProvider>)> =
+            Vec::with_capacity(live.len());
+        for (name, buffer) in live {
             let files = self.catalog.files_for(db, &name);
             if buffer.is_empty() && files.is_empty() {
                 continue;
             }
-            // merged schema: registry (covers files + past flushes) ∪ buffer
+            // merged schema: registry (covers files + past flushes) ∪ every
+            // live batch. Every one, not just the first: batches now come
+            // from several nodes, and two of them can legitimately disagree
+            // about which columns exist.
             let mut schema = self.table_schema(db, &name);
-            if let Some(b) = buffer.first() {
+            for b in &buffer {
                 schema = Some(timelake_query::schema_union(schema, b.schema())?);
             }
             let Some(schema) = schema else { continue };
@@ -1018,6 +1082,16 @@ impl Engine {
                 names.push(db);
             }
         }
+        // CL-3: a database whose first writes are still in an ingester's
+        // memory exists nowhere local yet. Without this a querier answers
+        // "no such database" for the first ten seconds of its life.
+        if let Some(r) = self.remote_buffers() {
+            for (db, _) in r.live_tables() {
+                if !names.contains(&db) {
+                    names.push(db);
+                }
+            }
+        }
         names.sort();
         names
     }
@@ -1035,6 +1109,17 @@ impl Engine {
         for t in self.catalog.tables_for(db) {
             if !names.contains(&t) {
                 names.push(t);
+            }
+        }
+        // CL-3: tables that exist only in an ingester's buffer. The list is
+        // refreshed by the tail loop, so it can lag by a tick — which costs
+        // a listing, never a count: a table that IS named in a query still
+        // resolves through the catalog + snapshot path above.
+        if let Some(r) = self.remote_buffers() {
+            for (d, t) in r.live_tables() {
+                if d == db && !names.contains(&t) {
+                    names.push(t);
+                }
             }
         }
         names.sort();
@@ -1158,6 +1243,180 @@ impl Engine {
             "CL2 recovery complete: peer's writes replayed and flushed"
         );
         Ok(n)
+    }
+
+    // ---- CL-3: the querier and the live rows it reads ------------------
+
+    /// Refuse writes on this node (CL-3). A querier is a read replica: it
+    /// has no peer to replicate to and its WAL is read by nobody, so a
+    /// write accepted here would be acknowledged and then invisible to the
+    /// cluster — the one outcome worse than refusing it.
+    pub fn set_read_only(&self) {
+        self.read_only.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
+
+    /// Attach the ingesters whose live buffers this node unions into every
+    /// query (CL-3). Only a querier sets this.
+    pub fn set_remote_buffers(&self, remote: Arc<querier::RemoteBuffers>) {
+        *self.remote.write().expect("remote lock") = Some(remote);
+    }
+
+    pub fn remote_buffers(&self) -> Option<Arc<querier::RemoteBuffers>> {
+        self.remote.read().expect("remote lock").clone()
+    }
+
+    /// The highest manifest sequence this node has applied — the freshness
+    /// watermark a querier catches up to (see `querier`).
+    pub fn catalog_head(&self) -> u64 {
+        self.catalog.head()
+    }
+
+    /// What this node is holding in memory right now: every table with live
+    /// (unflushed) rows, including rows mid-flush. This is what a querier
+    /// asks for, and the answer is deliberately the same set the local read
+    /// path unions — one definition of "live", not two that drift.
+    pub fn live_tables(&self) -> Vec<(String, String, u64)> {
+        let mut out: HashMap<(String, String), u64> = HashMap::new();
+        {
+            let dbs = self.dbs.read().expect("dbs lock");
+            for (db, tables) in dbs.iter() {
+                for (table, buf) in tables.iter() {
+                    let rows = buf.row_count() as u64;
+                    if rows > 0 {
+                        *out.entry((db.clone(), table.clone())).or_default() += rows;
+                    }
+                }
+            }
+        }
+        for ((db, table), batch) in self.flushing.read().expect("flushing lock").iter() {
+            *out.entry((db.clone(), table.clone())).or_default() += batch.num_rows() as u64;
+        }
+        let mut v: Vec<(String, String, u64)> = out
+            .into_iter()
+            .map(|((db, table), rows)| (db, table, rows))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// One table's live rows as Arrow IPC — the querier's read of this
+    /// node's buffer.
+    ///
+    /// The order is the same as the local read path for the same reason:
+    /// buffer, then rows mid-flush. A batch that has left `flushing` is
+    /// already committed to the catalog, and the caller's head watermark
+    /// guarantees it sees that commit — so the worst case here is a
+    /// transient duplicate, never a vanished row.
+    pub fn snapshot_ipc(&self, db: &str, table: &str) -> Result<Vec<u8>, String> {
+        let mut batches: Vec<timelake_query::QueryBatch> = {
+            let dbs = self.dbs.read().expect("dbs lock");
+            match dbs.get(db).and_then(|t| t.get(table)) {
+                Some(buf) if buf.row_count() > 0 => vec![buf.snapshot()?],
+                _ => Vec::new(),
+            }
+        };
+        if let Some(held) = self
+            .flushing
+            .read()
+            .expect("flushing lock")
+            .get(&(db.to_string(), table.to_string()))
+        {
+            batches.push(held.clone());
+        }
+        // Two batches of the same table can carry different column sets (a
+        // write added a column after the mid-flush batch was taken). One
+        // IPC stream has one schema, so widen both to the union rather than
+        // dropping the newer column.
+        if batches.len() > 1 {
+            let mut merged: Option<timelake_query::QuerySchema> = None;
+            for b in &batches {
+                merged = Some(timelake_query::schema_union(merged, b.schema())?);
+            }
+            if let Some(schema) = merged {
+                batches = timelake_query::align_to(schema, batches)?;
+            }
+        }
+        timelake_query::ipc::to_ipc(&batches)
+    }
+
+    /// Fold the shared manifest log forward until this node has applied at
+    /// least `target` (0 = "just take whatever is there"). Read-only: a
+    /// querier commits nothing, so this is the only way its view advances.
+    ///
+    /// Returns the head actually reached. Falling short is reported, not
+    /// hidden — a querier that cannot reach the watermark is a querier
+    /// whose answers could be short.
+    pub fn catch_up_catalog(&self, target: u64) -> u64 {
+        if self.catalog.head() >= target && target > 0 {
+            return self.catalog.head();
+        }
+        let before = self.catalog.head();
+        if let Err(e) = self.catalog.catch_up() {
+            tracing::warn!(error = %e, "catalog tail failed");
+            return before;
+        }
+        let head = self.catalog.head();
+        if head != before {
+            // New files can mean new tables or new columns; the registry is
+            // what the query path builds its merged schema from.
+            self.refresh_schema_registry();
+        }
+        head
+    }
+
+    /// (Re)build the schema registry from the newest cataloged file per
+    /// table (fullest column set in practice; compaction folds old columns
+    /// forward over time). Footer-only reads, cached — cheap enough to run
+    /// on every catalog advance, which is what a querier needs: a table
+    /// that gained a column after this node booted must not read short.
+    ///
+    /// The registry only ever widens: the union with what is already known
+    /// means a compaction that drops back to an older column set cannot
+    /// un-register a column that live rows may still carry.
+    fn refresh_schema_registry(&self) {
+        let mut newest: HashMap<(String, String), (String, u64)> = HashMap::new();
+        for f in self.catalog.all_files() {
+            let key = (f.db.clone(), f.table.clone());
+            let e = newest.entry(key).or_default();
+            if f.path > e.0 {
+                *e = (f.path, f.size_bytes);
+            }
+        }
+        for ((db, table), (path, size)) in newest {
+            let key = (db, table);
+            if self
+                .schema_source
+                .read()
+                .expect("schema source lock")
+                .get(&key)
+                == Some(&path)
+            {
+                continue; // already folded this file in
+            }
+            match timelake_query::provider::file_schema(&self.store, &path, size, &self.meta_cache)
+            {
+                Ok(schema) => {
+                    let mut reg = self.schemas.write().expect("schemas lock");
+                    let known = reg.get(&key).cloned();
+                    match timelake_query::schema_union(known, schema) {
+                        Ok(merged) => {
+                            reg.insert(key.clone(), merged);
+                            drop(reg);
+                            self.schema_source
+                                .write()
+                                .expect("schema source lock")
+                                .insert(key, path);
+                        }
+                        Err(e) => tracing::warn!(path, error = %e, "schema merge failed"),
+                    }
+                }
+                Err(e) => tracing::warn!(path, error = %e, "schema bootstrap failed"),
+            }
+        }
     }
 
     pub fn metrics_text_impl(&self) -> String {
@@ -1299,6 +1558,35 @@ impl Engine {
             ),
             None => String::new(),
         };
+        // CL-3 lines only on a querier (remote buffers set). `refusals` is
+        // the one to alert on: it separates "the cluster is down" from the
+        // failure this database exists to prevent — quiet under-counting.
+        let cl3_lines = match self.remote_buffers() {
+            Some(r) => format!(
+                "# TYPE timelake_querier_ingesters gauge\n\
+                 timelake_querier_ingesters {}\n\
+                 # TYPE timelake_querier_snapshot_fetches_total counter\n\
+                 timelake_querier_snapshot_fetches_total {}\n\
+                 # TYPE timelake_querier_snapshot_rows_total counter\n\
+                 timelake_querier_snapshot_rows_total {}\n\
+                 # TYPE timelake_querier_snapshot_errors_total counter\n\
+                 timelake_querier_snapshot_errors_total {}\n\
+                 # TYPE timelake_querier_refusals_total counter\n\
+                 timelake_querier_refusals_total {}\n\
+                 # TYPE timelake_querier_catchups_total counter\n\
+                 timelake_querier_catchups_total {}\n\
+                 # TYPE timelake_catalog_head gauge\n\
+                 timelake_catalog_head {}\n",
+                r.peer_count(),
+                r.stats.snapshot_fetches.load(Ordering::Relaxed),
+                r.stats.snapshot_rows.load(Ordering::Relaxed),
+                r.stats.snapshot_errors.load(Ordering::Relaxed),
+                r.stats.refusals.load(Ordering::Relaxed),
+                r.stats.catchups.load(Ordering::Relaxed),
+                self.catalog.head(),
+            ),
+            None => String::new(),
+        };
         format!(
             "# TYPE timelake_lines_written_total counter\n\
              timelake_lines_written_total {}\n\
@@ -1320,7 +1608,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1347,6 +1635,7 @@ impl Engine {
             s3_lines,
             tls_lines,
             cl2_lines,
+            cl3_lines,
         )
     }
 }
@@ -1435,11 +1724,18 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
     timelake_api::app(engine, auth, false)
 }
 
-/// The intra-cluster listener for an ingester (CL-2), bound to
-/// `TIMELAKE_CLUSTER_ADDR`. NOT the public data port: it carries only
-/// replication and recovery, and at C3 it moves behind required mTLS. There
-/// is no data-plane auth here — trust is the private network now, the peer
-/// certificate later.
+/// The intra-cluster listener for an ingester (CL-2 replication, CL-3 live
+/// reads), bound to `TIMELAKE_CLUSTER_ADDR`. NOT the public data port: it
+/// carries only peer traffic, and at C3 it moves behind required mTLS.
+/// There is no data-plane auth here — trust is the private network now, the
+/// peer certificate later.
+///
+/// SECURITY NOTE: `/internal/v1/snapshot` returns *rows*, not just metadata,
+/// and applies no SEC-2 visibility filter — a querier re-applies the
+/// caller's restriction when it scans them, exactly as it does for a file
+/// it reads from the bucket. So this listener must never be exposed
+/// publicly; it is the same trust boundary as read access to the object
+/// store itself.
 pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
     axum::Router::new()
         .route(
@@ -1450,8 +1746,65 @@ pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
             "/internal/v1/recover",
             axum::routing::post(internal_recover),
         )
+        .route("/internal/v1/live", axum::routing::get(internal_live))
+        .route(
+            "/internal/v1/snapshot",
+            axum::routing::get(internal_snapshot),
+        )
         .route("/internal/v1/health", axum::routing::get(|| async { "ok" }))
         .with_state(engine)
+}
+
+/// What this node holds live, plus its catalog head (CL-3).
+async fn internal_live(
+    axum::extract::State(engine): axum::extract::State<Arc<Engine>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let tables: Vec<Value> = engine
+        .live_tables()
+        .into_iter()
+        .map(|(db, table, rows)| serde_json::json!({"db": db, "table": table, "rows": rows}))
+        .collect();
+    // The head is read AFTER the buffers, so it can only be newer than the
+    // rows reported — never older. The other order would let a caller trust
+    // a watermark that predates a flush it did not see.
+    let head = engine.catalog_head();
+    axum::Json(serde_json::json!({ "head": head, "tables": tables })).into_response()
+}
+
+/// One table's live rows as an Arrow IPC stream (CL-3).
+async fn internal_snapshot(
+    axum::extract::State(engine): axum::extract::State<Arc<Engine>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let (Some(db), Some(table)) = (params.get("db"), params.get("table")) else {
+        return (StatusCode::BAD_REQUEST, "missing db/table").into_response();
+    };
+    let (db, table) = (db.clone(), table.clone());
+    let e = Arc::clone(&engine);
+    // Snapshot + IPC encode are CPU work over a lock: off the async runtime.
+    let encoded = tokio::task::spawn_blocking(move || e.snapshot_ipc(&db, &table)).await;
+    // Head AFTER the snapshot, and this order is load-bearing: a batch
+    // missing from the snapshot was committed before the snapshot was
+    // taken, so a head read now is guaranteed to include that commit. Read
+    // first, it could name a sequence older than a flush the caller did not
+    // see — which is exactly how a row goes missing.
+    let head = engine.catalog_head().to_string();
+    match encoded {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/vnd.apache.arrow.stream"),
+                (querier::CATALOG_HEAD_HEADER, head.as_str()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(join) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {join}")).into_response(),
+    }
 }
 
 /// Receive one replicated frame from the peer and record it durably.

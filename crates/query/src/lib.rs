@@ -27,6 +27,7 @@ pub use datafusion::arrow::datatypes::SchemaRef as QuerySchema;
 pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
 pub use datafusion::datasource::TableProvider as DfTableProvider;
 
+pub mod ipc;
 pub mod provider;
 pub mod sql_guard;
 pub mod visibility;

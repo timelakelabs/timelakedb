@@ -1,0 +1,138 @@
+{
+  "framework": "tsdb-bench/1.0",
+  "run_id": "timelakedb-cl3-cluster-through-router-20260810-203730",
+  "backend": "timelakedb",
+  "backend_display": "TimeLakeDB",
+  "backend_version": null,
+  "target": {
+    "url": "http://localhost:5970",
+    "db": "poc",
+    "container": null,
+    "image": null
+  },
+  "started_at": "2026-08-10T20:37:30-0400",
+  "finished_at": "2026-08-10T20:37:34-0400",
+  "config": {
+    "scale": "smoke",
+    "label": "cl3-cluster-through-router",
+    "products_per_day": 2000,
+    "backfill_days": 2,
+    "steps": 10,
+    "dropout_pct": 2.0,
+    "hosts": 50,
+    "host_hours": 1.0,
+    "disk_devices": 7,
+    "burst_size": 5000,
+    "batch_size": 5000,
+    "workers": 4,
+    "shape_a_samples": 20,
+    "shape_b_repeats": 3,
+    "scenarios": [
+      "ingest",
+      "hosts",
+      "query_a",
+      "query_b",
+      "burst",
+      "storage",
+      "context"
+    ]
+  },
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "host_cpu_count": 24,
+    "docker_mem_total_bytes": 16322297856
+  },
+  "metrics": {
+    "ingest": {
+      "lines": 72806,
+      "wall_s": 0.2,
+      "lines_per_s": 323269,
+      "mb_sent": 9.8,
+      "errors": 0,
+      "batch_p50_ms": 39,
+      "batch_p95_ms": 63,
+      "batch_max_ms": 66
+    },
+    "host_ingest": {
+      "lines": 24000,
+      "wall_s": 0.1,
+      "lines_per_s": 209007,
+      "errors": 0
+    },
+    "query_shape_a": {
+      "n": 20,
+      "errors": 0,
+      "median_ms": 58,
+      "p95_ms": 68,
+      "max_ms": 95
+    },
+    "query_shape_b": {
+      "queries": {
+        "B1_funnel_24h": {
+          "cold_ms": 64,
+          "warm_ms": 58,
+          "rows": 10,
+          "errors": 0
+        },
+        "B2_funnel_48h": {
+          "cold_ms": 64,
+          "warm_ms": 61,
+          "rows": 10,
+          "errors": 0
+        },
+        "B3_inflight_24h": {
+          "cold_ms": 64,
+          "warm_ms": 56,
+          "rows": 10,
+          "errors": 0
+        },
+        "B4_hourly_throughput_48h": {
+          "cold_ms": 58,
+          "warm_ms": 59,
+          "rows": 472,
+          "errors": 0
+        },
+        "B5_route_rollup_24h": {
+          "cold_ms": 60,
+          "warm_ms": 63,
+          "rows": 40,
+          "errors": 0
+        }
+      },
+      "total_errors": 0,
+      "all_completed": true
+    },
+    "burst": {
+      "events": 5000,
+      "wall_s": 0.07,
+      "events_per_s": 68953,
+      "errors": 0,
+      "batch_p50_ms": 72,
+      "batch_p95_ms": 72,
+      "batch_max_ms": 72,
+      "concurrent_query_ms": 22,
+      "concurrent_query_ok": true,
+      "concurrent_query": "B1_funnel_24h"
+    },
+    "context": {
+      "rows_48h": {
+        "ms": 58,
+        "value": 77806,
+        "error": null
+      },
+      "host_rows_6h": {
+        "ms": 53,
+        "value": 3000,
+        "error": null
+      },
+      "disk_rows_6h": {
+        "ms": 56,
+        "value": 21000,
+        "error": null
+      }
+    }
+  },
+  "notes": [
+    "storage: could not measure (no container/du unavailable)"
+  ]
+}

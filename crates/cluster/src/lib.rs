@@ -54,10 +54,13 @@ impl Role {
     /// Whether this role's behaviour exists yet. Roles are enabled one C2
     /// phase at a time; selecting an unbuilt role is a startup refusal, not
     /// a silent half-node. `all` (foundation), `ingester` (CL-2, WAL
-    /// replication) and `router` (write sharding) are built;
-    /// `querier`/`compactor` are not yet.
+    /// replication), `router` (write sharding) and `querier` (CL-3, stateless
+    /// reads) are built; `compactor` is not yet.
     pub fn implemented(self) -> bool {
-        matches!(self, Role::All | Role::Ingester | Role::Router)
+        matches!(
+            self,
+            Role::All | Role::Ingester | Role::Router | Role::Querier
+        )
     }
 }
 
@@ -232,13 +235,15 @@ mod tests {
     }
 
     #[test]
-    fn implemented_roles_are_all_ingester_and_router() {
+    fn implemented_roles_are_everything_but_the_compactor() {
         assert!(Role::All.implemented());
         assert!(Role::Ingester.implemented(), "CL-2 shipped the ingester");
         assert!(Role::Router.implemented(), "phase 3 shipped the router");
-        for r in [Role::Querier, Role::Compactor] {
-            assert!(!r.implemented(), "{} should not be built yet", r.as_str());
-        }
+        assert!(Role::Querier.implemented(), "phase 4 shipped the querier");
+        assert!(
+            !Role::Compactor.implemented(),
+            "compactor should not be built yet"
+        );
     }
 
     #[test]

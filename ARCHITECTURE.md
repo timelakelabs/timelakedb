@@ -470,11 +470,10 @@ in one process, bench and fixtures untouched. The specialised roles are
 built one phase at a time; **a role whose phase has not landed is refused
 at startup** (`exit 2` with a named message) rather than started
 half-built, so no one deploys an ingester that does not replicate. The
-node logs its role, id, and resolved peers at boot. Phases still to
-land: ingester WAL replication (CL-2), router, querier (CL-3),
-compactor.
+node logs its role, id, and resolved peers at boot. Phase still to land:
+the compactor role and its singleton lease.
 
-- **Router — shipped (C2 phase 3), writes.** Stateless, holds no data,
+- **Router — shipped (C2 phase 3, reads added in phase 4).** Stateless, holds no data,
   opens no engine. It hashes each line's `(db, measurement)` → one
   ingester and forwards that shard; the chosen ingester becomes the
   table's primary and replicates to its CL-2 peer, so durability is
@@ -482,13 +481,21 @@ compactor.
   and Grafana keep seeing (FR-8/FR-9). Atomicity holds: the whole body is
   validated before any shard is forwarded, so a poison line writes zero;
   a shard forward that fails for infrastructure reasons is returned for an
-  idempotent retry (LWW dedup). **Query/Flight forwarding is deferred to
-  phase 4** — a query is only correct once a querier unions every shard
-  from the shared store, so `/api/sql` on the router returns 501 until
-  then. Sharding is FNV-1a over `db\0measurement` mod N (stable across
-  restarts), with the ingester list sorted so a table always lands on the
-  same node. Metrics `timelake_router_{forwarded,forward_errors,rejected,
-  ingesters}`.
+  idempotent retry (LWW dedup). Sharding is FNV-1a over `db\0measurement`
+  mod N (stable across restarts), with the ingester list sorted so a table
+  always lands on the same node.
+  **Queries (phase 4):** `/api/sql` is forwarded to a querier — never to a
+  shard, because a query is only correct once every shard is unioned.
+  Round-robin, falling through to the next querier on a *transport*
+  failure (a dead querier must cost a retry, not half the queries) but
+  never on an HTTP status, which is a real answer — including a querier's
+  own refusal to answer from an incomplete cluster. Credential headers
+  pass through untouched: the querier is where SEC-2 visibility and SEC-4
+  data auth are decided. A router with no queriers configured still
+  answers 501 rather than guessing at an ingester. Flight SQL is served by
+  queriers directly, not forwarded — the router speaks HTTP only.
+  Metrics `timelake_router_{forwarded,forward_errors,rejected,ingesters,
+  queries_forwarded,query_errors,queriers}`.
 - **Ingester (CL-2) — shipped (C2 phase 2).** Write path per §5 plus:
   ship the WAL frame to the paired ingester **before the 204**
   ("replicated"), so an acknowledged write is durable on two nodes. Peer
@@ -510,15 +517,54 @@ compactor.
   gRPC/Flight wire if the per-batch round-trip becomes the bottleneck) at
   C3. Each ingester flushes its own buffers to S3 and commits via catalog
   CAS.
-- **Querier (CL-3)** — stateless: replays the catalog from S3, then
-  tails the manifest log (~1 s poll of the list past its head — cheap).
+- **Querier (CL-3) — shipped (C2 phase 4), reads.** Stateless: replays
+  the catalog from S3, then tails the manifest log (~1 s poll of the list
+  past its head — cheap). It opens no write path at all: a write sent to
+  a querier is refused with 501, because accepting it would acknowledge a
+  write durable nowhere the cluster reads. It runs no maintenance either
+  — compaction and retention belong to the compactor, and a second one
+  would be a second writer.
   **Freshness is not optional:** AT-2 demands exact counts seconds after
   ingest, so queriers must see unflushed rows. Ingesters therefore serve
-  their live buffer snapshots over an internal Flight endpoint (Arrow
-  IPC is the natural wire for RecordBatches; PR-9's immutable snapshots
-  make it a cheap zero-copy read), and the querier's table provider
-  unions snapshot + S3 files exactly as v1 unions buffer + files. This
-  is the IOx-proven shape, forced here by the harness rather than taste.
+  their live buffer snapshots over the intra-cluster listener as **Arrow
+  IPC** (`GET /internal/v1/snapshot`, plus `/internal/v1/live` for what a
+  node currently holds), and the querier's table provider unions snapshot
+  + S3 files exactly as v1 unions buffer + files. This is the IOx-proven
+  shape, forced here by the harness rather than taste. Arrow IPC is the
+  natural wire for RecordBatches and PR-9's immutable snapshots make it a
+  cheap read; it also keeps dictionary-encoded tag columns *encoded*
+  across the wire, where line protocol or JSON would hand the querier the
+  exact memory shape FR-2 exists to avoid. (The design said "internal
+  Flight endpoint"; the wire is an internal detail, and IPC over the
+  existing axum/reqwest listener needs no protobuf toolchain — the same
+  call made for CL-2's transport.)
+  **The freshness watermark** is what keeps a flush from losing a row.
+  The querier's catalog view lags the ingesters', so rows that have left
+  a buffer (flushed, committed) but not yet reached its catalog would be
+  in neither place — a *vanish*, the one failure a count-exactness
+  harness cannot tolerate. Every internal response therefore carries the
+  serving node's catalog head (`x-timelake-catalog-head`), read **after**
+  its buffers, and the querier folds the manifest log forward to the
+  highest head it saw before reading any file list. Because a batch
+  leaves `flushing` only after its commit, anything missing from a
+  snapshot is below that watermark, hence visible. The residual race is
+  the one the single-node path already accepts: a transient duplicate,
+  never a vanish. In the steady state the watermark costs no extra store
+  calls — the head rides a request the querier was already making.
+  **A partial answer is refused, not returned.** An unreachable ingester
+  means missing live rows and a silently short COUNT, so the query fails
+  with a named error and `timelake_querier_refusals_total` (alert on it).
+  This is deliberately the opposite of the write path's PR-7 trade: a
+  degraded write is still honest about what it stored; a degraded query
+  lies. Snapshot reads are idempotent and retry once first, so a peer
+  restart's dead pooled sockets cost a retry rather than a refusal.
+  **Table listing is refreshed on the query path**, not only by the tail
+  loop: a table written a moment ago exists in no catalog and no local
+  buffer, and listing it from a one-second-old view answers "table not
+  found" at exactly the moment the freshness claim matters most.
+  Known cost, a C3 refinement: providers are registered for every table
+  in the database before planning, so a query fans out snapshot requests
+  for tables it will not read.
 - **Compactor** — the §7 loops (compact/retention/GC) as a role,
   singleton by advisory `Discovery::lease`; a double-fired compaction
   stays safe (CAS accepts one output, GC collects the loser).
@@ -545,10 +591,16 @@ it: every peer is a node this deployment issued a certificate to.
 
 `bench/compose/timelakedb-s3.yml` (C0: localstack `s3,kms` + an init
 container that creates the bucket with default SSE-KMS + Bucket Keys
-and a KMS key + one `TIMELAKE_ROLE=all` node) and
-`timelakedb-cluster.yml` (C2: router, ingester×2, querier×2, compactor,
-localstack). Drills recorded in `bench/results/`, in the repo's
-evidence style:
+and a KMS key + one `TIMELAKE_ROLE=all` node); `timelakedb-cluster.yml`
+(the write-path rig: router + ingester pair on local disks — CL-2
+replication and write sharding are write-path properties and need no
+shared store); and `timelakedb-cluster-s3.yml` (the full C2 cluster:
+router, ingester×2, querier×2, localstack, all on ONE bucket — a querier
+is only meaningful over a shared store, and this is also where two
+writers commit to one manifest log, so the C1 catalog CAS runs under real
+contention). The queriers there carry no volumes on purpose, so CL-4 is a
+property of the deployment rather than a claim. Drills recorded in
+`bench/results/`, in the repo's evidence style:
 
 - **C0 gate:** bench smoke against the S3-backed node — counts exact,
   0 errors; the drill log records KMS calls and S3 requests with the
@@ -561,6 +613,10 @@ evidence style:
 - **C2 drills:** cluster smoke through the router; SIGKILL an ingester
   mid-ingest (CL-2: zero acknowledged loss via the peer's WAL); kill a
   querier (reads continue); boot a node from an empty disk (CL-4).
+  Recorded: `cl2-replication-drill.log` (12/12),
+  `router-sharding-drill.log` (8/8), `cl3-querier-drill.log` (19/19 —
+  freshness from live buffers, exactness across a flush, querier kill,
+  empty-disk rebuild, and the refusal when an ingester is missing).
 - **What LocalStack may NOT claim:** latency. Localhost S3 is not S3 —
   the port-forwarding lesson (PERFORMANCE_LOG 2026-08-09) applies
   doubly. LocalStack evidence is correctness, call counts, and recovery
@@ -630,7 +686,7 @@ M0–M5 are complete. The cluster phases (§12 design):
 |---|---|---|
 | C0 | `S3Store` + `put_if_absent`, SSE-KMS + Bucket Keys, `AwsKms` + `CachingKms`; single node on LocalStack | smoke exact on S3; KMS calls measured cache-on vs cache-off; at-rest + SSE verified |
 | C1 | Catalog CAS + checkpoints, commit re-validation | two-writer race drill: one winner per seq, loser converges, no lost/dup files |
-| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Flight), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild |
+| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Arrow IPC), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild. Phases 1–4 shipped (roles, CL-2, router, CL-3 querier); compactor role remains |
 | C3 | Consul discovery, intra-cluster mTLS, full scale | AT-3-style gate against the cluster; latency re-baselined off LocalStack |
 
 The console phases (§17 design, `docs/CONSOLE.md`). U0–U2 are independent

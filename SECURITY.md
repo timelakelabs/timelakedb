@@ -155,11 +155,28 @@ follow from "no authentication" and are listed so you can design around them.
    `timelake_flight_connections_anonymous_total` says how much of your
    traffic would break if you required a certificate today.
 
+10. **The intra-cluster listener is unauthenticated and now serves
+    rows.** `TIMELAKE_CLUSTER_ADDR` carries CL-2 replication and, since
+    CL-3, `GET /internal/v1/snapshot` — a table's live buffer as Arrow
+    IPC — and `/internal/v1/live`. Two consequences, both deliberate and
+    both requiring that this port stay on a private network:
+    it applies **no data-plane token check** (trust is the network now,
+    the peer certificate at C3), and it applies **no SEC-2 visibility
+    filter**, because the querier re-applies the caller's restriction
+    when it scans those batches, exactly as it does for a file it reads
+    from the object store. That makes reaching this port equivalent to
+    read access to the bucket itself. A querier is only as private as its
+    ingesters' cluster addresses.
+
 ## Deploying it safely today
 
 - **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
   (`TIMELAKE_ADDR=127.0.0.1:1963`) or to a private Docker/Kubernetes network,
   and publish nothing.
+- **Never publish `TIMELAKE_CLUSTER_ADDR`.** In a cluster it is the peer
+  link: replication frames in, live rows out, no authentication, no
+  visibility filter (exposure 10). It belongs on the private network the
+  nodes share and nowhere else.
 - **Turn on data-plane auth** (`TIMELAKE_DATA_AUTH=required`) once tokens are
   issued and clients hold them — this is the native way to make a port safe to
   expose. Stage it through `optional`, watching `timelake_data_requests_*`, so
