@@ -1,0 +1,129 @@
+C2 phase 4 — the stateless querier (CL-3)
+2026-08-10 · router + ingester×2 + querier×2 + one S3 bucket
+             (bench/compose/timelakedb-cluster-s3.yml)
+================================================================================
+
+THE CLAIM UNDER TEST is the one the whole role split rests on: separating
+reads from the write path costs neither freshness nor exactness. A querier
+owns no data. It replays the catalog from the shared bucket, tails the
+manifest log, and unions the ingesters' LIVE BUFFERS on top — because
+seconds after ingest the rows are still in an ingester's memory, in no
+Parquet file and no catalog, and AT-2 demands exact counts there.
+
+This is also the first rig where two writers commit to one manifest log, so
+the P0-4 catalog CAS runs under real contention rather than a unit test.
+
+Drilled: 3,200 lines across 8 tables, written through the single router
+endpoint and sharded across the ingester pair.
+
+  19/19 checks passed
+
+FRESHNESS — the answer is exact while the rows exist ONLY in memory.
+  - Both queriers returned all 3,200 rows with NOTHING flushed
+    (timelake_parquet_files contributed nothing for these tables).
+  - 38,400 rows crossed the wire as live buffer snapshots
+    (timelake_querier_snapshot_rows_total) — proof the answer came from the
+    ingesters' memory, not from files.
+  - querier-a and querier-b agreed exactly. Stateless nodes are
+    interchangeable, or they are not stateless.
+  - The router's forwarded query gave the same answer as asking a querier
+    directly.
+  - Sharding evidence a shared catalog cannot blur: each ingester's OWN
+    live buffer (/internal/v1/live) held 4 of the 8 tables — every table on
+    exactly one primary, distributed across the pair.
+
+THE FLUSH — rows cross from memory to the bucket with no loss and no
+double-count. This is the window that can only fail one way: a querier
+whose catalog view is older than a commit, reading a buffer the rows have
+already left, would show neither copy. Closed by a watermark — every
+internal response carries the serving ingester's catalog head, read AFTER
+its buffers, and the querier folds the manifest log forward to that head
+before it reads any file list. A batch missing from a snapshot is therefore
+guaranteed to be below the watermark, hence visible.
+  - The querier followed the ingesters' commits (catalog head advanced).
+  - Counts stayed EXACT across the transition, on both queriers.
+
+FAILURE BEHAVIOUR
+  - Kill a querier: reads continue on the other, and the ROUTER falls
+    through to it rather than failing every other query. (Round-robin with
+    no fall-through turns one dead node into a 50% error rate; the router
+    health-checks nothing — CL-5 — so "is it up" is answered by asking.)
+  - Restart it: exact again.
+  - CL-4, a querier rebuilt from an EMPTY disk: `up --force-recreate` on a
+    volume-less container reconstructed the entire view from the bucket and
+    answered exactly. The queriers carry no volumes on purpose, so this is
+    a property of the deployment, not an assertion in a document.
+  - Kill an INGESTER and the querier REFUSES the query (HTTP 400, named
+    error, timelake_querier_refusals_total +1) rather than answering short.
+    This is the deliberate opposite of the write path's PR-7 trade: a write
+    that degrades is still honest about what it stored; a query that
+    degrades lies. Counts returned, exact, once the ingester was back.
+  - A write sent to a querier is refused with 501 — not 400 (nothing is
+    wrong with the request) and not 500 (nothing is broken). Accepting it
+    would acknowledge a write that is durable nowhere the cluster reads.
+
+WHAT THE DRILL CAUGHT (both fixed before this log was written)
+  1. A table written a moment ago was invisible for up to a second. The
+     querier listed tables from a view the background tail refreshed on a
+     tick, so a BRAND-NEW table — in no catalog, in no local buffer — was
+     "table not found" until the tick landed. Write-then-read is exactly
+     the case the freshness claim is about, so the live view is now
+     refreshed ON THE QUERY PATH, before the table list is taken, with the
+     returned head folding the catalog forward in the same step. Steady
+     state costs one LAN round trip per ingester and no store calls.
+  2. A restarted peer left dead sockets in the querier's connection pool,
+     and the first use of one failed instantly — surfacing as "the cluster
+     is incomplete" for a blip that heals itself. Snapshot reads are
+     idempotent, so they now retry once; a genuinely absent peer still
+     refuses the connection immediately and fails fast.
+
+CLUSTER SMOKE — the unmodified harness drives the whole cluster through the
+router's single address, and gets the SAME numbers as one node:
+
+    python bench.py run --backend timelakedb --url http://localhost:5970 \
+                        --scale smoke
+    (bench/results/timelakedb-cl3-cluster-through-router-20260810-203730/)
+
+  - ingest 323,269 lines/s, 0 errors — writes sharded across the pair;
+  - Shape A median 58 ms / p95 68 ms, 0 errors;
+  - all five Shape B queries completed;
+  - context rows_48h = 77,806 EXACT — the same value the single-node run
+    produces, now composed by a querier unioning two ingesters' live
+    buffers with the shared bucket, reached through a router. host_rows_6h
+    = 3,000 and disk_rows_6h = 21,000, both exact.
+  - burst 5,000 events, 0 errors, concurrent query 22 ms.
+  - (B4 returned 472 hourly buckets against the single node's 473: that
+    count follows the wall-clock hour boundaries of a 48 h window at run
+    time, not the data. Storage is unmeasurable through the router, which
+    has no data directory to size — correctly so.)
+
+FR-8/FR-9 therefore survive the role split: the bench adapter, Telegraf and
+Grafana see one address and never learn the cluster exists.
+
+REGRESSION — the earlier phases and the single-node default are unchanged.
+  - CL-2 replication drill (phase 2): 12/12 PASS.
+  - Router sharding drill (phase 3): 8/8 PASS, including the 501 for
+    /api/sql on a router with no queriers configured.
+  - role=all bench smoke: 296,885 lines/s, 0 errors, Shape A median 49 ms,
+    all five Shape B complete, context rows_48h = 77,806 exact
+    (bench/results/timelakedb-cl3-regression-20260810-203229/run.json).
+
+SCOPE / NOT YET
+  - Flight SQL is served BY a querier (Grafana points at one) but is not
+    forwarded BY the router — the router speaks HTTP only.
+  - A query registers providers for every table in the database, so it
+    fans out snapshot requests for tables it will not read. Correct but
+    wasteful; narrowing it to the tables a query references is a C3
+    refinement.
+  - Intra-cluster links (replication, live snapshots) are plaintext HTTP at
+    C2 and move behind required mTLS at C3. /internal/v1/snapshot returns
+    ROWS, so that listener is the same trust boundary as read access to the
+    bucket and must never be public.
+  - Automatic failover of a dead ingester's shard still needs health
+    (phase 5 territory, with the compactor lease).
+
+WORKSPACE: 164 tests (+23: query ipc round-trip incl. dictionary survival,
+querier live-report parsing / peer ordering / refusal / outage tolerance,
+router querier rotation + fall-through, and 9 two-engine integration tests
+that wire an ingester and a querier to one store in a single process),
+clippy clean, fmt clean.

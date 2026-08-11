@@ -649,6 +649,16 @@
             <tr><td><code>timelake_router_forward_errors_total</code></td><td>counter</td><td>Shard forwards that failed (ingester down or rejected)</td></tr>
             <tr><td><code>timelake_router_rejected_total</code></td><td>counter</td><td>Bodies the router rejected before forwarding (malformed lines)</td></tr>
             <tr><td><code>timelake_router_ingesters</code></td><td>gauge</td><td>Ingesters the router is sharding across</td></tr>
+            <tr><td><code>timelake_router_queries_forwarded_total</code></td><td>counter</td><td>Queries the router forwarded to a querier</td></tr>
+            <tr><td><code>timelake_router_query_errors_total</code></td><td>counter</td><td>Forwarded queries that came back non-2xx, or a querier that could not be reached</td></tr>
+            <tr><td><code>timelake_router_queriers</code></td><td>gauge</td><td>Queriers the router rotates queries across</td></tr>
+            <tr><td><code>timelake_querier_ingesters</code></td><td>gauge</td><td>Ingesters a querier reads live rows from (querier role only)</td></tr>
+            <tr><td><code>timelake_querier_snapshot_fetches_total</code></td><td>counter</td><td>Live-buffer snapshots fetched — one per table per ingester per query</td></tr>
+            <tr><td><code>timelake_querier_snapshot_rows_total</code></td><td>counter</td><td>Unflushed rows pulled from ingester memory over the wire</td></tr>
+            <tr><td><code>timelake_querier_snapshot_errors_total</code></td><td>counter</td><td>Failed snapshot or live-view fetches</td></tr>
+            <tr><td><code>timelake_querier_refusals_total</code></td><td>counter</td><td>Queries refused rather than answered from an incomplete cluster. <strong>Alert on this</strong></td></tr>
+            <tr><td><code>timelake_querier_catchups_total</code></td><td>counter</td><td>Times a query had to fold the manifest log forward to reach an ingester's head</td></tr>
+            <tr><td><code>timelake_catalog_head</code></td><td>gauge</td><td>Highest manifest sequence this node has applied — the freshness watermark (querier role only)</td></tr>
             <tr><td><code>timelake_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
             <tr><td><code>timelake_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELAKE_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelake_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>
@@ -698,6 +708,12 @@
         <li><code>timelake_cl2_degraded == 1</code> — an ingester's replication
             peer is down; writes still land but on one node only, so a second
             failure now can lose the un-replicated writes.</li>
+        <li><code>timelake_querier_refusals_total</code> increasing — a querier
+            cannot reach an ingester, so it is refusing queries rather than
+            answering them short. This is the metric that separates "the
+            cluster is down" from "the cluster is quietly under-counting";
+            a database that answers a COUNT wrongly is worse than one that
+            says it cannot answer.</li>
         <li><code>timelake_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
         <li><code>timelake_admin_default_credential_active == 1</code> — the

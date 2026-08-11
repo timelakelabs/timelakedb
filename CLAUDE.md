@@ -122,7 +122,55 @@ This project is inspired by the following projects.
   `bench/results/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **C2 phase 3 SHIPPED — the router (write sharding)** (2026-08-10,
+- Status: **C2 phase 4 SHIPPED — the CL-3 stateless querier** (2026-08-10,
+  drill `bench/results/cl3-querier-drill.log` 19/19, NEW rig
+  `bench/compose/timelakedb-cluster-s3.yml` = router + ingester×2 +
+  querier×2 + localstack on ONE bucket; drill
+  `bench/compose/cluster-drill/cl3_drill.sh`). `TIMELAKE_ROLE=querier`:
+  owns no data, refuses writes (501), runs NO maintenance, replays the
+  catalog from the shared store and tails the manifest log (1 s).
+  **Freshness**: ingesters serve live buffers as Arrow IPC on the internal
+  listener — `GET /internal/v1/{live,snapshot}` (`crates/query/src/ipc.rs`;
+  IPC not JSON/LP so dict tag columns stay dict-encoded, FR-2) — and
+  `sql_batches` unions remote snapshots + files. **The watermark is the
+  load-bearing bit**: every internal response carries
+  `x-timelake-catalog-head` read AFTER the buffers, and the querier folds
+  the manifest log to the max head seen BEFORE reading any file list, so a
+  batch that left a buffer is guaranteed visible → duplicate possible,
+  vanish impossible. sql_batches is now TWO passes (all live rows, then
+  watermark, then all file lists) for that reason. **Refuses rather than
+  under-counts**: an unreachable ingester → named error +
+  `timelake_querier_refusals_total` (ALERT), the deliberate opposite of
+  PR-7 on the write path. Router now forwards `/api/sql` round-robin with
+  FALL-THROUGH on transport failure (no queriers → still 501; Flight not
+  forwarded). role=all/ingester/router unchanged (remote=None → no CL-3
+  metrics, pinned). 164 tests (+23), clippy/fmt clean.
+  **TWO BUGS THE DRILL CAUGHT, unit tests could not**: (1) a brand-new
+  table was "not found" for up to 1 s — the live view was tick-refreshed,
+  so it is now refreshed ON THE QUERY PATH before listing; (2) a restarted
+  peer left dead pooled sockets → spurious refusal, so snapshot reads
+  retry once. **Also fixed (pre-existing)**: the schema registry never
+  refreshed after boot, so a column added later read as absent on any
+  non-writing node — now rebuilt on every catalog advance, via a
+  footer-only read (`provider::file_schema`) instead of GETting the whole
+  object. CLUSTER SMOKE: the UNMODIFIED bench drives the whole cluster
+  through the router (`--url http://localhost:5970`) — 323K lines/s, Shape
+  A 58 ms, all Shape B complete, **rows_48h 77,806 EXACT = the single-node
+  value**, so FR-8/FR-9 survive the role split (run
+  `timelakedb-cl3-cluster-through-router-20260810-203730`). Regression:
+  CL-2 drill 12/12, router drill 8/8, role=all smoke 296,885 lines/s /
+  Shape A 49 ms / rows_48h 77,806 exact.
+  KNOWN COST (C3): a query registers providers for EVERY table in the db,
+  so it fans out snapshots for tables it will not read.
+  **C2 phasing:** (1) roles+discovery ✓ → (2) CL-2 ✓ → (3) router ✓ →
+  (4) CL-3 querier ✓ DONE → (5) compactor role + advisory lease (LAST).
+  Design: ARCHITECTURE §12.4.
+  PRE-EXISTING FLAKE, not from this work: `health.rs`
+  `rows_stay_visible_while_a_slow_flush_uploads` fails when run ALONE via
+  a test filter (passes in the full binary and the full workspace, and
+  fails the same way on the previous commit) — it can catch the
+  documented sub-millisecond swap→`flushing` gap in `flush_all`.
+- Previous: **C2 phase 3 SHIPPED — the router (write sharding)** (2026-08-10,
   drill `bench/results/router-sharding-drill.log`). `TIMELAKE_ROLE=router`:
   stateless, holds NO data, opens NO engine (main.rs branches before engine
   creation, `return`s). Hashes each line's `(db,measurement)` →

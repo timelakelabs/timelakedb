@@ -15,11 +15,12 @@
 //! client to retry; the retry is safe because writes are idempotent under
 //! LWW dedup (FR-5).
 //!
-//! QUERIES ARE NOT ROUTED HERE. In a sharded cluster a query is only correct
-//! once a querier unions every shard from the shared object store; forwarding
-//! a query to one ingester would return wrong counts. Query routing arrives
-//! with the querier (CL-3, C2 phase 4). Until then `/api/sql` on the router
-//! returns a clear 501.
+//! QUERIES GO TO A QUERIER, NEVER TO A SHARD. A query is only correct once
+//! every shard is unioned from the shared object store plus the ingesters'
+//! live buffers — which is exactly what a querier does (CL-3, C2 phase 4).
+//! So `/api/sql` is forwarded to a querier, round-robin, and a router
+//! configured with no queriers says so with a 501 rather than guessing at an
+//! ingester and returning a confidently short count.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,15 +39,29 @@ pub struct Target {
     write_url: String,
 }
 
+/// One read target: a querier's public SQL endpoint.
+#[derive(Clone)]
+pub struct QueryTarget {
+    pub id: String,
+    sql_url: String,
+}
+
 #[derive(Default)]
 pub struct RouterStats {
     pub forwarded: AtomicU64,
     pub forward_errors: AtomicU64,
     pub rejected: AtomicU64,
+    pub queries_forwarded: AtomicU64,
+    pub query_errors: AtomicU64,
 }
 
 pub struct RouterState {
     targets: Vec<Target>,
+    queriers: Vec<QueryTarget>,
+    /// Round-robin cursor over the queriers. Reads are stateless, so any
+    /// querier can answer any query; spreading them is the whole benefit of
+    /// running more than one.
+    next_querier: AtomicU64,
     client: reqwest::Client,
     pub stats: RouterStats,
 }
@@ -55,8 +70,17 @@ impl RouterState {
     /// `ingesters` is `(id, data_address)` for each ingester the router can
     /// reach. Order is fixed (sorted by id) so the hash → target mapping is
     /// stable across router restarts.
-    pub fn new(mut ingesters: Vec<(String, String)>) -> RouterState {
+    pub fn new(ingesters: Vec<(String, String)>) -> RouterState {
+        RouterState::with_queriers(ingesters, Vec::new())
+    }
+
+    /// As [`RouterState::new`], plus the queriers `/api/sql` is forwarded to.
+    pub fn with_queriers(
+        mut ingesters: Vec<(String, String)>,
+        mut queriers: Vec<(String, String)>,
+    ) -> RouterState {
         ingesters.sort_by(|a, b| a.0.cmp(&b.0));
+        queriers.sort_by(|a, b| a.0.cmp(&b.0));
         let targets = ingesters
             .into_iter()
             .map(|(id, addr)| Target {
@@ -64,8 +88,17 @@ impl RouterState {
                 write_url: format!("http://{addr}/api/v3/write_lp"),
             })
             .collect();
+        let queriers = queriers
+            .into_iter()
+            .map(|(id, addr)| QueryTarget {
+                id,
+                sql_url: format!("http://{addr}/api/sql"),
+            })
+            .collect();
         RouterState {
             targets,
+            queriers,
+            next_querier: AtomicU64::new(0),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -77,10 +110,31 @@ impl RouterState {
     pub fn target_ids(&self) -> Vec<String> {
         self.targets.iter().map(|t| t.id.clone()).collect()
     }
+
+    pub fn querier_ids(&self) -> Vec<String> {
+        self.queriers.iter().map(|q| q.id.clone()).collect()
+    }
+
+    /// Every querier, starting at the next one in the rotation.
+    ///
+    /// A dead querier must cost a retry, not half the queries: the router
+    /// health-checks nothing (discovery carries no correctness, CL-5), so
+    /// "is it up" is answered by asking. Queriers are stateless and
+    /// interchangeable, which is exactly what makes falling through to the
+    /// next one safe — it is the same answer from a different process.
+    fn querier_rotation(&self) -> Vec<&QueryTarget> {
+        if self.queriers.is_empty() {
+            return Vec::new();
+        }
+        let n = self.next_querier.fetch_add(1, Ordering::Relaxed) as usize;
+        (0..self.queriers.len())
+            .map(|i| &self.queriers[(n + i) % self.queriers.len()])
+            .collect()
+    }
 }
 
-/// The router's HTTP surface: the write endpoints, health/ping/metrics, and
-/// a 501 for query routing (queriers are phase 4).
+/// The router's HTTP surface: the write endpoints, query forwarding, and
+/// health/ping/metrics.
 pub fn router_app(state: Arc<RouterState>) -> axum::Router {
     axum::Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -89,7 +143,7 @@ pub fn router_app(state: Arc<RouterState>) -> axum::Router {
         .route("/write", post(write))
         .route("/api/v2/write", post(write))
         .route("/api/v3/write_lp", post(write))
-        .route("/api/sql", post(sql_not_here))
+        .route("/api/sql", post(sql))
         .with_state(state)
 }
 
@@ -102,20 +156,110 @@ async fn router_metrics(State(state): State<Arc<RouterState>>) -> String {
          # TYPE timelake_router_rejected_total counter\n\
          timelake_router_rejected_total {}\n\
          # TYPE timelake_router_ingesters gauge\n\
-         timelake_router_ingesters {}\n",
+         timelake_router_ingesters {}\n\
+         # TYPE timelake_router_queries_forwarded_total counter\n\
+         timelake_router_queries_forwarded_total {}\n\
+         # TYPE timelake_router_query_errors_total counter\n\
+         timelake_router_query_errors_total {}\n\
+         # TYPE timelake_router_queriers gauge\n\
+         timelake_router_queriers {}\n",
         state.stats.forwarded.load(Ordering::Relaxed),
         state.stats.forward_errors.load(Ordering::Relaxed),
         state.stats.rejected.load(Ordering::Relaxed),
         state.targets.len(),
+        state.stats.queries_forwarded.load(Ordering::Relaxed),
+        state.stats.query_errors.load(Ordering::Relaxed),
+        state.queriers.len(),
     )
 }
 
-async fn sql_not_here() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "query routing is not on the router yet — a query must union every \
-         shard, which needs a querier (C2 phase 4). Query an ingester directly \
-         for now.",
+/// Forward one SQL request to a querier and hand back its answer verbatim.
+///
+/// The body is passed through untouched — the router does not parse SQL and
+/// has no opinion about it. The credential headers travel with it, because
+/// the querier is where SEC-2 visibility and SEC-4 data auth are decided;
+/// dropping them here would silently widen or narrow what a caller sees.
+async fn sql(
+    State(state): State<Arc<RouterState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let rotation = state.querier_rotation();
+    if rotation.is_empty() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this router has no queriers configured (TIMELAKE_PEERS needs \
+             id=querier@cluster_addr|data_addr). A query must union every shard, \
+             so it cannot be answered by an ingester.",
+        )
+            .into_response();
+    }
+    let mut last_error = String::new();
+    for target in rotation {
+        let mut req = state
+            .client
+            .post(&target.sql_url)
+            .header("content-type", "application/json")
+            .body(body.clone());
+        for name in [
+            "authorization",
+            "x-timelake-authorizations",
+            "accept-encoding",
+        ] {
+            if let Some(v) = headers.get(name) {
+                req = req.header(name, v);
+            }
+        }
+        match req.send().await {
+            Ok(resp) => {
+                state
+                    .stats
+                    .queries_forwarded
+                    .fetch_add(1, Ordering::Relaxed);
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                if !status.is_success() {
+                    // A status IS an answer — including a querier's refusal
+                    // to answer from an incomplete cluster. Asking the next
+                    // querier would put the same question to a node with
+                    // the same view, and retrying a real error is how a
+                    // clear failure turns into a mystery.
+                    state.stats.query_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                let ct = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                return match resp.bytes().await {
+                    Ok(bytes) => (status, [("content-type", ct.as_str())], bytes).into_response(),
+                    Err(e) => {
+                        state.stats.query_errors.fetch_add(1, Ordering::Relaxed);
+                        err(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("querier {} response failed: {e}", target.id),
+                        )
+                    }
+                };
+            }
+            Err(e) => {
+                // Transport failure: that querier is not there. Queriers are
+                // stateless and interchangeable, so the next one answers the
+                // same question identically — a dead one costs a retry, not
+                // half the queries.
+                state.stats.query_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    querier = %target.id, error = %e,
+                    "query forward failed; falling through to the next querier"
+                );
+                last_error = format!("{}: {e}", target.id);
+            }
+        }
+    }
+    err(
+        StatusCode::BAD_GATEWAY,
+        &format!("no querier could be reached (last {last_error})"),
     )
 }
 
@@ -309,6 +453,50 @@ mod tests {
             acc
         });
         assert!(counts[0] > 5 && counts[1] > 5, "lopsided: {counts:?}");
+    }
+
+    #[test]
+    fn queries_rotate_across_queriers_and_the_rotation_is_stable() {
+        let s = RouterState::with_queriers(
+            vec![("ing-a".into(), "a:1963".into())],
+            vec![
+                ("qry-b".into(), "qb:1963".into()),
+                ("qry-a".into(), "qa:1963".into()),
+            ],
+        );
+        assert_eq!(s.querier_ids(), vec!["qry-a", "qry-b"], "sorted by id");
+        let first: Vec<String> = (0..4).map(|_| s.querier_rotation()[0].id.clone()).collect();
+        assert_eq!(first, vec!["qry-a", "qry-b", "qry-a", "qry-b"]);
+    }
+
+    #[test]
+    fn the_rotation_offers_every_querier_so_a_dead_one_costs_a_retry() {
+        // Without the fall-through, a dead querier fails every other query
+        // forever — round-robin turns one outage into a 50% error rate.
+        let s = RouterState::with_queriers(
+            vec![("ing-a".into(), "a:1963".into())],
+            vec![
+                ("qry-a".into(), "qa:1963".into()),
+                ("qry-b".into(), "qb:1963".into()),
+                ("qry-c".into(), "qc:1963".into()),
+            ],
+        );
+        let ids = |r: Vec<&QueryTarget>| r.into_iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(s.querier_rotation()), vec!["qry-a", "qry-b", "qry-c"]);
+        assert_eq!(
+            ids(s.querier_rotation()),
+            vec!["qry-b", "qry-c", "qry-a"],
+            "the next query starts at the next querier, but can still reach all"
+        );
+    }
+
+    #[test]
+    fn with_no_queriers_a_query_has_nowhere_correct_to_go() {
+        // Deliberately NOT "fall back to an ingester": that answers with one
+        // shard's rows and looks like a successful query.
+        let s = RouterState::new(vec![("ing-a".into(), "a:1963".into())]);
+        assert!(s.querier_rotation().is_empty());
+        assert!(s.querier_ids().is_empty());
     }
 
     #[test]

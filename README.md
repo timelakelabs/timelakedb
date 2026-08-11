@@ -63,9 +63,11 @@ on the site traces to a run under `bench/results/`.
   its own migration.
 - Drill: `bench/results/sec4-auth-drill.log`.
 
-**Next:** data-plane authentication (which turns SEC-2's authorization
-claims into real authorization); the cluster phases C1–C3 (catalog
-compare-and-swap → role split → Consul and mTLS, `ARCHITECTURE.md` §12);
+**Next:** the rest of the cluster work — C2's role split is four phases in
+(roles and discovery, CL-2 ingester replication, the router, and the CL-3
+stateless querier: `bench/results/cl3-querier-drill.log`), leaving the
+compactor role and its singleton lease, then C3's Consul and required
+intra-cluster mTLS (`ARCHITECTURE.md` §12);
 re-baselining the benchmark inside the container network, because ~94% of
 the reported Shape A latency is Docker Desktop port forwarding
 (`docs/evidence/PERFORMANCE_LOG.md`); and CI actually running somewhere.

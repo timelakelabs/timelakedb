@@ -71,8 +71,29 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        let state = Arc::new(timelake_server::router::RouterState::new(ingesters));
-        tracing::info!(ingesters = ?state.target_ids(), %addr, "router up (write sharding)");
+        // Queriers are optional: a router with none still shards writes, and
+        // says plainly that it cannot answer a query (CL-3).
+        let queriers: Vec<(String, String)> = discovery
+            .peers_with_role(timelake_cluster::Role::Querier)
+            .into_iter()
+            .filter(|n| !n.data_address.is_empty())
+            .map(|n| (n.id, n.data_address))
+            .collect();
+        if queriers.is_empty() {
+            tracing::warn!(
+                "router has no queriers in TIMELAKE_PEERS — /api/sql will return 501 \
+                 (a query must union every shard, so no ingester can answer it)"
+            );
+        }
+        let state = Arc::new(timelake_server::router::RouterState::with_queriers(
+            ingesters, queriers,
+        ));
+        tracing::info!(
+            ingesters = ?state.target_ids(),
+            queriers = ?state.querier_ids(),
+            %addr,
+            "router up (write sharding + query forwarding)"
+        );
         let app = timelake_server::router::router_app(state);
         let listener = TcpListener::bind(&addr).await.expect("router bind");
         axum::serve(listener, app).await.expect("router serve");
@@ -135,40 +156,80 @@ async fn main() {
         });
     }
 
+    // CL-3: the querier is a read replica. It takes no writes, runs no
+    // maintenance (compaction and retention are the compactor's job and a
+    // second one would be a second writer), and unions the ingesters' live
+    // buffers into every query so freshness survives the role split.
+    if role == timelake_cluster::Role::Querier {
+        use timelake_cluster::Discovery;
+        engine.set_read_only();
+        let ingesters: Vec<(String, String)> = discovery
+            .peers_with_role(timelake_cluster::Role::Ingester)
+            .into_iter()
+            .filter(|n| !n.address.is_empty())
+            .map(|n| (n.id, n.address))
+            .collect();
+        if ingesters.is_empty() {
+            eprintln!(
+                "TIMELAKE_ROLE=querier needs the ingesters' internal addresses in \
+                 TIMELAKE_PEERS (id=ingester@cluster_addr). Without them a query \
+                 cannot see rows that have not been flushed yet, and would answer \
+                 short."
+            );
+            std::process::exit(2);
+        }
+        let remote = Arc::new(timelake_server::querier::RemoteBuffers::new(ingesters));
+        engine.set_remote_buffers(Arc::clone(&remote));
+        tracing::info!(
+            ingesters = ?remote.peer_ids(),
+            catalog_head = engine.catalog_head(),
+            "querier up (stateless reads: shared store + live buffers)"
+        );
+        let e = Arc::clone(&engine);
+        tokio::spawn(timelake_server::querier::tail(
+            e,
+            remote,
+            Duration::from_secs(1),
+        ));
+    }
+
     // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
     // every 30 s, retention every 60 s — sequential on one blocking task
-    // so background work never stacks up on itself.
+    // so background work never stacks up on itself. A querier owns no
+    // data and commits nothing, so it runs none of this.
     let maint = Arc::clone(&engine);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(10));
-        let mut n: u64 = 0;
-        loop {
-            tick.tick().await;
-            n += 1;
-            let e = Arc::clone(&maint);
-            let compact = n.is_multiple_of(3);
-            let retention = n.is_multiple_of(6);
-            // Each stage is independent. A failing flush used to abort the
-            // rest of the tick, so one unflushable table stopped compaction
-            // and retention for every table on the node.
-            let res = tokio::task::spawn_blocking(move || {
-                if let Err(err) = e.flush_if_needed() {
-                    tracing::error!(%err, stage = "flush", "maintenance stage failed");
+    if role != timelake_cluster::Role::Querier {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut n: u64 = 0;
+            loop {
+                tick.tick().await;
+                n += 1;
+                let e = Arc::clone(&maint);
+                let compact = n.is_multiple_of(3);
+                let retention = n.is_multiple_of(6);
+                // Each stage is independent. A failing flush used to abort
+                // the rest of the tick, so one unflushable table stopped
+                // compaction and retention for every table on the node.
+                let res = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = e.flush_if_needed() {
+                        tracing::error!(%err, stage = "flush", "maintenance stage failed");
+                    }
+                    if compact && let Err(err) = e.compact_once() {
+                        tracing::error!(%err, stage = "compact", "maintenance stage failed");
+                    }
+                    if retention && let Err(err) = e.enforce_retention() {
+                        tracing::error!(%err, stage = "retention", "maintenance stage failed");
+                    }
+                    e.run_gc();
+                })
+                .await;
+                if let Err(join) = res {
+                    tracing::error!(%join, "maintenance task panicked");
                 }
-                if compact && let Err(err) = e.compact_once() {
-                    tracing::error!(%err, stage = "compact", "maintenance stage failed");
-                }
-                if retention && let Err(err) = e.enforce_retention() {
-                    tracing::error!(%err, stage = "retention", "maintenance stage failed");
-                }
-                e.run_gc();
-            })
-            .await;
-            if let Err(join) = res {
-                tracing::error!(%join, "maintenance task panicked");
             }
-        }
-    });
+        });
+    }
 
     // Flight SQL (FR-8) on its own gRPC port
     let flight_addr: std::net::SocketAddr = std::env::var("TIMELAKE_FLIGHT_ADDR")

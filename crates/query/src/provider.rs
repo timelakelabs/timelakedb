@@ -374,6 +374,55 @@ pub type MetaCache = std::sync::Mutex<
     std::collections::HashMap<String, Arc<datafusion::parquet::file::metadata::ParquetMetaData>>,
 >;
 
+/// One file's Parquet footer, from the cache or by a range read (never by
+/// fetching the file). The cache is the M5 metadata cache: footers are
+/// immutable, so a hit is always valid.
+fn cached_metadata(
+    file: &StoreFile,
+    path: &str,
+    meta_cache: &Arc<MetaCache>,
+) -> Result<Arc<datafusion::parquet::file::metadata::ParquetMetaData>, String> {
+    use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    if let Some(md) = meta_cache
+        .lock()
+        .expect("meta cache lock")
+        .get(path)
+        .cloned()
+    {
+        return Ok(md);
+    }
+    // footer only — a range read, not the file
+    let loaded = ArrowReaderMetadata::load(file, ArrowReaderOptions::default())
+        .map_err(|e| e.to_string())?;
+    let md = loaded.metadata().clone();
+    let mut cache = meta_cache.lock().expect("meta cache lock");
+    if cache.len() > 4096 {
+        cache.clear(); // crude bound; files are few post-compaction
+    }
+    cache.insert(path.to_string(), md.clone());
+    Ok(md)
+}
+
+/// The Arrow schema of one cataloged file, read from its footer alone.
+///
+/// The engine's schema registry is built from this. It used to `get` the
+/// whole object and decode it just to reach `batch.schema()` — tolerable on
+/// local disk at boot, wrong the moment the store is S3 and a *querier*
+/// (CL-3) re-reads it every time a new file appears for a table.
+pub fn file_schema(
+    store: &Arc<dyn Store>,
+    path: &str,
+    size_bytes: u64,
+    meta_cache: &Arc<MetaCache>,
+) -> Result<SchemaRef, String> {
+    use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    let file = StoreFile::with_len(store.clone(), path, size_bytes);
+    let md = cached_metadata(&file, path, meta_cache)?;
+    let arrow_md = ArrowReaderMetadata::try_new(md, ArrowReaderOptions::default())
+        .map_err(|e| e.to_string())?;
+    Ok(arrow_md.schema().clone())
+}
+
 pub struct LazyTable {
     name: String,
     schema: SchemaRef,
@@ -545,32 +594,12 @@ fn load_one_file(
     }
 
     // metadata-cache fast path: on a warm footer, decide row-group
-    // pruning WITHOUT fetching the file — only survivors get read
-    let cached_md = meta_cache
-        .lock()
-        .expect("meta cache lock")
-        .get(&meta.path)
-        .cloned();
+    // pruning WITHOUT fetching the file — only survivors get read.
     // Range-read handle: only the footer and the surviving row groups
     // ever leave the store.
     use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     let mut file = StoreFile::with_len(store.clone(), &meta.path, meta.size_bytes);
-
-    let md: Arc<_> = match cached_md {
-        Some(md) => md,
-        None => {
-            // footer only — a range read, not the file
-            let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
-                .map_err(|e| e.to_string())?;
-            let md = loaded.metadata().clone();
-            let mut cache = meta_cache.lock().expect("meta cache lock");
-            if cache.len() > 4096 {
-                cache.clear(); // crude bound; files are few post-compaction
-            }
-            cache.insert(meta.path.clone(), md.clone());
-            md
-        }
-    };
+    let md: Arc<_> = cached_metadata(&file, &meta.path, meta_cache)?;
 
     let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
         (0..md.num_row_groups()).collect()

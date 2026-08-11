@@ -30,6 +30,12 @@ pub enum WriteError {
     Backpressure(String),
     /// 500 — the engine failed to make the write durable.
     Internal(String),
+    /// 501 — this node does not take writes at all (CL-3: a querier is a
+    /// read replica). Distinct from 400/500 on purpose: nothing about the
+    /// request is wrong and nothing here is broken, so a client must go to
+    /// the router or an ingester rather than retry, and a monitor must not
+    /// read it as an engine fault.
+    NotHere(String),
 }
 
 /// The seam between HTTP and the engine. Implemented by
@@ -670,6 +676,7 @@ async fn write_common<E: Engine>(
         )
             .into_response(),
         Ok(Err(WriteError::Internal(msg))) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        Ok(Err(WriteError::NotHere(msg))) => err_response(StatusCode::NOT_IMPLEMENTED, &msg),
         Err(join) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &join.to_string()),
     }
 }

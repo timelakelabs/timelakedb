@@ -168,10 +168,22 @@ impl<S: Store> Catalog<S> {
         ))
     }
 
+    /// The highest manifest sequence this replica has applied. A querier
+    /// (CL-3) compares it against an ingester's head to decide whether its
+    /// view is already fresh enough to answer, so it is part of the
+    /// read-freshness contract, not just diagnostics.
+    pub fn head(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
     /// Fold every manifest entry newer than our known head into memory and
     /// advance `seq`. Called after a CAS collision; safe to call when there
     /// is nothing new (it just re-confirms the head).
-    fn catch_up(&self) -> std::io::Result<()> {
+    ///
+    /// Public because a read-only replica tails the log with it: a querier
+    /// holds no WAL and commits nothing, so this is the *only* way its view
+    /// of the shared store advances.
+    pub fn catch_up(&self) -> std::io::Result<()> {
         let head = self.seq.load(Ordering::SeqCst);
         let mut newer: Vec<(u64, ManifestEntry)> = Vec::new();
         for path in self.store.list("catalog/manifest")? {
