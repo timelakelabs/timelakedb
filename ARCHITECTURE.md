@@ -109,7 +109,7 @@ timelake/
     admin/       admin listener: console REST API + embedded UI ← SR-5, U0
   tests/
     at/          AT-1..AT-6 harness glue (tsdb-bench adapter lives in
-                 bench/backends/timelakedb.py, not here)
+                 ../Gauge/bench/backends/timelakedb.py, not here)
 ```
 
 Consolidating crates later is cheap; splitting a tangle is not. Start

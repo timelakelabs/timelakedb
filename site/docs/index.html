@@ -21,8 +21,8 @@
     <nav>
       <a href="../index.html">Home</a>
       <a href="reference.html">Reference</a>
-      <a href="../index.html#evidence">Benchmarks</a>
-      <a href="https://github.com/timelakedb/TimeLakeDB">GitHub</a>
+      <a href="../index.html#evidence">Architecture</a>
+      <a href="https://github.com/timelakelabs/timelakedb">GitHub</a>
     </nav>
   </div>
 </header>
@@ -86,25 +86,31 @@
       </div>
       <div class="note warn">
         <p>
-          <strong>The data plane has no authentication.</strong> Any client that
-          can reach port 1963 or 1964 can read and write everything on the node.
-          The <a href="#console">admin surface</a> is the exception — every
-          <code>/admin/*</code> route requires a session — but for writes and
-          queries, network reachability is still the only access control
-          TimeLakeDB has. Read <a href="#security">Security</a> before exposing
-          it anywhere.
+          <strong>The data plane can authenticate, but ships off.</strong>
+          Set <code>TIMELAKE_DATA_AUTH</code> to <code>optional</code> or
+          <code>required</code> and writes, <code>/api/sql</code> and Flight SQL
+          all authenticate by token. Until you do, the default is
+          <code>off</code>: any client that can reach port 1963 or 1964 reads
+          and writes everything, and network reachability is your only access
+          control. The <a href="#console">admin surface</a> always requires a
+          session. Read <a href="#security">Security</a> before exposing this
+          anywhere.
         </p>
       </div>
 
       <h3>Why it exists</h3>
       <p>
-        Five engines were given one identical workload — roughly 1–2 million
-        products a day moving through ten pipeline steps, then aggregated with
-        <code>COUNT(DISTINCT product_id)</code>. InfluxDB 1.8 was OOM-killed by
-        that query; InfluxDB 2.7 never finished it; QuestDB and VictoriaMetrics
-        had run out of memory on it in earlier trials. Those failures became
-        this database's requirements, and its benchmark harness is the
-        acceptance test rather than a marketing exercise.
+        Two problems, both of which show up late and hurt: the number of
+        distinct things you are tracking grows until the memory needed to
+        index them is memory you do not have, and the data you are obliged to
+        keep gets tangled with the data you are obliged to delete.
+      </p>
+      <p>
+        So tags are dictionary-encoded columns rather than entries in a series
+        index, every query runs inside a bounded memory pool that fails the
+        query instead of the process, and retention is a per-table setting you
+        change at runtime. Each of those is checked by an acceptance test
+        rather than asserted here.
       </p>
 
       <h3>How a write becomes a queryable row</h3>
@@ -552,8 +558,8 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             never acknowledged to a client.</li>
         <li>A file removed from the catalog is deleted only after
             <code>TIMELAKE_GC_GRACE_SECS</code>, so the archive is internally
-            consistent as long as the backup finishes inside the grace period.
-            A 25 s backup against a 900 s default has 36× of headroom.</li>
+            consistent as long as the backup finishes inside the grace period,
+            which the 900 s default leaves considerable room for.</li>
       </ul>
       <p>
         Quiescing writes (<code>--stop &lt;container&gt;</code>) removes even that
@@ -586,10 +592,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h2>Scaling</h2>
       <h3>Today: one node, honestly</h3>
       <p>
-        A single node absorbed 36.6M events per benchmark day at 365–671K
-        lines/s with every query completing, and bursts of 100K events landed in
-        0.12 s while queries ran concurrently. Vertical levers are the memory
-        pool, the admission count, flush size and the compaction trigger.
+        One node handles ingest, query, compaction and retention together, and
+        sustains writes while queries run concurrently. The vertical levers are
+        the query memory pool, the admission count, the flush size and the
+        compaction trigger — each of which is a named setting rather than a
+        heuristic, so what the node will do under pressure is something you
+        configure rather than discover.
       </p>
 
       <h3>Built to become a cluster</h3>
@@ -611,8 +619,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         Set a container memory limit and keep
         <code>TIMELAKE_QUERY_MEM_BYTES × TIMELAKE_MAX_CONCURRENT_QUERIES</code>
-        inside it. The reference benchmark configuration used a 3.5 GB pool with
-        2 admitted queries under an 8 GB cap.
+        inside it — that product is the ceiling queries can reach, so it is the
+        number the limit has to accommodate. A useful starting point is a pool
+        of roughly 40% of the container limit with 2 admitted queries, then
+        widen once you know your query shapes.
       </p>
     </section>
 
@@ -621,7 +631,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         A summary. The <a href="reference.html">full reference</a> carries the
         line protocol grammar, the SQL dialect, the Flight SQL command surface, the
-        InfluxDB compatibility matrix, every metric and a glossary.
+        client compatibility matrix, every metric and a glossary.
       </p>
 
       <h3>HTTP endpoints (port 1963)</h3>
@@ -782,7 +792,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
     <div style="margin-left:auto">
       <a href="../index.html">Home</a> ·
       <a href="reference.html">Reference</a> ·
-      <a href="../index.html#evidence">Benchmarks</a>
+      <a href="../index.html#evidence">Architecture</a>
     </div>
   </div>
 </footer>

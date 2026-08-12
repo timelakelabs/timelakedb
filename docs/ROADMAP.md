@@ -26,7 +26,7 @@ each engine does under the workload this project was born from*. That
 part is measured, ours, and worth restating because it is the moat:
 
 - **InfluxDB 1.8**: ingest decayed 308K → collapse, and the server was
-  **OOM-killed by a Shape B query** (`docs/evidence/BENCHMARK_RESULTS.md`).
+  **OOM-killed by a Shape B query** (`../Gauge/docs/BENCHMARK_RESULTS.md`).
 - **InfluxDB 2.7**: 123K → ~10K lines/s decay as series grew to ~40M;
   the funnel never completed.
 - **InfluxDB 3 Core**: passed everything — the bar to beat. TimeLakeDB

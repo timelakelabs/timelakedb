@@ -1,8 +1,9 @@
 # TimeLakeDB
 
 A new time-series database, specified from evidence: five engines ran the
-identical high-cardinality workload under `bench/` (tsdb-bench), and
-their measured successes and failures define what this one must do.
+identical high-cardinality workload under tsdb-bench, and their measured
+successes and failures define what this one must do. That harness now
+lives in its own repository, `../Gauge/` (moved 2026-08-11).
 
 ## Inspired
 This project is inspired by the following projects.
@@ -29,10 +30,10 @@ This project is inspired by the following projects.
   ARCHITECTURE §17): layered configuration with provenance, admin auth
   and roles, the hash-chained audit trail, logs, metrics views, cluster
   view. Phased U0–U3 in §14.
-- `docs/evidence/BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
+- `../Gauge/docs/BENCHMARK_RESULTS.md` — the evidence: InfluxDB 1.8 (OOM-killed by a
   query), 2.7 (funnel never completed, 12× ingest decay), 3 Core (passed
   everything — the bar to beat), plus prior QuestDB/VictoriaMetrics OOMs.
-- `docs/evidence/EVALUATION_PLAN.md` — the original workload definition and pass
+- `../Gauge/docs/EVALUATION_PLAN.md` — the original workload definition and pass
   criteria the benchmarks implement.
 
 ## Decided
@@ -113,9 +114,12 @@ This project is inspired by the following projects.
 - **RENAMED TimelordDB → TimeLakeDB** (2026-08-09). Crates `timelake-*`,
   env `TIMELAKE_*`, metrics `timelake_*`, headers
   `X-TimeLake-Authorizations` / `x-timelake-csrf`, data dir
-  `/var/lib/timelake/data`, adapter `bench/backends/timelakedb.py`
+  `/var/lib/timelake/data`, adapter `../Gauge/bench/backends/timelakedb.py`
   (backend key `timelakedb`), compose `bench/compose/timelakedb*.yml`.
-  Target GitHub org: `timelakedb` (free; `timelakelabs` parked).
+  GitHub org is **`timelakelabs`**, repos LOWERCASE under it:
+  `timelakelabs/timelakedb`, `timelakelabs/tributary` (settled 2026-08-11 —
+  the `timelakedb` org also exists but is not the one in use; SSH alias
+  `github.com-timelakelabs`, key `id_ed25519_timelakelabs`).
   **Deliberately unchanged:** the `TLDE1` encryption magic (format
   marker, not brand — renaming it makes old objects fail the magic check
   and fall into plaintext passthrough = silent corruption), historical
@@ -519,18 +523,27 @@ This project is inspired by the following projects.
 
 ## Ground rules for work in this directory
 
-- The acceptance test is `bench/` — do not invent a new harness.
-  A `timelakedb` backend adapter + compose target makes any prototype
-  measurable with `python bench.py run --backend timelakedb` and
-  comparable via `bench.py compare` against the recorded baselines in
-  `bench/results/`.
+- The acceptance test is tsdb-bench in `../Gauge/` — do not invent a new
+  harness. A `timelakedb` backend adapter + compose target makes any
+  prototype measurable with `python bench/bench.py run --backend
+  timelakedb` and comparable via `bench/bench.py compare` against the
+  recorded baselines in `../Gauge/bench/results/`. Run it from there.
+- **Performance numbers come from Gauge; correctness verdicts come from
+  Catchment** (`../Catchment/`, conformance and fault injection). Neither
+  produces the other's output, deliberately — two sources of truth for
+  one measure means the wrong one gets quoted.
+- `bench/` here is now only what is bound to this repository: the
+  `timelakedb*.yml` compose topologies (each `build: ../..`), the drill
+  scripts that launch them, and the drill transcripts in `bench/results/`
+  that source comments and `docs/PRODUCTION_READINESS.md` cite by name.
+  Catchment borrows those topologies; do not fork them.
 - The hard invariant is RR-1: no query may kill the server. Designs that
   can't uphold it are out, regardless of speed.
 - High-cardinality tags must cost what a compressed column costs (FR-2).
   Anything whose memory or write cost grows with distinct-tag-combination
   count repeats the failure this project exists to avoid.
 - Keep query semantics identical to the canonical five Shape B queries and
-  Shape A in `bench/backends/influxdb3.py` — those are the
+  Shape A in `../Gauge/bench/backends/influxdb3.py` — those are the
   reference meanings, validated by matching row counts across engines.
 - Telegraf (unmodified `influxdb`/`influxdb_v2` output plugins) and Grafana
   (stock datasource over Flight SQL) are first-class integrations — FR-8 /
