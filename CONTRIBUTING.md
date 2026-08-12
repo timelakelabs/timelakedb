@@ -13,7 +13,7 @@ faster, smaller or more robust, a benchmark run says so.
 - `ARCHITECTURE.md` — components, seams, and how requirements became
   structure.
 - `bench/README.md` — the harness. It is the executable specification.
-- `docs/evidence/BENCHMARK_RESULTS.md` — the measurements the project exists
+- `../Gauge/docs/BENCHMARK_RESULTS.md` — the measurements the project exists
   to answer.
 
 Changes that contradict `REQUIREMENTS.md` §9 (anti-requirements) will be
@@ -138,9 +138,9 @@ memory, run the harness and attach the result:
 
 ```bash
 cd bench
-python bench.py run --backend timelakedb --scale smoke --label my-change   # ~30 s sanity
-python bench.py run --backend timelakedb --scale laptop --label my-change  # real signal
-python bench.py compare <baseline-run> <my-change-run>
+python bench/bench.py run --backend timelakedb --scale smoke --label my-change   # ~30 s sanity
+python bench/bench.py run --backend timelakedb --scale laptop --label my-change  # real signal
+python bench/bench.py compare <baseline-run> <my-change-run>
 ```
 
 Recorded runs live in `bench/results/`; the InfluxDB 3 runs there are the

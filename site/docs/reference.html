@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reference — TimeLakeDB</title>
-<meta name="description" content="TimeLakeDB reference: line protocol grammar and types, SQL dialect, HTTP and Flight SQL surfaces, InfluxDB compatibility matrix, metrics and glossary.">
+<meta name="description" content="TimeLakeDB reference: line protocol grammar and types, SQL dialect, HTTP and Flight SQL surfaces, client compatibility, metrics and glossary.">
 <meta name="theme-color" content="#0b1320">
 <link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../assets/style.css">
@@ -21,8 +21,8 @@
     <nav>
       <a href="../index.html">Home</a>
       <a href="index.html">Docs</a>
-      <a href="../index.html#evidence">Benchmarks</a>
-      <a href="https://github.com/timelakedb/TimeLakeDB">GitHub</a>
+      <a href="../index.html#evidence">Architecture</a>
+      <a href="https://github.com/timelakelabs/timelakedb">GitHub</a>
     </nav>
   </div>
 </header>
@@ -582,11 +582,14 @@
     </section>
 
     <section id="compatibility">
-      <h2>InfluxDB Compatibility</h2>
+      <h2>Client compatibility</h2>
       <p>
-        Existing agents write to TimeLakeDB unmodified. The read side is
-        deliberately not InfluxDB-shaped: SQL and Flight SQL replace InfluxQL and
-        Flux (REQUIREMENTS.md §12).
+        The write surface is line protocol over HTTP, so agents that already
+        speak it — Telegraf among them — ship to TimeLakeDB unmodified. The
+        read surface is deliberately different: SQL over HTTP and Flight SQL,
+        rather than a query language of its own. The table below is what an
+        existing client will and will not find, so you can tell before you
+        try.
       </p>
 
       <div class="table-wrap">
@@ -749,7 +752,8 @@
             <tr><td>GC grace</td><td>The delay before a file removed from the catalog is deleted, so a long query's snapshot cannot dangle</td></tr>
             <tr><td>Backpressure</td><td>The 429 raised when the WAL hits its cap — a named limit rather than a silent drop (RR-5)</td></tr>
             <tr><td>Primary key</td><td>Tag set plus timestamp; the basis of last-write-wins de-duplication</td></tr>
-            <tr><td>Shape A / Shape B</td><td>The benchmark's two query shapes: a single-entity journey lookup, and the funnel aggregations across all entities</td></tr>
+            <tr><td>Point lookup</td><td>A query narrowed to one entity — the shape bloom filters and row-group pruning are for</td></tr>
+            <tr><td>Cross-entity aggregation</td><td>A query spanning every entity in a window, typically counting distinct ones; the shape that decides whether a memory pool holds</td></tr>
           </tbody>
         </table>
       </div>
@@ -766,7 +770,7 @@
     <div style="margin-left:auto">
       <a href="../index.html">Home</a> ·
       <a href="index.html">Docs</a> ·
-      <a href="../index.html#evidence">Benchmarks</a>
+      <a href="../index.html#evidence">Architecture</a>
     </div>
   </div>
 </footer>

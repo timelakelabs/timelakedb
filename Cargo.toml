@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A time-series database for high-cardinality event analytics, specified from a five-engine benchmark."
-repository = "https://github.com/timelakedb/TimeLakeDB"
-homepage = "https://github.com/timelakedb/TimeLakeDB"
+repository = "https://github.com/timelakelabs/timelakedb"
+homepage = "https://github.com/timelakelabs/timelakedb"
 readme = "README.md"
 
 [workspace.dependencies]

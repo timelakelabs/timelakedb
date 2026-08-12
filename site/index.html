@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TimeLakeDB — High-Performance Time-Series Database</title>
-<meta name="description" content="TimeLakeDB is a Rust time-series database for high-cardinality event analytics, specified from a five-engine benchmark: 36M events/day, every cross-product query completes, 0.50 GB/day on disk.">
+<title>TimeLakeDB — A time-series database for high-cardinality data</title>
+<meta name="description" content="TimeLakeDB is a Rust time-series database for high-cardinality data: tags cost a compressed column rather than a series index, no query can exhaust the server, and retention is set per table at runtime. Built on Apache DataFusion, Arrow and Parquet.">
 <meta name="theme-color" content="#0b1320">
 <meta property="og:title" content="TimeLakeDB — Time. Stored. Forever.">
-<meta property="og:description" content="A time-series database specified from evidence: the query that OOM-killed InfluxDB 1.8 returns here in 0.68 s.">
+<meta property="og:description" content="For when the number of distinct things you track outgrew the memory you have — and you need to say exactly how long each table keeps its data.">
 <meta property="og:type" content="website">
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
@@ -23,9 +23,9 @@
     <nav>
       <a href="docs/index.html">Docs</a>
       <a href="docs/reference.html">Reference</a>
-      <a href="#evidence">Benchmarks</a>
+      <a href="#evidence">Architecture</a>
       <a href="#quickstart">Quick Start</a>
-      <a href="https://github.com/timelakedb/TimeLakeDB">GitHub</a>
+      <a href="https://github.com/timelakelabs/timelakedb">GitHub</a>
     </nav>
   </div>
 </header>
@@ -41,11 +41,12 @@
         </div>
       </div>
       <div class="rule"></div>
-      <p class="lede">High-Performance Time-Series Database</p>
+      <p class="lede">A time-series database for high-cardinality data</p>
       <p class="sub">
-        Built in Rust on Apache DataFusion, Arrow and Parquet for
-        high-cardinality event analytics — the workload that made four
-        other engines run out of memory.
+        For when the number of distinct things you are tracking outgrew the
+        memory you have — and you need to say exactly how long each table
+        keeps its data. Built in Rust on Apache DataFusion, Arrow and
+        Parquet.
       </p>
       <div class="cta-row">
         <a class="btn btn-primary" href="#quickstart">Quick Start</a>
@@ -136,11 +137,10 @@
 <section>
   <div class="shell">
     <div class="section-head">
-      <h2>What it does, measured</h2>
+      <h2>Three things it promises</h2>
       <p>
-        Every number below comes from the same 36.6-million-event day run
-        through the benchmark harness in this repository — the same dataset
-        every other engine was given.
+        Each one is a structural property of the design rather than a tuning
+        guide — something you should not have to configure your way into.
       </p>
     </div>
     <div class="cards">
@@ -149,12 +149,13 @@
              stroke-linecap="round" aria-hidden="true">
           <path d="M12 20a8 8 0 1 1 8-8"/><path d="M12 12l5-3"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
         </svg>
-        <h3>Blazing fast</h3>
-        <span class="stat">211 ms → 0 ms</span>
+        <h3>Cardinality costs a column</h3>
+        <span class="stat">no series index</span>
         <p>
-          Median product lookup across 36.6M events, cold. Once footers are
-          cached the same lookups return in 0–6 ms, because immutable Parquet
-          metadata prunes files without fetching them.
+          Tags are Arrow dictionary columns from the write path to the file.
+          Nothing in memory grows with the number of distinct tag
+          combinations, so a million distinct ids a day is a compressed
+          column rather than an index you have to budget for.
         </p>
       </div>
       <div class="card">
@@ -162,12 +163,13 @@
              stroke-linejoin="round" aria-hidden="true">
           <path d="M12 3l9 4.5-9 4.5-9-4.5L12 3Z"/><path d="M3 12l9 4.5 9-4.5"/><path d="M3 16.5 12 21l9-4.5"/>
         </svg>
-        <h3>Efficient storage</h3>
-        <span class="stat">0.50 GB / day</span>
+        <h3>Data on your terms</h3>
+        <span class="stat">per-table retention</span>
         <p>
-          Columnar Parquet with entity-clustered compaction: less than half
-          the InfluxDB 3 footprint for the same data, and roughly a sixteenth
-          of what the 1.x and 2.x TSM engines wrote.
+          Retention is set per table and changed at runtime, not a global
+          knob chosen at install time. Columnar Parquet with
+          entity-clustered compaction keeps what you kept small, and drops
+          what you did not.
         </p>
       </div>
       <div class="card">
@@ -177,11 +179,11 @@
           <rect x="9" y="9" width="6" height="6" rx="1.4"/>
         </svg>
         <h3>Never killed by a query</h3>
-        <span class="stat">0.68 s</span>
+        <span class="stat">bounded by design</span>
         <p>
-          The cross-product aggregation that OOM-killed InfluxDB 1.8 returns
-          here in under a second. One shared memory pool, admission control
-          and server-side deadlines make that a structural property, not luck.
+          Every query runs inside one shared memory pool, behind admission
+          control, under a server-side deadline. A query too large to fit
+          fails and says so; the process it was running in stays up.
         </p>
       </div>
     </div>
@@ -191,73 +193,39 @@
 <section class="alt" id="evidence">
   <div class="shell">
     <div class="section-head">
-      <h2>Specified from evidence</h2>
+      <h2>How it is put together</h2>
       <p>
-        This database exists because five engines ran one identical workload —
-        ~1–2M products a day moving through ten pipeline steps, queried with
-        <code>COUNT(DISTINCT product_id)</code> — and their failures defined the
-        requirements.
+        Object-store native, columnar throughout, with one narrow seam for
+        every byte that leaves the process.
       </p>
     </div>
 
     <div class="metrics">
-      <div class="metric"><b>36.6M</b><span>events per benchmark day</span></div>
-      <div class="metric"><b>365–671K</b><span>lines/s ingest, zero errors</span></div>
-      <div class="metric"><b>4.7 s</b><span>SIGKILL recovery, zero acknowledged-write loss</span></div>
-      <div class="metric"><b>34 s / 13 s</b><span>backup / restore, all rows exact</span></div>
+      <div class="metric"><b>WAL</b><span>durable before the write is acknowledged</span></div>
+      <div class="metric"><b>Arrow</b><span>columnar buffers, dictionary-encoded tags</span></div>
+      <div class="metric"><b>Parquet</b><span>immutable files, compacted in the background</span></div>
+      <div class="metric"><b>Manifest log</b><span>the object store is the source of truth</span></div>
     </div>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Engine</th>
-            <th>Ingest</th>
-            <th>Product lookup</th>
-            <th>Cross-product funnels</th>
-            <th>Storage / day</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><strong>TimeLakeDB</strong></td>
-            <td>365–671K lines/s</td>
-            <td>211 ms median</td>
-            <td class="good">all complete, 0.68–1.7 s</td>
-            <td><strong>0.50 GB</strong></td>
-          </tr>
-          <tr>
-            <td>InfluxDB 3 Core</td>
-            <td>73K lines/s</td>
-            <td>520 ms median</td>
-            <td class="good">all complete, 5.7–30.3 s</td>
-            <td>1.15 GB</td>
-          </tr>
-          <tr>
-            <td>InfluxDB 2.7</td>
-            <td>33K lines/s avg (decayed 123K → 10K)</td>
-            <td>134 ms</td>
-            <td class="bad">did not finish (3 × 300 s timeout)</td>
-            <td>8.13 GB</td>
-          </tr>
-          <tr>
-            <td>InfluxDB 1.8</td>
-            <td>58.7K lines/s</td>
-            <td>18 ms</td>
-            <td class="bad">OOM-killed the server at 14.4 GB</td>
-            <td>8.15 GB</td>
-          </tr>
-          <tr>
-            <td>QuestDB · VictoriaMetrics</td>
-            <td colspan="3" class="bad">out of memory on the same query shape (prior trials)</td>
-            <td>—</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
+    <p>
+      A write is parsed, made durable in a write-ahead log, and applied to an
+      in-memory columnar buffer before the server answers. Buffers become
+      immutable Parquet; a manifest log records what exists. Queries run
+      through Apache DataFusion over both at once, so rows are visible as
+      soon as they are acknowledged rather than after the next flush.
+    </p>
+    <p>
+      Because the object store holds the data <em>and</em> the catalogue, a
+      node carries nothing that cannot be rebuilt. Delete one, point a new
+      one at the same bucket, and it serves.
+    </p>
+
     <p class="footnote">
-      Same seeded dataset, same query semantics, same machine. Full record and
-      raw run files live in <code>docs/evidence/</code> and <code>bench/results/</code>.
+      <strong>Pre-v1, and honest about it.</strong> There is no released
+      version yet, no compatibility promise between commits, and features
+      arrive one at a time behind their own tests. Read
+      <a href="docs/index.html">the documentation</a> for what is built today
+      and the security posture before deploying anything.
     </p>
   </div>
 </section>
@@ -266,7 +234,7 @@
   <div class="shell">
     <div class="section-head">
       <h2>Quick start</h2>
-      <p>Docker is the only prerequisite. The server speaks InfluxDB line protocol on 1963, Flight SQL on 1964, and serves its management console on 1963 at <code>/admin/ui</code>.</p>
+      <p>Docker is the only prerequisite. The server accepts line protocol on 1963, answers Flight SQL on 1964, and serves its management console on 1963 at <code>/admin/ui</code>.</p>
     </div>
 
     <div class="code">
@@ -313,8 +281,8 @@ curl http://localhost:<span class="n">1963</span>/health</pre>
     </div>
     <div style="margin-left:auto">
       <a href="docs/index.html">Documentation</a> ·
-      <a href="#evidence">Benchmarks</a> ·
-      <a href="https://github.com/timelakedb/TimeLakeDB">GitHub</a>
+      <a href="#evidence">Architecture</a> ·
+      <a href="https://github.com/timelakelabs/timelakedb">GitHub</a>
     </div>
   </div>
 </footer>

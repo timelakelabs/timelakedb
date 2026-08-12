@@ -2,8 +2,8 @@
 
 **Status:** Draft v1 · 2026-08-08
 **Evidence base:** Every requirement below traces to a measured result from
-the tsdb-bench evaluation (`docs/evidence/BENCHMARK_RESULTS.md`, raw records in
-`bench/results/`), in which five engines ran the identical workload:
+the tsdb-bench evaluation (`../Gauge/docs/BENCHMARK_RESULTS.md`, raw records in
+`../Gauge/bench/results/`), in which five engines ran the identical workload:
 InfluxDB 1.8 (OOM-killed by a query), InfluxDB 2.7 (funnel never completed),
 QuestDB and VictoriaMetrics (prior trials, OOM on the same query shape), and
 InfluxDB 3 Core (passed everything). TimeLakeDB must beat the survivor and
@@ -404,7 +404,7 @@ The existing harness (`bench/`) is the executable acceptance test.
   deterministic generator makes datasets byte-identical).
 - **AT-3 (MUST):** At `--scale full` on reference hardware, meet every PR
   and RR row above; `run.json` is the artifact of record, compared against
-  `influxdb3-idb3-full-*` baselines with `bench.py compare`.
+  `influxdb3-idb3-full-*` baselines with `bench/bench.py compare`.
 - **AT-4 (MUST):** Repeat AT-3 twice; results within 10% run-to-run
   (the idb3 baseline pair demonstrated this reproducibility).
 - **AT-5 (SHOULD):** Kill-during-load, backup/restore drill (≤ 2 min /

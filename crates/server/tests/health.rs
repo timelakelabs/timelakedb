@@ -87,7 +87,7 @@ async fn health_payload_is_the_adapter_contract() {
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // bench/backends/timelakedb.py healthy() needs 2xx; version() reads
+    // ../Gauge/bench/backends/timelakedb.py healthy() needs 2xx; version() reads
     // .version — wire contract, do not rename.
     assert_eq!(v["status"], "pass");
     assert_eq!(v["name"], "timelakedb");

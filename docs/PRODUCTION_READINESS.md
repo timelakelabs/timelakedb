@@ -81,10 +81,14 @@ Measured that way (2026-08-10):
 
 Decisions and changes made while preparing it:
 
-- **The org is `timelakedb`.** `TimeLakeLabs` appeared in `Cargo.toml`,
-  the README clone URL, the SECURITY.md advisory link and four site
-  pages while `CLAUDE.md` recorded `timelakedb` as the chosen org; the
-  URLs now say `timelakedb` in both repositories.
+- **The org is `timelakelabs`, and the repositories are lowercase under
+  it** — `timelakelabs/timelakedb` and `timelakelabs/tributary`. Three
+  spellings had accumulated (`TimeLakeLabs` in `Cargo.toml`, the README
+  clone URL, the SECURITY.md advisory link and four site pages;
+  `timelakedb` in `CLAUDE.md` as the "target org"), and the org that
+  actually exists settles it. Every URL in both repositories now matches
+  what is on GitHub, and the SSH alias and key are named
+  `github.com-timelakelabs` / `id_ed25519_timelakelabs` to match.
 - **The `store-s3` coverage hole is closed by a job, not by an
   exclusion.** A `store-s3` job runs the three `#[ignore]`d tests against
   a LocalStack service container — the Store contract over S3, the KMS
@@ -103,7 +107,7 @@ Decisions and changes made while preparing it:
 
 Remaining, and it needs a human with GitHub credentials:
 
-- Create the `timelakedb` org, push both repos **private**, and confirm
+- Push both repos to the `timelakelabs` org **private**, and confirm
   both workflows are green on a real runner.
 - Flip to public once they are, and enable Settings → Pages → Source:
   GitHub Actions so the site publishes.

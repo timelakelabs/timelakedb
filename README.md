@@ -1,6 +1,6 @@
 # TimeLakeDB
 
-[![ci](https://github.com/timelakedb/TimeLakeDB/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakedb/TimeLakeDB/actions/workflows/ci.yml)
+[![ci](https://github.com/timelakelabs/timelakedb/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakelabs/timelakedb/actions/workflows/ci.yml)
 
 A time-series database for high-cardinality event analytics, specified
 from evidence: five engines ran an identical 36M-event workload and their
@@ -19,8 +19,9 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `CONTRIBUTING.md` | Development environment, the crate map, what CI enforces |
 | `CHANGELOG.md` | What landed, milestone by milestone |
 | `docs/BACKUP_RESTORE.md` | The AT-5 procedure, runnable (`ops/tldb-backup.sh`) |
-| `docs/evidence/` | The benchmark record this project is built on |
-| `bench/` | tsdb-bench — the executable acceptance spec + recorded baselines |
+| `bench/` | Compose topologies for every deployment shape, the correctness drills that launch them, and their transcripts |
+| `../Gauge/` | tsdb-bench — the executable acceptance spec, recorded baselines, and `PERFORMANCE_LOG.md` |
+| `../Catchment/` | Conformance and fault-injection testing across this and Tributary |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
 > **Security:** the data plane **can** authenticate but ships `off`.
@@ -79,7 +80,7 @@ Still to come in C2: the compactor role and its singleton lease.
 required intra-cluster mTLS, `ARCHITECTURE.md` §12); re-baseline the
 benchmark inside the container network, because ~94% of the reported
 Shape A latency is Docker Desktop port forwarding
-(`docs/evidence/PERFORMANCE_LOG.md`).
+(`../Gauge/PERFORMANCE_LOG.md`).
 
 ### Previous: SEC-4 — authentication, admin surface and data plane
 
@@ -240,11 +241,11 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 ## Quickstart (Docker — no local Rust needed)
 
 ```bash
-git clone https://github.com/timelakedb/TimeLakeDB.git
+git clone https://github.com/timelakelabs/timelakedb.git
 cd TimeLakeDB/bench
 docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
-python bench.py backends       # timelakedb is registered
+python bench/bench.py backends       # timelakedb is registered
 ```
 
 The admin console is at <http://localhost:1963/admin/ui>. A fresh node
@@ -274,7 +275,7 @@ source and the restored copy (40,327,616). Runbook: `docs/BACKUP_RESTORE.md`.
 ## The rule
 
 The benchmark harness is the specification. Every milestone gates on a
-`bench.py run --backend timelakedb` result, compared against the recorded
+`bench/bench.py run --backend timelakedb` result, compared against the recorded
 InfluxDB 3 baselines in `bench/results/`.
 
 ## License

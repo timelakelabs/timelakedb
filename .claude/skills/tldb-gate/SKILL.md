@@ -27,10 +27,12 @@ docker compose -f compose/timelakedb.yml --profile grafana up -d --build
 
 ## Bench gate
 
+The harness lives in the Gauge repository, not here:
+
 ```powershell
-cd bench   # from the repository root
-python bench.py run --backend timelakedb --scale smoke  --label <X>   # shakeout, ~15 s
-python bench.py run --backend timelakedb --scale laptop --label <X>   # milestone gate, ~1 min
+cd ..\Gauge   # sibling of this repository
+python bench\bench.py run --backend timelakedb --scale smoke  --label <X>   # shakeout, ~15 s
+python bench\bench.py run --backend timelakedb --scale laptop --label <X>   # milestone gate, ~1 min
 ```
 
 Pass criteria:
@@ -38,7 +40,7 @@ Pass criteria:
 - context counts vs accepted lines: rows_48h == pipeline lines + burst
   (small deficit = LWW dedup of source PK collisions — compare against an
   influxdb3 run on the same fresh dataset before calling it a bug; the
-  influxdb3 baselines live in `bench/results/influxdb3-idb3-full-*`).
+  influxdb3 baselines live in `../Gauge/bench/results/influxdb3-idb3-full-*`).
 - Grafana (port 3003, admin/admin): datasource health OK; funnel panel
   query returns 10 steps. Crash drill: `docker restart -t 0 timelakedb`
   (NOT `docker kill` — kill suppresses the restart policy), healthy ≤30 s,

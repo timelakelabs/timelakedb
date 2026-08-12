@@ -37,7 +37,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 /// groups that survived pruning; nothing else leaves the store. Before
 /// this, every scan pulled the entire object into memory and `with_row_groups`
 /// bounded only *decoding* — which is why finer row groups measured as a
-/// regression rather than a win (docs/evidence/PERFORMANCE_LOG.md).
+/// regression rather than a win (../Gauge/PERFORMANCE_LOG.md).
 pub struct StoreFile {
     store: Arc<dyn Store>,
     path: String,
@@ -306,7 +306,7 @@ fn str_literal(e: &Expr) -> Option<String> {
 /// `Utf8View`, `BinaryView` and the primitives, and NOT `Dictionary`, so
 /// every tag GROUP BY falls into the row-format fallback that materialises
 /// a string per row per key. On this workload that single operator is ~85%
-/// of B2's plan compute (docs/evidence/PERFORMANCE_LOG.md).
+/// of B2's plan compute (../Gauge/PERFORMANCE_LOG.md).
 pub fn view_schema(schema: &datafusion::arrow::datatypes::Schema) -> SchemaRef {
     use datafusion::arrow::datatypes::{DataType, Schema};
     if !schema.fields().iter().any(|f| is_dict_utf8(f.data_type())) {

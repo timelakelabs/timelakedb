@@ -36,7 +36,7 @@ pub trait Store: Send + Sync + 'static {
     /// This is the seam that lets a reader take a Parquet footer and a
     /// couple of column chunks instead of the whole file — the measured
     /// reason row-group pruning could not pay (see
-    /// docs/evidence/PERFORMANCE_LOG.md, 2026-08-08).
+    /// ../Gauge/PERFORMANCE_LOG.md, 2026-08-08).
     fn get_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 
     /// Write `bytes` to `path` ONLY if no object exists there. Returns
