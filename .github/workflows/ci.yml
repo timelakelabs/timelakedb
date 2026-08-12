@@ -22,6 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # A 16-crate workspace built --all-targets, then rebuilt instrumented
+      # for coverage, does not fit on a hosted runner beside its preinstalled
+      # images: run 31561992129 reached 87 MB free and `ld` died with SIGBUS
+      # mid-link. That reads as a test failure in the log and is not one —
+      # the same sha passes in a stock rust:1-slim container. None of what is
+      # removed below is used by this job.
+      - name: Reclaim runner disk
+        run: |
+          echo "before: $(df -h --output=avail / | tail -1) available"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          echo "after:  $(df -h --output=avail / | tail -1) available"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
