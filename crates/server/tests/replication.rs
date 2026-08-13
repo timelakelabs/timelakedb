@@ -122,6 +122,56 @@ async fn receiving_before_enable_is_a_clean_error_not_a_panic() {
 }
 
 #[tokio::test]
+async fn recovering_twice_serves_each_row_once() {
+    // The operator's cautious double-recover, and the catch-up flow after
+    // the peer returns: a second recover must apply the frames that
+    // arrived after the first, never the same rows again. Unfixed, each
+    // recover re-applied the full replica WAL and flushed it into its own
+    // file, and cross-file dedup waits for a compaction that needs
+    // `compact_min_files` files in one partition — a threshold two files
+    // never reach — so every recovered count doubled, durably, on the
+    // serving read path (Catchment `ingester-kill`, 2026-08-13).
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.enable_replica_wal(&dir.path().join("replica-wal"))
+        .unwrap();
+    let t = now_ns();
+    for i in 0..100 {
+        let frame = format!("cpu,host=h{i} v={i}i {}\n", t + i);
+        eng.replicate_receive("poc", 1, frame.as_bytes()).unwrap();
+    }
+    assert_eq!(eng.recover_from_replica().unwrap(), 100);
+    let app = timelake_server::app(eng.clone());
+    assert_eq!(count(&app, "cpu").await, 100);
+
+    // The cautious second run: everything already applied is consumed,
+    // so nothing replays and nothing doubles.
+    assert_eq!(
+        eng.recover_from_replica().unwrap(),
+        0,
+        "consumed frames must not replay"
+    );
+    assert_eq!(
+        count(&app, "cpu").await,
+        100,
+        "a second recover must not double the table"
+    );
+
+    // The catch-up flow: the peer came back and replicated more; the next
+    // recover applies exactly the new frames on top of the old rows.
+    for i in 100..150 {
+        let frame = format!("cpu,host=h{i} v={i}i {}\n", t + i);
+        eng.replicate_receive("poc", 1, frame.as_bytes()).unwrap();
+    }
+    assert_eq!(
+        eng.recover_from_replica().unwrap(),
+        50,
+        "only the frames that arrived since the last recover"
+    );
+    assert_eq!(count(&app, "cpu").await, 150);
+}
+
+#[tokio::test]
 async fn a_lone_node_has_no_replicator_and_writes_normally() {
     // role=all never sets a replicator; the write path is unchanged. Prove
     // it emits no CL-2 metrics and still writes.
