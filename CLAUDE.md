@@ -465,7 +465,7 @@ This project is inspired by the following projects.
   `SEC3_CERT_RENEWAL_FAILED` alarm on a bad renewal. Both listeners TLS
   when `TIMELAKE_TLS_CERT`/`_KEY` set (HTTP via axum-server, Flight via
   tokio-rustls accept loop into `serve_with_incoming`); plaintext stays
-  the default (bench/fixtures unchanged). Triggers: 2 s mtime watcher
+  the default (`fixtures/` unchanged). Triggers: 2 s mtime watcher
   (works through a Windows bind mount) + POST /admin/tls/reload.
   Gauges: timelake_tls_cert_expiry_seconds, timelake_tls_last_reload_ok.
   Drill stack: `compose/timelakedb-tls.yml` (ports 2963/2964) +
@@ -482,7 +482,8 @@ This project is inspired by the following projects.
   snapshots are safe by objects-before-manifest ordering; quiesce only
   eliminates a tiny manifest-tear window.
 - Previous: **M4 — AT-3 green with two carve-outs** (run
-  tldb-m4-final + tldb-m4-settled2 + idb3-exactness in docs/evidence/).
+  tldb-m4-final + tldb-m4-settled2 + idb3-exactness in
+  ../Gauge/bench/results/).
   Fresh full-scale: Shape A median 211 ms, all Shape B complete (B1
   1.7 s, B4 0.68 s), burst 0.12 s, storage 0.50 GB/day, zero row loss
   (fixed-bound equality vs influxdb3 on identical data — the old "8-row
@@ -527,16 +528,18 @@ This project is inspired by the following projects.
   harness. A `timelakedb` backend adapter + compose target makes any
   prototype measurable with `python bench/bench.py run --backend
   timelakedb` and comparable via `bench/bench.py compare` against the
-  recorded baselines in `../Gauge/bench/results/`. Run it from there.
+  recorded baselines in `../Gauge/bench/results/`. Run both from
+  `../Gauge/` — the harness has not lived in this repository since G0.
 - **Performance numbers come from Gauge; correctness verdicts come from
   Catchment** (`../Catchment/`, conformance and fault injection). Neither
   produces the other's output, deliberately — two sources of truth for
   one measure means the wrong one gets quoted.
-- `bench/` here is now only what is bound to this repository: the
-  `timelakedb*.yml` compose topologies (each `build: ../..`), the drill
-  scripts that launch them, and the drill transcripts in `docs/evidence/`
-  that source comments and `docs/PRODUCTION_READINESS.md` cite by name.
-  Catchment borrows those topologies; do not fork them.
+- There is no `bench/` here any more. G0 gave the harness to Gauge, and D2
+  split what was left by what it actually is: `deploy/compose/` holds the
+  `timelakedb*.yml` topologies (each `build: ../..`) and the drill scripts
+  that launch them, and `docs/evidence/` holds the drill transcripts that
+  source comments and `docs/PRODUCTION_READINESS.md` cite by name.
+  Catchment and Riverkeeper borrow those topologies; do not fork them.
 - The hard invariant is RR-1: no query may kill the server. Designs that
   can't uphold it are out, regardless of speed.
 - High-cardinality tags must cost what a compressed column costs (FR-2).

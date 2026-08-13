@@ -19,7 +19,8 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 | `CONTRIBUTING.md` | Development environment, the crate map, what CI enforces |
 | `CHANGELOG.md` | What landed, milestone by milestone |
 | `docs/BACKUP_RESTORE.md` | The AT-5 procedure, runnable (`ops/tldb-backup.sh`) |
-| `bench/` | Compose topologies for every deployment shape, the correctness drills that launch them, and their transcripts |
+| `deploy/compose/` | Compose topologies for every deployment shape, and the correctness drills that launch them |
+| `docs/evidence/` | Drill transcripts — the recorded runs that source comments and `docs/PRODUCTION_READINESS.md` cite by name |
 | `../Gauge/` | tsdb-bench — the executable acceptance spec, recorded baselines, and `PERFORMANCE_LOG.md` |
 | `../Catchment/` | Conformance and fault-injection testing across this and Tributary |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
@@ -245,7 +246,7 @@ git clone https://github.com/timelakelabs/timelakedb.git
 cd TimeLakeDB/bench
 docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
-python bench/bench.py backends       # timelakedb is registered
+(cd ../Gauge && python bench/bench.py backends)   # timelakedb is registered
 ```
 
 The admin console is at <http://localhost:1963/admin/ui>. A fresh node
@@ -275,8 +276,9 @@ source and the restored copy (40,327,616). Runbook: `docs/BACKUP_RESTORE.md`.
 ## The rule
 
 The benchmark harness is the specification. Every milestone gates on a
-`bench/bench.py run --backend timelakedb` result, compared against the recorded
-InfluxDB 3 baselines in `docs/evidence/`.
+`bench/bench.py run --backend timelakedb` result, run from `../Gauge/` and
+compared against the recorded InfluxDB 3 baselines in
+`../Gauge/bench/results/`.
 
 ## License
 

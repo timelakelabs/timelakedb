@@ -1,6 +1,6 @@
 # TimeLakeDB on S3 (LocalStack) — the C0 rig (ARCHITECTURE §12.6).
 #   docker compose -f compose/timelakedb-s3.yml up -d --build
-#   python bench/bench.py run --backend timelakedb --url http://localhost:3966 --scale smoke
+#   (from ../Gauge) python bench/bench.py run --backend timelakedb --url http://localhost:3966 --scale smoke
 #
 # What this rig may claim: correctness, KMS/S3 call counts, recovery
 # behavior. What it may NOT claim: latency — localhost S3 is not S3.

@@ -491,7 +491,7 @@ which is the argument for adding them at U2 regardless.
 
 ### 7.5 Relationship to the harness
 
-The console reports; `bench/` remains the specification. The U2 gate is
+The console reports; Gauge's `bench/` remains the specification. The U2 gate is
 that the console's numbers agree with `/metrics` and with the `run.json`
 of a bench run — a console that disagrees with the harness is a bug in
 the console.
