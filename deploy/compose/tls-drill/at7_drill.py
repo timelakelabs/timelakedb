@@ -7,7 +7,7 @@ in-flight query completes, and the next new connection presents the new
 certificate. Then repeat with a deliberately corrupt renewal: the server
 keeps serving on the last-good cert and raises the SEC-3 alarm.
 
-Run from bench/:  python compose/tls-drill/at7_drill.py
+Run from deploy/:  python compose/tls-drill/at7_drill.py
 Prereqs: gen-certs.sh initial + the timelakedb-tls compose stack up.
 """
 

@@ -12,7 +12,8 @@ faster, smaller or more robust, a benchmark run says so.
   acceptance tests (AT-1…AT-7) that close them.
 - `ARCHITECTURE.md` — components, seams, and how requirements became
   structure.
-- `bench/README.md` — the harness. It is the executable specification.
+- `../Gauge/bench/README.md` — the harness. It is the executable
+  specification, and it lives in Gauge since the G0 split.
 - `../Gauge/docs/BENCHMARK_RESULTS.md` — the measurements the project exists
   to answer.
 
@@ -40,7 +41,7 @@ docker run --rm -v "$PWD":/src -w /src \
 Run the server the way the benchmarks do:
 
 ```bash
-cd bench
+cd deploy
 docker compose -f compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
 ```
@@ -137,16 +138,17 @@ For anything touching the write path, the read path, compaction, retention or
 memory, run the harness and attach the result:
 
 ```bash
-cd bench
+cd ../Gauge          # the harness lives in Gauge, not here (G0 split)
 python bench/bench.py run --backend timelakedb --scale smoke --label my-change   # ~30 s sanity
 python bench/bench.py run --backend timelakedb --scale laptop --label my-change  # real signal
 python bench/bench.py compare <baseline-run> <my-change-run>
 ```
 
-Recorded runs live in `docs/evidence/`; the InfluxDB 3 runs there are the
-baselines to beat. Do not invent a new measurement method for a change — if
+Recorded benchmark runs live in `../Gauge/bench/results/`; the InfluxDB 3
+runs there are the baselines to beat. This repository's `docs/evidence/`
+holds the correctness drill transcripts, which are a different thing. Do not invent a new measurement method for a change — if
 the harness cannot express what you are claiming, extend the harness (see
-"Adding a backend" and the scenario definitions in `bench/scenarios.py`) so
+"Adding a backend" and the scenario definitions in `../Gauge/bench/scenarios.py`) so
 the next person can reproduce it.
 
 Two hard-won measurement rules:

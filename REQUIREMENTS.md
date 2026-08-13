@@ -422,7 +422,7 @@ administrative surface (MUST, v1 · data plane phased).**
 
 ## 10. Acceptance testing — the benchmark is the specification
 
-The existing harness (`bench/`) is the executable acceptance test.
+The harness in `../Gauge/bench/` is the executable acceptance test.
 
 - **AT-1 (MUST):** Implement a `timelakedb` tsdb-bench adapter (~100 lines:
   write endpoint, five canonical Shape B queries in SQL, Shape A, health,

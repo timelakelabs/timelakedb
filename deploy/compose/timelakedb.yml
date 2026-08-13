@@ -1,6 +1,6 @@
 # TimeLakeDB target for tsdb-bench — the system under test.
 #   docker compose -f compose/timelakedb.yml up -d --build
-#   python bench/bench.py run --backend timelakedb --scale smoke --label tldb-smoke
+#   (from ../Gauge) python bench/bench.py run --backend timelakedb --scale smoke --label tldb-smoke
 name: bench-timelakedb
 services:
   timelakedb:

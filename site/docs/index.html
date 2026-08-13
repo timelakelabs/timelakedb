@@ -773,11 +773,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>Prove changes with the harness</h3>
       <p>
-        <code>bench/</code> is the executable specification. Run
-        <code>python bench.py run --backend timelakedb --scale laptop</code> and compare
-        against the recorded baselines in <code>docs/evidence/</code> rather than
-        inventing a new measurement each time; that is how every claim on this
-        site was produced.
+        Gauge's <code>bench/</code> is the executable specification. Run
+        <code>python bench.py run --backend timelakedb --scale laptop</code> from
+        <code>../Gauge/</code> and compare against the recorded baselines in
+        <code>../Gauge/bench/results/</code> rather than inventing a new
+        measurement each time; that is how every claim on this site was
+        produced.
       </p>
     </section>
   </main>

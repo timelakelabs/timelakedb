@@ -20,7 +20,7 @@ docker run --rm -v "${PWD}:/src" -v timelake-cargo-cache:/usr/local/cargo/regist
 ## Rebuild + start (with Grafana fixture)
 
 ```powershell
-cd bench
+cd deploy
 docker compose -f compose/timelakedb.yml --profile grafana up -d --build
 # fresh data: down first, then Remove-Item -Recurse compose\data\timelake
 ```
