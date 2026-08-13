@@ -2,12 +2,33 @@
 
 [![ci](https://github.com/timelakelabs/timelakedb/actions/workflows/ci.yml/badge.svg)](https://github.com/timelakelabs/timelakedb/actions/workflows/ci.yml)
 
-A time-series database for high-cardinality event analytics, specified
-from evidence: five engines ran an identical 36M-event workload and their
-measured failures define this one. The survivor (InfluxDB 3) sets the
-baselines this project must beat; the failures (a query OOM-killing
-InfluxDB 1.8, InfluxDB 2.x's funnel never completing, QuestDB and
-VictoriaMetrics OOMs) define what it must be structurally incapable of.
+A time-series database for developers whose cardinality outgrew their
+memory, and who need to say exactly how long data lives.
+
+Three promises, each a structural property rather than a tuning guide:
+
+1. **Cardinality costs a column, not an index.** Tags are Arrow dictionary
+   columns end to end. Nothing in the write path or in memory grows with
+   the number of distinct tag combinations — a million distinct ids a day
+   is a compressed column, not a series index.
+2. **No query can kill the server.** Every query runs inside an
+   admission-controlled memory pool with a deadline. A query that cannot
+   fit fails; the process does not.
+3. **You decide what data lives, and for how long.** Retention is per
+   table and changeable at runtime, not a global knob set at install time.
+
+Everything else — the object-store-native design, encryption at rest, row
+visibility labels, the cluster roles — follows from keeping those three
+true as a deployment grows.
+
+**Why those three, and not a wish list.** Five engines ran an identical
+high-cardinality workload, and their measured failures are the evidence: a
+single query OOM-killed InfluxDB 1.8; InfluxDB 2.x never completed a funnel
+aggregation and decayed 12× on ingest; QuestDB and VictoriaMetrics OOM'd on
+the same query shape; InfluxDB 3 passed everything and so sets the baselines
+to beat. That evaluation now lives in **Gauge**, where it can be pointed at
+any engine. It is the evidence for the promises — not the identity of this
+database, and not a description of one workload's tables.
 
 **Stack:** Rust · Apache DataFusion · Arrow · Parquet · `object_store`.
 
