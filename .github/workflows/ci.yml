@@ -182,6 +182,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The Tributary agent, which tier 1 has driven as a container since
+      # Catchment C1. A fixture here, not the thing under test — but it
+      # must exist before `up`, or compose builds it cold and uncached
+      # inside the stack's bring-up timeout. Scoped cache: the two
+      # TimeLakeDB builds in this file share the default scope on
+      # purpose (same context, shared layers); this one would evict them.
+      - name: Build the Tributary agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .tributary
+          load: true
+          tags: bench-timelakedb-tributary:latest
+          cache-from: type=gha,scope=tributary
+          cache-to: type=gha,scope=tributary,mode=max
+
       # Tier 1 only. Clustered scenarios are nightly in Catchment's own
       # repo; making every push wait for a five-node cluster is how a
       # conformance gate gets switched off.
