@@ -243,3 +243,76 @@ fn the_default_replication_timeout_is_sub_second() {
         "a second or more here reintroduces the stall D1 exists to bound"
     );
 }
+
+/// FR-1 requires bodies of 10 MB and up. axum's `Bytes` extractor defaults
+/// to 2 MB, which broke that contract in two places at once — and the
+/// second one was silent.
+///
+/// A large batch was refused with 413 on `/write`, which is at least loud.
+/// The same 413 from a peer's `/internal/v1/replicate` is not: the
+/// replicator reads any non-2xx as "peer not durable", so the node dropped
+/// to degraded and stopped replicating, while the write itself succeeded
+/// locally. "Durable on two nodes" quietly stopped holding for exactly the
+/// batches most worth replicating, and the alarm looked unexplained.
+///
+/// Both routers now take the ceiling from one config value, so they cannot
+/// disagree: a frame the internal listener refuses would be a write its
+/// peer had already accepted.
+#[tokio::test]
+async fn a_body_over_two_megabytes_is_accepted_on_both_planes() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+
+    let t = now_ns();
+    let mut lp = String::with_capacity(3 << 20);
+    let mut i = 0i64;
+    while lp.len() < (3 << 20) {
+        lp.push_str(&format!("cpu,host=h{i} v={i}i {}\n", t + i));
+        i += 1;
+    }
+    assert!(
+        lp.len() > (2 << 20),
+        "the probe must exceed axum's 2 MiB default"
+    );
+
+    // Public data plane.
+    let app = timelake_server::app(Arc::clone(&e));
+    let res = app
+        .oneshot(
+            Request::post("/write?db=d")
+                .header("content-type", "text/plain")
+                .body(Body::from(lp.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "FR-1 requires >=10 MB bodies; a {} byte write was refused",
+        lp.len()
+    );
+
+    // Intra-cluster plane: the same frame a peer would ship.
+    let dir2 = tempfile::tempdir().unwrap();
+    let peer = engine(dir2.path());
+    peer.enable_replica_wal(&dir2.path().join("replica-wal"))
+        .expect("replica wal");
+    let internal = timelake_server::internal_router(Arc::clone(&peer));
+    let res = internal
+        .oneshot(
+            Request::post("/internal/v1/replicate")
+                .header("x-repl-db", "d")
+                .header("x-repl-mult", "1")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(lp.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a frame the peer refuses is a write the primary already acknowledged"
+    );
+}

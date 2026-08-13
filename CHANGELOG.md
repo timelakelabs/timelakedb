@@ -13,6 +13,23 @@ here.
 
 ## [Unreleased]
 
+### Fixed — bodies over 2 MiB were refused, and replication went quiet (2026-08-13)
+
+- **FR-1 requires batches of 10 MB and up; anything over 2 MiB got 413.**
+  axum’s `Bytes` extractor carries a 2 MiB default limit and neither
+  listener overrode it. On `/write` that is at least loud. On a peer’s
+  `/internal/v1/replicate` it was not: the replicator reads any non-2xx as
+  “peer not durable”, so a large frame dropped the node into degraded mode
+  while the write succeeded locally — “durable on two nodes” stopped holding
+  for exactly the batches most worth replicating, under an alarm that looked
+  unexplained.
+- Now `TIMELAKE_MAX_BODY_BYTES`, default 32 MiB, applied to **both** routers
+  from one config value. A public limit above the internal one would accept
+  writes their own replica refuses, so they are deliberately not separate
+  knobs.
+- Pinned by `a_body_over_two_megabytes_is_accepted_on_both_planes`, which
+  exercises the public write and the replication frame in the same test.
+
 ### Changed — a slow replication peer can no longer stall ingest (2026-08-13)
 
 Design: `docs/P1-1_DESIGN.md` D1.
