@@ -107,11 +107,26 @@ Decisions and changes made while preparing it:
 
 Remaining, and it needs a human with GitHub credentials:
 
-- Push both repos to the `timelakelabs` org **private**, and confirm
-  both workflows are green on a real runner.
+- ~~Push both repos to the `timelakelabs` org **private**, and confirm both
+  workflows are green on a real runner.~~ **DONE (2026-08-13).** All five
+  repositories are green on a runner at their current heads: 173 tests,
+  82.74% line coverage, the `store-s3` contract against LocalStack, and
+  tier-1 conformance against an image built from this tree. Run URLs and
+  shas are in `docs/evidence/P0-1-ci.md`, which also records the three
+  infrastructure failures found on the way — runner disk, a conformance job
+  that executed no scenarios, and a harness that could not test itself
+  alone. None was a defect in the software.
 - Flip to public once they are, and enable Settings → Pages → Source:
   GitHub Actions so the site publishes.
 - Tag `v0.1.0-alpha` so there is a fixed point to talk about.
+
+**P0-1 is not closed.** The first item was the one blocking everything —
+until it was done, no claim in this document traced to anything but one
+laptop — but two of the three remain, and they are Phase 2 in
+`PROJECT_PLAN.md`. Marking the item DONE on the strength of the first would
+overstate it in precisely the way this project's standing rule forbids.
+Riverkeeper's R0 (`9296c05`) is also still unsigned and pushed, so
+`git verify-commit HEAD` returns Good in five of six repositories.
 
 ### P0-2 · `/api/sql` writes files as root  ⟂ **DONE (2026-08-10)**
 
