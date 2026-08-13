@@ -131,6 +131,34 @@ makes migration cheap — the real fleet's collectors are Telegraf-class
 agents emitting exactly these calls. Write-API compatibility is in scope;
 InfluxQL/Flux query compatibility stays out (§12).*
 
+**FR-10 · Non-UTF-8 sources survive ingestion intact (MUST).** Storage and
+query stay UTF-8 end to end — tags and fields are Arrow `Utf8` columns
+(FR-2), and Parquet, Flight SQL and the JSON API all assume it. Support
+for other character sets is therefore a *boundary* obligation, in two
+halves:
+
+- **The write API accepts a declared encoding.** A
+  `Content-Type: …; charset=<enc>` parameter on the write endpoints (at
+  minimum: windows-1252/latin-1, shift_jis, gb18030, utf-16le/be)
+  transcodes the body to UTF-8 before the parser. No charset parameter
+  means UTF-8 — exactly today's contract, where a non-UTF-8 body is
+  refused whole with 400 before the WAL. A byte sequence invalid in the
+  *declared* encoding refuses the request naming the offending line
+  (FR-9's error style); declared-charset data is never silently
+  substituted.
+- **Tributary transcodes at the tail.** A source may declare its file
+  encoding; declared sources transcode losslessly or the offending line is
+  quarantined. Undeclared sources keep the agent's deliberate lossy
+  default (invalid sequences → U+FFFD, so one bad byte cannot poison a
+  5,000-line batch — Tributary `DESIGN.md` §4.2), but every replacement is
+  counted and reported, never silent.
+
+What is stored is the UTF-8 transcription; FR-5's primary-key dedup
+operates on that form. *Added 2026-08-12 at user request. Unimplemented
+today: the shipped contract is UTF-8-only at both boundaries (refuse-whole
+at the API, lossy replace in the agent) — this FR is the requirement to
+close that gap, not a description of current behaviour.*
+
 ## 4. Performance requirements (at reference workload & hardware)
 
 | ID | Requirement | Target | Evidence / bar to beat |
