@@ -1320,24 +1320,52 @@ impl Engine {
     }
 
     /// Recover the peer's acknowledged writes: replay every frame in the
-    /// replica WAL into the engine and flush. Overlap with rows the dead
-    /// peer had already flushed to S3 is safe — LWW dedup (FR-5) collapses
-    /// it at compaction. Idempotent: recovering twice re-applies the same
-    /// rows to the same primary keys. Returns the frame count replayed.
+    /// replica WAL into the engine, flush, and CONSUME what was replayed.
+    ///
+    /// Consumption is what makes this idempotent in the only sense that
+    /// matters. The first version re-applied the full WAL every time and
+    /// called itself idempotent because LWW dedup "collapses duplicate
+    /// keys at compaction" — but each recover ends in its own flush, so
+    /// the re-applied rows land in a NEW file, and cross-file dedup waits
+    /// for a compaction that needs `compact_min_files` files in one
+    /// partition. Two files never reach a threshold of four, so a second
+    /// recover doubled every recovered count on the serving read path,
+    /// durably (Catchment `ingester-kill`, 2026-08-13). Consuming the
+    /// frames turns the second recover into what an operator means by it:
+    /// apply what arrived since the first, which is also exactly the
+    /// catch-up flow after the peer returns and new frames stream in.
+    ///
+    /// The replica lock is held across seal → read → apply → flush →
+    /// consume. A frame arriving mid-recovery (peer back up) must not
+    /// slip between the read and the delete — it would be consumed
+    /// unapplied, which is acked loss. The peer's replication call blocks
+    /// or times out into degraded for the duration; a node mid-recovery
+    /// is not a reliable replica anyway, and degraded-not-failed is the
+    /// pair's documented answer to that (PR-7). Crash between the flush
+    /// and the delete re-applies one recovery's frames — the narrow tail
+    /// of the old bug, closed by the next compaction. The other order
+    /// would turn that crash into data loss, which is never the trade.
     ///
     /// Phase-2 scope: recovery is an explicit operation (the drill and, in
     /// production, an operator or the router on a confirmed peer death).
     /// Automatic health-triggered failover is a later cluster phase.
+    /// Returns the frame count replayed.
     pub fn recover_from_replica(&self) -> std::io::Result<usize> {
+        let mut g = self.replica_wal.lock().expect("replica wal lock");
+        let wal = g
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("replica WAL not enabled"))?;
         let dir = self
             .replica_wal_dir
             .read()
             .expect("replica dir lock")
             .clone()
             .ok_or_else(|| std::io::Error::other("replica WAL not enabled"))?;
-        // Reopen to read the full durable set. The peer is dead in the
-        // recovery scenario, so no new frames race this.
-        let (_wal, frames) = Wal::open(&dir)?;
+        // Seal everything received so far; frames arriving after this
+        // recover belong to the next one. The fresh generation rotate()
+        // opens is where they will land.
+        let sealed = wal.rotate()?;
+        let (_reader, frames) = Wal::open(&dir)?;
         let n = frames.len();
         for (db, mult, body) in frames {
             let text = String::from_utf8_lossy(&body);
@@ -1346,10 +1374,11 @@ impl Engine {
             }
         }
         self.flush_all().map_err(std::io::Error::other)?;
+        wal.delete_generations_upto(sealed)?;
         self.cl2_recovered.fetch_add(n as u64, Ordering::Relaxed);
         tracing::info!(
             frames = n,
-            "CL2 recovery complete: peer's writes replayed and flushed"
+            "CL2 recovery complete: peer's writes replayed, flushed, and consumed"
         );
         Ok(n)
     }

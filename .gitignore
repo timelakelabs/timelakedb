@@ -19,3 +19,4 @@ docs/evidence/TimeLoadDB.png
 # lets it run unattended (personal, not a repo contract).
 ops/logs/
 .claude/settings.local.json
+/target-linux/
