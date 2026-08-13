@@ -133,6 +133,19 @@ jobs:
           token: ${{ steps.app.outputs.token }}
           path: .catchment
 
+      # Tier 1 includes scenarios that feed the database through Tributary,
+      # so the suite needs Tributary's corpus generator on disk — not just
+      # TimeLakeDB. Without it `catchment doctor` reports the prerequisite
+      # MISSING and exits 2, and because the step runs under `bash -e` the
+      # `ci` line never executes at all: the job fails having tested nothing.
+      # Catchment's own workflow has always checked out both products; this
+      # one had not, which is why that job went green and this one did not.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Tributary
+          token: ${{ steps.app.outputs.token }}
+          path: .tributary
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -158,6 +171,7 @@ jobs:
         working-directory: .catchment
         env:
           CATCHMENT_TIMELAKE_DIR: ${{ github.workspace }}
+          CATCHMENT_TRIBUTARY_DIR: ${{ github.workspace }}/.tributary
         run: |
           python -m catchment doctor
           python -m catchment ci --tier 1 --up --no-build
