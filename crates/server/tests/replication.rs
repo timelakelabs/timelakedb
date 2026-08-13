@@ -157,3 +157,89 @@ async fn a_lone_node_has_no_replicator_and_writes_normally() {
         "a lone node must not emit CL-2 metrics"
     );
 }
+
+// ---- P1-1 D1: a slow peer must not become an ingest outage -------------
+
+/// The failure this bounds is a *slow* peer, not a dead one.
+///
+/// A dead peer trips to degraded on the first refused connection and
+/// availability holds — that path was already covered. A slow peer trips
+/// nothing: it accepts the connection and simply never answers, so before
+/// D1 every write paid the full timeout before its ack. At the reference
+/// workload's ~232 events/s that is an ingest outage rather than a hiccup,
+/// and it is exactly the shape of the InfluxDB 1.x gaps this design came
+/// from (`docs/P1-1_DESIGN.md` §2).
+///
+/// So this pins the bound itself: a peer that accepts and then stalls costs
+/// the configured timeout and no more, and the write still succeeds because
+/// availability outranks the second replica.
+#[test]
+fn a_stalled_peer_costs_the_timeout_and_no_more() {
+    use std::io::Read;
+
+    // A listener that accepts and then reads forever without replying.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        listener.set_nonblocking(false).expect("blocking listener");
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    // Consume the request and never respond.
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    std::thread::sleep(std::time::Duration::from_millis(2_000));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let timeout_ms = 250;
+    let r = timelake_server::replication::Replicator::new(
+        "stalled-peer",
+        &addr.to_string(),
+        timeout_ms,
+    );
+
+    let started = std::time::Instant::now();
+    let acked = r.replicate("db", 1, b"cpu,host=a v=1i 1");
+    let elapsed = started.elapsed();
+
+    assert!(
+        !acked,
+        "a peer that never answers must not be reported as durable"
+    );
+    // The ceiling is the point. Generous upper bound so the assertion is
+    // about the bound existing, not about scheduler jitter; it would have
+    // been ~5 s before D1, which is what would fail here.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_000),
+        "a stalled peer cost {elapsed:?}, which is not bounded by the {timeout_ms} ms timeout"
+    );
+    assert!(
+        r.stats()
+            .degraded
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "a stalled peer must raise the degraded gauge, exactly as a dead one does"
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(addr); // unblock accept()
+    let _ = handle.join();
+}
+
+/// The default is a deliberate value, not an accident: it must stay far
+/// below any plausible healthy round-trip so that slow and dead collapse
+/// into one case.
+#[test]
+fn the_default_replication_timeout_is_sub_second() {
+    let d = timelake_server::EngineConfig::default();
+    assert_eq!(d.repl_timeout_ms, 250);
+    assert!(
+        d.repl_timeout_ms < 1_000,
+        "a second or more here reintroduces the stall D1 exists to bound"
+    );
+}

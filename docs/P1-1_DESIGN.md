@@ -84,11 +84,19 @@ coupling is new and has never been measured.
 Four changes, smallest first. Each is independently useful; the first is
 most of the value.
 
-**D1 · Cut the replication timeout to ~250 ms.** The contract is unchanged —
+**D1 · Cut the replication timeout to ~250 ms. — LANDED 2026-08-13.** The contract is unchanged —
 durable on two nodes, or loudly degraded — but the damage a slow peer can do
 becomes bounded. Slow becomes indistinguishable from dead, which is the safe
 direction and already the module's stated philosophy. One constant, and it
 is the single highest-value line in this document.
+
+  Shipped as `TIMELAKE_REPL_TIMEOUT_MS`, default 250 ms, rather than as a
+  constant: the right value is a property of a deployment's network, and
+  `timelake_cl2_replication_degraded_events` already makes a
+  too-aggressive setting visible as flapping rather than as silence.
+  Pinned by `a_stalled_peer_costs_the_timeout_and_no_more`, which stalls a
+  real socket instead of closing it — a dead-peer test would pass either
+  side of this change and prove nothing.
 
 **D2 · Give the internal listener its own admission control.** A semaphore
 sized independently of the ingest path, plus a body limit, so a querier's
