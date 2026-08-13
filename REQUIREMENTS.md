@@ -1,13 +1,27 @@
 # TimeLakeDB — Requirements
 
 **Status:** Draft v1 · 2026-08-08
-**Evidence base:** Every requirement below traces to a measured result from
-the tsdb-bench evaluation (`../Gauge/docs/BENCHMARK_RESULTS.md`, raw records in
-`../Gauge/bench/results/`), in which five engines ran the identical workload:
-InfluxDB 1.8 (OOM-killed by a query), InfluxDB 2.7 (funnel never completed),
-QuestDB and VictoriaMetrics (prior trials, OOM on the same query shape), and
-InfluxDB 3 Core (passed everything). TimeLakeDB must beat the survivor and
-must be structurally incapable of the four failures.
+
+**What these requirements serve.** Three promises, each a structural
+property rather than a tuning guide: *cardinality costs a column, not an
+index*; *no query can kill the server*; *you decide what data lives, and for
+how long*. Every requirement below exists to make one of those true and to
+keep it true as a deployment grows.
+
+**Evidence base.** The promises are measurements, not preferences. Five
+engines ran an identical high-cardinality workload, and their failures are
+why each promise is stated as an absolute rather than a target: InfluxDB 1.8
+(OOM-killed by a single query), InfluxDB 2.7 (funnel never completed, 12×
+ingest decay), QuestDB and VictoriaMetrics (OOM on the same query shape),
+InfluxDB 3 Core (passed everything, and so sets the baselines to beat).
+TimeLakeDB must beat the survivor and be structurally incapable of the four
+failures. The evaluation is in `../Gauge/docs/BENCHMARK_RESULTS.md`, raw
+records in `../Gauge/bench/results/`.
+
+That evaluation is the *evidence* for these requirements, not their subject.
+A requirement that can only be stated in terms of one workload's table names
+is a requirement about the benchmark rather than about the database, and
+belongs in Gauge's scenario definitions instead.
 
 
 ---
@@ -43,15 +57,23 @@ seconds — on the same node that is ingesting.*
 
 ## 2. Reference workload (normative)
 
-These numbers define "full scale" everywhere below. They are the real
-workload profile the evaluation simulated, and the acceptance harness
-generates them deterministically.
+These numbers define "full scale" everywhere below. A latency or memory
+requirement is meaningless without a fixed yardstick, so this is one: the
+profile the evaluation simulated, generated deterministically by the
+acceptance harness.
+
+It is a **calibration instrument, not a description of what TimeLakeDB is
+for.** The database is for the three promises stated at the top of this
+document; this workload is the measurement rig that shows whether they hold. The concrete column names
+below belong to Gauge's scenario definitions — they are named here only so
+a number can be traced back to the run that produced it, and no requirement
+in this document is expressed in terms of them.
 
 | Dimension | Value |
 |---|---|
-| Entities (`product_id`) | 1,000,000 new per day, never repeating |
-| Pipeline events | 10 steps × start/stop ≈ 20M events/day (~232/s avg) |
-| Event tags | entity id (~2M distinct per 2-day window), step (10), event (2), route (4), worker_ip (~500) |
+| High-cardinality entity id (`product_id` in the harness) | 1,000,000 new per day, never repeating |
+| Event stream | 10 steps × start/stop ≈ 20M events/day (~232/s avg) |
+| Event tags | entity id (~2M distinct per 2-day window), step (10), event (2), route (4), source address (~500) |
 | Burst pattern | 100,000 events delivered at once |
 | Fleet metrics | 2,500 hosts × (1 rollup + 7 disk devices) every 10 s ≈ 2,000 points/s |
 | Timestamps | nanosecond precision; slightly-future timestamps are legitimate |
