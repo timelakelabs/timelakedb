@@ -13,6 +13,32 @@ here.
 
 ## [Unreleased]
 
+### Fixed — a querier returned every row N times under concurrent reads (2026-08-13)
+
+Found by Catchment's `read-gate` scenario on its first real execution.
+Detail: `docs/FINDING_catalog_catch_up_race.md`.
+
+- **`Catalog::catch_up()` was not atomic between reading the head and
+  publishing it.** The `files` mutex covered only the apply, so N concurrent
+  callers all read the same stale head, all selected the same manifest
+  entries, and all applied them — and `apply_entry` pushed unconditionally.
+  One manifest entry became N copies of the same file, and every later query
+  scanned it N times.
+- A querier folds the log forward on **every** query, so concurrent queries
+  meant concurrent `catch_up`. Measured on a live cluster from a single
+  flush: 10,000 rows on the ingester, 80,000 on one querier, 60,000 on
+  another. `COUNT(DISTINCT)` was correct throughout — nothing was lost,
+  everything was counted repeatedly, which falsifies the CL-3 claim that
+  counts are exact seconds after ingest.
+- `catch_up` now takes `commit_lock` for the whole sequence, as `commit`
+  always has; the body moved to `catch_up_locked` so the commit retry path,
+  which already holds that lock, does not deadlock on a non-reentrant mutex.
+  `apply_entry` additionally dedups by file path — folding a log into a set
+  should be idempotent whoever calls it.
+- The over-count was the dangerous direction: a short count is visibly
+  wrong, while `COUNT(*)` returning eight times the truth reads as a healthy
+  system with more data than expected.
+
 ### Added — the intra-cluster listener bounds what a querier can cost an ingester (2026-08-13)
 
 Design: `docs/P1-1_DESIGN.md` D2.

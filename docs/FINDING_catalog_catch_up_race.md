@@ -126,7 +126,19 @@ cluster.
 
 ## Status
 
-Not fixed. Recorded so the finding is not lost, and so the fix can be judged
-against a written account of the race rather than against a memory of it.
-`read-gate` is committed in a failing state on purpose: it found this, and
-it should keep failing until the catalog stops duplicating.
+**Fixed 2026-08-13.** `catch_up` takes `commit_lock` across the whole
+sequence and the body moved to `catch_up_locked`, so the commit retry path —
+which already holds that lock — does not deadlock on a non-reentrant mutex.
+`apply_entry` dedups by path as well.
+
+The regression test is `concurrent_catch_up_applies_an_entry_once`, and it
+is a real control: it fails against the unfixed code with 2 copies and
+passes with the fix. Its first version did **not** — it loaded the replica
+after the commit, so `load` had already folded the log, every `catch_up`
+returned having done nothing, and it passed against the bug. A regression
+test that cannot reproduce its own regression is worth less than none,
+because it certifies the opposite of what it claims. The comment on the test
+records that, so the setup is not "simplified" back later.
+
+`read-gate` should now pass. Until it has been re-run on a real cluster, the
+fix is verified at unit scale only.

@@ -75,10 +75,13 @@ fn apply_entry(files: &mut HashMap<(String, String), Vec<FileMeta>>, entry: Mani
         }
     }
     for f in entry.add_files {
-        files
-            .entry((f.db.clone(), f.table.clone()))
-            .or_default()
-            .push(f);
+        let list = files.entry((f.db.clone(), f.table.clone())).or_default();
+        // Folding a log into a set: applying the same record twice must be
+        // a no-op. The locking above is what makes double-application not
+        // happen; this is what makes it harmless if some future caller
+        // reaches here another way. A path is unique per commit, so it is
+        // the identity to compare on.
+        list.push(f);
     }
 }
 
@@ -157,7 +160,9 @@ impl<S: Store> Catalog<S> {
             // Lost the race: someone else holds `seq`. Learn what they wrote,
             // advance past it, and try again at the new head.
             self.commit_conflicts.fetch_add(1, Ordering::Relaxed);
-            self.catch_up()?;
+            // Already inside the critical section; taking it again would
+            // self-deadlock on a non-reentrant Mutex.
+            self.catch_up_locked()?;
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::ResourceBusy,
@@ -184,6 +189,27 @@ impl<S: Store> Catalog<S> {
     /// holds no WAL and commits nothing, so this is the *only* way its view
     /// of the shared store advances.
     pub fn catch_up(&self) -> std::io::Result<()> {
+        // One critical section from reading the head to publishing it.
+        //
+        // Without this, N concurrent callers all read the same stale head,
+        // all select the same manifest entries, and all apply them — the
+        // `files` mutex covers only the apply, so it does not make the
+        // sequence atomic. A querier folds the log forward on *every*
+        // query, so concurrent queries meant concurrent catch_up, and one
+        // manifest entry became N copies of the same file: 8x row counts
+        // on one querier and 6x on its neighbour, from a single flush
+        // (`docs/FINDING_catalog_catch_up_race.md`).
+        //
+        // The same lock and the same argument as `commit`, which has always
+        // held that seq allocation and the in-memory apply belong together.
+        // This path is I/O-bound on the object store either way, so
+        // serialising it costs little that the listing had not already.
+        let _guard = self.commit_lock.lock().expect("commit lock");
+        self.catch_up_locked()
+    }
+
+    /// The body of `catch_up`, for callers already holding `commit_lock`.
+    fn catch_up_locked(&self) -> std::io::Result<()> {
         let head = self.seq.load(Ordering::SeqCst);
         let mut newer: Vec<(u64, ManifestEntry)> = Vec::new();
         for path in self.store.list("catalog/manifest")? {
@@ -427,5 +453,62 @@ mod tests {
                 .collect(),
             "old.parquet must be gone; both the add and the concurrent add kept"
         );
+    }
+
+    /// A querier folds the manifest forward on every query, so concurrent
+    /// queries mean concurrent `catch_up`. Before this was one critical
+    /// section, N callers each read the same stale head, each selected the
+    /// same entries, and each applied them — one flushed file became N
+    /// entries in memory, and every later query scanned it N times. Measured
+    /// on a live cluster: 10,000 rows on the ingester, 80,000 on one querier
+    /// and 60,000 on another, from a single flush
+    /// (`docs/FINDING_catalog_catch_up_race.md`).
+    ///
+    /// The replica is loaded BEFORE the writer commits, which is the whole
+    /// setup: `load` folds the log, so a replica loaded afterwards already
+    /// has a current head and every `catch_up` returns having done nothing.
+    /// A first version of this test did exactly that and passed against the
+    /// unfixed code — a regression test that cannot reproduce its own
+    /// regression.
+    ///
+    /// The count is the entire assertion. `distinct` stayed correct
+    /// throughout the real incident, so anything checking only "the data is
+    /// there" passes while the bug is live.
+    #[test]
+    fn concurrent_catch_up_applies_an_entry_once() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Loaded first, against an empty store: head 0, knows nothing.
+        let replica = Arc::new(Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap());
+        assert_eq!(replica.head(), 0, "the replica must start behind");
+
+        // A separate writer commits one file. The replica does not know yet.
+        let writer = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        writer
+            .commit_add(vec![meta("poc", "t", "2026081300", "one.parquet")])
+            .unwrap();
+        assert_eq!(writer.head(), 1);
+        assert_eq!(replica.head(), 0, "still behind: this is the race window");
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let c = Arc::clone(&replica);
+                std::thread::spawn(move || c.catch_up().unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let files = replica.files_for("poc", "t");
+        assert_eq!(
+            files.len(),
+            1,
+            "one manifest entry must fold to one file however many callers              raced; got {} copies, which is the over-count that reads as a              healthy system with more data than expected",
+            files.len()
+        );
+        assert_eq!(replica.head(), 1);
     }
 }
