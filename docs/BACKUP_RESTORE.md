@@ -118,9 +118,9 @@ Stop anything using the target volume first — the script refuses otherwise,
 because restoring underneath a live server corrupts the catalog.
 
 ```sh
-docker compose -f bench/compose/timelakedb.yml down
+docker compose -f deploy/compose/timelakedb.yml down
 ./ops/tldb-backup.sh restore -f timelake-backup-20260808-214500.tgz --recreate
-docker compose -f bench/compose/timelakedb.yml up -d
+docker compose -f deploy/compose/timelakedb.yml up -d
 ```
 
 `--recreate` deletes and recreates the volume so the restore lands on empty
@@ -179,7 +179,7 @@ roughly (days retained × 0.50 GB) per archive.
 
 ## Recorded results
 
-AT-5, full scale, on the evaluation box (`bench/results/`, M5 milestone):
+AT-5, full scale, on the evaluation box (`docs/evidence/`, M5 milestone):
 
 | Step | Result |
 |---|---|

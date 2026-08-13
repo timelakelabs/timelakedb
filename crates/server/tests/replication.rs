@@ -6,7 +6,7 @@
 //! it queryable, and receiving before the replica WAL is enabled is a clean
 //! error rather than a panic. The over-the-network replication, degraded
 //! mode, and the SIGKILL-zero-loss property are drilled live
-//! (`bench/results/cl2-replication-drill.log`).
+//! (`docs/evidence/cl2-replication-drill.log`).
 
 use std::sync::Arc;
 

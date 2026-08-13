@@ -51,4 +51,4 @@ Pass criteria:
 Conventional message + evidence in body; end with the session's
 Co-Authored-By/Claude-Session trailers. Update README "Status" + CLAUDE.md
 status bullet with the gate numbers. run.json lands in
-`bench/results/<run-id>/` — cite it.
+`docs/evidence/<run-id>/` — cite it.

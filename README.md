@@ -43,7 +43,7 @@ VictoriaMetrics OOMs) define what it must be structurally incapable of.
 `site/index.html` in a browser to preview it. `.github/workflows/pages.yml`
 publishes the directory on every push that touches it; enable it once per
 repository under **Settings → Pages → Source: GitHub Actions**. Every figure
-on the site traces to a run under `bench/results/`.
+on the site traces to a run under `docs/evidence/`.
 
 ## Status: C2 phase 4 — the cluster reads without losing freshness
 
@@ -71,7 +71,7 @@ replication, the router, and now the stateless querier.
   drove the whole cluster through the router's single address: 323K
   lines/s, all five Shape B queries complete, and `rows_48h` = 77,806 —
   exactly what one node returns.
-- Drills: `bench/results/cl2-replication-drill.log` (12/12),
+- Drills: `docs/evidence/cl2-replication-drill.log` (12/12),
   `router-sharding-drill.log` (8/8), `cl3-querier-drill.log` (19/19).
 
 Still to come in C2: the compactor role and its singleton lease.
@@ -108,8 +108,8 @@ Shape A latency is Docker Desktop port forwarding
   clients differ: `Bearer` for Grafana's Flight SQL and Tributary, `Token`
   for Telegraf v2, `Basic` for Telegraf v1 — a mechanism chosen from a
   recorded client probe rather than from the specifications.
-- Drills: `bench/results/sec4-auth-drill.log`,
-  `bench/results/data-auth-drill.log`.
+- Drills: `docs/evidence/sec4-auth-drill.log`,
+  `docs/evidence/data-auth-drill.log`.
 
 ### Previous: C0 — S3 object store with KMS envelope encryption
 
@@ -122,7 +122,7 @@ Shape A latency is Docker Desktop port forwarding
   56 uncached**, confirmed by LocalStack's own API log.
 - `Store` gained `put_if_absent` — the compare-and-swap primitive
   (S3 `If-None-Match`) that C1's multi-writer catalog needs.
-- Drill: `bench/results/c0-s3-drill.log`.
+- Drill: `docs/evidence/c0-s3-drill.log`.
 
 ### Previous: runtime retention management + console
 
@@ -152,7 +152,7 @@ Shape A latency is Docker Desktop port forwarding
   aggregation, so a `COUNT(*)` cannot count a hidden row. Unlabeled rows
   are public; malformed labels are visible to no one. Labels are ordinary
   dictionary tags: no write-path ceremony, FR-2 economics.
-- **Drill** (`bench/results/sec12-drill.log`): HTTP and Flight SQL
+- **Drill** (`docs/evidence/sec12-drill.log`): HTTP and Flight SQL
   enforce identically on buffer and Parquet paths; everything at rest is
   ciphertext (data *and* manifests); restart recovers through encrypted
   manifests; the smoke suite on the same image is unchanged (0 errors,
@@ -169,7 +169,7 @@ Shape A latency is Docker Desktop port forwarding
   atomic swap; triggers are a 2 s file watcher and POST
   `/admin/tls/reload`; `/metrics` exports
   `timelake_tls_cert_expiry_seconds` and `timelake_tls_last_reload_ok`.
-- **AT-7 drill 19/19** (`bench/results/at7-drill.log`): under stock
+- **AT-7 drill 19/19** (`docs/evidence/at7-drill.log`): under stock
   Telegraf-over-HTTPS plus sustained writes, rotating to a fresh 24 h
   cert landed mid-flight in a 20 s Flight SQL query (219B-combo SUM,
   result exact) — zero write errors, zero dropped connections, both
@@ -276,7 +276,7 @@ source and the restored copy (40,327,616). Runbook: `docs/BACKUP_RESTORE.md`.
 
 The benchmark harness is the specification. Every milestone gates on a
 `bench/bench.py run --backend timelakedb` result, compared against the recorded
-InfluxDB 3 baselines in `bench/results/`.
+InfluxDB 3 baselines in `docs/evidence/`.
 
 ## License
 

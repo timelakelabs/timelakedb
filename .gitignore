@@ -2,14 +2,14 @@
 target/
 
 # Benchmark targets' data volumes — never in git
-bench/compose/data/
+deploy/compose/data/
 
 # Python
 __pycache__/
 *.pyc
 
 # AT-7 drill certs are throwaway, minted per run by gen-certs.sh
-bench/compose/tls-drill/certs/
+deploy/compose/tls-drill/certs/
 
 # Brand sheet: a local design asset, not a repo artifact. The palette and
 # mark it defined now live in site/assets/ (style.css, logo.svg).

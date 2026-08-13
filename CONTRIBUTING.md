@@ -111,7 +111,7 @@ a LocalStack service container on every push — the `Store` contract over
 S3 including range reads, the KMS envelope round-trip, and the two-writer
 catalog CAS over `If-None-Match`. So the exclusion above means "covered by
 another job", not "not covered". To run them yourself, bring up the C0 rig
-(`bench/compose/timelakedb-s3.yml`) and:
+(`deploy/compose/timelakedb-s3.yml`) and:
 
 ```bash
 AWS_ENDPOINT_URL=http://localhost:4566 AWS_REGION=us-east-1 \
@@ -143,7 +143,7 @@ python bench/bench.py run --backend timelakedb --scale laptop --label my-change 
 python bench/bench.py compare <baseline-run> <my-change-run>
 ```
 
-Recorded runs live in `bench/results/`; the InfluxDB 3 runs there are the
+Recorded runs live in `docs/evidence/`; the InfluxDB 3 runs there are the
 baselines to beat. Do not invent a new measurement method for a change — if
 the harness cannot express what you are claiming, extend the harness (see
 "Adding a backend" and the scenario definitions in `bench/scenarios.py`) so

@@ -1,7 +1,7 @@
 //! Data-plane credentials (SEC-4 phased).
 //!
 //! WHY TOKENS AND NOT PASSWORDS OR HEADERS: the mechanism was chosen by
-//! measurement, not preference (`bench/results/data-auth-client-probe.log`).
+//! measurement, not preference (`docs/evidence/data-auth-client-probe.log`).
 //! Grafana's InfluxDB datasource in Flight SQL mode forwards exactly one
 //! credential onto the gRPC path — the `token` field, as
 //! `authorization: Bearer <token>`. Its basic-auth toggle and its custom
