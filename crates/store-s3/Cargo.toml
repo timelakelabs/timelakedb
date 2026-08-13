@@ -7,8 +7,15 @@ license.workspace = true
 [dependencies]
 timelake-store = { path = "../store" }
 aws-config = "1"
-aws-sdk-s3 = "1"
-aws-sdk-kms = "1"
+# default-features = false drops one feature only: `rustls`, which is
+# aws-smithy-runtime/tls-rustls -> legacy-rustls-ring -> rustls 0.21.
+# That old stack carries rustls-webpki 0.101.7 and three advisories
+# (GHSA-82j2-j2ch-gfr8 high, plus two low). The modern stack is already
+# here via default-https-client -> rustls-aws-lc -> rustls 0.23, so the
+# legacy one was compiled in beside it for nothing. Everything else the
+# defaults enable is listed back explicitly.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 tokio = { workspace = true }
 tracing.workspace = true
 

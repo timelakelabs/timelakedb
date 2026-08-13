@@ -168,6 +168,40 @@ follow from "no authentication" and are listed so you can design around them.
     read access to the bucket itself. A querier is only as private as its
     ingesters' cluster addresses.
 
+## Dependency advisories
+
+Advisories against crates in the dependency tree, and what was done about
+each. Recorded here rather than left as open alerts in a dashboard, because
+"we looked and it does not reach us" is a claim like any other and should be
+written down where it can be argued with.
+
+**Closed 2026-08-13 — three advisories against `rustls-webpki` 0.101.7**
+(GHSA-82j2-j2ch-gfr8, high, denial of service via panic on a malformed CRL;
+GHSA-xgp8-3hg3-c2mh and GHSA-965h-392x-2mh5, low, name-constraint parsing).
+Neither was reachable: rustls only parses a CRL if the client is configured
+with one, and the AWS SDK does not configure any. They are closed anyway,
+and at the root rather than by pinning. `aws-sdk-s3` and `aws-sdk-kms` carry
+`rustls` in their *default* features, which resolves through
+`aws-smithy-runtime/tls-rustls` to `legacy-rustls-ring` and so to rustls
+0.21. Their `default-https-client` default already supplies the current
+stack (`rustls-aws-lc`, rustls 0.23), so the obsolete TLS implementation was
+being compiled into the binary beside the one actually in use. Turning that
+one feature off removes it entirely.
+
+**Open — `thrift` 0.17.0, GHSA-2f9f-gq7v-9h6m** (medium, CVSS 5.3,
+availability only: memory allocation with an excessive size value). It
+arrives as `parquet` → `datafusion` → this workspace, and the fix is thrift
+0.23, a 0.x major change that no lockfile update can cross — arrow-rs has to
+move first, and there is nothing to pin here in the meantime.
+
+The reachable path would be parsing Parquet metadata from an untrusted
+source. TimeLakeDB reads Parquet that TimeLakeDB wrote, from its own object
+store, so reaching it means already holding write access to the bucket, at
+which point the object store itself is the larger problem. The assessment changes
+the moment this database is pointed at files it did not produce; if that
+becomes a supported mode, this advisory becomes blocking rather than
+deferred.
+
 ## Deploying it safely today
 
 - **Do not expose 1963 or 1964 to an untrusted network.** Bind to `127.0.0.1`
