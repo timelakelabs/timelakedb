@@ -98,7 +98,14 @@ is the single highest-value line in this document.
   real socket instead of closing it — a dead-peer test would pass either
   side of this change and prove nothing.
 
-**D2 · Give the internal listener its own admission control.** A semaphore
+**D2 · Give the internal listener its own admission control.** *Not yet
+landed — but investigating it found a live defect first, fixed 2026-08-13:
+the listener had no body limit, so axum’s 2 MiB default silently refused
+any replication frame above it and dropped the node to degraded. Both
+listeners now share `TIMELAKE_MAX_BODY_BYTES` (32 MiB). The semaphore
+below is still to do.*
+
+The remaining work: A semaphore
 sized independently of the ingest path, plus a body limit, so a querier's
 fan-out cannot consume an ingester's capacity. Refusing a snapshot is an
 honest outcome that the querier already handles — it refuses the query

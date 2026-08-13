@@ -78,6 +78,21 @@ pub struct EngineConfig {
     /// makes a too-aggressive value visible as flapping rather than as
     /// silence.
     pub repl_timeout_ms: u64,
+    /// Largest accepted HTTP body, on the public data plane and on the
+    /// intra-cluster listener alike.
+    ///
+    /// FR-1 requires >=10 MB bodies. axum's `Bytes` extractor defaults to
+    /// 2 MB, which silently broke that contract in two places at once: a
+    /// large batch was refused with 413 on `/write`, and a large *frame*
+    /// was refused the same way by the peer's `/internal/v1/replicate` —
+    /// which the replicator reads as a failed peer, so the node dropped to
+    /// degraded and "durable on two nodes" stopped holding, with an alarm
+    /// that looked unexplained.
+    ///
+    /// Both routers take this one value on purpose. If the public limit
+    /// ever exceeded the internal one, every write between the two sizes
+    /// would be accepted locally and refused by its replica.
+    pub max_body_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -94,6 +109,7 @@ impl Default for EngineConfig {
             gc_grace_secs: 900,
             data_auth: timelake_auth::DataAuthMode::Off,
             repl_timeout_ms: 250,
+            max_body_bytes: 32 << 20, // 32 MiB: FR-1 asks for >=10 MB, with headroom
         }
     }
 }
@@ -818,6 +834,12 @@ impl Engine {
     /// SEC-4 principal/session store, shared with the admin router.
     pub fn auth(&self) -> Arc<timelake_auth::Auth> {
         self.auth.clone()
+    }
+
+    /// The largest HTTP body this node accepts, on either listener.
+    /// Read by both routers so they cannot disagree (FR-1).
+    pub fn max_body_bytes(&self) -> usize {
+        self.cfg.max_body_bytes
     }
 
     /// Runtime FR-7 policy surface (backs /admin/retention).
@@ -1766,7 +1788,8 @@ impl timelake_flight::SqlBackend for Engine {
 /// plane does not (that migration is its own milestone).
 pub fn app(engine: Arc<Engine>) -> axum::Router {
     let auth = engine.auth();
-    timelake_api::app(engine, auth, false)
+    let limit = engine.max_body_bytes();
+    timelake_api::app(engine, auth, false).layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
 /// The intra-cluster listener for an ingester (CL-2 replication, CL-3 live
@@ -1782,6 +1805,7 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
 /// publicly; it is the same trust boundary as read access to the object
 /// store itself.
 pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
+    let limit = engine.max_body_bytes();
     axum::Router::new()
         .route(
             "/internal/v1/replicate",
@@ -1798,6 +1822,9 @@ pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
         )
         .route("/internal/v1/health", axum::routing::get(|| async { "ok" }))
         .with_state(engine)
+        // Same ceiling as the public plane, from the same config value: a
+        // frame this listener refuses is a write its peer already took.
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
 /// What this node holds live, plus its catalog head (CL-3).
@@ -1968,6 +1995,7 @@ pub fn config_from_env() -> EngineConfig {
         query_timeout_secs: env("TIMELAKE_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
         gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
         repl_timeout_ms: env("TIMELAKE_REPL_TIMEOUT_MS", d.repl_timeout_ms),
+        max_body_bytes: env("TIMELAKE_MAX_BODY_BYTES", d.max_body_bytes),
         // A typo here must refuse to start, not silently disable
         // authentication — the same posture as a malformed encryption key.
         data_auth: match std::env::var("TIMELAKE_DATA_AUTH") {
