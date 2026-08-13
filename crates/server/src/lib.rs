@@ -59,6 +59,25 @@ pub struct EngineConfig {
     /// `Off` (default) does not read `Authorization` at all — the
     /// documented compatibility contract. See `timelake_auth::guard`.
     pub data_auth: timelake_auth::DataAuthMode,
+    /// CL-2: how long a write waits for the replication peer before the
+    /// node declares itself degraded and acks on local durability alone.
+    ///
+    /// This bounds what a *slow* peer can do to ingest, which is the
+    /// failure a *dead* peer does not have: dead trips to degraded at once
+    /// and availability holds, while slow never trips anything and simply
+    /// multiplies every write's latency. Replication is synchronous before
+    /// the ack, so this value is a per-write latency ceiling — at the
+    /// reference workload's ~232 events/s, seconds here are an ingest
+    /// outage rather than a hiccup (`docs/P1-1_DESIGN.md` D1).
+    ///
+    /// The default is deliberately far below any plausible healthy
+    /// round-trip on a cluster network, so that "slow" and "dead" become
+    /// the same case — the safe direction, and the one the alarm already
+    /// describes. Raise it only with a measurement showing healthy peers
+    /// legitimately exceed it; `timelake_cl2_replication_degraded_events`
+    /// makes a too-aggressive value visible as flapping rather than as
+    /// silence.
+    pub repl_timeout_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -74,6 +93,7 @@ impl Default for EngineConfig {
             query_timeout_secs: 600,
             gc_grace_secs: 900,
             data_auth: timelake_auth::DataAuthMode::Off,
+            repl_timeout_ms: 250,
         }
     }
 }
@@ -1947,6 +1967,7 @@ pub fn config_from_env() -> EngineConfig {
         max_concurrent_queries: env("TIMELAKE_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
         query_timeout_secs: env("TIMELAKE_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
         gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
+        repl_timeout_ms: env("TIMELAKE_REPL_TIMEOUT_MS", d.repl_timeout_ms),
         // A typo here must refuse to start, not silently disable
         // authentication — the same posture as a malformed encryption key.
         data_auth: match std::env::var("TIMELAKE_DATA_AUTH") {

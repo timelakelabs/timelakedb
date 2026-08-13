@@ -104,6 +104,9 @@ async fn main() {
     let cfg = timelake_server::config_from_env();
 
     tracing::info!(%addr, data_dir = %data_dir.display(), ?cfg, "timelakedb M3 starting");
+    // Read before the config moves into the engine; the replicator is built
+    // further down, once discovery has produced a peer.
+    let repl_timeout_ms = cfg.repl_timeout_ms;
     let engine = timelake_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
 
     // CL-2: an ingester replicates every write to its paired ingester before
@@ -124,6 +127,7 @@ async fn main() {
                 engine.set_replicator(timelake_server::replication::Replicator::new(
                     &peer.id,
                     &peer.address,
+                    repl_timeout_ms,
                 ));
             }
             None => tracing::warn!(

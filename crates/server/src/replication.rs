@@ -46,12 +46,19 @@ pub struct Replicator {
 }
 
 impl Replicator {
-    pub fn new(peer_id: &str, peer_addr: &str) -> Replicator {
+    pub fn new(peer_id: &str, peer_addr: &str, timeout_ms: u64) -> Replicator {
         // A short timeout: a slow peer must not stall the write path
         // indefinitely — a timeout is treated exactly like a down peer
         // (degraded), which is the safe direction (availability holds).
+        //
+        // This sits before the ack, so the timeout *is* the per-write
+        // latency ceiling a degrading peer can impose. Short by design, so
+        // that "slow" and "dead" collapse into one case: a dead peer trips
+        // to degraded immediately and availability holds, while a slow one
+        // trips nothing and simply multiplies every write's latency.
+        // See `docs/P1-1_DESIGN.md` D1.
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_millis(timeout_ms))
             .build()
             .expect("replication client");
         Replicator {
