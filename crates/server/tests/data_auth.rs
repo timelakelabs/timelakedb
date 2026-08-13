@@ -10,7 +10,7 @@
 //! The three header spellings are exercised against the real router —
 //! `Bearer` (Grafana/Tributary), `Token` (Telegraf v2), `Basic`
 //! (Telegraf v1, token as password) — because the probe that fixed this
-//! design (`bench/results/data-auth-client-probe.log`) says these are
+//! design (`docs/evidence/data-auth-client-probe.log`) says these are
 //! what stock clients actually send.
 
 use std::sync::Arc;

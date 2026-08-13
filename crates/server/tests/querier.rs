@@ -6,7 +6,7 @@
 //! lose a row (the watermark); a querier refuses writes; and a lone `all`
 //! node is untouched by any of it. The multi-container behaviour — killing a
 //! querier, killing an ingester, routing through the router — is drilled
-//! live (`bench/results/cl3-querier-drill.log`).
+//! live (`docs/evidence/cl3-querier-drill.log`).
 
 use std::sync::Arc;
 

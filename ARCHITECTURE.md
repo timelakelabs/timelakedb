@@ -442,7 +442,7 @@ re-propose at the new head. Bounded (100 attempts → `ResourceBusy`);
 commits are small and rare, contention negligible at this fleet size;
 `timelake_catalog_commit_conflicts_total` counts the races. Drilled on
 both the local hard-link and the real S3 `If-None-Match`
-(`bench/results/catalog-cas-drill.log`).
+(`docs/evidence/catalog-cas-drill.log`).
 
 One refinement is deferred to C2 with the role split: **re-validating
 the commit against the new state on conflict** — a compaction whose
@@ -509,7 +509,7 @@ the compactor role and its singleton lease.
   and flushing; overlap with rows the dead peer already flushed is safe
   because LWW dedup (FR-5) makes it idempotent. Drilled: SIGKILL an
   ingester, recover on the peer, zero acknowledged loss, exact count
-  (`bench/results/cl2-replication-drill.log`). **Deliberately deferred:**
+  (`docs/evidence/cl2-replication-drill.log`). **Deliberately deferred:**
   recovery is explicit here (operator / the router on a confirmed peer
   death); automatic health-triggered failover is a later phase.
   Transport is plaintext HTTP on `TIMELAKE_CLUSTER_ADDR` at C2, behind a
@@ -589,7 +589,7 @@ it: every peer is a node this deployment issued a certificate to.
 
 ### 12.6 LocalStack: the test-and-metrics rig
 
-`bench/compose/timelakedb-s3.yml` (C0: localstack `s3,kms` + an init
+`deploy/compose/timelakedb-s3.yml` (C0: localstack `s3,kms` + an init
 container that creates the bucket with default SSE-KMS + Bucket Keys
 and a KMS key + one `TIMELAKE_ROLE=all` node); `timelakedb-cluster.yml`
 (the write-path rig: router + ingester pair on local disks — CL-2
@@ -600,7 +600,7 @@ is only meaningful over a shared store, and this is also where two
 writers commit to one manifest log, so the C1 catalog CAS runs under real
 contention). The queriers there carry no volumes on purpose, so CL-4 is a
 property of the deployment rather than a claim. Drills recorded in
-`bench/results/`, in the repo's evidence style:
+`docs/evidence/`, in the repo's evidence style:
 
 - **C0 gate:** bench smoke against the S3-backed node — counts exact,
   0 errors; the drill log records KMS calls and S3 requests with the

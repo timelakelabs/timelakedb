@@ -81,7 +81,7 @@ follow from "no authentication" and are listed so you can design around them.
    `SELECT`, `SHOW`, `DESCRIBE` and `EXPLAIN` run; `COPY`, DDL, DML and
    session statements are refused — including a `COPY` hidden inside
    `EXPLAIN ANALYZE`. HTTP and Flight SQL share the one enforcement point
-   (`bench/results/sql-sandbox-drill.log`; the same request that wrote a
+   (`docs/evidence/sql-sandbox-drill.log`; the same request that wrote a
    root-owned Parquet file now returns a refusal and writes nothing).
    Arbitrary file *reads* remain unreachable (no `read_parquet`/`read_csv`
    table functions registered, and `CREATE EXTERNAL TABLE` is refused by
@@ -208,7 +208,7 @@ follow from "no authentication" and are listed so you can design around them.
 |---|---|---|
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
 | Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
-| Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`bench/results/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presents the token (P0-5, done — Tributary repo `bench/results/p05-data-auth.log`). |
+| Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`docs/evidence/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presents the token (P0-5, done — Tributary repo `docs/evidence/p05-data-auth.log`). |
 | Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session over Flight SQL. AT-7 still 19/19 with it enabled. `/api/sql` identity outstanding. |
 | Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |

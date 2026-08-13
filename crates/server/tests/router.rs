@@ -10,8 +10,8 @@
 //! Stub nodes rather than real engines on purpose — the question here is
 //! what the router sends and how it reacts, not what an ingester does with
 //! it. The end-to-end version is drilled live
-//! (`bench/results/router-sharding-drill.log`,
-//! `bench/results/cl3-querier-drill.log`).
+//! (`docs/evidence/router-sharding-drill.log`,
+//! `docs/evidence/cl3-querier-drill.log`).
 
 use std::sync::{Arc, Mutex};
 

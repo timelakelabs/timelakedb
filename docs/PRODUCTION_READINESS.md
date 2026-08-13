@@ -133,7 +133,7 @@ rewrite is recorded in `docs/evidence/P0-1-ci.md`.
 
 ### P0-2 · `/api/sql` writes files as root  ⟂ **DONE (2026-08-10)**
 
-**Effort: M. Shipped** — read-only SQL guard at the plan + non-root, read-only-rootfs container; drill `bench/results/sql-sandbox-drill.log`. The original text is kept below for the record.
+**Effort: M. Shipped** — read-only SQL guard at the plan + non-root, read-only-rootfs container; drill `docs/evidence/sql-sandbox-drill.log`. The original text is kept below for the record.
 
 **Effort: M.** SECURITY.md exposures 2 and 4 **compound into remote code
 execution territory**, and this is verified, not theoretical: a single
@@ -171,7 +171,7 @@ front door (exposure 7): `X-TimeLake-Authorizations: admin` is a claim
 anyone can make.
 
 The mechanism was chosen by measurement, not preference — see
-`bench/results/data-auth-client-probe.log`. Grafana's Flight SQL path
+`docs/evidence/data-auth-client-probe.log`. Grafana's Flight SQL path
 forwards **only** the InfluxDB `token` field, as
 `authorization: Bearer <token>`; its basic-auth toggle and custom
 headers are HTTP-only and never reach gRPC. So the design is forced:
@@ -197,7 +197,7 @@ how a fleet goes down at once.
 
 ### P0-4 · Catalog commits are not atomic against a second writer  ⟂ **DONE (2026-08-10)**
 
-**Effort: M. Shipped** — CAS on the next manifest sequence (`put_if_absent`), catch-up-and-retry on conflict, `timelake_catalog_commit_conflicts_total`; drilled on local hard-link and real S3 If-None-Match (`bench/results/catalog-cas-drill.log`). Original text below.
+**Effort: M. Shipped** — CAS on the next manifest sequence (`put_if_absent`), catch-up-and-retry on conflict, `timelake_catalog_commit_conflicts_total`; drilled on local hard-link and real S3 If-None-Match (`docs/evidence/catalog-cas-drill.log`). Original text below.
 
 **Effort: M.** The CAS primitive exists — `Store::put_if_absent`, S3
 `If-None-Match`, local hard-link publish, built during C0 — but **catalog
@@ -212,7 +212,7 @@ This is C1 in `ARCHITECTURE.md` §12 and it gates everything in P2.
 
 ### P0-5 · Tributary cannot authenticate  ⟂ **DONE (2026-08-10)**
 
-**Shipped** (Tributary repo) — `TRIBUTARY_TOKEN`/`token_file`, redacted two ways, a 401 spools rather than drops, drilled 10/10 against a required-mode node (`bench/results/p05-data-auth.log`). Original text below.
+**Shipped** (Tributary repo) — `TRIBUTARY_TOKEN`/`token_file`, redacted two ways, a 401 spools rather than drops, drilled 10/10 against a required-mode node (`docs/evidence/p05-data-auth.log`). Original text below.
 
 **Effort: S once P0-3 lands.** The moment TimeLakeDB can require a
 credential, a shipper that cannot present one is not deployable.

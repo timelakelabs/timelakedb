@@ -4,7 +4,7 @@
 //! can `COPY … TO '<path>'`, which writes a file as the server process —
 //! and the container runs as root (SECURITY.md exposures 2 and 4). A single
 //! unauthenticated request wrote a Parquet file outside the data directory;
-//! this is the drill in `bench/results/sql-sandbox-drill.log`.
+//! this is the drill in `docs/evidence/sql-sandbox-drill.log`.
 //!
 //! Data-plane authentication does NOT close this. It narrows *who* can do it
 //! to any holder of a read-capable token — which is every Grafana in the

@@ -2,7 +2,7 @@
 # plus stock Telegraf writing over HTTPS. Separate ports and volume so
 # the plaintext bench fixture can keep running untouched.
 #
-#   cd bench/compose/tls-drill && sh gen-certs.sh initial && cd ..
+#   cd deploy/compose/tls-drill && sh gen-certs.sh initial && cd ..
 #   docker compose -f compose/timelakedb-tls.yml --profile telegraf up -d --build
 #   python compose/tls-drill/at7_drill.py
 name: bench-timelakedb-tls

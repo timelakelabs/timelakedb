@@ -17,7 +17,7 @@
 #     the deliberate opposite of the write path's degraded mode;
 #   - a write sent to a querier is refused (501), not accepted nowhere.
 #
-# Run from the HOST, from bench/compose:
+# Run from the HOST, from deploy/compose:
 #   docker compose -f timelakedb-cluster-s3.yml up -d --build
 #   sh cluster-drill/cl3_drill.sh
 set -e

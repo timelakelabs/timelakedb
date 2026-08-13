@@ -14,7 +14,7 @@ Written 2026-08-10. Two inputs, merged into one prioritised plan:
 Competitor feature claims are as of mid-2026, from their public docs and
 this project's own recorded evaluations (`docs/evidence/`). Verify
 before repeating any of them in public material — the evidence rule
-(site claims trace to `bench/results/`) applies to competitor claims
+(site claims trace to `docs/evidence/`) applies to competitor claims
 doubly.
 
 ---

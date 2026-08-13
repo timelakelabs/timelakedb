@@ -67,7 +67,7 @@ This project is inspired by the following projects.
 
 - **This machine has Docker but no Rust toolchain** (no MSVC either) —
   build and test via Docker:
-  `docker compose -f bench/compose/timelakedb.yml up -d --build`
+  `docker compose -f deploy/compose/timelakedb.yml up -d --build`
   then `curl http://localhost:1963/health`.
 - CI (`.github/workflows/ci.yml`) runs fmt + clippy -D warnings + tests.
 - The website is `site/` — hand-written HTML/CSS/SVG, no build step, all
@@ -78,7 +78,7 @@ This project is inspired by the following projects.
   each value lives in `site/assets/style.css` as CSS custom properties,
   and `site/assets/logo.svg` is the mark. (The original brand sheet is a
   local design asset, deliberately untracked.) Site claims must trace to
-  `bench/results/` — no marketing numbers.
+  `docs/evidence/` — no marketing numbers.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelake-server` (listens on TIMELAKE_ADDR,
   default 0.0.0.0:1963).
@@ -107,7 +107,7 @@ This project is inspired by the following projects.
   below.** SECURITY.md states the full posture. **P0-2 CLOSED**:
   `/api/sql` + Flight are read-only (plan-level guard
   `crates/query/src/sql_guard.rs`, drill
-  `bench/results/sql-sandbox-drill.log`) and the container is non-root
+  `docs/evidence/sql-sandbox-drill.log`) and the container is non-root
   under a read-only rootfs — the COPY-writes-a-file-as-root exposure is
   shut twice over. Known engine hardening: manifest replay should skip
   non-`.json` files.
@@ -115,7 +115,7 @@ This project is inspired by the following projects.
   env `TIMELAKE_*`, metrics `timelake_*`, headers
   `X-TimeLake-Authorizations` / `x-timelake-csrf`, data dir
   `/var/lib/timelake/data`, adapter `../Gauge/bench/backends/timelakedb.py`
-  (backend key `timelakedb`), compose `bench/compose/timelakedb*.yml`.
+  (backend key `timelakedb`), compose `deploy/compose/timelakedb*.yml`.
   GitHub org is **`timelakelabs`**, repos LOWERCASE under it:
   `timelakelabs/timelakedb`, `timelakelabs/tributary` (settled 2026-08-11 —
   the `timelakedb` org also exists but is not the one in use; SSH alias
@@ -123,7 +123,7 @@ This project is inspired by the following projects.
   **Deliberately unchanged:** the `TLDE1` encryption magic (format
   marker, not brand — renaming it makes old objects fail the magic check
   and fall into plaintext passthrough = silent corruption), historical
-  `bench/results/**` and `ops/logs/**` (records of runs that really
+  `docs/evidence/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
 - Status: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
@@ -153,7 +153,7 @@ This project is inspired by the following projects.
   which only exists after TimeLakeDB's `publish` job runs — so push order
   is Catchment → App+secrets → TimeLakeDB → grant package read → Tributary.
 - Previous: **flush handover made atomic** (2026-08-10, drill
-  `bench/results/flush-handover-atomicity.log`). A reader could see rows in
+  `docs/evidence/flush-handover-atomicity.log`). A reader could see rows in
   NEITHER the buffer nor the holding area mid-flush — a vanish, reachable by
   a plain COUNT(*), microseconds on disk but the length of a `put` on S3.
   Swap + holding-insert are now ONE critical section (`ingest_gate` → `dbs`
@@ -166,10 +166,10 @@ This project is inspired by the following projects.
   snapshot (pointer move; readers snapshot as they already do) — changes the
   type the read path and CL-3 wire consume.
 - Previous: **C2 phase 4 SHIPPED — the CL-3 stateless querier** (2026-08-10,
-  drill `bench/results/cl3-querier-drill.log` 19/19, NEW rig
-  `bench/compose/timelakedb-cluster-s3.yml` = router + ingester×2 +
+  drill `docs/evidence/cl3-querier-drill.log` 19/19, NEW rig
+  `deploy/compose/timelakedb-cluster-s3.yml` = router + ingester×2 +
   querier×2 + localstack on ONE bucket; drill
-  `bench/compose/cluster-drill/cl3_drill.sh`). `TIMELAKE_ROLE=querier`:
+  `deploy/compose/cluster-drill/cl3_drill.sh`). `TIMELAKE_ROLE=querier`:
   owns no data, refuses writes (501), runs NO maintenance, replays the
   catalog from the shared store and tails the manifest log (1 s).
   **Freshness**: ingesters serve live buffers as Arrow IPC on the internal
@@ -214,7 +214,7 @@ This project is inspired by the following projects.
   fails the same way on the previous commit) — it can catch the
   documented sub-millisecond swap→`flushing` gap in `flush_all`.
 - Previous: **C2 phase 3 SHIPPED — the router (write sharding)** (2026-08-10,
-  drill `bench/results/router-sharding-drill.log`). `TIMELAKE_ROLE=router`:
+  drill `docs/evidence/router-sharding-drill.log`). `TIMELAKE_ROLE=router`:
   stateless, holds NO data, opens NO engine (main.rs branches before engine
   creation, `return`s). Hashes each line's `(db,measurement)` →
   `crates/server/src/router.rs` `shard_of` (FNV-1a over `db\0measurement`
@@ -235,7 +235,7 @@ This project is inspired by the following projects.
   snapshots from ingesters + shared S3; enables query routing on the router)
   → (5) compactor+lease. Design: ARCHITECTURE §12.4.
 - Previous: **C2 phase 2 SHIPPED — CL-2 ingester WAL replication** (2026-08-10,
-  drill `bench/results/cl2-replication-drill.log`). ZERO ACKED LOSS on a
+  drill `docs/evidence/cl2-replication-drill.log`). ZERO ACKED LOSS on a
   node death: `TIMELAKE_ROLE=ingester` + peer from `TIMELAKE_PEERS` →
   each write replicated to peer's durable **replica WAL** BEFORE the 204.
   `crates/server/src/replication.rs` `Replicator` (blocking reqwest, one
@@ -274,7 +274,7 @@ This project is inspired by the following projects.
   zero-loss drill) → (3) router → (4) CL-3 querier + live-buffer snapshot
   → (5) compactor+lease. Design: ARCHITECTURE §12.4/12.5.
 - Previous: **P0-5 SHIPPED — Tributary presents the data-plane token**
-  (2026-08-10, in the TRIBUTARY repo: `bench/results/p05-data-auth.log`,
+  (2026-08-10, in the TRIBUTARY repo: `docs/evidence/p05-data-auth.log`,
   drill `bench/drill-p05.sh`). Tributary `crates/tributary/src/auth.rs`
   `Secret` (redacting Debug/Display, `.expose()` the only door) +
   `resolve_token(TRIBUTARY_TOKEN env | token_file, env wins, trimmed)`;
@@ -290,7 +290,7 @@ This project is inspired by the following projects.
   trail, targeted delete R-1, Tributary self-telemetry T-1) — see
   `docs/ROADMAP.md`.
 - Previous: **P0-4 SHIPPED — catalog commits are CAS (no multi-writer loss)**
-  (2026-08-10, drill `bench/results/catalog-cas-drill.log`). Was: `commit`
+  (2026-08-10, drill `docs/evidence/catalog-cas-drill.log`). Was: `commit`
   picked next seq from an in-process atomic + plain `put` → two writers on
   one bucket compute same seq, 2nd `put` clobbers 1st, its data files
   orphaned+invisible. Now `crates/catalog/src/lib.rs` `commit` is a CAS
@@ -310,7 +310,7 @@ This project is inspired by the following projects.
   tests (+3) + 1 S3 drill, clippy/fmt clean. NEXT P0: **P0-5 Tributary
   presents token** (last P0). Roadmap `docs/ROADMAP.md`.
 - Previous: **P0-2 SHIPPED — /api/sql read-only + non-root container**
-  (2026-08-10, drill `bench/results/sql-sandbox-drill.log`). The
+  (2026-08-10, drill `docs/evidence/sql-sandbox-drill.log`). The
   COPY-writes-a-file-as-root exposure (SECURITY.md ex. 2+4, verified: one
   request wrote /tmp/pwned.parquet owned by root) is shut TWICE:
   (1) `crates/query/src/sql_guard.rs` `ensure_read_only(&LogicalPlan)`
@@ -329,7 +329,7 @@ This project is inspired by the following projects.
   clean. NEXT P0: P0-4 catalog CAS (put_if_absent exists, catalog still
   plain put), P0-5 Tributary presents token. Roadmap `docs/ROADMAP.md`.
 - Previous: **SEC-4 phased data-plane auth SHIPPED** (2026-08-10, drill
-  `bench/results/data-auth-drill.log`). `TIMELAKE_DATA_AUTH=off|optional|
+  `docs/evidence/data-auth-drill.log`). `TIMELAKE_DATA_AUTH=off|optional|
   required` (default off = header not read, today's compat contract).
   Token = 256-bit OS-CSPRNG secret, prefix `tldb_`, stored only as
   SHA-256 digest (NOT Argon2id — no brute-force surface, and a ~50ms KDF
@@ -338,7 +338,7 @@ This project is inspired by the following projects.
   the ONE `decide()`; both HTTP and Flight route through
   `Engine::authenticate_data_impl` → `Auth::decide_data` → `guard::decide`
   so policy can't fork. **Mechanism fixed by measurement**
-  (`bench/results/data-auth-client-probe.log`): Grafana Flight SQL
+  (`docs/evidence/data-auth-client-probe.log`): Grafana Flight SQL
   forwards only the token field as `Bearer`; its basic-auth toggle +
   custom headers are HTTP-only, never reach gRPC. So: one token, three
   spellings — `Bearer` (Grafana/Tributary), `Token` (Telegraf v2),
@@ -360,7 +360,7 @@ This project is inspired by the following projects.
   the token (P0-5)**; console page not browser-drilled (API is).
   Roadmap: `docs/ROADMAP.md` (competitive) + `docs/PRODUCTION_READINESS.md`.
 - Previous: **SEC-3 v2 client certificates SHIPPED — WANT mode** (2026-08-10,
-  drill `bench/results/sec3-mtls-want-mode.log`). `TIMELAKE_TLS_CLIENT_CA`
+  drill `docs/evidence/sec3-mtls-want-mode.log`). `TIMELAKE_TLS_CLIENT_CA`
   = PEM bundle → both listeners request a client cert, verify one if
   presented, serve either way. `crates/tls/src/client_auth.rs`:
   `RotatingClientCa` (ArcSwap<RootCertStore>, dual-CA overlap,
@@ -387,7 +387,7 @@ This project is inspired by the following projects.
   its own. Windows curl (schannel) can't drive this — drill from a Linux
   container on the compose network.
 - Previous: **SEC-4 admin auth SHIPPED** (2026-08-09, drill
-  `bench/results/sec4-auth-drill.log`). New `timelake-auth` crate:
+  `docs/evidence/sec4-auth-drill.log`). New `timelake-auth` crate:
   roles viewer<operator<admin, Argon2id, sessions (cookie or bearer,
   30 min idle / 12 h absolute), CSRF double-submit + Origin on cookie
   mutations, per-principal login backoff; principals persist at
@@ -418,7 +418,7 @@ This project is inspired by the following projects.
   deletion control. Test: retention_is_manageable_at_runtime_and
   _persists_fr7.
 - Previous: **C0 SHIPPED — S3 + KMS, key-cached** (2026-08-09, ARCH §12
-  design phased C0-C3; drill log `bench/results/c0-s3-drill.log`).
+  design phased C0-C3; drill log `docs/evidence/c0-s3-drill.log`).
   New `timelake-store-s3` crate: `S3Store` (aws-sdk-s3 behind the Store
   trait; owned-runtime sync bridge — never `block_on` in callers;
   path-style auto under `AWS_ENDPOINT_URL`) and `AwsKms`
@@ -430,7 +430,7 @@ This project is inspired by the following projects.
   is the measured baseline). SSE-KMS + Bucket Keys per PUT and as
   bucket default. Env: `TIMELAKE_OBJECT_STORE=s3://…`,
   `TIMELAKE_KMS_KEY_ID` (alias ok; mutually exclusive with
-  `TIMELAKE_ENCRYPTION_KEY`). Rig: `bench/compose/timelakedb-s3.yml`
+  `TIMELAKE_ENCRYPTION_KEY`). Rig: `deploy/compose/timelakedb-s3.yml`
   (LocalStack s3+kms, init hook creates alias/timelake + buckets;
   ports 3966/3967) — proves correctness/call-counts/recovery, NEVER
   latency. Ignored integration tests run in-network:
@@ -458,7 +458,7 @@ This project is inspired by the following projects.
   collapsible_if, is_multiple_of). Next: token auth (turns SEC-2 claims
   into authorization), in-network bench re-baseline, CI on a remote.
 - Previous: **SEC-3 SHIPPED — AT-7 drill 19/19** (see
-  `bench/results/at7-drill.log`). New `timelake-tls` crate:
+  `docs/evidence/at7-drill.log`). New `timelake-tls` crate:
   validate-before-swap cert loading (PEM, expiry via x509-parser,
   key↔cert match via `CertifiedKey::from_der`), `ArcSwap` resolver
   consulted only at handshake, last-good + named
@@ -482,7 +482,7 @@ This project is inspired by the following projects.
   snapshots are safe by objects-before-manifest ordering; quiesce only
   eliminates a tiny manifest-tear window.
 - Previous: **M4 — AT-3 green with two carve-outs** (run
-  tldb-m4-final + tldb-m4-settled2 + idb3-exactness in bench/results/).
+  tldb-m4-final + tldb-m4-settled2 + idb3-exactness in docs/evidence/).
   Fresh full-scale: Shape A median 211 ms, all Shape B complete (B1
   1.7 s, B4 0.68 s), burst 0.12 s, storage 0.50 GB/day, zero row loss
   (fixed-bound equality vs influxdb3 on identical data — the old "8-row
@@ -507,7 +507,7 @@ This project is inspired by the following projects.
      spawn_blocking or yielding chunked loads. THIS FIRST.
   2. Compose service has NO memory limit — a runaway container took down
      the Docker VM (all host containers!). Add mem_limit ~6g to
-     bench/compose/timelakedb.yml before any further full-scale run.
+     deploy/compose/timelakedb.yml before any further full-scale run.
   3. Shape A ~4 s/lookup at full scale: bloom row-group pruning
      apparently ineffective — VERIFY blooms are actually written for
      Dictionary columns (SerializedFileReader on a real file); arrow
@@ -517,7 +517,7 @@ This project is inspired by the following projects.
      double-count removed (batch_size 1M, DataSourceExec accounting).
   5. Still pending: Shape B full-scale pass, exactness cross-check vs
      influxdb3 (8-row/2 ppm LWW delta), then AT-3 scorecard + commit.
-  Run logs: bench/results/tldb-m4-full{,2,3}.log. Gate via /tldb-gate.
+  Run logs: docs/evidence/tldb-m4-full{,2,3}.log. Gate via /tldb-gate.
   Also: (3 ppm) `docker kill` suppresses restart policies — drills use
   `docker restart -t 0`.
 
@@ -534,7 +534,7 @@ This project is inspired by the following projects.
   one measure means the wrong one gets quoted.
 - `bench/` here is now only what is bound to this repository: the
   `timelakedb*.yml` compose topologies (each `build: ../..`), the drill
-  scripts that launch them, and the drill transcripts in `bench/results/`
+  scripts that launch them, and the drill transcripts in `docs/evidence/`
   that source comments and `docs/PRODUCTION_READINESS.md` cite by name.
   Catchment borrows those topologies; do not fork them.
 - The hard invariant is RR-1: no query may kill the server. Designs that
