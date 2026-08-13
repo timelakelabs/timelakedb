@@ -162,7 +162,33 @@ registered and `CREATE EXTERNAL TABLE` does not survive the per-request
 session. Both are accidents of current configuration, not boundaries.
 The allowlist makes it a boundary.
 
-### P0-3 · Data-plane authentication  ⟂ in progress, design settled
+### P0-3 · Data-plane authentication  ⟂ **BUILT, NOT DEFAULTED ON (2026-08-13)**
+
+**Every item this entry listed as remaining has shipped.** The Flight SQL
+side, the engine implementation, the `/admin/tokens` management surface and
+its console page, the authenticated/anonymous metrics split
+(`timelake_data_requests_authenticated_total`) and the drills are all in:
+routes at `crates/api/src/lib.rs:171`, integration tests in
+`crates/server/tests/data_auth.rs`, transcripts in
+`docs/evidence/data-auth-drill.log` and `sec4-auth-drill.log`. Riverkeeper
+R0 independently verified the data-auth truth table on 23 assertions.
+
+**It is still not closed, and the reason is the last line of this entry.**
+The mechanism ships `off`: `crates/server/src/lib.rs:76` compiles in
+`DataAuthMode::Off`, and only an explicit `TIMELAKE_DATA_AUTH` changes it.
+So the sentence this entry opens with — anyone who can reach `:1963` or
+`:1964` has full read and write access to every database — remains true of
+a default install, which is the condition P0-3 exists to describe. Building
+the lock is not the same as fitting it.
+
+Closing this means defaulting to `optional`, taking the measured
+authenticated/anonymous split from a real deployment, and only then
+considering `required`. Until that first flip, treat the data plane as open
+and rely on network isolation, exactly as `SECURITY.md` and the README say.
+
+The original text follows unchanged, for the record.
+
+**Status when written: in progress, design settled.**
 
 **Effort: M (partially built).** Today anyone who can reach `:1963` or
 `:1964` has full read and write access to every database. SEC-2's
