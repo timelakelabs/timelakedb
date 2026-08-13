@@ -138,6 +138,31 @@ decision; D4 is a deployment note. None blocks the compactor lease.
 
 ## 4. The drill
 
+**Status 2026-08-13: D1 is demonstrated, D2 is not.** Catchment's
+`ingest-isolation` (phase C3, tier 3, `cluster-s3`) exists and passes:
+
+| | |
+|---|---|
+| peer frozen for | 5.26 s, by `pause` — SIGSTOP, sockets open |
+| slowest write batch while frozen | **0.281 s** |
+| pre-D1 cost of the same batch | ~5 s — 18x the ceiling, past the 2 s assertion |
+| rows | 12,000 written, 12,000 stored, 12,000 distinct, 0 lost, 0 rejected |
+
+Evidence: `catchment/results/ingest-isolation-20260813-143712/run.json`.
+0.281 s is the 250 ms timeout plus overhead, which is D1's fingerprint —
+the scenario would have failed against the previous build, which is the
+only property that makes it worth having.
+
+**D2's read gate was not reached.** That run issued three queries and had
+none refused, so the concurrency ceiling has never fired outside a unit
+test. The gate below is met for D1 and open for D2.
+
+One caution the drill itself produced: its *first* run reported PASS having
+frozen nothing, because `docker pause` was given a container name from the
+wrong topology and the fault primitive recorded the failure instead of
+raising. Catchment's fault primitives now raise, and the false-green run is
+kept at `catchment/results/ingest-isolation-20260813-142826/run.json`.
+
 The gate is a scenario watched to go red, not a latency table. Ingest
 isolation is only proven by a run that would have failed before the change.
 
@@ -159,9 +184,16 @@ same discipline C1 exists to enforce.
 
 ## 5. Gate
 
-- The drill above passes, and is recorded in `docs/evidence/`.
-- The same drill, run against the pre-D1 build, **fails** — recorded, so the
-  scenario is proven able to detect the fault.
+- ~~The drill above passes, and is recorded~~ — **MET for D1**, see §4.
+  Recorded in Catchment's `results/`, which is where that suite keeps its
+  evidence, rather than in this repository's `docs/evidence/`.
+- **Open for D2**: a run in which the read gate actually refuses. Until
+  `timelake_cl3_reads_refused_total` moves under load, D2 is a unit-tested
+  branch and nothing more.
+- The same drill, run against the pre-D1 build, **fails**. Currently argued
+  from the timeout arithmetic — 0.281 s measured against a 5 s prior
+  ceiling — rather than executed against the old binary. Worth doing
+  properly: the scenario's value rests on it.
 - `Role::Compactor.implemented()` is true and the pin at
   `crates/cluster/src/lib.rs:244` is inverted.
 - A killed ingester loses no acknowledged write, with RPO and RTO measured
