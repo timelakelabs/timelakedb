@@ -13,6 +13,25 @@ here.
 
 ## [Unreleased]
 
+### Added — the intra-cluster listener bounds what a querier can cost an ingester (2026-08-13)
+
+Design: `docs/P1-1_DESIGN.md` D2.
+
+- **`/internal/v1/live` and `/internal/v1/snapshot` are now bounded by
+  `TIMELAKE_INTERNAL_MAX_CONCURRENT` (default 8), refusing with 503 rather
+  than queueing.** A querier unions every ingester’s live buffer on each
+  query, so read load on the query tier arrives as work on the ingest tier,
+  and an ingester’s real job is taking writes. The permit is *tried*, never
+  waited on: queueing would turn a refusal into latency, and the querier’s
+  own 30 s deadline would hold an ingester for the whole of it.
+- Refusing is the honest outcome and the querier already models it — a failed
+  snapshot makes it refuse the query rather than answer from an incomplete
+  cluster. Refusals are counted in `timelake_cl3_reads_refused_total`, so a
+  ceiling that is set too low reads as a ceiling rather than as a broken peer.
+- **`replicate` and `health` are deliberately left unbounded.** Throttling a
+  peer’s write path is the stall D1 exists to prevent, reached from the other
+  side; and health has to answer precisely when the node is saturated.
+
 ### Fixed — bodies over 2 MiB were refused, and replication went quiet (2026-08-13)
 
 - **FR-1 requires batches of 10 MB and up; anything over 2 MiB got 413.**

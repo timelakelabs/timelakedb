@@ -105,7 +105,14 @@ any replication frame above it and dropped the node to degraded. Both
 listeners now share `TIMELAKE_MAX_BODY_BYTES` (32 MiB). The semaphore
 below is still to do.*
 
-The remaining work: A semaphore
+**D2 · admission control on the internal listener — LANDED 2026-08-13.**
+`TIMELAKE_INTERNAL_MAX_CONCURRENT` (default 8) gates `/live` and
+`/snapshot`, refusing with 503 rather than queueing; `replicate` and
+`health` are left unbounded on purpose. Pinned by
+`the_read_gate_bounds_queriers_and_never_the_write_path`, which uses a
+ceiling of zero so the routing is deterministic rather than raced.
+
+Original note: A semaphore
 sized independently of the ingest path, plus a body limit, so a querier's
 fan-out cannot consume an ingester's capacity. Refusing a snapshot is an
 honest outcome that the querier already handles — it refuses the query

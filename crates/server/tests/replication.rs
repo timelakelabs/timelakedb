@@ -316,3 +316,79 @@ async fn a_body_over_two_megabytes_is_accepted_on_both_planes() {
         "a frame the peer refuses is a write the primary already acknowledged"
     );
 }
+
+/// D2: the read gate protects ingest, and must not strangle it instead.
+///
+/// A querier unions every ingester's live buffer on each query, so read load
+/// on the query tier arrives as work on the ingest tier. The gate bounds
+/// that. What it must *not* bound is the peer's write path — throttling
+/// `replicate` would be the stall D1 exists to prevent, arrived at from the
+/// other side — nor `health`, which has to answer precisely when the node is
+/// saturated.
+///
+/// A ceiling of zero makes the routing deterministic without racing the
+/// semaphore: every gated route refuses, every ungated one still answers.
+#[tokio::test]
+async fn the_read_gate_bounds_queriers_and_never_the_write_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = timelake_server::EngineConfig {
+        internal_max_concurrent: 0,
+        ..Default::default()
+    };
+    let e = timelake_server::Engine::open(dir.path(), cfg).expect("open");
+    e.enable_replica_wal(&dir.path().join("replica-wal"))
+        .expect("replica wal");
+
+    let status = |app: axum::Router, req: Request<Body>| async move {
+        app.oneshot(req).await.unwrap().status()
+    };
+
+    // Gated: the querier's fan-out.
+    for path in ["/internal/v1/live", "/internal/v1/snapshot?table=cpu"] {
+        let s = status(
+            timelake_server::internal_router(Arc::clone(&e)),
+            Request::get(path).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} must refuse rather than consume ingest capacity"
+        );
+    }
+
+    // Ungated: the peer's writes and the liveness signal.
+    let s = status(
+        timelake_server::internal_router(Arc::clone(&e)),
+        Request::post("/internal/v1/replicate")
+            .header("x-repl-db", "d")
+            .header("x-repl-mult", "1")
+            .body(Body::from("cpu,host=a v=1i 1"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "throttling a peer's writes is the stall D1 exists to prevent"
+    );
+
+    let s = status(
+        timelake_server::internal_router(Arc::clone(&e)),
+        Request::get("/internal/v1/health")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "health must answer while saturated — that is when it carries information"
+    );
+
+    // Refusals are visible, not merely logged.
+    assert!(
+        e.cl3_reads_refused() >= 2,
+        "a refusal the operator cannot see is indistinguishable from a broken peer"
+    );
+}

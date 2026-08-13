@@ -93,6 +93,26 @@ pub struct EngineConfig {
     /// ever exceeded the internal one, every write between the two sizes
     /// would be accepted locally and refused by its replica.
     pub max_body_bytes: usize,
+    /// CL-3: how many live/snapshot reads the intra-cluster listener will
+    /// serve at once before refusing.
+    ///
+    /// A querier unions the ingesters' live buffers on every query, so read
+    /// load on a querier becomes work on every ingester — and an ingester's
+    /// real job is taking writes. Without a ceiling an expensive query fans
+    /// out unbounded, slows the ingester, and its peer then blocks on every
+    /// write it takes (`docs/P1-1_DESIGN.md` D2).
+    ///
+    /// Refusing is the honest outcome and the querier already models it:
+    /// a failed snapshot makes it refuse the query rather than answer from
+    /// an incomplete cluster, because a partial answer is worse than no
+    /// answer. Watch `timelake_cl3_reads_refused_total` — a rising count
+    /// means this ceiling, not a broken peer.
+    ///
+    /// Deliberately NOT applied to `/internal/v1/replicate`: throttling a
+    /// peer's writes is the stall D1 exists to prevent. Nor to `/health`,
+    /// which must answer while the node is saturated — that is when the
+    /// answer matters most.
+    pub internal_max_concurrent: usize,
 }
 
 impl Default for EngineConfig {
@@ -110,6 +130,9 @@ impl Default for EngineConfig {
             data_auth: timelake_auth::DataAuthMode::Off,
             repl_timeout_ms: 250,
             max_body_bytes: 32 << 20, // 32 MiB: FR-1 asks for >=10 MB, with headroom
+            // Above one querier's max_concurrent_queries (6), so a single
+            // querier at full tilt is served rather than refused.
+            internal_max_concurrent: 8,
         }
     }
 }
@@ -360,6 +383,7 @@ pub struct Engine {
     replica_wal: Mutex<Option<Wal>>,
     replica_wal_dir: RwLock<Option<PathBuf>>,
     cl2_replica_frames: AtomicU64,
+    cl3_reads_refused: AtomicU64,
     cl2_recovered: AtomicU64,
     /// CL-3: a querier is a read replica. It holds no WAL of its own and
     /// must not pretend to — a write accepted here would be durable
@@ -481,6 +505,7 @@ impl Engine {
             replica_wal: Mutex::new(None),
             replica_wal_dir: RwLock::new(None),
             cl2_replica_frames: AtomicU64::new(0),
+            cl3_reads_refused: AtomicU64::new(0),
             cl2_recovered: AtomicU64::new(0),
             read_only: std::sync::atomic::AtomicBool::new(false),
             remote: RwLock::new(None),
@@ -840,6 +865,27 @@ impl Engine {
     /// Read by both routers so they cannot disagree (FR-1).
     pub fn max_body_bytes(&self) -> usize {
         self.cfg.max_body_bytes
+    }
+
+    /// Concurrency ceiling for intra-cluster live/snapshot reads (CL-3).
+    pub fn internal_max_concurrent(&self) -> usize {
+        self.cfg.internal_max_concurrent
+    }
+
+    /// True where the intra-cluster listener runs: the replica WAL is
+    /// enabled on exactly those nodes (ingesters). Keeps a lone `all`
+    /// node's /metrics unchanged, as the CL-2 lines already do.
+    pub fn serves_internal_listener(&self) -> bool {
+        self.replica_wal.lock().expect("replica wal lock").is_some()
+    }
+
+    /// Live/snapshot reads refused because the ceiling was reached.
+    pub fn cl3_reads_refused(&self) -> u64 {
+        self.cl3_reads_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn note_cl3_read_refused(&self) {
+        self.cl3_reads_refused.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Runtime FR-7 policy surface (backs /admin/retention).
@@ -1625,6 +1671,19 @@ impl Engine {
             ),
             None => String::new(),
         };
+        // The CL-3 read gate. Gated on the listener existing rather than on
+        // a replicator: an ingester with no peer still serves queriers, and
+        // its refusals are exactly as worth seeing. Named apart from the
+        // querier-side cl3 lines below, which answer a different question.
+        let read_gate_lines = if self.serves_internal_listener() {
+            format!(
+                "# TYPE timelake_cl3_reads_refused_total counter\n\
+                 timelake_cl3_reads_refused_total {}\n",
+                self.cl3_reads_refused.load(Ordering::Relaxed),
+            )
+        } else {
+            String::new()
+        };
         // CL-3 lines only on a querier (remote buffers set). `refusals` is
         // the one to alert on: it separates "the cluster is down" from the
         // failure this database exists to prevent — quiet under-counting.
@@ -1675,7 +1734,7 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}{}",
+             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1703,6 +1762,7 @@ impl Engine {
             tls_lines,
             cl2_lines,
             cl3_lines,
+            read_gate_lines,
         )
     }
 }
@@ -1806,7 +1866,36 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
 /// store itself.
 pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
     let limit = engine.max_body_bytes();
-    axum::Router::new()
+    let gate = Arc::new(ReadGate {
+        sem: Arc::new(tokio::sync::Semaphore::new(
+            engine.internal_max_concurrent(),
+        )),
+        engine: Arc::clone(&engine),
+    });
+
+    // Reads a querier fans out. These are bounded: a querier unions every
+    // ingester's live buffer on every query, so read load on the query tier
+    // lands as work on the ingest tier, and an ingester's real job is taking
+    // writes (D2). The permit is *tried*, never waited on — queueing here
+    // would turn a refusal into latency, and the querier's own 30 s deadline
+    // would hold the resources for the whole of it.
+    let reads = axum::Router::new()
+        .route("/internal/v1/live", axum::routing::get(internal_live))
+        .route(
+            "/internal/v1/snapshot",
+            axum::routing::get(internal_snapshot),
+        )
+        .with_state(Arc::clone(&engine))
+        .layer(axum::middleware::from_fn_with_state(
+            gate,
+            internal_read_gate,
+        ));
+
+    // Deliberately unbounded. Throttling `replicate` would stall a peer's
+    // write path, which is the failure D1 exists to prevent — protecting
+    // ingest by strangling ingest. `health` must answer while the node is
+    // saturated, since that is exactly when the answer carries information.
+    let unbounded = axum::Router::new()
         .route(
             "/internal/v1/replicate",
             axum::routing::post(internal_replicate),
@@ -1815,16 +1904,48 @@ pub fn internal_router(engine: Arc<Engine>) -> axum::Router {
             "/internal/v1/recover",
             axum::routing::post(internal_recover),
         )
-        .route("/internal/v1/live", axum::routing::get(internal_live))
-        .route(
-            "/internal/v1/snapshot",
-            axum::routing::get(internal_snapshot),
-        )
         .route("/internal/v1/health", axum::routing::get(|| async { "ok" }))
-        .with_state(engine)
+        .with_state(engine);
+
+    reads
+        .merge(unbounded)
         // Same ceiling as the public plane, from the same config value: a
         // frame this listener refuses is a write its peer already took.
         .layer(axum::extract::DefaultBodyLimit::max(limit))
+}
+
+/// State for the CL-3 read gate: the permits, and the engine that counts
+/// refusals so they show up on `/metrics` rather than only in a log.
+#[derive(Clone)]
+struct ReadGate {
+    sem: Arc<tokio::sync::Semaphore>,
+    engine: Arc<Engine>,
+}
+
+/// Refuse rather than queue when the ceiling is reached.
+///
+/// 503 is the honest answer and the querier already handles it: a failed
+/// snapshot makes it refuse the query instead of answering from an
+/// incomplete cluster. A queued request would instead be answered late,
+/// which for a query that has already been abandoned is pure cost paid by
+/// the ingest path.
+async fn internal_read_gate(
+    axum::extract::State(gate): axum::extract::State<Arc<ReadGate>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match Arc::clone(&gate.sem).try_acquire_owned() {
+        Ok(_permit) => next.run(req).await,
+        Err(_) => {
+            gate.engine.note_cl3_read_refused();
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "intra-cluster read concurrency exhausted",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// What this node holds live, plus its catalog head (CL-3).
@@ -1996,6 +2117,10 @@ pub fn config_from_env() -> EngineConfig {
         gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
         repl_timeout_ms: env("TIMELAKE_REPL_TIMEOUT_MS", d.repl_timeout_ms),
         max_body_bytes: env("TIMELAKE_MAX_BODY_BYTES", d.max_body_bytes),
+        internal_max_concurrent: env(
+            "TIMELAKE_INTERNAL_MAX_CONCURRENT",
+            d.internal_max_concurrent,
+        ),
         // A typo here must refuse to start, not silently disable
         // authentication — the same posture as a malformed encryption key.
         data_auth: match std::env::var("TIMELAKE_DATA_AUTH") {
