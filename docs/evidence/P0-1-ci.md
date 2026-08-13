@@ -16,7 +16,7 @@ a runner at all.
 | Tributary | `5eee47d` | [31561969531](https://github.com/timelakelabs/tributary/actions/runs/31561969531) | success |
 | Catchment | `17276bf` | [31650406399](https://github.com/timelakelabs/catchment/actions/runs/31650406399) | success |
 | Gauge | `1be9c8e` | [31591472854](https://github.com/timelakelabs/gauge/actions/runs/31591472854) | success |
-| Riverkeeper | `a5552dc` | [31591721097](https://github.com/timelakelabs/riverkeeper/actions/runs/31591721097) | success |
+| Riverkeeper | `ffe03e7` | [31670372043](https://github.com/timelakelabs/riverkeeper/actions/runs/31670372043) | success |
 
 Each sha is the current head of its default branch, so no row is a green run
 on a superseded tree.
@@ -84,13 +84,34 @@ sibling a runner does not have.
   tagging `v0.1.0-alpha` are the other three items under P0-1's "Remaining",
   and none is done. `pages.yml` self-skips on a private repo, so the site is
   not published.
-- **Riverkeeper's R0 (`9296c05`) is unsigned and pushed.** `git verify-commit
-  HEAD` returns Good in five of six repositories, not six. Signing it means
-  rewriting a published commit and force-pushing.
+- **Tier 1 is the only tier that gates a push** — see below.
 - **Tier 2 and tier 3 have not run.** Only tier 1 gates a push. The clustered,
   S3 and TLS scenarios are nightly in Catchment's own repository.
 - **Coverage margin is thin.** 82.74% against an 80% gate. The first moderate
   feature landing without tests turns this red.
+
+## R0 is signed, and the history was rewritten to do it
+
+Riverkeeper's `9296c05` was the only unsigned commit anywhere in the program.
+`commit.gpgsign` is `true` globally, so it was a bypass rather than a default,
+and it was already pushed — signing it therefore meant rewriting published
+history rather than amending a local commit.
+
+Done 2026-08-13. Three commits were rebuilt from their existing trees and
+re-signed with `A0F1BE5219310A70`, then force-pushed:
+
+| was | now | |
+|---|---|---|
+| `9296c05` | `15a94a2` | R0 — was unsigned, now signed |
+| `9964ca2` | `dbcd639` | descendant, resigned because R0's sha changed |
+| `a5552dc` | `ffe03e7` | descendant, resigned because R0's sha changed |
+
+`e8f8b97` is untouched. It is signed by the retired key `8386E2ED97F1E59E`,
+whose secret half no longer exists; the public half was re-imported, so it
+still verifies. Trees, message bytes, and author and committer identities and
+dates were verified byte-identical to the originals before the branch moved —
+only the signatures differ. `git verify-commit HEAD` now returns Good in all
+six repositories rather than five.
 
 ## Setup this depended on
 

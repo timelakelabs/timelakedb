@@ -125,8 +125,11 @@ until it was done, no claim in this document traced to anything but one
 laptop — but two of the three remain, and they are Phase 2 in
 `PROJECT_PLAN.md`. Marking the item DONE on the strength of the first would
 overstate it in precisely the way this project's standing rule forbids.
-Riverkeeper's R0 (`9296c05`) is also still unsigned and pushed, so
-`git verify-commit HEAD` returns Good in five of six repositories.
+
+Riverkeeper's R0 — the one unsigned commit anywhere in the program — was
+signed on 2026-08-13 by rewriting and force-pushing its history, so
+`git verify-commit HEAD` now returns Good in all six repositories. The
+rewrite is recorded in `docs/evidence/P0-1-ci.md`.
 
 ### P0-2 · `/api/sql` writes files as root  ⟂ **DONE (2026-08-10)**
 
