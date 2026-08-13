@@ -1,9 +1,27 @@
 name: ci
 
+# Markdown does not gate this workflow. Every job here is expensive — clippy,
+# 173 tests, an instrumented coverage rebuild, a Docker image and tier-1
+# conformance, ~30 minutes of billed private-repo minutes (Catchment/CI.md
+# treats that budget as a real constraint) — and none of it can be affected
+# by a prose change: no Rust source pulls a .md in via include_str!, and no
+# test opens one. The .md references in crates/ are doc comments and error
+# strings citing SECURITY.md, not reads.
+#
+# The cost is that a docs-only commit gets no run, so its sha has no green
+# result of its own. That is the intended trade: the last green run still
+# describes the last commit that could have changed behaviour, which is what
+# the evidence in docs/evidence/P0-1-ci.md is actually claiming.
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
 
 # Without this, a second push during a 20-minute Rust build queues a
 # whole second build rather than replacing the first. On a private repo
