@@ -269,6 +269,7 @@ async fn sql(
 async fn write(
     State(state): State<Arc<RouterState>>,
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
     let db = params
@@ -290,7 +291,34 @@ async fn write(
     }
     let precision = params.get("precision").cloned();
 
-    let text = match std::str::from_utf8(&body) {
+    // Decompress before validating, exactly as the single-node endpoint
+    // does (api::maybe_gunzip). The router sells itself as the drop-in
+    // single write endpoint, and both Tributary (gzip on by default) and
+    // Telegraf's influxdb_v2 output send gzip bodies — the first version
+    // of this handler read the raw gzip bytes as line protocol and 400'd
+    // every batch, so a fleet of correct agents pointed at the correct
+    // endpoint quarantined its entire output as poison (Catchment
+    // router-tributary-exactness, 2026-08-13). Shards are forwarded PLAIN:
+    // the router re-chunks bodies, so what it forwards must stand alone,
+    // and the intra-cluster hop is a LAN where correctness outranks the
+    // recompression it would cost.
+    let gzipped = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+    let decompressed;
+    let raw: &[u8] = if gzipped {
+        use std::io::Read as _;
+        let mut out = Vec::with_capacity(body.len() * 4);
+        if let Err(e) = flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out) {
+            return err(StatusCode::BAD_REQUEST, &format!("bad gzip body: {e}"));
+        }
+        decompressed = out;
+        &decompressed
+    } else {
+        &body
+    };
+    let text = match std::str::from_utf8(raw) {
         Ok(t) => t,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body is not utf-8"),
     };
