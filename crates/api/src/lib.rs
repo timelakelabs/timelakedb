@@ -175,6 +175,11 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
             "/admin/tokens/{id}",
             axum::routing::delete(tokens_revoke::<E>),
         )
+        .route("/admin/cert-grants", get(cert_grants_list::<E>))
+        .route(
+            "/admin/cert-grants/{cn}",
+            axum::routing::put(cert_grants_set::<E>).delete(cert_grants_remove::<E>),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_guard::<E>,
@@ -898,6 +903,97 @@ async fn tokens_revoke<E: Engine>(
     match state.auth.revoke_token(&id) {
         Ok(true) => Json(json!({ "id": id, "status": "revoked" })).into_response(),
         Ok(false) => err_response(StatusCode::NOT_FOUND, "no such token, or already revoked"),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ---- SEC-2 certificate grants (exposures 7/9) --------------------------
+//
+// A verified client-certificate identity (its CN) is held to a set of
+// authorizations: the query path intersects the caller's self-asserted
+// claims with these, so a certificate can only ever NARROW what its
+// holder sees. No grants recorded = the want-mode passthrough (claims
+// unchanged), which is why an unmapped certificate grants nothing.
+
+async fn cert_grants_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Operator) {
+        return deny;
+    }
+    let grants: Vec<_> = state
+        .auth
+        .cert_grant_identities()
+        .into_iter()
+        .map(|(identity, authorizations)| {
+            json!({ "identity": identity, "authorizations": authorizations })
+        })
+        .collect();
+    Json(json!({ "cert_grants": grants })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CertGrantsRequest {
+    /// The authorizations this certificate identity is granted; a caller's
+    /// claims are intersected with these. Empty means the identity sees
+    /// only rows visible to no authorization (public), which is the
+    /// tightest a grant can be.
+    #[serde(default)]
+    authorizations: Vec<String>,
+}
+
+async fn cert_grants_set<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(cn): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    // Granting is deciding what an identity may see: admin, no exceptions.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let parsed: CertGrantsRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    if cn.trim().is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "certificate CN must not be empty");
+    }
+    match state
+        .auth
+        .set_cert_grants(&cn, parsed.authorizations.clone())
+    {
+        Ok(()) => Json(json!({
+            "identity": cn,
+            "authorizations": parsed.authorizations,
+            "status": "set",
+        }))
+        .into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn cert_grants_remove<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(cn): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    match state.auth.remove_cert_grants(&cn) {
+        Ok(true) => Json(json!({ "identity": cn, "status": "removed" })).into_response(),
+        Ok(false) => err_response(
+            StatusCode::NOT_FOUND,
+            "no grants recorded for that identity",
+        ),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

@@ -1193,7 +1193,12 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
     let mut probes = 0;
     while !flusher.is_finished() && std::time::Instant::now() < deadline {
         let batches = eng
-            .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
+            .sql_batches(
+                "poc",
+                "SELECT COUNT(*) AS n FROM slowflush",
+                Vec::new(),
+                None,
+            )
             .await
             .expect("mid-flush query must not fail");
         let n = timelake_query::batches_to_json(&batches)[0]["n"].as_i64();
@@ -1206,7 +1211,12 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
 
     // and after the flush the answer is identical, from files
     let batches = eng
-        .sql_batches("poc", "SELECT COUNT(*) AS n FROM slowflush", Vec::new())
+        .sql_batches(
+            "poc",
+            "SELECT COUNT(*) AS n FROM slowflush",
+            Vec::new(),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(timelake_query::batches_to_json(&batches)[0]["n"], 3);

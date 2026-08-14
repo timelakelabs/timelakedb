@@ -49,6 +49,12 @@ pub const PRINCIPALS_PATH: &str = "catalog/config/principals.json";
 /// Data-plane tokens live beside the principals, so they inherit SEC-1
 /// envelope encryption and the C0 S3 sharing story for free.
 pub const TOKENS_PATH: &str = "catalog/config/tokens.json";
+/// SEC-2 grants for verified client-certificate identities: a CN → the
+/// authorizations that identity is held to. A caller presenting a cert
+/// has its self-asserted claims intersected with these (exposures 7/9).
+/// Beside the tokens, so it inherits the same envelope encryption and
+/// object-store sharing.
+pub const CERT_GRANTS_PATH: &str = "catalog/config/cert-grants.json";
 /// The seeded username and its seeded password.
 pub const DEFAULT_USER: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admin";
@@ -166,6 +172,8 @@ pub struct Auth {
     store: Arc<dyn Store>,
     principals: RwLock<BTreeMap<String, Principal>>,
     tokens: RwLock<TokenIndex>,
+    /// CN -> the authorizations a verified client certificate is granted.
+    cert_grants: RwLock<BTreeMap<String, Vec<String>>>,
     sessions: RwLock<HashMap<String, Session>>,
     failures: Mutex<HashMap<String, Failures>>,
     /// Successful and failed logins, for /metrics.
@@ -224,10 +232,22 @@ impl Auth {
             Err(e) => return Err(e),
         };
 
+        let cert_grants: BTreeMap<String, Vec<String>> = match store.get(CERT_GRANTS_PATH) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{CERT_GRANTS_PATH}: {e}"),
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e),
+        };
+
         let auth = Auth {
             store,
             principals: RwLock::new(principals),
             tokens: RwLock::new(TokenIndex::from_records(tokens)),
+            cert_grants: RwLock::new(cert_grants),
             sessions: RwLock::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             logins_total: AtomicU64::new(0),
@@ -279,6 +299,63 @@ impl Auth {
         let t = self.tokens.read().expect("tokens lock");
         let bytes = serde_json::to_vec_pretty(&t.records()).expect("tokens json");
         self.store.put(TOKENS_PATH, &bytes)
+    }
+
+    /// The authorizations a verified client-certificate identity is
+    /// granted, or `None` if none are recorded for it. `None` means the
+    /// caller's claims are kept as asserted (the documented want-mode
+    /// passthrough); `Some` intersects them (exposures 7/9).
+    pub fn cert_grants(&self, identity: &str) -> Option<Vec<String>> {
+        self.cert_grants
+            .read()
+            .expect("cert grants lock")
+            .get(identity)
+            .cloned()
+    }
+
+    /// Grant a certificate identity a set of authorizations, replacing any
+    /// prior set. This can only ever NARROW what that identity sees — the
+    /// query path intersects claims with it and never unions.
+    pub fn set_cert_grants(&self, identity: &str, authorizations: Vec<String>) -> Result<()> {
+        self.cert_grants
+            .write()
+            .expect("cert grants lock")
+            .insert(identity.to_string(), authorizations);
+        self.persist_cert_grants()?;
+        tracing::info!(identity, "SEC-2: certificate grants set");
+        Ok(())
+    }
+
+    /// Remove a certificate identity's grants. Returns whether it existed.
+    /// After this the identity is back to the want-mode passthrough.
+    pub fn remove_cert_grants(&self, identity: &str) -> Result<bool> {
+        let removed = self
+            .cert_grants
+            .write()
+            .expect("cert grants lock")
+            .remove(identity)
+            .is_some();
+        if removed {
+            self.persist_cert_grants()?;
+            tracing::info!(identity, "SEC-2: certificate grants removed");
+        }
+        Ok(removed)
+    }
+
+    /// Every recorded (identity, authorizations), for the admin list view.
+    pub fn cert_grant_identities(&self) -> Vec<(String, Vec<String>)> {
+        self.cert_grants
+            .read()
+            .expect("cert grants lock")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn persist_cert_grants(&self) -> Result<()> {
+        let g = self.cert_grants.read().expect("cert grants lock");
+        let bytes = serde_json::to_vec_pretty(&*g).expect("cert grants json");
+        self.store.put(CERT_GRANTS_PATH, &bytes)
     }
 
     /// Issue a data-plane token. The secret is returned exactly once and
@@ -594,6 +671,46 @@ mod tests {
     fn auth_on_with(dir: &std::path::Path, bootstrap: &str) -> Arc<Auth> {
         let store: Arc<dyn Store> = Arc::new(LocalStore::new(dir).unwrap());
         Auth::open(store, Some(bootstrap)).unwrap()
+    }
+
+    #[test]
+    fn cert_grants_are_set_read_removed_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let auth = auth_on(dir.path());
+            assert_eq!(
+                auth.cert_grants("cn=probe"),
+                None,
+                "unmapped identity has none"
+            );
+            auth.set_cert_grants("cn=probe", vec!["alpha".into(), "beta".into()])
+                .unwrap();
+            assert_eq!(
+                auth.cert_grants("cn=probe"),
+                Some(vec!["alpha".into(), "beta".into()])
+            );
+            // Distinct identities do not bleed into each other.
+            assert_eq!(auth.cert_grants("cn=other"), None);
+        }
+        {
+            // Reopened from the same store: the grants persisted.
+            let auth = auth_on(dir.path());
+            assert_eq!(
+                auth.cert_grants("cn=probe"),
+                Some(vec!["alpha".into(), "beta".into()]),
+                "cert grants must survive a restart, like tokens"
+            );
+            assert!(auth.remove_cert_grants("cn=probe").unwrap());
+            assert!(
+                !auth.remove_cert_grants("cn=probe").unwrap(),
+                "idempotent remove"
+            );
+            assert_eq!(auth.cert_grants("cn=probe"), None);
+        }
+        {
+            let auth = auth_on(dir.path());
+            assert_eq!(auth.cert_grants("cn=probe"), None, "removal persisted too");
+        }
     }
 
     #[test]
