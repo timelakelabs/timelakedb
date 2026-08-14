@@ -110,6 +110,94 @@ async fn post_sql(app: &axum::Router, with_credentials: bool) -> (StatusCode, St
 }
 
 #[tokio::test]
+async fn a_gzip_write_body_is_decompressed_validated_and_forwarded_plain() {
+    // Tributary gzips by default, and stock Telegraf's influxdb_v2 output
+    // speaks gzip too. The single-node endpoint decompresses; the router —
+    // which sells itself as the drop-in single write endpoint those
+    // clients keep pointing at — read the raw gzip bytes as line protocol
+    // and rejected every batch with 400. The agent then did exactly what
+    // it should with a rejected batch: bisected it hunting the poison
+    // line, and quarantined all 40,000 lines of a correct corpus, per
+    // stream, with `shipped: 0` (Catchment router-tributary-exactness,
+    // 2026-08-13). A client that works against one node must work against
+    // the router, or the router is not a drop-in anything.
+    let (a, log_a) = stub_node("[]", StatusCode::OK).await;
+    let (b, log_b) = stub_node("[]", StatusCode::OK).await;
+    let state = Arc::new(RouterState::new(vec![
+        ("ingester-a".into(), a),
+        ("ingester-b".into(), b),
+    ]));
+    let app = router_app(state);
+
+    let body = "cpu,host=h1 v=1i 1\nmem,host=h1 v=2i 2\n";
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, body.as_bytes()).unwrap();
+    let gz = enc.finish().unwrap();
+
+    let res = app
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("content-encoding", "gzip")
+                .body(Body::from(gz))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "a gzip write must pass through the router exactly as it passes \
+         into a single node"
+    );
+
+    // Give the stub servers a beat to record the forwards.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Every line arrived somewhere, in PLAIN text: the router re-chunks
+    // bodies per shard, so what it forwards must parse on its own, with
+    // no memory of the original request's headers.
+    let all: String = {
+        let a = log_a.lock().unwrap().bodies.concat();
+        let b = log_b.lock().unwrap().bodies.concat();
+        a + &b
+    };
+    assert!(
+        all.contains("cpu,host=h1 v=1i 1"),
+        "cpu line missing: {all:?}"
+    );
+    assert!(
+        all.contains("mem,host=h1 v=2i 2"),
+        "mem line missing: {all:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_corrupt_gzip_body_is_a_400_that_says_so() {
+    // The failure mode must name itself: "bad gzip body", not "line has
+    // no measurement" about bytes the client never wrote.
+    let (a, _log) = stub_node("[]", StatusCode::OK).await;
+    let state = Arc::new(RouterState::new(vec![("ingester-a".into(), a)]));
+    let app = router_app(state);
+    let res = app
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-encoding", "gzip")
+                .body(Body::from(&b"\x1f\x8b\x08\x00garbage"[..]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let msg = String::from_utf8_lossy(&bytes);
+    assert!(
+        msg.contains("gzip"),
+        "the reason must name gzip, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn a_query_reaches_a_querier_and_its_answer_comes_back_verbatim() {
     let (addr, log) = stub_node(r#"[{"n":42}]"#, StatusCode::OK).await;
     let app = router_app(Arc::new(RouterState::with_queriers(

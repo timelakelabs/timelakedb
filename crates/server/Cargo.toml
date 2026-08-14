@@ -25,6 +25,7 @@ timelake-flight = { path = "../flight" }
 timelake-tls = { path = "../tls" }
 axum-server.workspace = true
 reqwest.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 # CL-3 tests wire two engines to ONE store in a single process — the
@@ -33,7 +34,6 @@ timelake-store = { path = "../store" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true
-flate2.workspace = true
 
 
 
