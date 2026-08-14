@@ -90,8 +90,27 @@ Riverkeeper does not set posture. Both directions are legitimate:
 
 ## Status
 
-**Open.** Riverkeeper's certificate-narrowing control is blocked on this
-decision — it will not ship a control that reports VERIFIED for a
-property the running system cannot exercise. The token-grant narrowing is
-VERIFIED and unaffected. Evidence: the wire comparison above, reproduced
-by Riverkeeper against the `tls` topology.
+**Fixed 2026-08-14** — the feature was wired (operator decision, over
+softening the document). Both gaps are closed:
+
+1. `PeerIdentity` now threads from the Flight connection through
+   `SqlBackend::query_batches` into `Engine::sql_batches`, which sets
+   `QuerySession.identity` and calls `.resolve(granted)`. The cert
+   identity reaches the query.
+2. `Auth` gained a persisted cert-grants store (`cert-grants.json`,
+   beside the tokens) and an admin surface: `GET /admin/cert-grants`,
+   `PUT /admin/cert-grants/{cn}`, `DELETE /admin/cert-grants/{cn}`. An
+   operator can now grant a certificate identity a set of authorizations.
+
+So SECURITY.md exposures 7 and 9 are now accurate as written — the
+implementation caught up to the document rather than the other way
+around. Riverkeeper's `flight-cert-grants-narrow` verifies it end to end
+over the `tls` topology, reusing the token control's SEC-2 oracle: a
+trusted certificate granted G, presenting claims C, sees exactly C∩G and
+never more. The control's probe mutation doubles as the regression guard
+— before this fix a certificate did not narrow, so the "grants ignored"
+assertion would have HELD (NOT-FALSIFIABLE); it now deviates, PROVEN.
+
+Rust regression coverage:
+`crates/auth/src/lib.rs::cert_grants_are_set_read_removed_and_survive_reopen`
+plus the pre-existing `QuerySession` intersection tests.

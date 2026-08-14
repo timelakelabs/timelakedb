@@ -63,11 +63,15 @@ pub trait SqlBackend: Send + Sync + 'static {
 
     /// `authorizations` are the session's visibility authorizations
     /// (SEC-2), from `x-timelake-authorizations` request metadata.
+    /// `identity` is the verified client-certificate CN, when the caller
+    /// presented one: the backend intersects its claims with what that
+    /// identity is granted (exposures 7/9). `None` is anonymous.
     fn query_batches<'a>(
         &'a self,
         db: String,
         sql: String,
         authorizations: Vec<String>,
+        identity: Option<String>,
     ) -> SqlFuture<'a>;
 
     /// Databases holding data — one catalog each, for `CommandGetCatalogs`.
@@ -285,9 +289,20 @@ impl FlightSqlService for TimeLakeFlight {
         // for honest clients and decisive for forged tickets.
         let auths = resolve_auths(self.backend.as_ref(), request.metadata(), &db, auths)?;
 
+        // The verified client-certificate identity for THIS connection, if
+        // the caller presented one (SEC-3 want mode). tonic puts the
+        // connection's `connect_info` in every request's extensions; the
+        // backend intersects the caller's claims with what this identity
+        // is granted (exposures 7/9). It is applied on DoGet — where the
+        // rows actually flow — not at planning.
+        let identity = request
+            .extensions()
+            .get::<PeerIdentity>()
+            .and_then(|p| p.0.clone());
+
         let batches = self
             .backend
-            .query_batches(db, sql, auths)
+            .query_batches(db, sql, auths, identity)
             .await
             .map_err(Status::internal)?;
         let schema = match batches.first() {
@@ -607,6 +622,7 @@ mod tests {
             _db: String,
             _sql: String,
             _authorizations: Vec<String>,
+            _identity: Option<String>,
         ) -> SqlFuture<'a> {
             Box::pin(async { Ok(Vec::new()) })
         }

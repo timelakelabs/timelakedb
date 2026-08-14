@@ -1014,7 +1014,10 @@ impl timelake_api::Engine for Engine {
         query: String,
         authorizations: Vec<String>,
     ) -> Result<Value, String> {
-        let batches = self.sql_batches(&db, &query, authorizations).await?;
+        // HTTP has no verified client-certificate identity to fold in
+        // (SEC-3 want mode is exercised on the Flight listener), so the
+        // cert-grant narrowing is a no-op here.
+        let batches = self.sql_batches(&db, &query, authorizations, None).await?;
         Ok(batches_to_json(&batches))
     }
 
@@ -1045,6 +1048,7 @@ impl Engine {
         db: &str,
         query: &str,
         authorizations: Vec<String>,
+        identity: Option<&str>,
     ) -> Result<Vec<timelake_query::QueryBatch>, String> {
         let remote = self.remote_buffers();
         if let Some(r) = &remote {
@@ -1075,7 +1079,20 @@ impl Engine {
             ));
         }
 
-        let session = QuerySession::with_authorizations(authorizations);
+        // SEC-2 (exposures 7/9): a verified client-certificate identity
+        // turns the caller's self-asserted claims into grants — its
+        // authorizations are intersected with what that identity is
+        // granted, and only ever narrowed. An anonymous caller, or a cert
+        // with no grants recorded, passes through unchanged (want mode
+        // grants nothing on its own). `resolve` is a no-op unless BOTH an
+        // identity and a grant set are present, so this is safe for every
+        // caller.
+        let mut session = QuerySession::with_authorizations(authorizations);
+        if let Some(id) = identity {
+            session.identity = Some(id.to_string());
+        }
+        let granted = identity.and_then(|id| self.auth.cert_grants(id));
+        let session = session.resolve(granted.as_deref());
 
         // PASS 1 — every live row, before any catalog read.
         //
@@ -1856,8 +1873,12 @@ impl timelake_flight::SqlBackend for Engine {
         db: String,
         sql: String,
         authorizations: Vec<String>,
+        identity: Option<String>,
     ) -> timelake_flight::SqlFuture<'a> {
-        Box::pin(async move { self.sql_batches(&db, &sql, authorizations).await })
+        Box::pin(async move {
+            self.sql_batches(&db, &sql, authorizations, identity.as_deref())
+                .await
+        })
     }
 
     fn databases(&self) -> Vec<String> {
