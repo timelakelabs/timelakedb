@@ -229,11 +229,22 @@ stack (`rustls-aws-lc`, rustls 0.23), so the obsolete TLS implementation was
 being compiled into the binary beside the one actually in use. Turning that
 one feature off removes it entirely.
 
-**Open — `thrift` 0.17.0, GHSA-2f9f-gq7v-9h6m** (medium, CVSS 5.3,
-availability only: memory allocation with an excessive size value). It
-arrives as `parquet` → `datafusion` → this workspace, and the fix is thrift
-0.23, a 0.x major change that no lockfile update can cross — arrow-rs has to
-move first, and there is nothing to pin here in the meantime.
+**Open, blocked upstream — `thrift` 0.17.0, GHSA-2f9f-gq7v-9h6m** (medium,
+CVSS 5.3, availability only: memory allocation with an excessive size
+value). It arrives as `thrift` → `parquet` (the non-optional `arrow`
+feature) → `datafusion` → this workspace. arrow-rs has since rewritten the
+Parquet metadata parser to drop the external `thrift` crate, and the
+removal completes in **`parquet` 59** — but the latest released
+**`datafusion` (54)** still pins `parquet ^58.3.0` and *rejects* 59.
+Verified 2026-08-15: `cargo update -p parquet --precise 59.0.0` fails with
+"candidate versions found which didn't match: 59.0.0, required by
+datafusion v54.1.0". So there is still nothing to pin here — no released
+`datafusion` reaches a thrift-free `parquet`. It resolves when
+`datafusion` 55 lands on `parquet` 59+, a major bump we take then rather
+than chase a pre-release for a deferred, unreachable advisory. The rest of
+the tree is otherwise refreshed to latest within-semver (`cargo update`);
+the other flagged crates — `paste`, `lru` — arrive down the same
+`datafusion`/`parquet` chain and clear on the same upgrade.
 
 The reachable path would be parsing Parquet metadata from an untrusted
 source. TimeLakeDB reads Parquet that TimeLakeDB wrote, from its own object
