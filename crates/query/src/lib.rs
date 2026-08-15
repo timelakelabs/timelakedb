@@ -10,6 +10,7 @@
 //! as new [`Restriction`] variants through this same hook.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, UInt64Array};
 use datafusion::arrow::datatypes::DataType;
@@ -75,6 +76,33 @@ impl QueryEnv {
     }
 }
 
+/// A per-process monotonic id stamped on every sanitized query failure, so
+/// the opaque message the caller receives can be matched to the full error
+/// in the server log. It is not secret — it is returned to the caller — and
+/// not stable across restarts; the server log carries timestamps for that.
+static QUERY_REF: AtomicU64 = AtomicU64::new(0);
+
+fn next_query_ref() -> String {
+    format!("q-{:08x}", QUERY_REF.fetch_add(1, Ordering::Relaxed))
+}
+
+/// SEC-5 (exposure 5): a DataFusion error names the tables and columns a
+/// query touched — a schema disclosure to any caller, and a bad *column*
+/// name makes DataFusion enumerate every real column of the table. Log the
+/// full error server-side against `ref_id` and return a message that says
+/// only that the query failed. The caller gets `ref_id` to quote to an
+/// operator; an attacker gets nothing enumerable.
+///
+/// This is the opaque policy: every DataFusion planning/execution failure
+/// collapses to the one message. The deliberately-safe messages a query can
+/// still return — the read-only-guard refusal (exposure 2), the timeout, the
+/// "database does not exist" — do NOT pass through here; they name a
+/// statement type or the caller's own input, not discovered schema.
+fn opaque(ref_id: &str, stage: &str, e: impl std::fmt::Display) -> String {
+    tracing::warn!(query_ref = %ref_id, stage, error = %e, "query failed");
+    format!("query could not be executed (ref: {ref_id})")
+}
+
 /// Execute SQL over registered providers under the SHARED environment.
 pub async fn run_sql_env(
     env: &QueryEnv,
@@ -83,6 +111,7 @@ pub async fn run_sql_env(
     tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
+    let ref_id = next_query_ref();
     // admission control: excess queries queue here, bounded by RR-1
     let _permit = env
         .admission
@@ -119,7 +148,7 @@ pub async fn run_sql_env(
     // the scan itself, so no plan shape can aggregate around it.
     for (name, provider) in tables {
         ctx.register_table(&name, provider)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| opaque(&ref_id, "register", e))?;
     }
 
     let work = async {
@@ -130,13 +159,17 @@ pub async fn run_sql_env(
             .state()
             .create_logical_plan(sql)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| opaque(&ref_id, "plan", e))?;
+        // The guard's refusal is a deliberate, safe message (exposure 2) —
+        // it names a statement class, not schema — so it is returned as-is.
         sql_guard::ensure_read_only(&plan)?;
         let df = ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| e.to_string())?;
-        df.collect().await.map_err(|e| e.to_string())
+            .map_err(|e| opaque(&ref_id, "execute", e))?;
+        df.collect()
+            .await
+            .map_err(|e| opaque(&ref_id, "collect", e))
     };
     match tokio::time::timeout(env.timeout, work).await {
         Ok(res) => res,
@@ -594,6 +627,63 @@ mod tests {
         assert_eq!(rows[0]["products"], 2);
         assert_eq!(rows[1]["step"], "02-extract");
         assert_eq!(rows[1]["products"], 1);
+    }
+
+    #[tokio::test]
+    async fn query_errors_are_opaque_sec5() {
+        // Exposure 5: a bad table name must not be echoed, and a bad column
+        // name must not make the error enumerate the real schema. Drives the
+        // PRODUCTION path (run_sql_env), not the run_sql test helper.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let batch = buffer_with(&format!("events,host=a value=1.0 {t}", t = now - 1_000));
+        let (schema, aligned) = align(vec![batch]).unwrap();
+        let parts = aligned.into_iter().map(|b| vec![b]).collect();
+        let provider: Arc<dyn datafusion::datasource::TableProvider> =
+            Arc::new(MemTable::try_new(schema, parts).unwrap());
+
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30);
+        let session = QuerySession::default();
+
+        // Bad table name — must not appear in the message.
+        let err = run_sql_env(
+            &env,
+            &session,
+            "db",
+            vec![("events".into(), provider.clone())],
+            "SELECT * FROM secret_ledger",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("query could not be executed"),
+            "not opaque: {err}"
+        );
+        assert!(err.contains("ref: q-"), "no correlation ref: {err}");
+        assert!(!err.contains("secret_ledger"), "leaked table name: {err}");
+
+        // Bad column name — must not echo the name nor enumerate the schema
+        // (DataFusion's raw error lists "Valid fields are ...host...value...").
+        let err = run_sql_env(
+            &env,
+            &session,
+            "db",
+            vec![("events".into(), provider.clone())],
+            "SELECT secret_column FROM events",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("query could not be executed"),
+            "not opaque: {err}"
+        );
+        assert!(!err.contains("secret_column"), "leaked column name: {err}");
+        assert!(
+            !err.contains("host") && !err.contains("value"),
+            "enumerated schema: {err}"
+        );
     }
 
     #[tokio::test]
