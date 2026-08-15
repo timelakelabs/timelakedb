@@ -47,11 +47,21 @@ jobs:
       # mid-link. That reads as a test failure in the log and is not one —
       # the same sha passes in a stock rust:1-slim container. None of what is
       # removed below is used by this job.
+      #
+      # The original list (dotnet/ghc/android/CodeQL) left the margin thin
+      # enough that a lockfile refresh alone re-crossed it (run 31901364946:
+      # "No space left on device" in the same llvm-cov link). Freeing the
+      # rest of the language runtimes this job never touches, plus the
+      # preloaded Docker images, restores real headroom (~10+ GB).
       - name: Reclaim runner disk
         run: |
           echo "before: $(df -h --output=avail / | tail -1) available"
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/lib/jvm /usr/local/graalvm \
+                      /usr/local/share/powershell /usr/share/swift \
+                      /usr/local/share/chromium
+          sudo docker image prune -af || true
           echo "after:  $(df -h --output=avail / | tail -1) available"
 
       - uses: dtolnay/rust-toolchain@stable
