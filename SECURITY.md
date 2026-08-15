@@ -165,12 +165,25 @@ follow from "no authentication" and are listed so you can design around them.
    authenticating proxy that *sets* (and strips inbound) the header, or a
    deployment migrated far enough to run `required`.
 
-8. **Encryption at rest does not cover the local WAL**, which holds recent
-   line-protocol bytes until flush, nor does it protect data from anyone who
-   can reach the query API (queries decrypt transparently). It protects the
-   object store's media: a stolen volume, a decommissioned disk, an S3
-   bucket leak. Key material is held in process memory and sourced from the
-   environment.
+8. **~~Encryption at rest does not cover the local WAL~~, which holds recent
+   line-protocol bytes until flush. CLOSED (SEC-8).** When at-rest encryption
+   is configured (`TIMELAKE_ENCRYPTION_KEY[_FILE]` or `TIMELAKE_KMS_KEY_ID`)
+   the WAL is now encrypted with the SAME envelope key as the object store:
+   each generation file carries a per-file data key wrapped by the KEK, and
+   every frame is sealed with AES-256-GCM. Turning on store encryption covers
+   the WAL — and the durable replica WAL — with no extra flag. Plaintext
+   segments written before a key was configured still replay (passthrough,
+   keyed on a file-level magic, exactly as the object store passes through
+   pre-encryption objects), so enabling it needs no migration. Replay fails
+   **closed**: an encrypted segment with no key, or a whole frame that fails
+   authentication, refuses to start rather than silently dropping an acked
+   write; only an incomplete *trailing* frame — a crash mid-append — is the
+   tolerated torn tail. Key material is held in process memory and sourced
+   from the environment. What this still does NOT do, by design, is protect
+   data from anyone who can reach the query API — queries decrypt
+   transparently; that is authentication's job (SEC-4), not encryption's.
+   Encryption at rest protects the media: a stolen volume, a decommissioned
+   disk, an S3 bucket leak, and now the WAL among them.
 
 9. **Want-mode client authentication is optional by design, so it
    grants nothing on its own.** An attacker simply declines to present a

@@ -29,7 +29,7 @@ use timelake_ingest::{parse_lines, precision_multiplier};
 use timelake_query::{QuerySession, batches_to_json};
 use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
-use timelake_wal::Wal;
+use timelake_wal::{Wal, WalCipher};
 
 pub mod querier;
 pub mod ratelimit;
@@ -161,6 +161,9 @@ pub struct StoreStack {
     pub backend: &'static str,
     pub kms_stats: Option<Arc<KmsStats>>,
     pub s3_stats: Option<Arc<S3Stats>>,
+    /// SEC-8: the envelope key handle, surfaced so the WAL can encrypt with
+    /// the SAME key as the object store. `Some` exactly when `encrypted`.
+    pub kms: Option<Arc<dyn Kms>>,
 }
 
 impl StoreStack {
@@ -171,6 +174,7 @@ impl StoreStack {
             backend: "custom",
             kms_stats: None,
             s3_stats: None,
+            kms: None,
         }
     }
 }
@@ -238,38 +242,55 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     }
-    let (store, encrypted, kms_stats): (Arc<dyn Store>, bool, Option<Arc<KmsStats>>) =
-        match (kms_key, local_key) {
-            (Some(key_id), None) => {
-                let aws = AwsKms::new(ctx.expect("ctx built for kms"), key_id);
-                if std::env::var("TIMELAKE_KMS_CACHE").as_deref() == Ok("off") {
-                    tracing::warn!(
-                        "TIMELAKE_KMS_CACHE=off: strict per-object data keys, \
-                         one KMS call per object (the drill's baseline mode)"
-                    );
-                    let kms: Arc<dyn Kms> = Arc::new(aws);
-                    (Arc::new(EncryptingStore::new(base, kms)), true, None)
-                } else {
-                    let cached = CachingKms::new(
-                        aws,
-                        std::time::Duration::from_secs(env_u64(
-                            "TIMELAKE_KMS_CACHE_MAX_AGE_SECS",
-                            300,
-                        )),
-                        env_u64("TIMELAKE_KMS_CACHE_MAX_USES", 1000) as u32,
-                    );
-                    let stats = cached.stats();
-                    let kms: Arc<dyn Kms> = Arc::new(cached);
-                    (Arc::new(EncryptingStore::new(base, kms)), true, Some(stats))
-                }
+    #[allow(clippy::type_complexity)]
+    let (store, encrypted, kms_stats, kms): (
+        Arc<dyn Store>,
+        bool,
+        Option<Arc<KmsStats>>,
+        Option<Arc<dyn Kms>>,
+    ) = match (kms_key, local_key) {
+        (Some(key_id), None) => {
+            let aws = AwsKms::new(ctx.expect("ctx built for kms"), key_id);
+            if std::env::var("TIMELAKE_KMS_CACHE").as_deref() == Ok("off") {
+                tracing::warn!(
+                    "TIMELAKE_KMS_CACHE=off: strict per-object data keys, \
+                     one KMS call per object (the drill's baseline mode)"
+                );
+                let kms: Arc<dyn Kms> = Arc::new(aws);
+                (
+                    Arc::new(EncryptingStore::new(base, kms.clone())),
+                    true,
+                    None,
+                    Some(kms),
+                )
+            } else {
+                let cached = CachingKms::new(
+                    aws,
+                    std::time::Duration::from_secs(env_u64("TIMELAKE_KMS_CACHE_MAX_AGE_SECS", 300)),
+                    env_u64("TIMELAKE_KMS_CACHE_MAX_USES", 1000) as u32,
+                );
+                let stats = cached.stats();
+                let kms: Arc<dyn Kms> = Arc::new(cached);
+                (
+                    Arc::new(EncryptingStore::new(base, kms.clone())),
+                    true,
+                    Some(stats),
+                    Some(kms),
+                )
             }
-            (None, Some(kek)) => {
-                let kms: Arc<dyn Kms> = Arc::new(LocalKek::new(kek));
-                (Arc::new(EncryptingStore::new(base, kms)), true, None)
-            }
-            (None, None) => (base, false, None),
-            (Some(_), Some(_)) => unreachable!("refused above"),
-        };
+        }
+        (None, Some(kek)) => {
+            let kms: Arc<dyn Kms> = Arc::new(LocalKek::new(kek));
+            (
+                Arc::new(EncryptingStore::new(base, kms.clone())),
+                true,
+                None,
+                Some(kms),
+            )
+        }
+        (None, None) => (base, false, None, None),
+        (Some(_), Some(_)) => unreachable!("refused above"),
+    };
 
     Ok(StoreStack {
         store,
@@ -277,7 +298,30 @@ pub fn store_stack_from_env(data_dir: &Path) -> std::io::Result<StoreStack> {
         backend,
         kms_stats,
         s3_stats,
+        kms,
     })
+}
+
+/// Adapts the object store's envelope `Kms` to the WAL's `WalCipher` (SEC-8),
+/// so the WAL encrypts with the same key without the wal crate depending on
+/// the store. `Kms::generate` returns `(dek, wrapped)`; the WAL wants
+/// `(wrapped, dek)`.
+struct WalKms(Arc<dyn Kms>);
+
+impl WalCipher for WalKms {
+    fn generate(&self) -> std::io::Result<(Vec<u8>, [u8; 32])> {
+        self.0
+            .generate()
+            .map(|(dek, wrapped)| (wrapped, dek))
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+    fn unwrap(&self, wrapped: &[u8]) -> std::io::Result<[u8; 32]> {
+        // A wrong key fails here — fail closed, as InvalidData, so WAL replay
+        // refuses rather than dropping acked frames.
+        self.0
+            .unwrap(wrapped)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
 }
 
 /// Where runtime retention config lives in the object store (FR-7).
@@ -338,6 +382,9 @@ pub struct Engine {
     /// SEC-6: per-client concurrency cap in front of the admission
     /// semaphore, so one client cannot hold the whole query budget.
     client_limiter: Arc<ClientLimiter>,
+    /// SEC-8: the WAL's encryption key (the object store's envelope key),
+    /// used to open the local and replica WALs. `None` = plaintext WAL.
+    wal_cipher: Option<Arc<dyn WalCipher>>,
     /// Full column set per (db, table): survives flushes and restarts so
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
@@ -455,10 +502,15 @@ impl Engine {
             backend: _,
             kms_stats,
             s3_stats,
+            kms,
         } = stack;
         let catalog = Catalog::load(store.clone())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let (wal, frames) = Wal::open(&data_dir.join("wal"))?;
+        // SEC-8: the WAL encrypts with the SAME envelope key as the object
+        // store, so turning on at-rest encryption covers the WAL too.
+        let wal_cipher: Option<Arc<dyn WalCipher>> =
+            kms.map(|k| Arc::new(WalKms(k)) as Arc<dyn WalCipher>);
+        let (wal, frames) = Wal::open(&data_dir.join("wal"), wal_cipher.clone())?;
 
         // FR-7 runtime policies: the store copy (written by
         // /admin/retention) outranks the env seed — an operator's
@@ -502,6 +554,7 @@ impl Engine {
             store_encrypted,
             query_env,
             client_limiter,
+            wal_cipher,
             schemas: RwLock::new(HashMap::new()),
             schema_source: RwLock::new(HashMap::new()),
             auth,
@@ -1341,7 +1394,9 @@ impl Engine {
     /// explicit `recover_from_replica`, never during normal operation, so
     /// this node does not double-flush its peer's live rows.
     pub fn enable_replica_wal(&self, dir: &Path) -> std::io::Result<()> {
-        let (wal, frames) = Wal::open(dir)?;
+        // SEC-8: the replica WAL holds the peer's acked frames — encrypt it
+        // with the same key as the local WAL and the object store.
+        let (wal, frames) = Wal::open(dir, self.wal_cipher.clone())?;
         self.cl2_replica_frames
             .store(frames.len() as u64, Ordering::Relaxed);
         *self.replica_wal.lock().expect("replica wal lock") = Some(wal);
@@ -1408,7 +1463,7 @@ impl Engine {
         // recover belong to the next one. The fresh generation rotate()
         // opens is where they will land.
         let sealed = wal.rotate()?;
-        let (_reader, frames) = Wal::open(&dir)?;
+        let (_reader, frames) = Wal::open(&dir, self.wal_cipher.clone())?;
         let n = frames.len();
         for (db, mult, body) in frames {
             let text = String::from_utf8_lossy(&body);
