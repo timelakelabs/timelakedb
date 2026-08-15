@@ -24,8 +24,11 @@ set -e
 R=${R:-http://localhost:5970}          # router
 QA=${QA:-http://localhost:5973}        # querier-a
 QB=${QB:-http://localhost:5974}        # querier-b
-IA=${IA:-http://localhost:5981}        # ingester-a internal
-IB=${IB:-http://localhost:5982}        # ingester-b internal
+# The internal listener (:1965) is NOT published (SECURITY.md exposure
+# 10); reach it from inside each ingester via `docker exec`, by container
+# name, never a host port.
+IA=${IA:-cl3-ingester-a}               # ingester-a container
+IB=${IB:-cl3-ingester-b}               # ingester-b container
 COMPOSE=${COMPOSE:-timelakedb-cluster-s3.yml}
 TABLES=${TABLES:-8}
 PER=${PER:-400}
@@ -51,7 +54,7 @@ except Exception: print(0)")
   echo "$_sum"
 }
 metric() { curl -s "$1/metrics" | grep "^$2 " | awk '{print $2}' | head -1; }
-live_tables() { curl -s "$1/internal/v1/live" | python -c "import sys,json; print(len(json.load(sys.stdin)['tables']))"; }
+live_tables() { docker exec "$1" curl -s http://localhost:1965/internal/v1/live | python -c "import sys,json; print(len(json.load(sys.stdin)['tables']))"; }
 sql_code() {
   curl -s -o /dev/null -w "%{http_code}" -X POST "$1/api/sql" \
     -H 'content-type: application/json' \

@@ -31,7 +31,11 @@ services:
     hostname: ingester-b
     ports:
       - "5964:1963"
-      - "5965:1965"   # internal listener (recover endpoint) for the host drill
+      # TIMELAKE_CLUSTER_ADDR (:1965) is deliberately NOT published
+      # (SECURITY.md exposure 10: unauthenticated, no visibility filter,
+      # serves live rows and /recover — reaching it is read access to the
+      # data). The drill reaches it from inside the network with
+      # `docker exec`, never a host port. Do not re-add a `:1965` publish.
     environment:
       TIMELAKE_ROLE: ingester
       TIMELAKE_NODE_ID: ingester-b

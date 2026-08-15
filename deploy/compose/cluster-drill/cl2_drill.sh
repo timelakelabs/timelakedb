@@ -12,12 +12,17 @@
 # Topology: ingester-a and ingester-b, each the other's replication peer.
 # We write to A directly (the router that would front them is C2 phase 3).
 # Run from the HOST (needs docker start/stop/kill); the ingesters publish
-# their ports. localhost:5963=A, 5964=B, 5965=B-internal.
+# their DATA ports (localhost:5963=A, 5964=B). The internal listener
+# (:1965) is not published — it is reached via `docker exec` (exposure 10).
 #   sh cl2_drill.sh
 set -e
 A=${A:-http://localhost:5963}
 B=${B:-http://localhost:5964}
-BINT=${BINT:-http://localhost:5965}
+# The internal listener (:1965) is NOT published to the host (SECURITY.md
+# exposure 10). Reach it from INSIDE the container instead — this is the
+# only path a drill should use, and it matches the private-network posture
+# the guidance requires.
+recover_on_b() { docker exec ingester-b curl -s -X POST http://localhost:1965/internal/v1/recover; }
 N=${N:-20000}
 RUN=$(date +%s)
 
@@ -88,7 +93,7 @@ chk "$(rows "$B" "$T")" "0" "B has NOT applied the replica frames (dormant, no d
 echo "-- SIGKILL ingester-a --"
 docker kill ingester-a >/dev/null 2>&1 || true
 sleep 2
-REC=$(curl -s -X POST "$BINT/internal/v1/recover"); echo "  recover: $REC"
+REC=$(recover_on_b); echo "  recover: $REC"
 sleep 1
 chk "$(rows "$B" "$T")" "$N" "ZERO ACKED LOSS: every line A acked is queryable on B after recovery"
 RECN=$(metric "$B" timelake_cl2_recovered_total)
