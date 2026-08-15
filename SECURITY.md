@@ -117,8 +117,21 @@ follow from "no authentication" and are listed so you can design around them.
    `open engine (recovery): Permission denied`. Chown the volume to
    `1000:1000` once, or start on a fresh volume.
 
-5. **Query errors are returned verbatim**, including DataFusion planning errors
-   that disclose table and column names.
+5. **~~Query errors are returned verbatim~~, including DataFusion planning
+   errors that disclose table and column names. CLOSED (SEC-5).** A query
+   that fails to plan or execute now returns one opaque message —
+   `query could not be executed (ref: q-XXXXXXXX)` — on both `/api/sql` and
+   Flight SQL. The full DataFusion error is logged server-side against that
+   `ref`, so an operator diagnoses from the reference the caller quotes
+   while the caller learns only that the query failed. This closes the
+   column-enumeration variant too: a bad column name previously made
+   DataFusion return `No field named X. Valid fields are ...` and list every
+   real column of the table. Sanitized at the one shared execution point
+   (`crates/query` `run_sql_env`), so the HTTP and Flight surfaces cannot
+   diverge. Deliberately-safe messages are unchanged and still returned in
+   full: the read-only-guard refusal (exposure 2) names a statement class,
+   the timeout and the "database does not exist" message name the caller's
+   own input — none discloses schema.
 
 6. **No rate limiting per client.** The memory pool and admission semaphore
    keep a query from killing the server, but nothing stops one client from
