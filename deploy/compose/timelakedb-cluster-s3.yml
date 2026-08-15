@@ -60,7 +60,9 @@ services:
         condition: service_healthy
     ports:
       - "5971:1963"   # public data port
-      - "5981:1965"   # internal listener (the drill inspects /internal/v1/live)
+      # :1965 (TIMELAKE_CLUSTER_ADDR) is NOT published — SECURITY.md
+      # exposure 10. The drill inspects /internal/v1/live from inside the
+      # network via `docker exec`, never a host port.
     environment:
       <<: *node-env
       TIMELAKE_ROLE: ingester
@@ -82,7 +84,7 @@ services:
         condition: service_healthy
     ports:
       - "5972:1963"
-      - "5982:1965"
+      # :1965 not published — see ingester-a and SECURITY.md exposure 10.
     environment:
       <<: *node-env
       TIMELAKE_ROLE: ingester
