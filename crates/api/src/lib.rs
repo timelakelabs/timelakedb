@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -70,6 +72,19 @@ pub trait Engine: Send + Sync + 'static {
         action: Action,
         db: &str,
     ) -> Result<Decision, TokenError>;
+
+    /// SEC-6 (exposure 6): admit one query for a client, keyed by
+    /// `key` (the handler passes the data-plane token id when present, else
+    /// the network origin, else `None` when the transport cannot attribute
+    /// the caller). Returns an opaque guard to hold for the query's lifetime
+    /// or `None` when the client is already at its per-client concurrency
+    /// cap and the handler must refuse (429 / `ResourceExhausted`).
+    ///
+    /// The default never limits — a mock engine and the router inherit it —
+    /// so only the real engine, which owns the limiter, enforces the cap.
+    fn admit_client(&self, _key: Option<String>) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
 
     /// Prometheus exposition text (SR-4).
     fn metrics_text(&self) -> String;
@@ -142,7 +157,13 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
         .route("/write", post(write_v1::<E>))
         .route("/api/v2/write", post(write_v2::<E>))
         .route("/api/v3/write_lp", post(write_v3::<E>))
-        .route("/api/sql", post(sql::<E>))
+        .route(
+            "/api/sql",
+            post(sql::<E>).layer(axum::middleware::from_fn_with_state(
+                engine.clone(),
+                rate_limit_sql::<E>,
+            )),
+        )
         .with_state(engine.clone());
 
     let state = AdminState {
@@ -787,6 +808,57 @@ async fn sql<E: Engine>(
         Ok(rows) => Json(rows).into_response(),
         Err(msg) => err_response(StatusCode::BAD_REQUEST, &msg),
     }
+}
+
+/// SEC-6 (exposure 6): per-client concurrency cap for `/api/sql`, as a
+/// middleware so the handler stays a pure query path. Keyed by the
+/// data-plane token when the caller presents one (its header, hashed —
+/// the raw secret never becomes a map key) and by the network origin
+/// otherwise. The admission guard is held across the downstream handler
+/// and releases the slot on drop; a client already at its cap is refused
+/// with 429 before the query runs. A caller the transport cannot attribute
+/// (no token, no connect-info — e.g. an endpoint unit test) is not capped;
+/// the global admission bound (RR-1) still applies.
+async fn rate_limit_sql<E: Engine>(
+    State(engine): State<Arc<E>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let key = client_key_of(&request);
+    match engine.admit_client(key) {
+        Some(_slot) => next.run(request).await,
+        None => err_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent queries for this client (SEC-6)",
+        ),
+    }
+}
+
+/// The SEC-6 client key: `tok:<hash>` of the Authorization header when
+/// present, else `ip:<addr>` from the connection info, else None (nothing
+/// to key on — not capped).
+fn client_key_of(request: &axum::extract::Request) -> Option<String> {
+    if let Some(auth) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(format!("tok:{:016x}", short_hash(auth)));
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| format!("ip:{}", a.ip()))
+}
+
+/// A non-cryptographic digest so a bearer token becomes a stable map key
+/// without the raw secret ever being stored. Collisions only conflate two
+/// clients' limits, never widen access.
+fn short_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 // ---- data-plane tokens (SEC-4 phased) ----------------------------------

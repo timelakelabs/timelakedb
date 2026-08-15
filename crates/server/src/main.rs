@@ -338,7 +338,9 @@ async fn main() {
                 sock_addr,
                 axum_server::tls_rustls::RustlsConfig::from_config(http_tls),
             )
-            .serve(app.into_make_service())
+            // with_connect_info so the SEC-6 per-client limiter can key on
+            // the peer address when a caller presents no data-plane token.
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("server error (TLS)");
         }
@@ -349,9 +351,15 @@ async fn main() {
                 }
             });
             let listener = TcpListener::bind(&addr).await.expect("bind listen address");
-            axum::serve(listener, timelake_server::app(engine))
-                .await
-                .expect("server error");
+            axum::serve(
+                listener,
+                // with_connect_info: the SEC-6 limiter keys on the peer
+                // address for callers without a data-plane token.
+                timelake_server::app(engine)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("server error");
         }
         _ => panic!("TIMELAKE_TLS_CERT and TIMELAKE_TLS_KEY must be set together"),
     }
