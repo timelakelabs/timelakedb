@@ -133,9 +133,24 @@ follow from "no authentication" and are listed so you can design around them.
    the timeout and the "database does not exist" message name the caller's
    own input — none discloses schema.
 
-6. **No rate limiting per client.** The memory pool and admission semaphore
-   keep a query from killing the server, but nothing stops one client from
-   consuming the whole admission budget.
+6. **~~No rate limiting per client.~~ CLOSED (SEC-6).** The memory pool and
+   admission semaphore (RR-1) bound the TOTAL number of concurrent queries;
+   they did nothing to stop one client from taking every permit and starving
+   the rest. A per-client concurrency cap now sits in front of the admission
+   semaphore: a client already holding
+   `TIMELAKE_MAX_CONCURRENT_QUERIES_PER_CLIENT` queries (default 4, of the
+   global 6) is refused — HTTP 429, Flight `ResourceExhausted` — rather than
+   queued, so the refusal is visible to an operator and a probe alike. The
+   client is keyed by its data-plane token when it presents one and by
+   network origin otherwise, on both `/api/sql` and Flight SQL. The default
+   keeps two permits always reachable by another client; raise it and
+   `TIMELAKE_MAX_CONCURRENT_QUERIES` together for a single-tenant deployment
+   whose one dashboard issues many concurrent panels —
+   `timelake_query_rate_limited_total` makes a too-low cap visible. Only
+   queries are capped (writes have their own backpressure, RR-5); `0`
+   disables the cap. This bounds concurrency, not request rate: a flood of
+   cheap, fast queries is still served, which is the object-store and
+   admission budget's job, not this cap's.
 
 7. **Visibility authorizations are self-asserted on the anonymous path.**
    `X-TimeLake-Authorizations: admin` is a claim any client can make.

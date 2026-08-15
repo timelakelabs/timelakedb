@@ -32,8 +32,10 @@ use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::Wal;
 
 pub mod querier;
+pub mod ratelimit;
 pub mod replication;
 pub mod router;
+use ratelimit::ClientLimiter;
 use replication::Replicator;
 
 #[derive(Clone, Debug)]
@@ -49,6 +51,15 @@ pub struct EngineConfig {
     pub retention: Vec<(String, u64)>,
     /// Admission control: queries beyond this queue (RR-1).
     pub max_concurrent_queries: usize,
+    /// SEC-6 (exposure 6): the most concurrent queries any ONE client may
+    /// hold of the `max_concurrent_queries` budget, keyed by data-plane
+    /// token when present and by network origin otherwise. Beyond it the
+    /// client is refused (429 / Flight `ResourceExhausted`) so it cannot
+    /// starve the rest. Kept below `max_concurrent_queries` so a permit is
+    /// always reachable by another client; `0` disables the per-client cap.
+    /// Raise this and `max_concurrent_queries` together for a single-tenant
+    /// deployment whose one dashboard issues many concurrent panels.
+    pub max_concurrent_queries_per_client: usize,
     /// Server-side query cap (RR-2): abandoned work stops burning pool.
     pub query_timeout_secs: u64,
     /// Files superseded by compaction/retention are physically deleted
@@ -125,6 +136,10 @@ impl Default for EngineConfig {
             compact_min_files: 4,
             retention: Vec::new(),
             max_concurrent_queries: 6,
+            // Below the global 6, so two permits are always reachable by
+            // other clients — exposure 6's "no one client takes the whole
+            // budget", without refusing a modest single-client burst.
+            max_concurrent_queries_per_client: 4,
             query_timeout_secs: 600,
             gc_grace_secs: 900,
             data_auth: timelake_auth::DataAuthMode::Off,
@@ -320,6 +335,9 @@ pub struct Engine {
     cfg: EngineConfig,
     /// Shared pool + admission + timeout (RR-1/RR-2) — ONE for all queries.
     query_env: timelake_query::QueryEnv,
+    /// SEC-6: per-client concurrency cap in front of the admission
+    /// semaphore, so one client cannot hold the whole query budget.
+    client_limiter: Arc<ClientLimiter>,
     /// Full column set per (db, table): survives flushes and restarts so
     /// providers can present a stable merged schema without re-reading
     /// every footer per query.
@@ -465,6 +483,7 @@ impl Engine {
             cfg.max_concurrent_queries,
             cfg.query_timeout_secs,
         );
+        let client_limiter = ClientLimiter::new(cfg.max_concurrent_queries_per_client);
         // SEC-4 principals live in the store like everything else, so
         // they are encrypted with it and travel with a cluster's bucket.
         let auth = timelake_auth::Auth::open(
@@ -482,6 +501,7 @@ impl Engine {
             catalog,
             store_encrypted,
             query_env,
+            client_limiter,
             schemas: RwLock::new(HashMap::new()),
             schema_source: RwLock::new(HashMap::new()),
             auth,
@@ -955,6 +975,12 @@ impl timelake_api::Engine for Engine {
         db: &str,
     ) -> Result<timelake_auth::Decision, timelake_auth::TokenError> {
         self.authenticate_data_impl(authorization, action, db)
+    }
+
+    fn admit_client(&self, key: Option<String>) -> Option<Box<dyn Send>> {
+        self.client_limiter
+            .admit(key)
+            .map(|g| Box::new(g) as Box<dyn Send>)
     }
 
     fn write_lp(
@@ -1780,7 +1806,9 @@ impl Engine {
              # TYPE timelake_admin_logins_total counter\n\
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
-             timelake_admin_login_failures_total {}\n{}{}{}{}{}{}{}{}{}",
+             timelake_admin_login_failures_total {}\n\
+             # TYPE timelake_query_rate_limited_total counter\n\
+             timelake_query_rate_limited_total {}\n{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -1800,6 +1828,7 @@ impl Engine {
             },
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
+            self.client_limiter.rejected(),
             client_ca_lines,
             data_auth_lines,
             auth_split_lines,
@@ -1866,6 +1895,12 @@ impl timelake_flight::SqlBackend for Engine {
     ) -> Result<Option<Vec<String>>, timelake_auth::TokenError> {
         self.authenticate_data_impl(authorization, timelake_auth::Action::Read, db)
             .map(|d| d.granted)
+    }
+
+    fn admit_client(&self, key: Option<String>) -> Option<Box<dyn Send>> {
+        self.client_limiter
+            .admit(key)
+            .map(|g| Box::new(g) as Box<dyn Send>)
     }
 
     fn query_batches<'a>(
@@ -2163,6 +2198,10 @@ pub fn config_from_env() -> EngineConfig {
             .map(|s| parse_retention(&s))
             .unwrap_or_default(),
         max_concurrent_queries: env("TIMELAKE_MAX_CONCURRENT_QUERIES", d.max_concurrent_queries),
+        max_concurrent_queries_per_client: env(
+            "TIMELAKE_MAX_CONCURRENT_QUERIES_PER_CLIENT",
+            d.max_concurrent_queries_per_client,
+        ),
         query_timeout_secs: env("TIMELAKE_QUERY_TIMEOUT_SECS", d.query_timeout_secs),
         gc_grace_secs: env("TIMELAKE_GC_GRACE_SECS", d.gc_grace_secs),
         repl_timeout_ms: env("TIMELAKE_REPL_TIMEOUT_MS", d.repl_timeout_ms),

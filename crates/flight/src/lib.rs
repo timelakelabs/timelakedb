@@ -74,6 +74,17 @@ pub trait SqlBackend: Send + Sync + 'static {
         identity: Option<String>,
     ) -> SqlFuture<'a>;
 
+    /// SEC-6 (exposure 6): admit one query for a client, keyed by `key` (a
+    /// hash of the authorization metadata when present, else the peer
+    /// address, else `None` when neither is available). Returns an opaque
+    /// guard to hold for the query's lifetime, or `None` when the client is
+    /// at its per-client concurrency cap and the handler must refuse with
+    /// `ResourceExhausted`. The default never limits — only the real engine,
+    /// which owns the limiter, enforces the cap.
+    fn admit_client(&self, _key: Option<String>) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+
     /// Databases holding data — one catalog each, for `CommandGetCatalogs`.
     fn databases(&self) -> Vec<String>;
 
@@ -127,6 +138,16 @@ fn authorization_from_metadata(md: &tonic::metadata::MetadataMap) -> Option<Stri
     md.get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// A non-cryptographic digest so a bearer token becomes a stable per-client
+/// key (SEC-6) without the raw secret ever being stored as a map key.
+/// Collisions only conflate two clients' limits, never widen access.
+fn short_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// A refusal, in the grammar gRPC clients understand. Grafana surfaces
@@ -295,10 +316,31 @@ impl FlightSqlService for TimeLakeFlight {
         // backend intersects the caller's claims with what this identity
         // is granted (exposures 7/9). It is applied on DoGet — where the
         // rows actually flow — not at planning.
-        let identity = request
-            .extensions()
-            .get::<PeerIdentity>()
-            .and_then(|p| p.0.clone());
+        // TLS connections carry FlightConn (identity + peer addr); the
+        // plaintext listener carries tonic's own connect info, whose
+        // remote_addr() the key falls back to.
+        let conn = request.extensions().get::<FlightConn>();
+        let identity = conn.and_then(|c| c.identity.0.clone());
+
+        // SEC-6: cap concurrent queries per client — the token (its metadata
+        // value, hashed) when the caller presents one, else the peer
+        // address. The guard is held across the query and releases the slot
+        // on drop; a client already at its cap is refused before it runs.
+        let client_key = authorization_from_metadata(request.metadata())
+            .map(|a| format!("tok:{:016x}", short_hash(&a)))
+            .or_else(|| {
+                conn.and_then(|c| c.addr)
+                    .or_else(|| request.remote_addr())
+                    .map(|a| format!("ip:{}", a.ip()))
+            });
+        let _slot = match self.backend.admit_client(client_key) {
+            Some(g) => g,
+            None => {
+                return Err(Status::resource_exhausted(
+                    "too many concurrent queries for this client (SEC-6)",
+                ));
+            }
+        };
 
         let batches = self
             .backend
@@ -467,6 +509,17 @@ pub async fn serve(
 #[derive(Debug, Clone, Default)]
 pub struct PeerIdentity(pub Option<String>);
 
+/// The connection info tonic hands every request on the TLS listener: the
+/// verified certificate identity (SEC-3) and the peer address (SEC-6, so
+/// the per-client limiter can key on origin when no token is presented).
+/// The plaintext listener uses tonic's own `TcpConnectInfo` instead, whose
+/// `remote_addr()` the handler falls back to.
+#[derive(Debug, Clone, Default)]
+pub struct FlightConn {
+    pub identity: PeerIdentity,
+    pub addr: Option<std::net::SocketAddr>,
+}
+
 /// How many connections took each path.
 ///
 /// Want mode's whole problem is that it is invisible: the anonymous and
@@ -487,12 +540,16 @@ pub struct ClientAuthCounts {
 pub struct IdentifiedStream {
     inner: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     identity: PeerIdentity,
+    peer: std::net::SocketAddr,
 }
 
 impl tonic::transport::server::Connected for IdentifiedStream {
-    type ConnectInfo = PeerIdentity;
+    type ConnectInfo = FlightConn;
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.identity.clone()
+        FlightConn {
+            identity: self.identity.clone(),
+            addr: Some(self.peer),
+        }
     }
 }
 
@@ -572,6 +629,7 @@ pub async fn serve_tls(
                                 Ok::<_, std::io::Error>(IdentifiedStream {
                                     inner: tls_stream,
                                     identity,
+                                    peer,
                                 }),
                                 (listener, acceptor, counts),
                             ));
