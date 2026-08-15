@@ -1,8 +1,15 @@
-# The client-certificate SEC-2 narrowing is documented but inert
+# mTLS client-authorization: not wired end to end (an operational gap)
 
-**Found 2026-08-14** by Riverkeeper, building R3's client-certificate
-narrowing control. Not a hypothesis: confirmed over the wire against the
-`tls` topology, and traced to two specific gaps in the query path.
+**Noted 2026-08-14** by Riverkeeper, building R3's client-certificate
+narrowing control; **wired the same day**. This is deliberately NOT filed
+as a `FINDING_*` — it was never a breach. A client certificate could not
+WIDEN what its holder saw; it simply failed to NARROW, leaving a cert
+holder at the same self-asserted, honor-system baseline that SECURITY.md
+exposure 7 already documents as open. So this is an mTLS completeness gap
+— the client-authorization plane was not plumbed through — not a security
+finding. Recorded because the document described the capability as
+current; the fix made the document true. Confirmed over the wire against
+the `tls` topology, and traced to two specific gaps in the query path.
 
 ---
 
@@ -61,19 +68,24 @@ trusted-cert + claims(alpha,beta,gamma): idx [0,1,2,3,4,5]
 The mechanism is correct and unit-tested in isolation; it is simply not
 wired to anything a deployment can drive.
 
-## Why this matters, and the direction it fails
+## Why this is an operational gap, not a finding
 
-Unlike most Riverkeeper findings this is not a *breach* — the certificate
-does not WIDEN visibility, and the anonymous honor-system path is exactly
-as (un)restricted as documented. The failure is an over-claim: an
-operator reading exposure 9 would believe they can hold a certificate
-holder to less than its self-asserted claims, and design a deployment
-around it. They cannot. A security document that promises a control it
-does not deliver is planned-around at the worst time.
+The certificate does not WIDEN visibility, and the anonymous
+honor-system path is exactly as (un)restricted as documented. Nobody
+sees anything they should not — there is no breach and no
+over-permission. The missing behaviour was an OPTIONAL tightening (hold
+a cert holder to less than it claims), and its absence leaves that
+holder at the self-asserted baseline exposure 7 already documents as
+open. So an operator relying on the documented posture is not misled
+about their actual exposure; they simply do not get an additional
+restriction the document implied was available. That is mTLS
+client-authorization being incomplete — a maturity/plumbing gap — rather
+than a security defect. It is recorded because the document described the
+capability as a current property, and closing the gap made that true.
 
 ## The options (a posture/product decision, not Riverkeeper's)
 
-Riverkeeper does not set posture. Both directions are legitimate:
+Riverkeeper does not set posture. Both directions were legitimate:
 
 - **Soften the document.** Mark the certificate-narrowing path in
   exposures 7 and 9 as a mechanism present in the query layer but not yet
