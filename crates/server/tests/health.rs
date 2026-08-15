@@ -788,6 +788,74 @@ async fn encrypted_store_serves_and_survives_restart_sec1() {
     assert_eq!(rows[0]["n"], 500);
 }
 
+#[tokio::test]
+async fn encrypted_wal_bytes_are_ciphertext_and_replay_sec8() {
+    use timelake_store::{EncryptingStore, Kms, LocalKek, LocalStore, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let kek = timelake_store::key_from_hex(&"7b".repeat(32)).unwrap();
+    // Open with the SAME envelope key surfaced onto the StoreStack, which is
+    // what turns on WAL encryption (SEC-8) — the store and WAL share it.
+    let open_encrypted = || {
+        let base = LocalStore::new(&dir.path().join("objects")).unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(LocalKek::new(kek));
+        let store: Arc<dyn Store> = Arc::new(EncryptingStore::new(base, kms.clone()));
+        let stack = timelake_server::StoreStack {
+            store,
+            encrypted: true,
+            backend: "test",
+            kms_stats: None,
+            s3_stats: None,
+            kms: Some(kms),
+        };
+        timelake_server::Engine::open_with_stack(dir.path(), engine_cfg(Vec::new()), stack).unwrap()
+    };
+
+    let t = now_ns();
+    // A distinctive measurement name that must never appear in the WAL bytes.
+    let needle = "sec8_secret_measurement";
+    {
+        let app = timelake_server::app(open_encrypted());
+        let lp = format!("{needle},pid=p1 v=1i {}", t - 1000);
+        assert_eq!(
+            write_lp(&app, "/api/v3/write_lp?db=poc", lp.into_bytes(), false).await,
+            StatusCode::NO_CONTENT
+        );
+        // deliberately NOT flushed — the acked row lives only in the WAL now
+    } // engine dropped — "crash"
+
+    // The WAL segment on disk is encrypted: it opens with the TLDW header and
+    // the plaintext measurement name is nowhere in the raw bytes.
+    let mut wal_with_content = 0;
+    for entry in walkdir(&dir.path().join("wal")) {
+        let bytes = std::fs::read(&entry).unwrap();
+        if bytes.len() <= 8 {
+            continue; // header-only / empty generation
+        }
+        assert!(
+            bytes.starts_with(&0x544C_4457u32.to_le_bytes()), // "TLDW"
+            "wal segment {entry:?} must be encrypted"
+        );
+        assert!(
+            !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "plaintext leaked into the WAL segment {entry:?}"
+        );
+        wal_with_content += 1;
+    }
+    assert!(
+        wal_with_content >= 1,
+        "expected a WAL segment holding the write"
+    );
+
+    // Restart: the acked row replays from the encrypted WAL.
+    let app = timelake_server::app(open_encrypted());
+    let (code, rows) = sql(&app, "poc", &format!("SELECT COUNT(*) AS n FROM {needle}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        rows[0]["n"], 1,
+        "a 204'd write must replay from the encrypted WAL"
+    );
+}
+
 /// An authenticated admin session: the cookie plus its CSRF token.
 #[derive(Clone, Default)]
 struct AdminSession {
