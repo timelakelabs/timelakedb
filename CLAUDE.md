@@ -126,7 +126,22 @@ This project is inspired by the following projects.
   `docs/evidence/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
   Local repo directory is still `TimelordDB/` — rename it whenever.
-- Status: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
+- Status: **Pushed & private; P0-1 CLOSED; CI green-then-billing-blocked
+  (2026-08-16).** All five repos pushed, CI recorded green on real runners
+  (`docs/evidence/P0-1-ci.md`). Since then: **SEC-5** query-error
+  sanitization (= P1-4), **SEC-6** per-client rate cap (= P1-3), **SEC-8**
+  WAL encryption (= P1-5) all merged, each with a Riverkeeper control
+  (R6, coverage 10/11); intra-cluster port de-published (exposure 10);
+  deps refreshed within-semver (PR #4 open — `thrift` blocked upstream until
+  datafusion 55). Site adopted the new mountain-lake brand (teal accent;
+  `site/assets/logo.svg` + `avatar.svg` + repointed tokens). **Two live
+  blockers:** GitHub Actions hit the **spending limit** (jobs won't start) —
+  mitigation is 2 self-hosted WSL runners (`../ops/WSL_RUNNERS.md`, scoped
+  not applied); and the **Phase 2 public flip** (public repos, Pages,
+  `v0.1.0-alpha`) is paywalled. Still open: C2 phase 5 compactor, R-1
+  targeted delete, P1-2 audit, P1-6/P1-7, T-1 Tributary metrics. Full
+  milestone reconciliation: `../PROJECT_PLAN.md` §0.
+- Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does
   not hold (no `gh`, no remotes). What IS done: every CI step run against a
   CLEAN target dir in stock `rust:1-slim` (fmt/clippy/173 tests/coverage all
