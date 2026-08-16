@@ -13,6 +13,49 @@ here.
 
 ## [Unreleased]
 
+### Security — three open exposures closed (2026-08-15)
+
+Driven by Riverkeeper R6; each shipped with a control in that repo that goes
+red if the fix regresses. These are the P1-4/P1-3/P1-5 items, taken early.
+
+- **SEC-5 (exposure 5) — query errors are sanitized.** A query that failed
+  to plan or execute returned the DataFusion error verbatim, disclosing
+  table and column names (a bad column enumerated the whole schema). It now
+  returns one opaque `query could not be executed (ref: q-XXXXXXXX)` on both
+  `/api/sql` and Flight SQL, with the full error logged server-side against
+  that ref. Sanitized at the one shared execution point
+  (`crates/query` `run_sql_env`). = **P1-4 error redaction**.
+- **SEC-6 (exposure 6) — per-client query concurrency cap.** The admission
+  semaphore bounded total concurrency but let one client take every permit.
+  A per-client cap now sits in front of it: past its cap (default 4 of the
+  global 6) a client is refused — HTTP 429 / Flight `ResourceExhausted` —
+  keyed by data-plane token when present and by network origin otherwise, on
+  both surfaces (`crates/server/src/ratelimit.rs`). Metric
+  `timelake_query_rate_limited_total`. = **P1-3 per-client rate limits**.
+- **SEC-8 (exposure 8) — the WAL is encrypted at rest.** At-rest encryption
+  covered the object store but not the local WAL, so a stolen volume gave up
+  the unflushed writes in cleartext. The WAL now encrypts with the SAME
+  envelope key: a per-file data key wrapped by the KEK in a `TLDW` header,
+  AES-256-GCM frames, plaintext passthrough on upgrade, and replay that fails
+  CLOSED on a missing/wrong key or a frame that fails authentication
+  (`crates/wal`). Covers the durable replica WAL. = **P1-5 WAL encryption**.
+
+### Changed — the intra-cluster port is never published (exposure 10)
+
+The cluster listener (`TIMELAKE_CLUSTER_ADDR`, `:1965`) serves live rows with
+no data-plane token check and no SEC-2 visibility filter, so reaching it is
+read access to the bucket — it belongs on the private network only. The
+shipped cluster compose files no longer publish it to a routable interface;
+the cluster drills reach it via `docker exec`. Surfaced by Riverkeeper R4.
+
+### Changed — dependencies refreshed to latest within-semver (2026-08-15)
+
+`cargo update` across the workspace (~36 crates). The `thrift` advisory
+(GHSA-2f9f-gq7v-9h6m, medium/availability, deferred and unreachable — we
+parse only Parquet we wrote) stays open, **blocked upstream**: arrow-rs
+dropped the external thrift crate in `parquet` 59, but `datafusion` 54
+(latest) pins `parquet ^58.3.0` and rejects 59. Clears with `datafusion` 55.
+
 ### Fixed — a querier returned every row N times under concurrent reads (2026-08-13)
 
 Found by Catchment's `read-gate` scenario on its first real execution.
