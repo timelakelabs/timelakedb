@@ -212,6 +212,10 @@ async fn main() {
                 let e = Arc::clone(&maint);
                 let compact = n.is_multiple_of(3);
                 let retention = n.is_multiple_of(6);
+                // R-1b runs on the compaction cadence: physical delete is the
+                // same kind of rewrite work and never on a query's critical
+                // path, since R-1a already hides the rows at read time.
+                let tombstones = n.is_multiple_of(3);
                 // Each stage is independent. A failing flush used to abort
                 // the rest of the tick, so one unflushable table stopped
                 // compaction and retention for every table on the node.
@@ -221,6 +225,9 @@ async fn main() {
                     }
                     if compact && let Err(err) = e.compact_once() {
                         tracing::error!(%err, stage = "compact", "maintenance stage failed");
+                    }
+                    if tombstones && let Err(err) = e.apply_tombstones_once() {
+                        tracing::error!(%err, stage = "tombstones", "maintenance stage failed");
                     }
                     if retention && let Err(err) = e.enforce_retention() {
                         tracing::error!(%err, stage = "retention", "maintenance stage failed");
