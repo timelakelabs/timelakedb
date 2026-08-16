@@ -272,25 +272,34 @@ principal, and `docs/CONSOLE.md` already designs the hash-chained trail.
 For most regulated deployments this is a hard gate, not a nicety —
 and "who read this data" is the question SEC-2 exists to answer.
 
-### P1-3 · No per-client rate limiting
+### P1-3 · Per-client rate limiting — DONE (SEC-6, 2026-08-15)
 
-**Effort: M.** Exposure 6. The shared memory pool and admission
-semaphore uphold RR-1 — no single query kills the server — but nothing
-stops one client from consuming the entire admission budget and starving
-every other tenant. Availability guardrails are not access control.
+**Was Effort: M. Exposure 6, now CLOSED.** The shared memory pool and
+admission semaphore uphold RR-1, but nothing stopped one client from
+taking the whole admission budget. A per-client concurrency cap now sits
+in front of the semaphore: past its cap (default 4 of the global 6) a
+client is refused — HTTP 429 / Flight `ResourceExhausted` — keyed by
+data-plane token else network origin, on both surfaces
+(`crates/server/src/ratelimit.rs`). Verified by Riverkeeper's
+`query-rate-limited-per-client` control.
 
-### P1-4 · Query errors disclose schema
+### P1-4 · Query error sanitization — DONE (SEC-5, 2026-08-15)
 
-**Effort: S.** Exposure 5: DataFusion planning errors are returned
-verbatim, naming tables and columns. Trivial to fix, and it stops
-mattering the moment there is more than one tenant.
+**Was Effort: S. Exposure 5, now CLOSED.** DataFusion errors were
+returned verbatim, naming tables and columns. Every failure now returns
+one opaque `query could not be executed (ref: q-XXXXXXXX)` on both
+surfaces, with the full error logged server-side against that ref
+(`crates/query` `run_sql_env`). Verified by Riverkeeper's
+`query-errors-are-sanitized` control.
 
-### P1-5 · The WAL is not encrypted
+### P1-5 · WAL encryption at rest — DONE (SEC-8, 2026-08-15)
 
-**Effort: M.** Exposure 8. SEC-1 covers every object through the store
-chokepoint — Parquet, manifests, checkpoints — but recent line-protocol
-bytes sit in the WAL in plaintext until flush. A stolen volume is
-exactly the threat SEC-1 was built for, and this is the hole in it.
+**Was Effort: M. Exposure 8, now CLOSED.** SEC-1 covered every object
+through the store chokepoint, but recent line-protocol bytes sat in the
+WAL in plaintext until flush. The WAL now encrypts with the SAME envelope
+key: per-file wrapped DEK, AES-256-GCM frames, plaintext passthrough on
+upgrade, replay fails closed on a missing/wrong key (`crates/wal`). Covers
+the replica WAL. Verified by Riverkeeper's `wal-encrypted-at-rest` control.
 
 ### P1-6 · Tributary L4 — identity and mTLS under rotation
 
