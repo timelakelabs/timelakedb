@@ -1,14 +1,16 @@
-/* TimeLakeDB site — palette and proportions taken from the brand sheet:
-   0B1320 navy, 2563EB blue, D4AF37 gold, E6E8EC mist, 6B7280 gray. */
+/* TimeLakeDB site — palette from the 2026-08 brand board (the mountain-lake
+   mark). Was gold-accented (D4AF37); now teal-accented to match the new
+   identity: 0B1220 ground, 3B82F6 blue, 14B8A6 teal, 7DD3FC sky, E6EDF5
+   mist. --teal replaces the former --gold (all accent usages repointed). */
 
 :root {
-  --navy: #0b1320;
-  --navy-soft: #101c30;
-  --navy-line: #1d2b44;
-  --blue: #2563eb;
-  --blue-bright: #5b9bff;
-  --gold: #d4af37;
-  --mist: #e6e8ec;
+  --navy: #0b1220;
+  --navy-soft: #0f1e33;
+  --navy-line: #1c2e45;
+  --blue: #3b82f6;
+  --blue-bright: #7dd3fc;
+  --teal: #14b8a6;
+  --mist: #e6edf5;
   --gray: #6b7280;
   --ink: #16202f;
   --paper: #ffffff;
@@ -76,7 +78,7 @@ a:hover { text-decoration: underline; }
 }
 .brand:hover { text-decoration: none; }
 .brand .mark { width: 34px; height: 34px; flex: none; }
-.brand .db { color: var(--gold); }
+.brand .db { color: var(--teal); }
 .topbar nav {
   margin-left: auto;
   display: flex;
@@ -120,7 +122,7 @@ a:hover { text-decoration: underline; }
   margin: 0;
   line-height: 1;
 }
-.wordmark .db { color: var(--gold); }
+.wordmark .db { color: var(--teal); }
 .hero .kicker {
   color: var(--blue-bright);
   letter-spacing: .34em;
@@ -131,7 +133,7 @@ a:hover { text-decoration: underline; }
 }
 .hero .rule {
   height: 1px;
-  background: linear-gradient(90deg, var(--gold), rgba(212, 175, 55, 0));
+  background: linear-gradient(90deg, var(--teal), rgba(20, 184, 166, 0));
   margin: 20px 0 16px;
   max-width: 460px;
 }
@@ -203,8 +205,8 @@ a:hover { text-decoration: underline; }
   padding-bottom: 13px;
 }
 .pill {
-  border: 1px solid var(--gold);
-  color: var(--gold);
+  border: 1px solid var(--teal);
+  color: var(--teal);
   border-radius: 999px;
   padding: 2px 12px;
   font-size: .78rem;
@@ -318,7 +320,7 @@ td.bad { color: #b3261e; font-weight: 600; }
 .code .c { color: #6f87ab; }      /* comment */
 .code .s { color: #9fe0a4; }      /* string  */
 .code .k { color: #7fb2ff; }      /* keyword */
-.code .n { color: var(--gold); }  /* number  */
+.code .n { color: var(--teal); }  /* number  */
 .copy {
   margin-left: auto;
   background: transparent;
@@ -386,7 +388,7 @@ code:not(pre code) {
 .docs-body ul { padding-left: 20px; }
 .docs-body li { margin-bottom: 7px; }
 .note {
-  border-left: 3px solid var(--gold);
+  border-left: 3px solid var(--teal);
   background: #fdf8ea;
   padding: 14px 18px;
   border-radius: 0 10px 10px 0;
@@ -417,7 +419,7 @@ footer.site .shell {
 }
 footer.site a { color: var(--blue-bright); }
 footer.site .kicker {
-  color: var(--gold);
+  color: var(--teal);
   letter-spacing: .3em;
   font-size: .72rem;
   text-transform: uppercase;

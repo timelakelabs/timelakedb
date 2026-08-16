@@ -1,18 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img"
-     aria-label="TimeLakeDB mark: data spikes over a mountain lake">
+     aria-label="TimeLakeLabs avatar">
   <defs>
-    <linearGradient id="tl-spike" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="av-spike" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#5EEAD4"/>
       <stop offset=".5" stop-color="#7DD3FC"/>
       <stop offset="1" stop-color="#3B82F6"/>
     </linearGradient>
-    <radialGradient id="tl-glow" cx=".5" cy=".4" r=".62">
+    <radialGradient id="av-glow" cx=".5" cy=".42" r=".7">
       <stop offset="0" stop-color="#12335A"/>
       <stop offset="1" stop-color="#0B1220"/>
     </radialGradient>
   </defs>
-  <circle cx="100" cy="100" r="98" fill="url(#tl-glow)"/>
-  <g fill="url(#tl-spike)">
+  <!-- square ground so the corners are navy, not transparent, for GitHub -->
+  <rect width="200" height="200" rx="0" fill="#0B1220"/>
+  <rect width="200" height="200" fill="url(#av-glow)"/>
+  <g fill="url(#av-spike)">
     <rect x="50" y="98" width="4" height="30" rx="2"/>
     <rect x="56" y="82" width="4" height="46" rx="2"/>
     <rect x="62" y="70" width="4" height="58" rx="2"/>
@@ -59,5 +61,4 @@
     <rect x="64" y="160.5" width="20" height="3" rx="1.5" opacity=".28"/>
     <rect x="116" y="160.5" width="20" height="3" rx="1.5" opacity=".28"/>
   </g>
-  <circle cx="100" cy="100" r="95.5" fill="none" stroke="#E6EDF5" stroke-width="1.5" opacity=".32"/>
 </svg>
