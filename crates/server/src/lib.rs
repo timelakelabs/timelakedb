@@ -364,6 +364,41 @@ pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// A stable, content-addressed id for a targeted-delete predicate (R-1).
+/// Identical delete requests hash to the same id, so re-issuing one dedups
+/// in the catalog instead of stacking a duplicate tombstone. Deterministic
+/// across runs (`DefaultHasher` uses fixed keys), so replay agrees with the
+/// original writer.
+fn tombstone_id(
+    db: &str,
+    table: &str,
+    tag_equals: &[(String, String)],
+    min_ts_ns: Option<i64>,
+    max_ts_ns: Option<i64>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    // Canonicalize tag order so {a,b} and {b,a} address the same delete.
+    let mut tags = tag_equals.to_vec();
+    tags.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    db.hash(&mut h);
+    table.hash(&mut h);
+    tags.hash(&mut h);
+    min_ts_ns.hash(&mut h);
+    max_ts_ns.hash(&mut h);
+    format!("del-{:016x}", h.finish())
+}
+
+/// Whether a tombstone's time window overlaps a file's span. A tag-only
+/// tombstone (no bounds) overlaps everything; a bounded one uses
+/// closed-interval overlap. Only a read-pruning heuristic for R-1b — a
+/// false positive merely reads a file that then drops no rows.
+fn tombstone_overlaps_file(t: &timelake_catalog::Tombstone, f: &FileMeta) -> bool {
+    let lo = t.min_ts_ns.unwrap_or(i64::MIN);
+    let hi = t.max_ts_ns.unwrap_or(i64::MAX);
+    lo <= f.max_ts_ns && hi >= f.min_ts_ns
+}
+
 pub struct Engine {
     dbs: RwLock<HashMap<String, HashMap<String, TableBuffer>>>,
     /// Writers hold this shared for append+apply; flush holds it
@@ -421,6 +456,8 @@ pub struct Engine {
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
     retention_drops_total: AtomicU64,
+    /// R-1b: files rewritten or dropped by the physical tombstone GC pass.
+    tombstone_rewrites_total: AtomicU64,
     file_seq: AtomicU64,
     /// Deferred deletions: (when superseded, path). Drained by run_gc
     /// after gc_grace_secs so in-flight catalog snapshots never dangle.
@@ -565,6 +602,7 @@ impl Engine {
             flushes_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
             retention_drops_total: AtomicU64::new(0),
+            tombstone_rewrites_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
             pending_gc: Mutex::new(Vec::new()),
             meta_cache: Arc::new(Default::default()),
@@ -929,6 +967,108 @@ impl Engine {
         Ok(n)
     }
 
+    /// R-1b physical delete: rewrite catalogued files so rows matching an
+    /// active tombstone are gone from the bytes on disk, not merely hidden at
+    /// read time (R-1a). Runs as maintenance because a tombstone is a
+    /// standing filter: data written after a delete is reclaimed on a later
+    /// pass, and until then R-1a keeps it invisible, so a query never depends
+    /// on this having run. Deferred GC (grace window) covers in-flight
+    /// queries still holding the old paths, exactly as compaction does.
+    pub fn apply_tombstones_once(&self) -> Result<usize, String> {
+        let tombstones = self.catalog.tombstones();
+        if tombstones.is_empty() {
+            return Ok(0);
+        }
+        // Bounded per tick so a large backlog cannot monopolize maintenance.
+        const MAX_FILES_PER_TICK: usize = 16;
+        let mut rewritten = 0usize;
+        for f in self.catalog.all_files() {
+            if rewritten >= MAX_FILES_PER_TICK {
+                break;
+            }
+            // Only the tombstones that could touch THIS file: same table, and
+            // a time window that overlaps the file's span.
+            let deletes: Vec<timelake_catalog::Tombstone> = tombstones
+                .iter()
+                .filter(|t| t.db == f.db && t.table == f.table && tombstone_overlaps_file(t, &f))
+                .cloned()
+                .collect();
+            if deletes.is_empty() {
+                continue;
+            }
+
+            let bytes = self
+                .store
+                .get(&f.path)
+                .map_err(|e| format!("store get {}: {e}", f.path))?;
+            let batches = flush::read_parquet_bytes(bytes)?;
+            // Reuse the exact read-time filter (SEC-2 hook): the bytes that
+            // survive here are precisely the rows a query would still return.
+            let restriction = timelake_query::Restriction::Tombstone { deletes };
+            let mut kept = Vec::with_capacity(batches.len());
+            let mut before = 0usize;
+            let mut after = 0usize;
+            for b in batches {
+                before += b.num_rows();
+                let fb = timelake_query::apply_restriction(&restriction, &b)?;
+                after += fb.num_rows();
+                if fb.num_rows() > 0 {
+                    kept.push(fb);
+                }
+            }
+            if after == before {
+                // Overlapped the time span but matched no row here (e.g. the
+                // tag value isn't in this file) — nothing to reclaim, and a
+                // rewrite would only churn the store.
+                continue;
+            }
+
+            if after == 0 {
+                // Every row is gone: drop the file outright.
+                self.catalog
+                    .commit(Vec::new(), vec![f.path.clone()])
+                    .map_err(|e| format!("catalog commit: {e}"))?;
+            } else {
+                // Some rows survive: write them to a fresh file and swap it in
+                // atomically (add new + remove old in one manifest entry).
+                let merged = timelake_compact::merge_files(vec![kept])?;
+                let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
+                let path = format!(
+                    "{}/{}/data/{}/t{:020}-{seq:06}.parquet",
+                    f.db, f.table, f.partition, merged.max_ts_ns
+                );
+                self.store
+                    .put(&path, &merged.bytes)
+                    .map_err(|e| format!("store put {path}: {e}"))?;
+                self.catalog
+                    .commit(
+                        vec![FileMeta {
+                            db: f.db.clone(),
+                            table: f.table.clone(),
+                            partition: f.partition.clone(),
+                            path,
+                            rows: merged.rows,
+                            size_bytes: merged.bytes.len() as u64,
+                            min_ts_ns: merged.min_ts_ns,
+                            max_ts_ns: merged.max_ts_ns,
+                        }],
+                        vec![f.path.clone()],
+                    )
+                    .map_err(|e| format!("catalog commit: {e}"))?;
+            }
+            // Old bytes leave on the grace timer, never synchronously: an
+            // in-flight query may still be reading the path we just removed.
+            self.defer_gc(vec![f.path.clone()]);
+            rewritten += 1;
+        }
+        if rewritten > 0 {
+            self.tombstone_rewrites_total
+                .fetch_add(rewritten as u64, Ordering::Relaxed);
+            tracing::info!(files = rewritten, "tombstone physical GC pass");
+        }
+        Ok(rewritten)
+    }
+
     /// SEC-4 principal/session store, shared with the admin router.
     pub fn auth(&self) -> Arc<timelake_auth::Auth> {
         self.auth.clone()
@@ -981,6 +1121,73 @@ impl Engine {
         let mut r = self.retention.write().expect("retention lock");
         r.retain(|(t, _)| t != table);
         Self::persist_retention(&self.store, &r)
+    }
+
+    /// R-1 targeted delete: record a durable tombstone predicate that hides
+    /// every matching row from every query, immediately and cluster-wide,
+    /// before the physical GC (R-1b) reclaims the bytes. Returns the
+    /// tombstone id and the manifest seq it committed at.
+    ///
+    /// Refuses an empty predicate — a delete with neither a tag match nor a
+    /// time bound would erase the whole table, which is what retention and a
+    /// future DROP are for, not this surface.
+    pub fn delete_where(
+        &self,
+        db: &str,
+        table: &str,
+        tag_equals: Vec<(String, String)>,
+        min_ts_ns: Option<i64>,
+        max_ts_ns: Option<i64>,
+    ) -> Result<(String, u64), String> {
+        // A querier owns no write path; deletes, like writes, go to an
+        // ingester or the router that fronts them.
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err("this node is a querier (TIMELAKE_ROLE=querier) and holds no delete \
+                        path — send the delete to the router or an ingester"
+                .into());
+        }
+        if tag_equals.is_empty() && min_ts_ns.is_none() && max_ts_ns.is_none() {
+            return Err("a targeted delete needs at least one predicate — a tag match or a \
+                        time bound. Refusing to delete an entire table from this surface."
+                .into());
+        }
+        if let (Some(a), Some(b)) = (min_ts_ns, max_ts_ns) {
+            if a > b {
+                return Err(format!(
+                    "time window is empty: start {a} is after end {b}"
+                ));
+            }
+        }
+        // Deleting from a table that was never written is a client mistake
+        // worth surfacing rather than silently recording a dead predicate.
+        if !self.table_names(db).iter().any(|t| t == table) {
+            return Err(format!(
+                "table '{table}' does not exist in database '{db}'"
+            ));
+        }
+
+        // Content-addressed id: the tombstone is a standing predicate, so
+        // re-issuing the identical delete is idempotent. The catalog dedups
+        // by id on replay regardless; short-circuiting here also spares a
+        // redundant manifest entry when a caller retries.
+        let id = tombstone_id(db, table, &tag_equals, min_ts_ns, max_ts_ns);
+        if let Some(t) = self.catalog.tombstones().into_iter().find(|t| t.id == id) {
+            return Ok((id, t.created_seq));
+        }
+        let tombstone = timelake_catalog::Tombstone {
+            id: id.clone(),
+            db: db.to_string(),
+            table: table.to_string(),
+            tag_equals,
+            min_ts_ns,
+            max_ts_ns,
+            created_seq: 0, // stamped with the landing seq inside commit
+        };
+        let seq = self
+            .catalog
+            .commit_tombstone(tombstone)
+            .map_err(|e| format!("commit tombstone: {e}"))?;
+        Ok((id, seq))
     }
 
     fn persist_retention(store: &Arc<dyn Store>, policies: &[(String, u64)]) -> Result<(), String> {
@@ -1114,6 +1321,17 @@ impl timelake_api::Engine for Engine {
 
     fn remove_retention(&self, table: &str) -> Result<(), String> {
         Engine::remove_retention(self, table)
+    }
+
+    fn delete_where(
+        &self,
+        db: &str,
+        table: &str,
+        tag_equals: Vec<(String, String)>,
+        min_ts_ns: Option<i64>,
+        max_ts_ns: Option<i64>,
+    ) -> Result<(String, u64), String> {
+        Engine::delete_where(self, db, table, tag_equals, min_ts_ns, max_ts_ns)
     }
 }
 
@@ -1257,6 +1475,10 @@ impl Engine {
             }
             let Some(schema) = schema else { continue };
 
+            // R-1: the active targeted-delete predicates for THIS table are
+            // scoped onto a per-table session, so the mandatory predicate
+            // hides deleted rows in the same scan that enforces visibility —
+            // never leaking one table's tombstone onto another's rows.
             let provider = timelake_query::provider::LazyTable::new(
                 name.clone(),
                 schema,
@@ -1266,7 +1488,9 @@ impl Engine {
                 std::time::Duration::from_secs(self.cfg.query_timeout_secs),
                 self.query_env.runtime.memory_pool.clone(),
                 self.meta_cache.clone(),
-                session.clone(),
+                session
+                    .clone()
+                    .with_tombstones(self.catalog.tombstones_for(db, &name)),
                 self.visibility_filtered.clone(),
             );
             tables.push((name, Arc::new(provider)));
@@ -1853,6 +2077,8 @@ impl Engine {
              # TYPE timelake_wal_bytes gauge\ntimelake_wal_bytes {}\n\
              # TYPE timelake_compactions_total counter\ntimelake_compactions_total {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
+             # TYPE timelake_tombstone_rewrites_total counter\n\
+             timelake_tombstone_rewrites_total {}\n\
              # TYPE timelake_encryption_enabled gauge\ntimelake_encryption_enabled {}\n\
              # TYPE timelake_visibility_rows_filtered_total counter\n\
              timelake_visibility_rows_filtered_total {}\n\
@@ -1874,6 +2100,7 @@ impl Engine {
             wal_bytes,
             self.compactions_total.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
+            self.tombstone_rewrites_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),
             if self.auth.default_credential_active() {

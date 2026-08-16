@@ -56,6 +56,7 @@ to expose a port beyond a trusted segment.
 | Tenancy isolation | **Not a boundary.** `org` is accepted and ignored; databases are namespaces only. |
 | Encryption at rest | **Implemented, opt-in.** Set `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or `TIMELAKE_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough). Since **SEC-8** the local WAL (and the replica WAL) is encrypted with the same envelope key — see exposure 8. |
 | Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-TimeLake-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
+| Targeted delete / erasure | **Implemented (R-1), `admin` only.** `POST /admin/delete` records a durable tombstone — a `(tag equalities AND time window)` predicate — that hides every matching row from every query at once, in the live buffer and in settled files, and from `COUNT(*)` as much as from `SELECT`, because it is enforced at the same in-scan point as visibility. A background pass then physically rewrites the files so the bytes are gone from the settled store (deferred GC covers in-flight readers). An empty predicate is refused; deletes are irreversible and go to the write path, not a querier. See [Targeted delete (R-1)](#targeted-delete-r-1). |
 | Audit logging | Not implemented. Writes and queries are not attributed to a principal, because there is no principal. |
 | Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
 
@@ -208,6 +209,59 @@ follow from "no authentication" and are listed so you can design around them.
     from the object store. That makes reaching this port equivalent to
     read access to the bucket itself. A querier is only as private as its
     ingesters' cluster addresses.
+
+## Targeted delete (R-1)
+
+A recorded delete is a **standing predicate**, not a one-shot scrub. `POST
+/admin/delete` (admin role) takes `{db, table, tags{}, start_ns?, end_ns?}`
+and commits a *tombstone* to the manifest log — the same append-only,
+CAS-guarded log that carries file additions — so it is durable, replays on
+restart, and propagates to every querier the moment it is committed. A row
+matches a tombstone when it satisfies **all** of the tag equalities **and**
+falls inside the `[start_ns, end_ns]` window (either bound may be omitted).
+
+Two layers, and the security property rests entirely on the first:
+
+- **Logical (immediate, everywhere).** The tombstone is enforced inside the
+  scan through the same mandatory-predicate hook as row visibility — below
+  every user predicate and before any aggregation. So a deleted row is
+  invisible to `SELECT`, to `COUNT(*)`/`SUM(...)`, and across every storage
+  layer (live buffer, just-flushed holding area, settled Parquet) the
+  instant the delete is committed, with no rebuild and no window. A
+  tombstone is scoped to its `(db, table)`: the same tag value in another
+  table is untouched.
+- **Physical (background reclamation).** A maintenance pass
+  (`apply_tombstones_once`, on the compaction cadence) rewrites any file
+  that still holds matching rows and drops files emptied entirely, so the
+  bytes leave the settled store — the "actually gone", not merely "not
+  returned", half. Superseded files leave on the normal GC grace timer, so
+  an in-flight query holding an old catalog snapshot never dangles.
+  `timelake_tombstone_rewrites_total` counts the work. Because the tombstone
+  stays a standing filter, data written to a matched predicate *after* the
+  delete is hidden immediately (logical) and reclaimed on a later pass
+  (physical).
+
+Residual properties to design around, all deliberate:
+
+- **The predicate must be non-empty.** A delete with neither a tag match nor
+  a time bound is refused — erasing a whole table is retention's job (and a
+  future explicit `DROP`), not this surface, so a malformed request cannot
+  wipe everything.
+- **Deletes are `admin`, and unauthenticated by default like every surface.**
+  `/admin/*` authenticates (SEC-4), but the seeded `admin`/`admin` window
+  (exposure 3a) applies here too: close it before exposing the console.
+- **The WAL is not scrubbed by a delete.** A tombstone governs the settled
+  store and the query path; recent line-protocol bytes for a since-deleted
+  row can persist in the WAL until it rotates. Where a delete must guarantee
+  the bytes are gone from *all* media, pair it with at-rest encryption
+  (exposure 8) so the WAL residue is ciphertext.
+
+Pinned by `crates/catalog` (tombstone durability + CAS replay),
+`crates/query` (`Restriction::Tombstone`, the in-scan filter and its
+aggregate-leak test) and `crates/server/tests/delete.rs` (end-to-end across
+buffer and files, the time window, cross-table isolation, the admin guard,
+idempotency, and a drill that reads the raw Parquet bytes back and asserts a
+deleted value is physically absent).
 
 ## Dependency advisories
 
