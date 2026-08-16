@@ -97,6 +97,19 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Remove one table's policy (the table keeps everything again).
     fn remove_retention(&self, table: &str) -> Result<(), String>;
+
+    /// R-1 targeted delete: record a durable tombstone that hides every row
+    /// matching (all `tag_equals` AND the `[min_ts_ns, max_ts_ns]` window)
+    /// from every query at once. Returns (tombstone id, manifest seq).
+    /// Rejects an empty predicate — that would erase the whole table.
+    fn delete_where(
+        &self,
+        db: &str,
+        table: &str,
+        tag_equals: Vec<(String, String)>,
+        min_ts_ns: Option<i64>,
+        max_ts_ns: Option<i64>,
+    ) -> Result<(String, u64), String>;
 }
 
 /// Parse "365d", "72h", "90m", or bare seconds — the write half of the
@@ -183,6 +196,7 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
             "/admin/retention/{table}",
             axum::routing::delete(retention_delete::<E>),
         )
+        .route("/admin/delete", post(admin_delete::<E>))
         .route(
             "/admin/session",
             get(session_show::<E>).delete(session_logout::<E>),
@@ -602,6 +616,82 @@ async fn retention_delete<E: Engine>(
     match state.engine.remove_retention(&table) {
         Ok(()) => Json(json!({ "table": table, "status": "removed" })).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+/// A targeted-delete request (R-1). Timestamps are nanoseconds — the same
+/// unit line protocol and the engine speak internally — so the window is
+/// unambiguous and needs no timezone parsing on this admin surface.
+#[derive(Deserialize)]
+struct DeleteRequest {
+    db: String,
+    table: String,
+    /// Tag equalities the row must ALL satisfy. Order-independent.
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
+    /// Inclusive lower time bound, nanoseconds since the Unix epoch.
+    #[serde(default)]
+    start_ns: Option<i64>,
+    /// Inclusive upper time bound, nanoseconds since the Unix epoch.
+    #[serde(default)]
+    end_ns: Option<i64>,
+}
+
+/// POST /admin/delete — record a targeted-delete tombstone (R-1). Deleting
+/// data is irreversible and governs what the node stores, so it sits with
+/// `admin`, the same bar as removing a retention policy.
+async fn admin_delete<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let del: DeleteRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    let db = del.db.trim();
+    let table = del.table.trim();
+    if db.is_empty() || table.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "db and table must not be empty");
+    }
+    let tag_equals: Vec<(String, String)> = del.tags.into_iter().collect();
+
+    // The engine owns the policy (empty-predicate refusal, table existence,
+    // window sanity) so HTTP and any future transport share one rule.
+    match state
+        .engine
+        .delete_where(db, table, tag_equals, del.start_ns, del.end_ns)
+    {
+        Ok((id, seq)) => Json(json!({
+            "db": db,
+            "table": table,
+            "tombstone_id": id,
+            "seq": seq,
+            "status": "recorded",
+        }))
+        .into_response(),
+        // A rejected predicate or a missing table is the caller's error; a
+        // failed commit is ours.
+        Err(e) => {
+            let is_client = e.contains("needs at least one predicate")
+                || e.contains("does not exist")
+                || e.contains("time window is empty")
+                || e.contains("querier");
+            let code = if is_client {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err_response(code, &e)
+        }
     }
 }
 

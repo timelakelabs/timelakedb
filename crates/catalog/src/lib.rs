@@ -44,6 +44,29 @@ pub struct FileMeta {
     pub max_ts_ns: i64,
 }
 
+/// A targeted-delete predicate (R-1). Rows of `table` in `db` that match ALL
+/// of `tag_equals` AND fall in the half-open time range `[min_ts_ns,
+/// max_ts_ns)` are deleted. An unset bound is open on that side; an empty
+/// `tag_equals` matches every row in range (a pure time delete). Recorded in
+/// the manifest log so it replays on restart and reaches every node exactly
+/// as a file add does. `id` makes replay and CAS-retry idempotent;
+/// `created_seq` is the manifest seq it committed at (R-1b uses it to know
+/// which files predate the delete and must be rewritten).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Tombstone {
+    pub id: String,
+    pub db: String,
+    pub table: String,
+    #[serde(default)]
+    pub tag_equals: Vec<(String, String)>,
+    #[serde(default)]
+    pub min_ts_ns: Option<i64>,
+    #[serde(default)]
+    pub max_ts_ns: Option<i64>,
+    #[serde(default)]
+    pub created_seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     seq: u64,
@@ -52,6 +75,10 @@ struct ManifestEntry {
     /// retention drops). Removals apply before adds on replay.
     #[serde(default)]
     remove_paths: Vec<String>,
+    /// Targeted-delete predicates (R-1) recorded by this commit. `default`
+    /// so every manifest written before R-1 still deserializes.
+    #[serde(default)]
+    tombstones: Vec<Tombstone>,
 }
 
 /// Read and parse one manifest object, tagging the path on failure so a
@@ -68,7 +95,11 @@ fn read_entry<S: Store>(store: &S, path: &str) -> std::io::Result<ManifestEntry>
 
 /// Fold one entry into the in-memory file index: removals first (so a
 /// compaction's replacement is atomic to a reader), then adds.
-fn apply_entry(files: &mut HashMap<(String, String), Vec<FileMeta>>, entry: ManifestEntry) {
+fn apply_entry(
+    files: &mut HashMap<(String, String), Vec<FileMeta>>,
+    tombstones: &mut Vec<Tombstone>,
+    entry: ManifestEntry,
+) {
     if !entry.remove_paths.is_empty() {
         for list in files.values_mut() {
             list.retain(|f| !entry.remove_paths.contains(&f.path));
@@ -83,12 +114,23 @@ fn apply_entry(files: &mut HashMap<(String, String), Vec<FileMeta>>, entry: Mani
         // the identity to compare on.
         list.push(f);
     }
+    // Same idempotency contract for tombstones — a delete predicate replayed
+    // by `load`/`catch_up`, or re-seen after a CAS retry, must not accumulate
+    // duplicates. `id` is the identity.
+    for t in entry.tombstones {
+        if !tombstones.iter().any(|x| x.id == t.id) {
+            tombstones.push(t);
+        }
+    }
 }
 
 pub struct Catalog<S: Store> {
     store: S,
     seq: AtomicU64,
     files: Mutex<HashMap<(String, String), Vec<FileMeta>>>,
+    /// Active targeted-delete predicates (R-1), folded from the manifest log.
+    /// Locked AFTER `files` wherever both are held, so the two never deadlock.
+    tombstones: Mutex<Vec<Tombstone>>,
     /// Serializes this process's own commits so seq allocation, CAS, and the
     /// in-memory apply are one critical section. The CAS handles the
     /// *inter*-process race; this handles the intra-process one, and keeps
@@ -108,16 +150,18 @@ impl<S: Store> Catalog<S> {
     /// Load by replaying the manifest log (sorted list = seq order).
     pub fn load(store: S) -> std::io::Result<Catalog<S>> {
         let mut files: HashMap<(String, String), Vec<FileMeta>> = HashMap::new();
+        let mut tombstones: Vec<Tombstone> = Vec::new();
         let mut seq = 0u64;
         for path in store.list("catalog/manifest")? {
             let entry = read_entry(&store, &path)?;
             seq = seq.max(entry.seq);
-            apply_entry(&mut files, entry);
+            apply_entry(&mut files, &mut tombstones, entry);
         }
         Ok(Catalog {
             store,
             seq: AtomicU64::new(seq),
             files: Mutex::new(files),
+            tombstones: Mutex::new(tombstones),
             commit_lock: Mutex::new(()),
             commit_conflicts: AtomicU64::new(0),
         })
@@ -141,20 +185,48 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
+        self.commit_entry(add_files, remove_paths, Vec::new())
+    }
+
+    /// Durably record a targeted-delete predicate (R-1) in the manifest log.
+    /// The same CAS loop as any commit, so it composes with file adds/removes
+    /// and replays/propagates identically. Returns the seq it landed at.
+    pub fn commit_tombstone(&self, tombstone: Tombstone) -> std::io::Result<u64> {
+        self.commit_entry(Vec::new(), Vec::new(), vec![tombstone])
+    }
+
+    fn commit_entry(
+        &self,
+        add_files: Vec<FileMeta>,
+        remove_paths: Vec<String>,
+        tombstones: Vec<Tombstone>,
+    ) -> std::io::Result<u64> {
         let _commit = self.commit_lock.lock().expect("commit lock");
         for _ in 0..MAX_COMMIT_ATTEMPTS {
             let seq = self.seq.load(Ordering::SeqCst) + 1;
+            // Stamp each tombstone with the seq it is actually landing at, so
+            // `created_seq` stays correct even when a CAS retry bumps the head.
+            let stamped: Vec<Tombstone> = tombstones
+                .iter()
+                .cloned()
+                .map(|mut t| {
+                    t.created_seq = seq;
+                    t
+                })
+                .collect();
             let entry = ManifestEntry {
                 seq,
                 add_files: add_files.clone(),
                 remove_paths: remove_paths.clone(),
+                tombstones: stamped,
             };
             let bytes = serde_json::to_vec(&entry).expect("manifest json");
             if self.store.put_if_absent(&manifest_path(seq), &bytes)? {
                 // We own this slot. Advance the head and apply our own entry.
                 self.seq.store(seq, Ordering::SeqCst);
                 let mut files = self.files.lock().expect("catalog lock");
-                apply_entry(&mut files, entry);
+                let mut tombs = self.tombstones.lock().expect("tombstone lock");
+                apply_entry(&mut files, &mut tombs, entry);
                 return Ok(seq);
             }
             // Lost the race: someone else holds `seq`. Learn what they wrote,
@@ -222,12 +294,14 @@ impl<S: Store> Catalog<S> {
         // handled by apply_entry; across entries, order is the log order.
         newer.sort_by_key(|(seq, _)| *seq);
         let mut files = self.files.lock().expect("catalog lock");
+        let mut tombs = self.tombstones.lock().expect("tombstone lock");
         let mut new_head = head;
         for (seq, entry) in newer {
-            apply_entry(&mut files, entry);
+            apply_entry(&mut files, &mut tombs, entry);
             new_head = new_head.max(seq);
         }
         drop(files);
+        drop(tombs);
         self.seq.store(new_head, Ordering::SeqCst);
         Ok(())
     }
@@ -255,6 +329,24 @@ impl<S: Store> Catalog<S> {
             .get(&(db.to_string(), table.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// All active targeted-delete predicates (R-1), for the query filter and
+    /// the compaction/apply pass.
+    pub fn tombstones(&self) -> Vec<Tombstone> {
+        self.tombstones.lock().expect("tombstone lock").clone()
+    }
+
+    /// Tombstones scoped to one table — what the query path folds into its
+    /// mandatory predicate.
+    pub fn tombstones_for(&self, db: &str, table: &str) -> Vec<Tombstone> {
+        self.tombstones
+            .lock()
+            .expect("tombstone lock")
+            .iter()
+            .filter(|t| t.db == db && t.table == table)
+            .cloned()
+            .collect()
     }
 
     /// Tables known to the catalog for a database (buffer may know more).
@@ -510,5 +602,100 @@ mod tests {
             files.len()
         );
         assert_eq!(replica.head(), 1);
+    }
+
+    fn tomb(id: &str, db: &str, table: &str) -> Tombstone {
+        Tombstone {
+            id: id.into(),
+            db: db.into(),
+            table: table.into(),
+            tag_equals: vec![("host".into(), "web-1".into())],
+            min_ts_ns: Some(1),
+            max_ts_ns: Some(100),
+            created_seq: 0,
+        }
+    }
+
+    /// A targeted-delete predicate is durable: it rides the same manifest log
+    /// as file adds, so a cold replay must reconstruct it. Without this, a
+    /// delete would silently un-apply after a restart and the "deleted" rows
+    /// would reappear — a data-exposure regression, not just a lost feature.
+    #[test]
+    fn tombstone_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+            cat.commit_add(vec![meta("poc", "t", "2026081600", "a.parquet")])
+                .unwrap();
+            cat.commit_tombstone(tomb("d1", "poc", "t")).unwrap();
+        }
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        let ts = cat.tombstones_for("poc", "t");
+        assert_eq!(ts.len(), 1, "the tombstone must replay from the log");
+        assert_eq!(ts[0].id, "d1");
+        assert_eq!(ts[0].tag_equals, vec![("host".into(), "web-1".into())]);
+        // Scoping works: a different table sees nothing.
+        assert!(cat.tombstones_for("poc", "other").is_empty());
+        // And the file it hides is still catalogued (logical delete only).
+        assert_eq!(cat.files_for("poc", "t").len(), 1);
+    }
+
+    /// `created_seq` must equal the seq the tombstone actually landed at, even
+    /// when a CAS race bumps the head between building the entry and winning
+    /// the slot. Physical GC (R-1b) only reclaims files whose max_ts predates
+    /// the delete; a stale `created_seq` would misorder that comparison.
+    #[test]
+    fn tombstone_created_seq_matches_landing_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = || LocalStore::new(dir.path()).unwrap();
+
+        // Two writers both at head 0. A takes seq 1 with a file; B's tombstone
+        // loses the seq-1 race and must retry onto seq 2.
+        let a = Catalog::load(store()).unwrap();
+        let b = Catalog::load(store()).unwrap();
+        let sa = a
+            .commit_add(vec![meta("poc", "t", "2026081600", "a.parquet")])
+            .unwrap();
+        let sb = b.commit_tombstone(tomb("d1", "poc", "t")).unwrap();
+        assert_eq!(sa, 1);
+        assert_eq!(sb, 2, "the tombstone must land past the file commit");
+        assert!(b.commit_conflicts() >= 1, "B should have lost seq 1");
+
+        let fresh = Catalog::load(store()).unwrap();
+        let ts = fresh.tombstones_for("poc", "t");
+        assert_eq!(ts.len(), 1);
+        assert_eq!(
+            ts[0].created_seq, 2,
+            "created_seq must be the slot it won, not the slot first attempted"
+        );
+    }
+
+    /// Tombstones fold by id, so replaying or catching up over the same entry
+    /// twice keeps exactly one copy — the mirror of the file over-count race.
+    #[test]
+    fn tombstone_applied_once_by_id() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Arc::new(Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap());
+        assert_eq!(replica.head(), 0, "the replica must start behind");
+
+        let writer = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        writer.commit_tombstone(tomb("d1", "poc", "t")).unwrap();
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let c = Arc::clone(&replica);
+                std::thread::spawn(move || c.catch_up().unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            replica.tombstones_for("poc", "t").len(),
+            1,
+            "one tombstone entry must fold to one tombstone however many callers raced"
+        );
     }
 }

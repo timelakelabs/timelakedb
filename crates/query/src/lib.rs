@@ -256,6 +256,12 @@ pub struct QuerySession {
     /// presented one (SEC-3 want mode). `None` is an anonymous caller —
     /// served, because Grafana and Telegraf have no certificate.
     pub identity: Option<String>,
+    /// Active targeted-delete predicates for the tables this query touches
+    /// (R-1), read from the catalog when the session is built. The
+    /// mandatory predicate turns these into a [`Restriction::Tombstone`], so
+    /// a deleted row is hidden from every query shape immediately — before
+    /// the physical GC reclaims the bytes.
+    pub tombstones: Vec<timelake_catalog::Tombstone>,
 }
 
 impl QuerySession {
@@ -263,7 +269,16 @@ impl QuerySession {
         QuerySession {
             authorizations,
             identity: None,
+            tombstones: Vec::new(),
         }
+    }
+
+    /// Attach the active tombstones the mandatory predicate should enforce.
+    /// The engine scopes these to the tables in the query (`tombstones_for`)
+    /// before handing them over.
+    pub fn with_tombstones(mut self, tombstones: Vec<timelake_catalog::Tombstone>) -> QuerySession {
+        self.tombstones = tombstones;
+        self
     }
 
     /// Resolve what this session may actually see.
@@ -307,6 +322,40 @@ pub enum Restriction {
         column: String,
         authorizations: Vec<String>,
     },
+    /// Drop rows matching any active targeted-delete predicate (R-1). Each
+    /// tombstone is (tag equality AND time range); a row is removed if it
+    /// satisfies *any* one of them. Enforced at the same scan point as
+    /// visibility — below every user predicate and before aggregation — so a
+    /// delete hides its rows from every query shape at once, everywhere,
+    /// before the physical GC (R-1b) rewrites the files.
+    Tombstone {
+        deletes: Vec<timelake_catalog::Tombstone>,
+    },
+}
+
+impl Restriction {
+    /// Columns the scan must materialize for this restriction even when the
+    /// query projects none of them. Projection pushdown would otherwise read
+    /// a batch without the mask's inputs, and a hidden row would slip through
+    /// a narrow `SELECT`. The provider unions these into `read_names`.
+    pub fn required_columns(&self) -> Vec<String> {
+        match self {
+            Restriction::Visibility { column, .. } => vec![column.clone()],
+            Restriction::Tombstone { deletes } => {
+                // Time bounds are evaluated against the "time" column; tag
+                // equalities against each named tag column.
+                let mut cols = vec!["time".to_string()];
+                for t in deletes {
+                    for (tag, _) in &t.tag_equals {
+                        if !cols.contains(tag) {
+                            cols.push(tag.clone());
+                        }
+                    }
+                }
+                cols
+            }
+        }
+    }
 }
 
 /// THE injection point (SEC-2). Called unconditionally for every table
@@ -317,28 +366,51 @@ pub fn mandatory_predicate(
     session: &QuerySession,
     _table: &str,
     schema: &datafusion::arrow::datatypes::Schema,
-) -> Option<Restriction> {
-    if schema.field_with_name(VISIBILITY_COLUMN).is_err() {
-        return None;
+) -> Vec<Restriction> {
+    let mut out = Vec::new();
+    // A labelled table is filtered by the caller's authorizations; an
+    // unlabelled one (the bench workload) carries no visibility restriction.
+    if schema.field_with_name(VISIBILITY_COLUMN).is_ok() {
+        out.push(Restriction::Visibility {
+            column: VISIBILITY_COLUMN.to_string(),
+            authorizations: session.authorizations.clone(),
+        });
     }
-    Some(Restriction::Visibility {
-        column: VISIBILITY_COLUMN.to_string(),
-        authorizations: session.authorizations.clone(),
-    })
+    // Any table with an active targeted delete gets the tombstone filter —
+    // independent of whether it is labelled. The engine has already scoped
+    // `session.tombstones` to the tables in this query.
+    if !session.tombstones.is_empty() {
+        out.push(Restriction::Tombstone {
+            deletes: session.tombstones.clone(),
+        });
+    }
+    out
 }
 
 /// Enforce one restriction on one batch. Rows fail closed: a label the
 /// session's authorizations do not satisfy — or one that does not parse —
 /// drops its row here, before DataFusion ever sees it.
 pub fn apply_restriction(r: &Restriction, batch: &RecordBatch) -> Result<RecordBatch, String> {
+    match r {
+        Restriction::Visibility {
+            column,
+            authorizations,
+        } => apply_visibility(column, authorizations, batch),
+        Restriction::Tombstone { deletes } => apply_tombstone(deletes, batch),
+    }
+}
+
+/// SEC-2 visibility filter: rows whose label the session's authorizations do
+/// not satisfy — or that do not parse — fail closed and drop here.
+fn apply_visibility(
+    column: &str,
+    authorizations: &[String],
+    batch: &RecordBatch,
+) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{BooleanArray, DictionaryArray, StringArray, StringViewArray};
     use datafusion::arrow::compute::filter_record_batch;
     use datafusion::arrow::datatypes::Int32Type;
 
-    let Restriction::Visibility {
-        column,
-        authorizations,
-    } = r;
     // A batch without the column (a file written before labels existed)
     // holds unlabeled rows, and unlabeled rows are visible to everyone.
     let Some(col) = batch.column_by_name(column) else {
@@ -427,6 +499,156 @@ pub fn apply_restriction(r: &Restriction, batch: &RecordBatch) -> Result<RecordB
     filter_record_batch(batch, &mask).map_err(|e| e.to_string())
 }
 
+/// R-1 targeted-delete filter: a row is dropped if it matches *any* active
+/// tombstone (all of that tombstone's tag equalities AND its time range).
+/// Tombstones that name a tag the batch lacks are unsatisfiable and match
+/// nothing — the read filter never over-deletes on a missing column.
+fn apply_tombstone(
+    deletes: &[timelake_catalog::Tombstone],
+    batch: &RecordBatch,
+) -> Result<RecordBatch, String> {
+    use datafusion::arrow::array::BooleanArray;
+    use datafusion::arrow::compute::filter_record_batch;
+
+    let n = batch.num_rows();
+    if n == 0 || deletes.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    // Read the time column once; time-bounded tombstones need it, tag-only
+    // ones do not, so its absence is only fatal to the former.
+    let time_vals = batch.column_by_name("time").and_then(|c| read_ts_nanos(c));
+
+    let mut keep = vec![true; n];
+    for t in deletes {
+        // Fold each tag equality into a per-row "still matches" vector. Any
+        // tag column missing from this batch makes the whole tombstone
+        // unsatisfiable here — skip it rather than delete indiscriminately.
+        let mut matches = vec![true; n];
+        let mut satisfiable = true;
+        for (tag, val) in &t.tag_equals {
+            match batch.column_by_name(tag) {
+                None => {
+                    satisfiable = false;
+                    break;
+                }
+                Some(col) => {
+                    let eq = string_col_equals(col, val)?;
+                    for i in 0..n {
+                        matches[i] = matches[i] && eq[i];
+                    }
+                }
+            }
+        }
+        if !satisfiable {
+            continue;
+        }
+        if t.min_ts_ns.is_some() || t.max_ts_ns.is_some() {
+            match &time_vals {
+                // No usable time column: cannot confirm the bound, so this
+                // tombstone matches nothing here (never over-deletes).
+                None => continue,
+                Some(tv) => {
+                    for i in 0..n {
+                        let within = t.min_ts_ns.is_none_or(|m| tv[i] >= m)
+                            && t.max_ts_ns.is_none_or(|m| tv[i] <= m);
+                        matches[i] = matches[i] && within;
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            if matches[i] {
+                keep[i] = false;
+            }
+        }
+    }
+
+    let mask = BooleanArray::from(keep);
+    filter_record_batch(batch, &mask).map_err(|e| e.to_string())
+}
+
+/// Per-row equality of a string-ish column against a literal. Handles the
+/// three shapes a tag arrives in — dictionary (buffer), Utf8, and the
+/// Utf8View the provider presents. NULL never equals a literal.
+fn string_col_equals(
+    col: &datafusion::arrow::array::ArrayRef,
+    val: &str,
+) -> Result<Vec<bool>, String> {
+    use datafusion::arrow::array::{DictionaryArray, StringArray, StringViewArray};
+    use datafusion::arrow::datatypes::Int32Type;
+
+    match col.data_type() {
+        DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8 => {
+            let dict = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .expect("checked dictionary type");
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("checked utf8 values");
+            // Evaluate each distinct value once, then map keys through it.
+            let eq: Vec<bool> = (0..values.len())
+                .map(|i| !values.is_null(i) && values.value(i) == val)
+                .collect();
+            let keys = dict.keys();
+            Ok((0..dict.len())
+                .map(|i| !dict.is_null(i) && eq[keys.value(i) as usize])
+                .collect())
+        }
+        DataType::Utf8 => {
+            let a = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("checked utf8");
+            Ok((0..a.len())
+                .map(|i| !a.is_null(i) && a.value(i) == val)
+                .collect())
+        }
+        DataType::Utf8View => {
+            let a = col
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("checked utf8view");
+            Ok((0..a.len())
+                .map(|i| !a.is_null(i) && a.value(i) == val)
+                .collect())
+        }
+        other => Err(format!(
+            "targeted-delete tag predicate needs a string column, got {other:?}"
+        )),
+    }
+}
+
+/// Read a time column as nanoseconds. A null timestamp becomes `i64::MIN` so
+/// it can never fall inside a `[min, max]` delete window. Returns `None` for
+/// a non-time column, which callers treat as "cannot evaluate a time bound".
+fn read_ts_nanos(col: &datafusion::arrow::array::ArrayRef) -> Option<Vec<i64>> {
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    use datafusion::arrow::datatypes::TimeUnit;
+    match col.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let a = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+            Some(
+                (0..a.len())
+                    .map(|i| if a.is_null(i) { i64::MIN } else { a.value(i) })
+                    .collect(),
+            )
+        }
+        DataType::Int64 => {
+            let a = col.as_any().downcast_ref::<Int64Array>()?;
+            Some(
+                (0..a.len())
+                    .map(|i| if a.is_null(i) { i64::MIN } else { a.value(i) })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Merge batches with heterogeneous-but-compatible schemas (files written
 /// before a column existed union'd with newer ones): the merged schema is
 /// the first-seen-ordered union; missing columns become nulls. A name
@@ -502,12 +724,19 @@ pub async fn run_sql(
         let (schema, aligned) = align(batches)?;
         // SEC-2: the hook is on the path for every table, every query —
         // this in-memory path enforces at registration, before DataFusion.
-        let aligned = match mandatory_predicate(session, &name, &schema) {
-            None => aligned,
-            Some(r) => aligned
-                .iter()
-                .map(|b| apply_restriction(&r, b))
-                .collect::<Result<Vec<_>, _>>()?,
+        // Each restriction (visibility, then tombstones) is applied in turn.
+        let restrictions = mandatory_predicate(session, &name, &schema);
+        let aligned = if restrictions.is_empty() {
+            aligned
+        } else {
+            aligned
+                .into_iter()
+                .map(|b| {
+                    restrictions
+                        .iter()
+                        .try_fold(b, |acc, r| apply_restriction(r, &acc))
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
         // one partition per batch -> DataFusion scans them in parallel
         let parts = aligned.into_iter().map(|b| vec![b]).collect();
@@ -724,6 +953,79 @@ mod tests {
             let rows = batches_to_json(&rows);
             assert_eq!(rows[0]["n"], expect, "auths {auths:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn tombstone_hides_rows_and_aggregates() {
+        // Two hosts, three timestamps. A targeted delete (R-1) must hide
+        // exactly the matching rows — including from COUNT(*), the same
+        // aggregate-leak surface the visibility filter is pinned against.
+        let lp = "metrics,host=web-1 value=1.0 100\n\
+                  metrics,host=web-1 value=1.0 500\n\
+                  metrics,host=web-2 value=1.0 100\n\
+                  metrics,host=web-1 value=1.0 2000";
+        let batch = buffer_with(lp);
+
+        async fn count(session: &QuerySession, batch: &RecordBatch) -> i64 {
+            let rows = run_sql(
+                session,
+                vec![("metrics".into(), vec![batch.clone()])],
+                "SELECT COUNT(*) AS n FROM metrics",
+                64 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+            batches_to_json(&rows)[0]["n"].as_i64().unwrap()
+        }
+
+        let tomb = |tags: &[(&str, &str)], min: Option<i64>, max: Option<i64>| {
+            timelake_catalog::Tombstone {
+                id: "d1".into(),
+                db: "db".into(),
+                table: "metrics".into(),
+                tag_equals: tags
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                min_ts_ns: min,
+                max_ts_ns: max,
+                created_seq: 1,
+            }
+        };
+
+        // No tombstone: all four rows present.
+        assert_eq!(count(&QuerySession::default(), &batch).await, 4);
+
+        // Delete web-1 in [0, 1000]: drops the two early web-1 rows, keeps
+        // web-2@100 and web-1@2000 (the latter is outside the window).
+        let s = QuerySession::default()
+            .with_tombstones(vec![tomb(&[("host", "web-1")], Some(0), Some(1000))]);
+        assert_eq!(count(&s, &batch).await, 2);
+
+        // ...and it is the RIGHT rows, not merely the right count.
+        let rows = run_sql(
+            &s,
+            vec![("metrics".into(), vec![batch.clone()])],
+            "SELECT host, \"time\" FROM metrics ORDER BY \"time\"",
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let rows = batches_to_json(&rows);
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(rows[0]["host"], "web-2"); // @100 survives (wrong host)
+        assert_eq!(rows[1]["host"], "web-1"); // @2000 survives (outside window)
+
+        // Tag-only tombstone (no time bound): every web-2 row, at any time.
+        let s = QuerySession::default()
+            .with_tombstones(vec![tomb(&[("host", "web-2")], None, None)]);
+        assert_eq!(count(&s, &batch).await, 3);
+
+        // A tombstone naming a tag the table lacks is unsatisfiable — it must
+        // match nothing, never fall back to deleting everything.
+        let s = QuerySession::default()
+            .with_tombstones(vec![tomb(&[("region", "eu")], None, None)]);
+        assert_eq!(count(&s, &batch).await, 4);
     }
 
     #[test]

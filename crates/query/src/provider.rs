@@ -847,22 +847,37 @@ impl TableProvider for LazyTable {
 
         // SEC-2: THE mandatory-predicate call — unconditional, per scan.
         // Whatever it returns is applied to every batch below, before the
-        // plan exists, so no query shape can aggregate around it.
-        let restriction = crate::mandatory_predicate(&self.session, &self.name, &self.schema);
+        // plan exists, so no query shape can aggregate around it. It may now
+        // return more than one restriction (visibility, then R-1 tombstones).
+        let restrictions = crate::mandatory_predicate(&self.session, &self.name, &self.schema);
+        // Columns every restriction needs materialized even when the query
+        // projects none of them (the visibility label; the time and tag
+        // columns a tombstone tests). Without these, a narrow projection
+        // would strip the mask's inputs and a hidden row would leak.
+        let mut extra_cols: Vec<String> = Vec::new();
+        for r in &restrictions {
+            for c in r.required_columns() {
+                if !extra_cols.contains(&c) {
+                    extra_cols.push(c);
+                }
+            }
+        }
 
         // projection pushdown: read only needed columns. An EMPTY
         // projection (COUNT(*)) wants zero-column batches that still
         // carry row counts — we read the cheapest column to count rows.
-        // Under a restriction the label column rides along even when the
-        // query never mentions it (COUNT(*) must not count hidden rows);
-        // align_to / the count path drop it again before results form.
+        // Under a restriction the mask columns ride along even when the
+        // query never mentions them (COUNT(*) must not count hidden rows);
+        // align_to / the count path drop them again before results form.
         let count_only = projection.is_some_and(|p| p.is_empty());
         let (target_schema, needed): (SchemaRef, Option<Vec<String>>) = match projection {
             None => (self.schema.clone(), None),
             Some(_) if count_only => {
                 let mut cols = vec!["time".to_string()];
-                if restriction.is_some() {
-                    cols.push(crate::VISIBILITY_COLUMN.to_string());
+                for c in &extra_cols {
+                    if !cols.contains(c) {
+                        cols.push(c.clone());
+                    }
                 }
                 (
                     Arc::new(datafusion::arrow::datatypes::Schema::empty()),
@@ -879,10 +894,10 @@ impl TableProvider for LazyTable {
                     .map(|n| self.schema.field_with_name(n).unwrap().clone())
                     .collect();
                 let mut read_names = names.clone();
-                if restriction.is_some()
-                    && !read_names.iter().any(|n| n == crate::VISIBILITY_COLUMN)
-                {
-                    read_names.push(crate::VISIBILITY_COLUMN.to_string());
+                for c in &extra_cols {
+                    if !read_names.iter().any(|n| n == c) {
+                        read_names.push(c.clone());
+                    }
                 }
                 (
                     Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
@@ -918,22 +933,24 @@ impl TableProvider for LazyTable {
         .map_err(|e| DataFusionError::Execution(format!("scan load task: {e}")))?
         .map_err(DataFusionError::Execution)?;
         // SEC-2 enforcement: every batch — buffer snapshot and file alike —
-        // passes the restriction before the plan is built.
-        let batches = match &restriction {
-            None => batches,
-            Some(r) => {
-                let mut kept = Vec::with_capacity(batches.len());
-                let mut dropped: u64 = 0;
-                for b in batches {
-                    let before = b.num_rows();
-                    let f = crate::apply_restriction(r, &b).map_err(DataFusionError::Execution)?;
-                    dropped += (before - f.num_rows()) as u64;
-                    kept.push(f);
+        // passes each restriction before the plan is built.
+        let batches = if restrictions.is_empty() {
+            batches
+        } else {
+            let mut kept = Vec::with_capacity(batches.len());
+            let mut dropped: u64 = 0;
+            for b in batches {
+                let before = b.num_rows();
+                let mut cur = b;
+                for r in &restrictions {
+                    cur = crate::apply_restriction(r, &cur).map_err(DataFusionError::Execution)?;
                 }
-                self.filtered_rows
-                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
-                kept
+                dropped += (before - cur.num_rows()) as u64;
+                kept.push(cur);
             }
+            self.filtered_rows
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+            kept
         };
         // The reservation's job is done: try_grow during the load is what
         // rejects an oversized candidate set BEFORE memory blows up (the
