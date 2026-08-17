@@ -430,6 +430,10 @@ pub struct Engine {
     schema_source: RwLock<HashMap<(String, String), String>>,
     /// SEC-4 principals and sessions for the admin surface.
     auth: Arc<timelake_auth::Auth>,
+    /// P1-2 (SR-6): the hash-chained audit trail every admin mutation writes
+    /// to. Shared with the admin router; fail-closed unless the operator
+    /// sets `TIMELAKE_AUDIT_FAIL_OPEN`.
+    audit: Arc<timelake_audit::AuditLog>,
     /// The data-plane split: how many requests authenticated, came
     /// anonymous, or were rejected. The measurement an operator flips
     /// `optional` → `required` on — same lesson as the mTLS counters.
@@ -581,6 +585,19 @@ impl Engine {
                 .ok()
                 .as_deref(),
         )?;
+        // P1-2 (SR-6): the audit trail is local, fsync-per-record, and lives
+        // beside the WAL. A per-node chain, so the node id is stamped on
+        // every record. Fail-closed by default (§5.5) — an operator who
+        // wants mutations to proceed when the sink is broken sets fail-open.
+        let node_id = std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| "tldb".to_string());
+        let audit_fail_open = std::env::var("TIMELAKE_AUDIT_FAIL_OPEN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let audit = Arc::new(timelake_audit::AuditLog::open(
+            data_dir.join("audit"),
+            node_id,
+            audit_fail_open,
+        )?);
         let engine = Engine {
             dbs: RwLock::new(HashMap::new()),
             ingest_gate: RwLock::new(()),
@@ -595,6 +612,7 @@ impl Engine {
             schemas: RwLock::new(HashMap::new()),
             schema_source: RwLock::new(HashMap::new()),
             auth,
+            audit,
             retention: RwLock::new(retention),
             flushing: RwLock::new(HashMap::new()),
             cfg,
@@ -1072,6 +1090,12 @@ impl Engine {
     /// SEC-4 principal/session store, shared with the admin router.
     pub fn auth(&self) -> Arc<timelake_auth::Auth> {
         self.auth.clone()
+    }
+
+    /// P1-2 audit trail, shared with the admin router so every mutating
+    /// handler records through the same chain.
+    pub fn audit_log(&self) -> Arc<timelake_audit::AuditLog> {
+        self.audit.clone()
     }
 
     /// The largest HTTP body this node accepts, on either listener.
@@ -2089,7 +2113,11 @@ impl Engine {
              # TYPE timelake_admin_login_failures_total counter\n\
              timelake_admin_login_failures_total {}\n\
              # TYPE timelake_query_rate_limited_total counter\n\
-             timelake_query_rate_limited_total {}\n{}{}{}{}{}{}{}{}{}",
+             timelake_query_rate_limited_total {}\n\
+             # TYPE timelake_audit_records_total counter\n\
+             timelake_audit_records_total {}\n\
+             # TYPE timelake_audit_sink_healthy gauge\n\
+             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -2111,6 +2139,8 @@ impl Engine {
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
             self.client_limiter.rejected(),
+            self.audit.records_total(),
+            if self.audit.healthy() { 1 } else { 0 },
             client_ca_lines,
             data_auth_lines,
             auth_split_lines,
@@ -2215,8 +2245,9 @@ impl timelake_flight::SqlBackend for Engine {
 /// plane does not (that migration is its own milestone).
 pub fn app(engine: Arc<Engine>) -> axum::Router {
     let auth = engine.auth();
+    let audit = engine.audit_log();
     let limit = engine.max_body_bytes();
-    timelake_api::app(engine, auth, false).layer(axum::extract::DefaultBodyLimit::max(limit))
+    timelake_api::app(engine, auth, audit, false).layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
 /// The intra-cluster listener for an ingester (CL-2 replication, CL-3 live
@@ -2451,7 +2482,8 @@ pub fn app_with_tls_admin(
         }
     };
     let auth = engine.auth();
-    timelake_api::app(engine, auth.clone(), true).merge(
+    let audit = engine.audit_log();
+    timelake_api::app(engine, auth.clone(), audit, true).merge(
         axum::Router::new()
             .route("/admin/tls/reload", axum::routing::post(reload))
             .layer(axum::middleware::from_fn_with_state(

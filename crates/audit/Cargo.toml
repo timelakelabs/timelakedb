@@ -1,0 +1,15 @@
+[package]
+name = "timelake-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Same SHA-256 the auth crate already uses for token digests — no new
+# supply-chain surface (see crates/auth).
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true

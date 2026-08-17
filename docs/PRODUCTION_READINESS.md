@@ -264,13 +264,25 @@ Sequence: P0-4 (CAS) → C2 role split → WAL replication → query HA.
 This is the longest pole on the list and the one most likely to be
 underestimated. Start it early even though it finishes late.
 
-### P1-2 · No audit logging
+### P1-2 · Audit logging — DONE for admin mutations (SR-6, 2026-08-16)
 
-**Effort: M.** Writes and queries are attributed to nobody, because
-until P0-3 there *is* nobody. Once tokens land there is finally a
-principal, and `docs/CONSOLE.md` already designs the hash-chained trail.
-For most regulated deployments this is a hard gate, not a nicety —
-and "who read this data" is the question SEC-2 exists to answer.
+**Was Effort: M.** Every administrative mutation is now recorded to a
+per-node, SHA-256-chained, fsync'd append-only log (`crates/audit`,
+`<data_dir>/audit/`): who (principal + role), from where (source), what
+(dotted action), on what (target), and the resolved before/after. Denials
+are recorded too, and reading the log is itself audited. **Fail-closed** —
+a mutation is refused with `503 audit sink unavailable` while the sink
+cannot append (`TIMELAKE_AUDIT_FAIL_OPEN=1` overrides). Read via
+`GET /admin/audit` (viewer) with filters and `?verify=1` (chain check);
+`timelake_audit_records_total` / `timelake_audit_sink_healthy` on
+`/metrics`. Tamper-*evident*, not tamper-proof (external anchoring is
+future work — see SECURITY.md "Audit trail (P1-2)").
+
+**Still open (the follow-on):** the data plane is unauthenticated by
+default, so its reads/writes have no principal to attribute — data-plane
+auditing arrives with `TIMELAKE_DATA_AUTH=required`. Session login/logout
+chaining, a `system.audit` SQL exposure, object-store upload on rotation,
+and the retention floor are the remaining `docs/CONSOLE.md` §5 items.
 
 ### P1-3 · Per-client rate limiting — DONE (SEC-6, 2026-08-15)
 

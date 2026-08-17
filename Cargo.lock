@@ -4488,8 +4488,20 @@ dependencies = [
  "flate2",
  "serde",
  "serde_json",
+ "timelake-audit",
  "timelake-auth",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "timelake-audit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
@@ -4598,6 +4610,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "timelake-api",
+ "timelake-audit",
  "timelake-auth",
  "timelake-buffer",
  "timelake-catalog",
