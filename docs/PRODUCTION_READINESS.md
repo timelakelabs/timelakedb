@@ -41,7 +41,7 @@ Five axes. An item earns priority by which axis it unblocks.
 
 | # | Axis | Today |
 |---|---|---|
-| 1 | **Deployable by someone else** | No — never pushed, CI never ran, no packaging |
+| 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). No Helm chart; no public release cut yet |
 | 2 | **Access controlled and attributable** | No — open data plane, no audit trail |
 | 3 | **Survives node loss** | No — single node, single volume, RPO = last backup |
 | 4 | **Failures visible before outages** | Mostly — good metrics, no alerting story, no audit |
@@ -313,25 +313,50 @@ key: per-file wrapped DEK, AES-256-GCM frames, plaintext passthrough on
 upgrade, replay fails closed on a missing/wrong key (`crates/wal`). Covers
 the replica WAL. Verified by Riverkeeper's `wal-encrypted-at-rest` control.
 
-### P1-6 · Tributary L4 — identity and mTLS under rotation
+### P1-6 · Tributary L4 — identity and mTLS under rotation — DONE (2026-08-17)
 
-**Effort: M.** The server half shipped (want-mode client certificates,
-dual-CA overlap, AT-6 11/11, AT-7 19/19). Tributary now needs to present
-a certificate, rotate it on the client side with the same
-validate-before-swap and last-good discipline, and pass the gate already
-written into its `ROADMAP.md`: *rotate both server and client
-certificates under sustained shipping, exact count, zero dropped
-connections, and Grafana's dashboards keep rendering throughout without
-a client certificate.*
+**Was Effort: M.** The server half had already shipped (want-mode client
+certificates, dual-CA overlap, AT-6 11/11, AT-7 19/19). Tributary now
+presents a certificate and rotates it with the same validate-before-swap
+and last-good discipline, and the gate written into its `ROADMAP.md` is
+met: 10/10 in `Tributary/bench/results/l4-mtls-rotation.log` — both
+certificates rotated under sustained shipping, 15,000 written read back
+exactly, a rejected renewal kept the last-good pair shipping, and an
+anonymous caller was served throughout (AT-6 not regressed).
 
-### P1-7 · Tributary's queue is node-local durability, not replication
+**The gap it exposed, on this side.** The certificate is verified at the
+TLS layer but its CN reaches no HTTP handler: `identity_of` is wired only
+into the Flight listener, and `/api/sql` plus the write endpoints carry no
+peer identity (`CLAUDE.md` has recorded this as NOT DONE — axum-server owns
+that accept loop, so it needs a custom `Accept`). Tributary writes over
+HTTP, so its certificate currently buys handshake-level verification, not
+identity-based authorization: no SEC-2 grant intersection and no
+per-identity attribution on the write path. Closing that is the remaining
+work before "identity" means on HTTP what it already means on Flight.
 
-**Effort: S — documentation and knobs, not architecture.** Its own
-roadmap already states this honestly. On an ephemeral or spot node, a
-non-empty queue buys minutes, not guarantees. What is needed is not a
-fix but an explicit, documented trade: a shorter checkpoint interval, a
-bounded queue, and a stated RPO under node loss — so an operator chooses
-it rather than discovers it.
+### P1-7 · Tributary's queue is node-local durability, not replication — DONE (2026-08-17)
+
+**Was Effort: S.** The trade is now explicit, and the RPO is **measured**
+rather than asserted (`Tributary/bench/results/p17-queue-rpo.log`):
+
+| the node… | RPO |
+|---|---|
+| comes back (process restart, same disk) | **0** — the checkpoint resumes exactly (L1, re-verified) |
+| is gone (spot eviction, evicted pod) | `batch_lines × (1 + max_inflight)` + queue contents |
+
+At Tributary's shipped defaults that ceiling is 25,000 lines — 25 s at
+1,000 lines/s. The agent now prints its live exposure every
+`rpo_report_secs`, so an operator watches the number instead of deriving
+it; `Tributary/DESIGN.md` §3.3 states the trade.
+
+**Two corrections the measurement forced**, both worth more than the
+number itself. The mitigation as originally written — "a shorter
+checkpoint interval and a smaller queue" — was subtly wrong: the
+checkpoint interval governs *duplicates on restart*, not loss on node
+death. And the first drill reported that smaller batches were *worse*,
+because a single `kill -9` samples the flush sawtooth; instrumenting the
+agent's own peak exposure showed smaller batches are in fact 10× better by
+peak and 50× better by bound.
 
 ---
 
