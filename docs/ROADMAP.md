@@ -208,7 +208,8 @@ admin export* is the correct replacement, not a regression) · real
 multi-tenancy (`org` stops being ignored) · migration tooling from
 InfluxDB (`vmctl` equivalent) · Windows event log source · OTLP logs
 into Tributary · Flight `DoPut` · `CREATE`/`DROP TABLE` either work or
-refuse loudly · packaging (Helm, deb/rpm) · **Tributary L6 stays
+refuse loudly · packaging (Helm; ~~deb/rpm~~ **done 2026-08-17** —
+`packaging/`, attached to each tagged release) · **Tributary L6 stays
 gated** — L3 measured 492k lines/s without proving line protocol is the
 bottleneck; its own roadmap forbids starting it until that is proven.
 

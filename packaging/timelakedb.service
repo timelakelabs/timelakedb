@@ -1,0 +1,53 @@
+[Unit]
+Description=TimeLakeDB — time-series database for high-cardinality event analytics
+Documentation=https://github.com/timelakelabs/timelakedb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=timelake
+Group=timelake
+EnvironmentFile=/etc/timelakedb/timelakedb.env
+ExecStart=/usr/bin/timelake-server
+Restart=on-failure
+RestartSec=5s
+
+# systemd creates and owns /var/lib/timelake (0750, timelake:timelake), so a
+# fresh install has a correct data directory even if the package's own mkdir
+# was overridden.
+StateDirectory=timelake
+StateDirectoryMode=0750
+
+# Hardening. The shape mirrors the container's (SECURITY.md exposure 4): the
+# data directory is the ONLY path this service can write. A write primitive
+# that ever escaped the SQL guard (exposure 2) would land on a read-only
+# filesystem owned by a user with no shell.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/timelake
+
+# The engine holds many Parquet files open across a scan; the stock 1024 is
+# reached on a wide query long before anything else binds.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
