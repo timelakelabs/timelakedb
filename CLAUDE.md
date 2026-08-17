@@ -135,6 +135,12 @@ This project is inspired by the following projects.
   records a manifest-log tombstone hidden in-scan (R-1a: buffer + files,
   aggregates, cluster-wide) and physically reclaimed by a maintenance pass
   (R-1b), with a Riverkeeper control (R7, `targeted-delete-hides-rows`);
+  **P1-2 audit trail** shipped — new `timelake-audit` crate (fsync'd,
+  SHA-256-chained, tamper-evident); every admin mutation writes one
+  attributable record with resolved before/after; **fail-closed** (503 while
+  the sink is broken, `TIMELAKE_AUDIT_FAIL_OPEN` escape); `GET /admin/audit`
+  (viewer) with `?verify=1`; `timelake_audit_*` metrics (SR-6; data-plane +
+  login/logout auditing deferred);
   intra-cluster port de-published (exposure 10);
   deps refreshed within-semver (PR #4 open — `thrift` blocked upstream until
   datafusion 55). Site adopted the new mountain-lake brand (teal accent;
@@ -143,7 +149,7 @@ This project is inspired by the following projects.
   mitigation is 2 self-hosted WSL runners (`../ops/WSL_RUNNERS.md`, scoped
   not applied); and the **Phase 2 public flip** (public repos, Pages,
   `v0.1.0-alpha`) is paywalled. Still open: C2 phase 5 compactor,
-  P1-2 audit, P1-6/P1-7, T-1 Tributary metrics. Full
+  P1-6/P1-7, T-1 Tributary metrics. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does

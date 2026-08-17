@@ -57,7 +57,7 @@ to expose a port beyond a trusted segment.
 | Encryption at rest | **Implemented, opt-in.** Set `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or `TIMELAKE_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough). Since **SEC-8** the local WAL (and the replica WAL) is encrypted with the same envelope key — see exposure 8. |
 | Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-TimeLake-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
 | Targeted delete / erasure | **Implemented (R-1), `admin` only.** `POST /admin/delete` records a durable tombstone — a `(tag equalities AND time window)` predicate — that hides every matching row from every query at once, in the live buffer and in settled files, and from `COUNT(*)` as much as from `SELECT`, because it is enforced at the same in-scan point as visibility. A background pass then physically rewrites the files so the bytes are gone from the settled store (deferred GC covers in-flight readers). An empty predicate is refused; deletes are irreversible and go to the write path, not a querier. See [Targeted delete (R-1)](#targeted-delete-r-1). |
-| Audit logging | Not implemented. Writes and queries are not attributed to a principal, because there is no principal. |
+| Audit logging | **Admin mutations (P1-2 / SR-6).** Every administrative mutation — retention set/remove, targeted delete, token and cert-grant lifecycle, password change — writes one fsync'd, hash-chained record attributing it to its authenticated principal, with the resolved before/after state. **Fail-closed**: while the sink cannot append, mutations are refused with `503 audit sink unavailable` (`TIMELAKE_AUDIT_FAIL_OPEN=1` overrides). Read via `GET /admin/audit` (viewer role) with filters and `?verify=1` for a whole-chain check; `timelake_audit_records_total` / `timelake_audit_sink_healthy` on `/metrics`. Tamper-*evident* (a per-node SHA-256 chain), not tamper-proof — an external anchor is future work. **Still not covered:** data-plane reads/writes are unattributed (no data-plane principal by default, exposure 1/7), and session login/logout auditing is a documented follow-on. See [Audit trail (P1-2)](#audit-trail-p1-2). |
 | Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
 
 ## Known exposures
@@ -262,6 +262,60 @@ aggregate-leak test) and `crates/server/tests/delete.rs` (end-to-end across
 buffer and files, the time window, cross-table isolation, the admin guard,
 idempotency, and a drill that reads the raw Parquet bytes back and asserts a
 deleted value is physically absent).
+
+## Audit trail (P1-2)
+
+Every administrative mutation writes one record to a per-node,
+hash-chained, append-only log (`<data_dir>/audit/`, fsync per record). The
+record names **who** (the authenticated principal and role), **from where**
+(the request source), **what** (a dotted action such as `retention.set`,
+`token.issue`, `data.delete`, `cert_grants.remove`, `password.change`),
+**on what** (the target), and the **resolved before/after** — so it answers
+"what actually changed for the server", which is the question an incident
+asks. A denial is recorded too (`outcome: "denied"`), and reading the log
+is itself audited (`audit.read`).
+
+- **Tamper evidence, not tamper proofing.** `hash =
+  SHA-256(record-without-hash || prev_hash)`, a per-node chain from a fixed
+  genesis. `GET /admin/audit?verify=1` walks the chain and reports the first
+  break by seq: an edited field, a deleted record (seq gap), or a broken
+  link all surface. What it does **not** stop is someone with write access
+  to the file rewriting the *whole* chain — detecting that needs an external
+  anchor (a WORM bucket or a signed head), designed-for but not built.
+- **Fail-closed (§5.5).** If the sink cannot append, a mutation is refused
+  with `503 audit sink unavailable` and the door stays shut until the sink
+  recovers — an administrative change that leaves no record is worse than
+  one that did not happen. `TIMELAKE_AUDIT_FAIL_OPEN=1` inverts this for an
+  operator who would rather keep mutating and be alerted; the choice is
+  itself a deployment-time decision, not a console one.
+- **Read surface.** `GET /admin/audit` (viewer) filters by
+  `action`/`principal`/`target`/`since` and returns the most-recent page
+  (`limit`, default 1000). `timelake_audit_records_total` and
+  `timelake_audit_sink_healthy` are on `/metrics`.
+
+Scope and residuals, all deliberate for this slice:
+
+- **Admin mutations only.** The data plane is unauthenticated by default
+  (exposure 1), so a write or query has no principal to attribute — data-plane
+  auditing arrives with `TIMELAKE_DATA_AUTH=required` and a token identity.
+- **Session login/logout are not yet chained.** Login already emits metrics
+  and structured logs (`timelake_admin_logins_total` /
+  `_login_failures_total`); folding those events into the audit chain is a
+  follow-on, as is threading a session id (the admin `SessionInfo` carries
+  none today) and a request-correlation id.
+- **The recorded denials are engine/policy denials** (`outcome: "denied"` —
+  an empty-predicate delete, a rejected password). A role-based `403` refused
+  by the admin guard *before* the handler runs is not yet chained; folding
+  guard denials into the trail is part of the same login/logout follow-on.
+- **Local segments only.** Object-store upload on rotation (SEC-1 encrypted),
+  the read-only `system.audit` SQL exposure, and the retention floor
+  (`TIMELAKE_AUDIT_MIN_RETENTION_DAYS`) are the next enhancements on top of
+  this chain (`docs/CONSOLE.md` §5.4).
+
+Pinned by `crates/audit` (the chain: link, replay, tamper detection on edit
+and deletion, fail-closed gate) and `crates/server/tests/audit.rs`
+(end-to-end attribution, `?verify=1`, a recorded denial, self-audited reads,
+and the viewer gate).
 
 ## Dependency advisories
 
