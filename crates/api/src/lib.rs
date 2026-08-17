@@ -145,6 +145,8 @@ pub fn humanize_secs(secs: u64) -> String {
 pub struct AdminState<E: Engine> {
     engine: Arc<E>,
     auth: Arc<Auth>,
+    /// P1-2 (SR-6): every mutating handler records through this chain.
+    audit: Arc<timelake_audit::AuditLog>,
     /// Mark session cookies `Secure` — set when the listener is TLS.
     secure_cookies: bool,
 }
@@ -154,6 +156,7 @@ impl<E: Engine> Clone for AdminState<E> {
         AdminState {
             engine: self.engine.clone(),
             auth: self.auth.clone(),
+            audit: self.audit.clone(),
             secure_cookies: self.secure_cookies,
         }
     }
@@ -162,7 +165,12 @@ impl<E: Engine> Clone for AdminState<E> {
 /// The data plane (unauthenticated — FR-1/FR-8/FR-9 clients) plus the
 /// admin surface (authenticated — SEC-4). Two routers, two states,
 /// merged: no admin route can accidentally inherit the open state.
-pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> Router {
+pub fn app<E: Engine>(
+    engine: Arc<E>,
+    auth: Arc<Auth>,
+    audit: Arc<timelake_audit::AuditLog>,
+    secure_cookies: bool,
+) -> Router {
     let data = Router::new()
         .route("/health", get(health))
         .route("/ping", get(ping::<E>).head(ping::<E>))
@@ -182,6 +190,7 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
     let state = AdminState {
         engine,
         auth,
+        audit,
         secure_cookies,
     };
 
@@ -197,6 +206,7 @@ pub fn app<E: Engine>(engine: Arc<E>, auth: Arc<Auth>, secure_cookies: bool) -> 
             axum::routing::delete(retention_delete::<E>),
         )
         .route("/admin/delete", post(admin_delete::<E>))
+        .route("/admin/audit", get(audit_list::<E>))
         .route(
             "/admin/session",
             get(session_show::<E>).delete(session_logout::<E>),
@@ -475,6 +485,7 @@ async fn change_password<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
         Ok(b) => b,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -484,6 +495,12 @@ async fn change_password<E: Engine>(
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    // A password change is audited as an event, never with its values — the
+    // record carries who rotated their own credential, not the secret.
+    let target = Some(session.username.clone());
     match state.auth.change_password(
         &session.username,
         &change.current_password,
@@ -491,16 +508,27 @@ async fn change_password<E: Engine>(
     ) {
         // Every session for this principal — including this one — is
         // invalidated by the rotation, so the client must log in again.
-        Ok(()) => Json(json!({
-            "status": "password changed",
-            "reauthenticate": true,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e, "code": "password_rejected" })),
-        )
-            .into_response(),
+        Ok(()) => {
+            let ev = audit_event(&session, source, "password.change", target, None, None, "ok");
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({
+                "status": "password changed",
+                "reauthenticate": true,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let ev =
+                audit_event(&session, source, "password.change", target, None, None, "denied");
+            let _ = state.audit.record(ev);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e, "code": "password_rejected" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -544,6 +572,7 @@ async fn retention_set<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
         Ok(b) => b,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -588,17 +617,48 @@ async fn retention_set<E: Engine>(
     if let Some(deny) = require(&session, needed) {
         return deny;
     }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
 
+    let before = current.map(|s| json!({"seconds": s, "duration": humanize_secs(s)}));
+    let after = json!({"seconds": seconds, "duration": humanize_secs(seconds)});
     match state.engine.set_retention(table, seconds) {
-        Ok(()) => Json(json!({
-            "table": table,
-            "seconds": seconds,
-            "duration": humanize_secs(seconds),
-            "status": "set",
-            "destructive": destructive,
-        }))
-        .into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "retention.set",
+                Some(table.to_string()),
+                before,
+                Some(after),
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({
+                "table": table,
+                "seconds": seconds,
+                "duration": humanize_secs(seconds),
+                "status": "set",
+                "destructive": destructive,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "retention.set",
+                Some(table.to_string()),
+                before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
     }
 }
 
@@ -610,12 +670,48 @@ async fn retention_delete<E: Engine>(
     // Removing a policy makes the table grow without bound — governing
     // the node's storage, so it sits with `admin` alongside shrinking.
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
     }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let before = state
+        .engine
+        .retention_policies()
+        .into_iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, s)| json!({"seconds": s, "duration": humanize_secs(s)}));
     match state.engine.remove_retention(&table) {
-        Ok(()) => Json(json!({ "table": table, "status": "removed" })).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "retention.remove",
+                Some(table.clone()),
+                before,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "table": table, "status": "removed" })).into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "retention.remove",
+                Some(table.clone()),
+                before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
     }
 }
 
@@ -645,6 +741,7 @@ async fn admin_delete<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
     }
@@ -663,33 +760,64 @@ async fn admin_delete<E: Engine>(
         return err_response(StatusCode::BAD_REQUEST, "db and table must not be empty");
     }
     let tag_equals: Vec<(String, String)> = del.tags.into_iter().collect();
+    // The predicate as recorded in the audit trail — what was asked to be
+    // deleted, independent of how many rows it matched.
+    let predicate = json!({
+        "tags": tag_equals
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<String, String>>(),
+        "start_ns": del.start_ns,
+        "end_ns": del.end_ns,
+    });
+    let target = Some(format!("{db}.{table}"));
 
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
     // The engine owns the policy (empty-predicate refusal, table existence,
     // window sanity) so HTTP and any future transport share one rule.
     match state
         .engine
         .delete_where(db, table, tag_equals, del.start_ns, del.end_ns)
     {
-        Ok((id, seq)) => Json(json!({
-            "db": db,
-            "table": table,
-            "tombstone_id": id,
-            "seq": seq,
-            "status": "recorded",
-        }))
-        .into_response(),
+        Ok((id, seq)) => {
+            let after = json!({"predicate": predicate, "tombstone_id": id, "seq": seq});
+            let ev = audit_event(&session, source, "data.delete", target, None, Some(after), "ok");
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({
+                "db": db,
+                "table": table,
+                "tombstone_id": id,
+                "seq": seq,
+                "status": "recorded",
+            }))
+            .into_response()
+        }
         // A rejected predicate or a missing table is the caller's error; a
-        // failed commit is ours.
+        // failed commit is ours. Either way the attempt is audited (§5.1).
         Err(e) => {
             let is_client = e.contains("needs at least one predicate")
                 || e.contains("does not exist")
                 || e.contains("time window is empty")
                 || e.contains("querier");
-            let code = if is_client {
-                StatusCode::BAD_REQUEST
+            let (code, outcome) = if is_client {
+                (StatusCode::BAD_REQUEST, "denied")
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                (StatusCode::INTERNAL_SERVER_ERROR, "error")
             };
+            let ev = audit_event(
+                &session,
+                source,
+                "data.delete",
+                target,
+                None,
+                Some(predicate),
+                outcome,
+            );
+            let _ = state.audit.record(ev);
             err_response(code, &e)
         }
     }
@@ -1003,6 +1131,7 @@ async fn tokens_issue<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     // Issuing a credential is granting access: admin, no exceptions.
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
@@ -1034,6 +1163,9 @@ async fn tokens_issue<E: Engine>(
             .unwrap_or(0)
             + n
     });
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
     match state.auth.issue_token(
         &issue.description,
         scope,
@@ -1042,14 +1174,36 @@ async fn tokens_issue<E: Engine>(
         expires_at_secs,
         &session.username,
     ) {
-        Ok((secret, record)) => Json(json!({
-            // Shown exactly once. Only the digest is stored, so there is
-            // no "show me again" — losing it means issuing a new one.
-            "secret": secret,
-            "token": token_view(&record),
-        }))
-        .into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok((secret, record)) => {
+            // The audit `after` is the safe token view — never the secret,
+            // which exists in memory only long enough to be shown once.
+            let view = token_view(&record);
+            let target = view.get("id").and_then(|v| v.as_str()).map(String::from);
+            let ev = audit_event(
+                &session,
+                source,
+                "token.issue",
+                target,
+                None,
+                Some(view.clone()),
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({
+                // Shown exactly once. Only the digest is stored, so there is
+                // no "show me again" — losing it means issuing a new one.
+                "secret": secret,
+                "token": view,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(&session, source, "token.issue", None, None, None, "error");
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
     }
 }
 
@@ -1059,13 +1213,37 @@ async fn tokens_revoke<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
     }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
     match state.auth.revoke_token(&id) {
-        Ok(true) => Json(json!({ "id": id, "status": "revoked" })).into_response(),
+        Ok(true) => {
+            let ev =
+                audit_event(&session, source, "token.revoke", Some(id.clone()), None, None, "ok");
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "id": id, "status": "revoked" })).into_response()
+        }
+        // A no-op (already gone): a 404, no state change, nothing to record.
         Ok(false) => err_response(StatusCode::NOT_FOUND, "no such token, or already revoked"),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "token.revoke",
+                Some(id.clone()),
+                None,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
     }
 }
 
@@ -1112,6 +1290,7 @@ async fn cert_grants_set<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     // Granting is deciding what an identity may see: admin, no exceptions.
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
@@ -1127,17 +1306,52 @@ async fn cert_grants_set<E: Engine>(
     if cn.trim().is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "certificate CN must not be empty");
     }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let before = state
+        .auth
+        .cert_grant_identities()
+        .into_iter()
+        .find(|(id, _)| *id == cn)
+        .map(|(_, a)| json!({"authorizations": a}));
     match state
         .auth
         .set_cert_grants(&cn, parsed.authorizations.clone())
     {
-        Ok(()) => Json(json!({
-            "identity": cn,
-            "authorizations": parsed.authorizations,
-            "status": "set",
-        }))
-        .into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "cert_grants.set",
+                Some(cn.clone()),
+                before,
+                Some(json!({"authorizations": parsed.authorizations.clone()})),
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({
+                "identity": cn,
+                "authorizations": parsed.authorizations,
+                "status": "set",
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "cert_grants.set",
+                Some(cn.clone()),
+                before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
     }
 }
 
@@ -1147,21 +1361,211 @@ async fn cert_grants_remove<E: Engine>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
     if let Some(deny) = require(&session, Role::Admin) {
         return deny;
     }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let before = state
+        .auth
+        .cert_grant_identities()
+        .into_iter()
+        .find(|(id, _)| *id == cn)
+        .map(|(_, a)| json!({"authorizations": a}));
     match state.auth.remove_cert_grants(&cn) {
-        Ok(true) => Json(json!({ "identity": cn, "status": "removed" })).into_response(),
+        Ok(true) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "cert_grants.remove",
+                Some(cn.clone()),
+                before,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "identity": cn, "status": "removed" })).into_response()
+        }
         Ok(false) => err_response(
             StatusCode::NOT_FOUND,
             "no grants recorded for that identity",
         ),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "cert_grants.remove",
+                Some(cn.clone()),
+                before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
     }
+}
+
+/// Filters for `GET /admin/audit`. All optional; an empty query returns the
+/// most recent page. `since` is an RFC 3339 string compared lexically, which
+/// is a chronological compare for this format.
+#[derive(Deserialize, Default)]
+struct AuditQuery {
+    action: Option<String>,
+    principal: Option<String>,
+    target: Option<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+    /// `?verify=1` appends a whole-chain verification result.
+    verify: Option<u8>,
+}
+
+/// GET /admin/audit (viewer): the audit trail, filtered, most-recent last,
+/// with an optional `?verify=1` chain check. Reading the log is itself
+/// audited (§5.1) — best-effort, since a read is never blocked by the sink,
+/// only mutations are.
+async fn audit_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    Query(q): Query<AuditQuery>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Viewer) {
+        return deny;
+    }
+
+    let records = match state.audit.read_all() {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("read audit log: {e}"),
+            );
+        }
+    };
+
+    let matches = |r: &AuditRecord| {
+        q.action.as_ref().is_none_or(|a| &r.action == a)
+            && q.principal.as_ref().is_none_or(|p| &r.principal == p)
+            && q.target.as_ref().is_none_or(|t| r.target.as_deref() == Some(t.as_str()))
+            && q.since.as_ref().is_none_or(|s| r.ts.as_str() >= s.as_str())
+    };
+    let filtered: Vec<&AuditRecord> = records.iter().filter(|r| matches(r)).collect();
+
+    // Most-recent last; a limit keeps the tail (the newest N), so a large log
+    // does not have to be paged from the front to see what just happened.
+    let limit = q.limit.unwrap_or(1000).min(10_000);
+    let start = filtered.len().saturating_sub(limit);
+    let page: Vec<&AuditRecord> = filtered[start..].to_vec();
+
+    // `?verify=1`: verify the WHOLE chain, not the filtered page — a subset is
+    // not itself a valid chain.
+    let verify = (q.verify.unwrap_or(0) != 0).then(|| match verify_records(&records) {
+        Ok(()) => json!({"ok": true}),
+        Err(b) => json!({"ok": false, "break": {"seq": b.seq, "reason": b.reason}}),
+    });
+
+    // §5.1: reading the audit log is itself audited. Best-effort — the read is
+    // served regardless, so no gate and no 503.
+    let _ = state.audit.record(audit_event(
+        &session,
+        source,
+        "audit.read",
+        None,
+        None,
+        Some(json!({"returned": page.len(), "total": records.len()})),
+        "ok",
+    ));
+
+    let mut body = json!({
+        "records": page,
+        "total": records.len(),
+        "returned": page.len(),
+        "role": session.role.as_str(),
+    });
+    if let Some(v) = verify {
+        body["verify"] = v;
+    }
+    Json(body).into_response()
 }
 
 use axum::response::IntoResponse;
 
 fn err_response(code: StatusCode, msg: &str) -> axum::response::Response {
     (code, Json(json!({ "error": msg }))).into_response()
+}
+
+// -- P1-2 audit emission (SR-6) --------------------------------------------
+
+use timelake_audit::{AuditLog, AuditRecord, NewRecord, verify_records};
+
+/// The request's source address, if the listener attached one. Stamped on
+/// the audit record's `source`.
+fn source_of(ext: &axum::http::Extensions) -> Option<String> {
+    ext.get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| a.ip().to_string())
+}
+
+/// A `503 audit sink unavailable`, the fail-closed refusal (§5.5).
+fn audit_unavailable() -> axum::response::Response {
+    err_response(StatusCode::SERVICE_UNAVAILABLE, "audit sink unavailable")
+}
+
+/// Fail-closed admission, called BEFORE a mutation runs. `Some(503)` means
+/// the sink is known-broken and the caller must not mutate; `None` means
+/// proceed.
+fn audit_gate(audit: &AuditLog) -> Option<axum::response::Response> {
+    audit.gate().err().map(|_| audit_unavailable())
+}
+
+/// Record the outcome of a mutation. `Some(503)` means the record could not
+/// be written and fail-open is off, so the caller returns it instead of a
+/// success response (the mutation happened, but leaving no record is refused
+/// — the next `audit_gate` then keeps the door shut until the sink recovers).
+/// `None` means the record is durable (or fail-open swallowed the failure)
+/// and the caller may return success.
+fn audit_record(audit: &AuditLog, nr: NewRecord) -> Option<axum::response::Response> {
+    match audit.record(nr) {
+        Ok(_) => None,
+        Err(e) if audit.fail_open() => {
+            tracing::error!(error = %e, "audit append failed but fail-open is set; proceeding");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "audit append failed; refusing (fail-closed)");
+            Some(audit_unavailable())
+        }
+    }
+}
+
+/// Build a `NewRecord` for a mutation, filling the common fields. Session id
+/// is not yet threaded from `SessionInfo` (it carries none), so it stays
+/// `None`; request-id likewise until correlation middleware exists.
+#[allow(clippy::too_many_arguments)]
+fn audit_event(
+    session: &SessionInfo,
+    source: Option<String>,
+    action: &str,
+    target: Option<String>,
+    before: Option<Value>,
+    after: Option<Value>,
+    outcome: &str,
+) -> NewRecord {
+    NewRecord {
+        principal: session.username.clone(),
+        role: session.role.as_str().to_string(),
+        session: None,
+        source,
+        request_id: None,
+        action: action.to_string(),
+        target,
+        before,
+        after,
+        outcome: outcome.to_string(),
+    }
 }
