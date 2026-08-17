@@ -1,6 +1,10 @@
 # Rust build output (future)
 target/
 
+# Release artifacts built by packaging/build.sh — the .deb/.rpm and the
+# binary they wrap are attached to a GitHub Release, never committed.
+dist/
+
 # Benchmark targets' data volumes — never in git
 deploy/compose/data/
 

@@ -142,6 +142,12 @@ This project is inspired by the following projects.
   (viewer) with `?verify=1`; `timelake_audit_*` metrics (SR-6; data-plane +
   login/logout auditing deferred);
   intra-cluster port de-published (exposure 10);
+  **release packaging** shipped — `packaging/` builds a `.deb` + `.rpm` from
+  one nfpm spec, attached to `v*` tags by `.github/workflows/release.yml`;
+  built against glibc 2.31 (Debian 11 container) because a current-image
+  build needs GLIBC_2.39 and would not start on RHEL 9 / Debian 12 / Ubuntu
+  22.04; `packaging/verify.sh` installs + runs them on Debian 12, Ubuntu
+  22.04, Rocky 9 and AL2023; packages bind loopback and do NOT auto-start;
   deps refreshed within-semver (PR #4 open — `thrift` blocked upstream until
   datafusion 55). Site adopted the new mountain-lake brand (teal accent;
   `site/assets/logo.svg` + `avatar.svg` + repointed tokens). **Two live

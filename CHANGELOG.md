@@ -13,6 +13,33 @@ here.
 
 ## [Unreleased]
 
+### Added — Linux packages for releases (2026-08-17)
+
+- **`.deb` and `.rpm`, attached to every tagged release.** A `v*` tag runs
+  `.github/workflows/release.yml`, which builds both packages and uploads
+  them with `SHA256SUMS`. One `packaging/nfpm.yaml` produces both formats, so
+  the two cannot drift; the whole build runs in containers, so a laptop and
+  the runner produce the same artifact.
+- **The packages are inert on install, deliberately.** The shipped
+  `/etc/timelakedb/timelakedb.env` binds `127.0.0.1` only and the systemd
+  unit is installed but not started — with an unauthenticated data plane
+  (SECURITY.md exposure 1), `apt install` must not put a database on the
+  network before anyone has read the config. The unit runs as a shell-less
+  `timelake` account under `ProtectSystem=strict` with `/var/lib/timelake` as
+  its only writable path, mirroring the container's posture (exposure 4).
+- **Built against glibc 2.31 on purpose.** Linked on a current image the
+  server requires `GLIBC_2.39`, which RHEL 9, Debian 12 and Ubuntu 22.04 do
+  not have — it would install cleanly and then fail to start. Building on
+  Debian 11 covers RHEL/Rocky 9+, Debian 11+, Ubuntu 20.04+ and Amazon Linux
+  2023; `build.sh` fails if the binary ever needs more than the metadata
+  promises.
+- **`packaging/verify.sh` installs and runs the packages** on Debian 12,
+  Ubuntu 22.04, Rocky 9 and Amazon Linux 2023, and the release workflow runs
+  it. It found two defects on its first execution: `apt remove` deleted
+  `/var/lib/timelake` (a package-owned empty directory is removed with the
+  package), and every AL2023 install failed in the `PREIN` scriptlet because
+  AL2023 ships without `shadow-utils`.
+
 ### Security — three open exposures closed (2026-08-15)
 
 Driven by Riverkeeper R6; each shipped with a control in that repo that goes
