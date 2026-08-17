@@ -260,14 +260,45 @@ files); **SIGKILL → healthy in 0.8 s** with zero acknowledged-write loss
 (RR-3). Known limits: cross-file dedup completes with compaction (M3);
 no file pruning yet; fresh-vs-settled work is M3/M4.
 
+## Install (Linux packages)
+
+Each release attaches a `.deb` and an `.rpm` built from that tag.
+
+```bash
+# Debian / Ubuntu
+curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb_0.1.0~alpha_amd64.deb
+sudo apt install ./timelakedb_0.1.0~alpha_amd64.deb
+
+# RHEL / Rocky / Alma / Amazon Linux 2023
+curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb-0.1.0~alpha-1.x86_64.rpm
+sudo dnf install ./timelakedb-0.1.0~alpha-1.x86_64.rpm
+```
+
+The package installs the server, a hardened systemd unit, and
+`/etc/timelakedb/timelakedb.env`. **It does not start anything.** The data
+plane is unauthenticated by default, so the shipped config binds `127.0.0.1`
+only and starting the service is your decision, not the installer's:
+
+```bash
+sudo systemctl enable --now timelakedb
+curl http://127.0.0.1:1963/health
+```
+
+Before binding anything routable, read the top of
+`/etc/timelakedb/timelakedb.env` — it explains what to set first, and
+[`SECURITY.md`](SECURITY.md) gives the full posture.
+
+Requires glibc 2.31+ (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+, AL2023);
+verified on Debian 12, Ubuntu 22.04, Rocky 9 and Amazon Linux 2023. See
+[`packaging/`](packaging/README.md) to build them yourself.
+
 ## Quickstart (Docker — no local Rust needed)
 
 ```bash
 git clone https://github.com/timelakelabs/timelakedb.git
-cd TimeLakeDB/bench
-docker compose -f compose/timelakedb.yml up -d --build
+cd timelakedb
+docker compose -f deploy/compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
-(cd ../Gauge && python bench/bench.py backends)   # timelakedb is registered
 ```
 
 The admin console is at <http://localhost:1963/admin/ui>. A fresh node

@@ -46,6 +46,26 @@ but your own agents needs access. Setting `required` (with tokens issued
 and clients configured) removes that constraint — it is the intended way
 to expose a port beyond a trusted segment.
 
+**What the `.deb` / `.rpm` do about that.** A distro package is a sharper
+version of this problem than a container is: `apt install` that started a
+service listening on every interface would hand an unauthenticated database
+to whatever network the machine is attached to, before the operator had read
+anything. So the packages are deliberately inert on install:
+
+- the shipped `/etc/timelakedb/timelakedb.env` binds **`127.0.0.1` only**, on
+  both the HTTP and Flight SQL ports;
+- the systemd unit is installed but **not enabled or started** — that is an
+  explicit `systemctl enable --now timelakedb` after you have configured it,
+  and the postinstall says so;
+- the unit runs as a shell-less `timelake` account under
+  `ProtectSystem=strict`, with `/var/lib/timelake` as the only writable path
+  — the same shape as the container (exposure 4);
+- `packaging/verify.sh` asserts the loopback default on every supported
+  distro, so a future edit that widens it fails the release build.
+
+Changing `TIMELAKE_ADDR` to a routable address is the moment the guidance
+above starts applying to you. Uninstalling never deletes `/var/lib/timelake`.
+
 | Control | Status |
 |---|---|
 | Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELAKE_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |

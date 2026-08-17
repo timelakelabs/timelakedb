@@ -1,0 +1,105 @@
+# One spec, both formats. `nfpm pkg -p deb` and `-p rpm` read this same file,
+# which is the point: a .deb and an .rpm built from separate metadata drift
+# apart, and the drift is always discovered by the user whose distro got the
+# less-tested one.
+#
+# Build with packaging/build.sh — it produces the binary against an old glibc
+# and then calls nfpm twice.
+
+name: timelakedb
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: semver
+section: database
+priority: optional
+maintainer: TimeLake Labs <noreply@timelakelabs.dev>
+description: |
+  Time-series database for high-cardinality event analytics.
+  TimeLakeDB stores events as Parquet in an object store with a manifest-log
+  catalog, and answers SQL over HTTP and Flight SQL. It is specified from a
+  five-engine benchmark rather than from a feature list.
+vendor: TimeLake Labs
+homepage: https://github.com/timelakelabs/timelakedb
+license: Apache-2.0
+
+# The binary is built against an old glibc on purpose (see build.sh), but a
+# floor stated here turns "too old" into a refused install with a clear
+# message instead of a runtime symbol-lookup crash. The two package managers
+# spell the C library differently, which is exactly the kind of divergence
+# a single spec with overrides keeps honest.
+#
+# The useradd dependency is not theoretical: Amazon Linux 2023 ships WITHOUT
+# shadow-utils, so preinstall.sh died with "Error in PREIN scriptlet" and the
+# whole install rolled back. Declaring it makes dnf pull shadow-utils in
+# before the scriptlet runs.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= ${PKG_GLIBC_MIN})
+      - passwd
+  rpm:
+    depends:
+      - glibc >= ${PKG_GLIBC_MIN}
+      - shadow-utils
+
+contents:
+  - src: dist/timelake-server
+    dst: /usr/bin/timelake-server
+    file_info:
+      mode: 0755
+
+  - src: packaging/timelakedb.service
+    dst: /usr/lib/systemd/system/timelakedb.service
+    file_info:
+      mode: 0644
+
+  # A config file: the operator's edits survive an upgrade. dpkg treats it as
+  # a conffile and rpm as %config(noreplace); a replacement lands beside it as
+  # .dpkg-dist / .rpmnew rather than overwriting.
+  - src: packaging/timelakedb.env
+    dst: /etc/timelakedb/timelakedb.env
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: timelake
+
+  - dst: /etc/timelakedb
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: timelake
+
+  # NOTE: /var/lib/timelake is deliberately NOT listed here. A package-owned
+  # directory is removed by dpkg/rpm when the package goes away and the
+  # directory is empty — so shipping the data directory meant `apt remove`
+  # deleted it, which is precisely the "uninstalling must never destroy the
+  # database" rule this package claims to follow. (Caught by the install test:
+  # the data-directory-kept assertion did not fire.) postinstall.sh creates it
+  # instead, and systemd's StateDirectory= re-creates it on start, so it is
+  # present from first install without being owned by the package manager.
+
+  # Plain files, NOT `type: doc` — nfpm has no such content type and silently
+  # drops any entry that declares one, so these shipped as nothing at all
+  # until the install test looked for SECURITY.md and did not find it.
+  - src: README.md
+    dst: /usr/share/doc/timelakedb/README.md
+  - src: SECURITY.md
+    dst: /usr/share/doc/timelakedb/SECURITY.md
+  - src: CHANGELOG.md
+    dst: /usr/share/doc/timelakedb/CHANGELOG.md
+  - src: LICENSE
+    dst: /usr/share/doc/timelakedb/LICENSE
+
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+deb:
+  compression: xz
+rpm:
+  compression: xz
