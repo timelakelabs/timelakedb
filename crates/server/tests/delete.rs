@@ -216,7 +216,11 @@ async fn delete_hides_rows_across_buffer_and_files_and_aggregates() {
         .iter()
         .map(|r| r["host"].as_str().unwrap())
         .collect();
-    assert_eq!(hosts, vec!["web-2"], "only web-2 should remain, got {hosts:?}");
+    assert_eq!(
+        hosts,
+        vec!["web-2"],
+        "only web-2 should remain, got {hosts:?}"
+    );
 }
 
 #[tokio::test]
@@ -255,11 +259,7 @@ async fn delete_honours_the_time_window() {
     assert_eq!(count(&app).await, 2);
 
     // Confirm the exact survivors.
-    let (_, rows) = sql(
-        &app,
-        "SELECT host, \"time\" FROM metrics ORDER BY \"time\"",
-    )
-    .await;
+    let (_, rows) = sql(&app, "SELECT host, \"time\" FROM metrics ORDER BY \"time\"").await;
     let arr = rows.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["host"], "web-2"); // @1e9 (wrong host)
@@ -386,12 +386,11 @@ fn parquet_bytes_contain(root: &std::path::Path, needle: &[u8]) -> bool {
             if parquet_bytes_contain(&p, needle) {
                 return true;
             }
-        } else if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
-            if let Ok(bytes) = std::fs::read(&p) {
-                if bytes.windows(needle.len()).any(|w| w == needle) {
-                    return true;
-                }
-            }
+        } else if p.extension().and_then(|s| s.to_str()) == Some("parquet")
+            && let Ok(bytes) = std::fs::read(&p)
+            && bytes.windows(needle.len()).any(|w| w == needle)
+        {
+            return true;
         }
     }
     false

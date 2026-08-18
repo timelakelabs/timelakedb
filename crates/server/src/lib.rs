@@ -31,6 +31,7 @@ use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, Local
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::{Wal, WalCipher};
 
+pub mod logfile;
 pub mod querier;
 pub mod ratelimit;
 pub mod replication;
@@ -364,6 +365,52 @@ pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// `"64MiB"`, `"512KB"`, or a bare byte count. `KiB` is 1024 and `KB` is
+/// 1000; both spellings are accepted because both are written, and they are
+/// deliberately not treated as the same number.
+pub fn parse_size_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix("GiB") {
+        (v, 1024u64.pow(3))
+    } else if let Some(v) = s.strip_suffix("MiB") {
+        (v, 1024u64.pow(2))
+    } else if let Some(v) = s.strip_suffix("KiB") {
+        (v, 1024)
+    } else if let Some(v) = s.strip_suffix("GB") {
+        (v, 1_000_000_000)
+    } else if let Some(v) = s.strip_suffix("MB") {
+        (v, 1_000_000)
+    } else if let Some(v) = s.strip_suffix("KB") {
+        (v, 1_000)
+    } else if let Some(v) = s.strip_suffix('B') {
+        (v, 1)
+    } else {
+        (s, 1)
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .map(|n| n * mult)
+}
+
+/// `"1d"`, `"12h"`, `"30m"`, `"90s"`, or bare seconds.
+pub fn parse_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last()? {
+        'd' => (&s[..s.len() - 1], 86_400),
+        'h' => (&s[..s.len() - 1], 3_600),
+        'm' => (&s[..s.len() - 1], 60),
+        's' => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .map(|n| n * mult)
+}
+
 /// A stable, content-addressed id for a targeted-delete predicate (R-1).
 /// Identical delete requests hash to the same id, so re-issuing one dedups
 /// in the catalog instead of stacking a duplicate tombstone. Deterministic
@@ -593,10 +640,28 @@ impl Engine {
         let audit_fail_open = std::env::var("TIMELAKE_AUDIT_FAIL_OPEN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let audit = Arc::new(timelake_audit::AuditLog::open(
+        // Rotation and retention for the trail. Splitting is on by default
+        // because one unbounded audit file cannot be archived or read
+        // selectively; DELETING is off by default and floored at 90 days
+        // even when set, because these records are evidence.
+        let audit_policy = timelake_audit::Policy {
+            rotate_bytes: std::env::var("TIMELAKE_AUDIT_ROTATE_SIZE")
+                .ok()
+                .and_then(|v| parse_size_bytes(&v))
+                .or(timelake_audit::Policy::default().rotate_bytes),
+            rotate_after: std::env::var("TIMELAKE_AUDIT_ROTATE_EVERY")
+                .ok()
+                .and_then(|v| parse_secs(&v))
+                .map(std::time::Duration::from_secs),
+            retain_days: std::env::var("TIMELAKE_AUDIT_RETAIN_DAYS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
+        };
+        let audit = Arc::new(timelake_audit::AuditLog::open_with(
             data_dir.join("audit"),
             node_id,
             audit_fail_open,
+            audit_policy,
         )?);
         let engine = Engine {
             dbs: RwLock::new(HashMap::new()),
@@ -1166,28 +1231,28 @@ impl Engine {
         // A querier owns no write path; deletes, like writes, go to an
         // ingester or the router that fronts them.
         if self.read_only.load(Ordering::Relaxed) {
-            return Err("this node is a querier (TIMELAKE_ROLE=querier) and holds no delete \
+            return Err(
+                "this node is a querier (TIMELAKE_ROLE=querier) and holds no delete \
                         path — send the delete to the router or an ingester"
-                .into());
+                    .into(),
+            );
         }
         if tag_equals.is_empty() && min_ts_ns.is_none() && max_ts_ns.is_none() {
-            return Err("a targeted delete needs at least one predicate — a tag match or a \
+            return Err(
+                "a targeted delete needs at least one predicate — a tag match or a \
                         time bound. Refusing to delete an entire table from this surface."
-                .into());
+                    .into(),
+            );
         }
-        if let (Some(a), Some(b)) = (min_ts_ns, max_ts_ns) {
-            if a > b {
-                return Err(format!(
-                    "time window is empty: start {a} is after end {b}"
-                ));
-            }
+        if let (Some(a), Some(b)) = (min_ts_ns, max_ts_ns)
+            && a > b
+        {
+            return Err(format!("time window is empty: start {a} is after end {b}"));
         }
         // Deleting from a table that was never written is a client mistake
         // worth surfacing rather than silently recording a dead predicate.
         if !self.table_names(db).iter().any(|t| t == table) {
-            return Err(format!(
-                "table '{table}' does not exist in database '{db}'"
-            ));
+            return Err(format!("table '{table}' does not exist in database '{db}'"));
         }
 
         // Content-addressed id: the tombstone is a standing predicate, so

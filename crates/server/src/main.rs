@@ -6,11 +6,21 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // System log. Unset TIMELAKE_LOG_FILE keeps the unchanged path: stdout,
+    // which systemd and Docker capture and rotate for you. Set it and the
+    // node writes to a file it rotates itself, by size and/or by time.
+    // This is NOT the audit trail — that is hash-chained evidence with its
+    // own rotation and its own retention floor.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match timelake_server::logfile::from_env() {
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        Some(log) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            // No ANSI escapes in a file — they make a log grep-hostile.
+            .with_ansi(false)
+            .with_writer(timelake_server::logfile::LogSink(log))
+            .init(),
+    }
 
     // Cluster role + topology (CL-1/CL-5). `all` is the default and does
     // everything, as it always has. A role whose C2 phase has not landed is
