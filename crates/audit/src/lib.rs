@@ -33,9 +33,53 @@ use sha2::{Digest, Sha256};
 /// hash is a function of a known constant rather than of nothing.
 pub const GENESIS: &str = "sha256:genesis";
 
-/// The single append-only segment. One file for now; rotation and
-/// object-store upload (§5.4) are a later enhancement on top of this.
+/// The live segment. Rotation renames it aside as
+/// `audit.<zero-padded-last-seq>.jsonl` and opens a fresh one.
 const SEGMENT: &str = "audit.jsonl";
+
+/// Default size trigger. An audit trail that is never rotated becomes one
+/// enormous file that nothing can ship, archive or read selectively; a
+/// default of "split it" is safe because splitting deletes nothing.
+const DEFAULT_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The floor from `docs/CONSOLE.md` §5.4. Pruning may never delete a
+/// segment younger than this, whatever else is configured — the retention
+/// controls must not be able to erase the record of their own use.
+pub const MIN_RETENTION_DAYS: u64 = 90;
+
+/// Rotation and retention policy for the trail.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// Rotate once the live segment passes this many bytes.
+    pub rotate_bytes: Option<u64>,
+    /// Rotate this long after the live segment was opened.
+    pub rotate_after: Option<std::time::Duration>,
+    /// Delete segments older than this many days. `None` — the default —
+    /// **never deletes anything.**
+    ///
+    /// Audit records are evidence. Losing them to a default nobody chose is
+    /// the failure this is shaped to avoid, so retention is opt-in and is
+    /// clamped to [`MIN_RETENTION_DAYS`] even when set lower.
+    pub retain_days: Option<u64>,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            rotate_bytes: Some(DEFAULT_ROTATE_BYTES),
+            rotate_after: None,
+            retain_days: None,
+        }
+    }
+}
+
+impl Policy {
+    /// The effective retention, floored. Returns `None` when nothing is to
+    /// be deleted.
+    pub fn effective_retain_days(&self) -> Option<u64> {
+        self.retain_days.map(|d| d.max(MIN_RETENTION_DAYS))
+    }
+}
 
 /// The caller-supplied half of a record — everything the sink does not
 /// assign itself (it stamps `node`, `seq`, `ts`, `prev_hash`, `hash`).
@@ -167,13 +211,13 @@ pub fn verify_records(records: &[AuditRecord]) -> Result<(), AuditBreak> {
     let mut prev = GENESIS.to_string();
     let mut expected_seq: Option<u64> = None;
     for r in records {
-        if let Some(want) = expected_seq {
-            if r.seq != want {
-                return Err(AuditBreak {
-                    seq: r.seq,
-                    reason: format!("expected seq {want}, found {}", r.seq),
-                });
-            }
+        if let Some(want) = expected_seq
+            && r.seq != want
+        {
+            return Err(AuditBreak {
+                seq: r.seq,
+                reason: format!("expected seq {want}, found {}", r.seq),
+            });
         }
         if r.prev_hash != prev {
             return Err(AuditBreak {
@@ -197,42 +241,144 @@ pub fn verify_records(records: &[AuditRecord]) -> Result<(), AuditBreak> {
 /// whoever appends supplies the node id. Not `Sync` — [`AuditLog`] holds it
 /// behind a mutex, exactly as the engine holds the WAL.
 pub struct AuditSink {
+    dir: PathBuf,
     path: PathBuf,
     writer: File,
     /// The seq the next appended record will get (1-based).
     next_seq: u64,
     /// The hash of the last record — the next record's `prev_hash`.
     head: String,
+    policy: Policy,
+    /// Bytes in the live segment, and when it was opened — the two
+    /// rotation triggers.
+    written: u64,
+    opened: std::time::SystemTime,
 }
 
 impl AuditSink {
-    /// Open (creating if absent) the audit segment under `dir`, recovering
-    /// `next_seq` and `head` by replaying what is already there. Replay does
-    /// not verify the chain — a running node keeps auditing regardless; the
-    /// break is surfaced on demand through [`AuditSink::verify`].
     pub fn open(dir: impl AsRef<Path>) -> io::Result<AuditSink> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        AuditSink::open_with(dir, Policy::default())
+    }
+
+    /// Open (creating if absent) the live audit segment under `dir`,
+    /// recovering `next_seq` and `head` from the **whole trail** — every
+    /// rotated segment plus the live one. Recovering from the live file
+    /// alone would restart the chain at genesis immediately after a
+    /// rotation, which is precisely the discontinuity the chain exists to
+    /// make impossible.
+    ///
+    /// Replay does not verify the chain: a running node keeps auditing
+    /// regardless, and the break is surfaced on demand through
+    /// [`AuditSink::verify`].
+    pub fn open_with(dir: impl AsRef<Path>, policy: Policy) -> io::Result<AuditSink> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
         let path = dir.join(SEGMENT);
 
         let mut next_seq = 1u64;
         let mut head = GENESIS.to_string();
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let rec: AuditRecord = serde_json::from_str(&line).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("corrupt audit record: {e}"))
-                })?;
+        for seg in segments_in_order(&dir)? {
+            for rec in read_segment(&seg)? {
                 next_seq = rec.seq + 1;
                 head = rec.hash;
             }
         }
 
         let writer = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(AuditSink { path, writer, next_seq, head })
+        let written = writer.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(AuditSink {
+            dir,
+            path,
+            writer,
+            next_seq,
+            head,
+            policy,
+            written,
+            opened: std::time::SystemTime::now(),
+        })
+    }
+
+    /// Would either rotation trigger fire?
+    fn should_rotate(&self, next: u64) -> bool {
+        if self.written == 0 {
+            return false; // never rotate an empty segment
+        }
+        if let Some(limit) = self.policy.rotate_bytes
+            && self.written + next > limit
+        {
+            return true;
+        }
+        if let Some(after) = self.policy.rotate_after
+            && self.opened.elapsed().unwrap_or_default() >= after
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Close the live segment and start a new one.
+    ///
+    /// Named by the last seq it contains, zero-padded, so the segments sort
+    /// into chain order by filename and a missing one is obvious both to a
+    /// human and to `read_all`. The chain is NOT restarted: the next record
+    /// still carries the previous record's hash as its `prev_hash`, so
+    /// verification runs straight through the boundary.
+    fn rotate(&mut self) -> io::Result<()> {
+        let last = self.next_seq.saturating_sub(1);
+        let target = self.dir.join(format!("audit.{last:012}.jsonl"));
+        if target.exists() {
+            // Already rotated at this seq; nothing sensible to do but keep
+            // writing rather than clobber evidence.
+            return Ok(());
+        }
+        self.writer.flush()?;
+        self.writer.sync_all()?;
+        std::fs::rename(&self.path, &target)?;
+        self.writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.written = 0;
+        self.opened = std::time::SystemTime::now();
+        self.prune();
+        Ok(())
+    }
+
+    /// Delete whole segments older than the configured retention.
+    ///
+    /// Three guards, because this is the one operation here that destroys
+    /// evidence: it does nothing unless retention was explicitly configured,
+    /// it is clamped to [`MIN_RETENTION_DAYS`], and it never touches the
+    /// live segment.
+    fn prune(&self) {
+        let Some(days) = self.policy.effective_retain_days() else {
+            return;
+        };
+        let cutoff = match std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(days * 86_400))
+        {
+            Some(t) => t,
+            None => return,
+        };
+        let Ok(segs) = rotated_segments(&self.dir) else {
+            return;
+        };
+        for seg in segs {
+            let Ok(md) = std::fs::metadata(&seg) else {
+                continue;
+            };
+            let Ok(modified) = md.modified() else {
+                continue;
+            };
+            if modified < cutoff {
+                let _ = std::fs::remove_file(&seg);
+            }
+        }
+    }
+
+    /// Every segment file, rotated and live, in chain order.
+    pub fn segment_paths(&self) -> io::Result<Vec<PathBuf>> {
+        segments_in_order(&self.dir)
     }
 
     /// Append one record durably (fsync). On any I/O error the in-memory
@@ -264,10 +410,18 @@ impl AuditSink {
         // is the chain advanced — a failure here leaves the sink exactly
         // where it was, which is what lets the policy layer fail a mutation
         // closed without desyncing the log.
+        // Rotate BEFORE writing, so a record is never split across the
+        // boundary and the segment named `audit.<N>.jsonl` really does end
+        // at seq N.
+        if self.should_rotate(line.len() as u64) {
+            self.rotate()?;
+        }
+
         self.writer.write_all(&line)?;
         self.writer.flush()?;
         self.writer.sync_all()?;
 
+        self.written += line.len() as u64;
         self.next_seq = rec.seq + 1;
         self.head = rec.hash.clone();
         Ok(rec)
@@ -284,8 +438,19 @@ impl AuditSink {
     }
 
     /// Every record on disk, in order. Backs the read endpoint.
+    /// Every record in the trail, across every segment, in chain order.
+    ///
+    /// Concatenating in segment order is what lets [`verify_records`] work
+    /// unchanged after rotation: the chain does not restart at a boundary,
+    /// so a whole missing segment surfaces as a seq gap and a `prev_hash`
+    /// mismatch exactly like a missing record would. Deleting a file is not
+    /// a way to hide anything.
     pub fn read_all(&self) -> io::Result<Vec<AuditRecord>> {
-        read_segment(&self.path)
+        let mut out = Vec::new();
+        for seg in segments_in_order(&self.dir)? {
+            out.extend(read_segment(&seg)?);
+        }
+        Ok(out)
     }
 
     /// Re-read the segment and verify the whole chain. `Ok(())` if intact.
@@ -308,8 +473,23 @@ pub struct AuditLog {
 impl AuditLog {
     /// Open the log under `dir`, stamping `node` on every record. `fail_open`
     /// comes from `TIMELAKE_AUDIT_FAIL_OPEN` — default false (fail-closed).
-    pub fn open(dir: impl AsRef<Path>, node: impl Into<String>, fail_open: bool) -> io::Result<AuditLog> {
-        let sink = AuditSink::open(dir)?;
+    pub fn open(
+        dir: impl AsRef<Path>,
+        node: impl Into<String>,
+        fail_open: bool,
+    ) -> io::Result<AuditLog> {
+        AuditLog::open_with(dir, node, fail_open, Policy::default())
+    }
+
+    /// As [`AuditLog::open`], with an explicit rotation and retention
+    /// policy. The server builds one from `TIMELAKE_AUDIT_*`.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        node: impl Into<String>,
+        fail_open: bool,
+        policy: Policy,
+    ) -> io::Result<AuditLog> {
+        let sink = AuditSink::open_with(dir, policy)?;
         let count = sink.count();
         Ok(AuditLog {
             node: node.into(),
@@ -344,7 +524,9 @@ impl AuditLog {
         if self.healthy() || self.fail_open {
             Ok(())
         } else {
-            Err(AuditUnavailable("audit sink is unhealthy; refusing the mutation".into()))
+            Err(AuditUnavailable(
+                "audit sink is unhealthy; refusing the mutation".into(),
+            ))
         }
     }
 
@@ -376,6 +558,33 @@ impl AuditLog {
     }
 }
 
+/// Rotated segments only, sorted. `audit.<012 seq>.jsonl` sorts
+/// lexicographically into chain order because the seq is zero-padded.
+fn rotated_segments(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with("audit.") && name.ends_with(".jsonl") && name != SEGMENT {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Every segment in chain order: the rotated ones, then the live one.
+fn segments_in_order(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = rotated_segments(dir)?;
+    let live = dir.join(SEGMENT);
+    if live.exists() {
+        out.push(live);
+    }
+    Ok(out)
+}
+
 fn read_segment(path: &Path) -> io::Result<Vec<AuditRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -387,7 +596,10 @@ fn read_segment(path: &Path) -> io::Result<Vec<AuditRecord>> {
             continue;
         }
         let rec: AuditRecord = serde_json::from_str(&line).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt audit record: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt audit record: {e}"),
+            )
         })?;
         out.push(rec);
     }
@@ -555,6 +767,140 @@ mod tests {
         assert_eq!(log.records_total(), 2);
     }
 
+    /// A tiny rotation limit, so a handful of records spans several files.
+    fn rotating(dir: &Path) -> AuditSink {
+        AuditSink::open_with(
+            dir,
+            Policy {
+                rotate_bytes: Some(512),
+                rotate_after: None,
+                retain_days: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rotation_splits_the_trail_and_the_chain_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = rotating(dir.path());
+        for _ in 0..40 {
+            sink.append("tldb-1", ev("retention.set")).unwrap();
+        }
+        assert!(
+            sink.segment_paths().unwrap().len() > 1,
+            "40 records at a 512-byte limit must have rotated"
+        );
+        // The whole point: the chain runs straight through the boundaries.
+        assert!(
+            sink.verify().unwrap().is_ok(),
+            "a rotated trail must still verify end to end"
+        );
+        assert_eq!(
+            sink.read_all().unwrap().len(),
+            40,
+            "no record lost to rotation"
+        );
+    }
+
+    #[test]
+    fn seqs_are_continuous_across_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = rotating(dir.path());
+        for _ in 0..30 {
+            sink.append("tldb-1", ev("token.issue")).unwrap();
+        }
+        let all = sink.read_all().unwrap();
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.seq, i as u64 + 1, "seq must not restart at a boundary");
+        }
+    }
+
+    /// Reopening after a rotation must continue the chain, not restart it.
+    /// Recovering `head` from the live segment alone would hand the next
+    /// record a genesis prev_hash and split the trail in two.
+    #[test]
+    fn reopening_after_rotation_continues_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = rotating(dir.path());
+            for _ in 0..40 {
+                sink.append("tldb-1", ev("a")).unwrap();
+            }
+        }
+        let mut sink = rotating(dir.path());
+        let next = sink.append("tldb-1", ev("after-restart")).unwrap();
+        assert_eq!(next.seq, 41, "seq continues across a restart");
+        assert_ne!(next.prev_hash, GENESIS, "the chain must not restart");
+        assert!(sink.verify().unwrap().is_ok());
+    }
+
+    /// Deleting a whole segment is the obvious way to try to hide a record.
+    /// It must be caught, exactly as editing one is.
+    #[test]
+    fn deleting_a_rotated_segment_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = rotating(dir.path());
+        for _ in 0..40 {
+            sink.append("tldb-1", ev("a")).unwrap();
+        }
+        assert!(sink.verify().unwrap().is_ok());
+
+        let rotated = rotated_segments(dir.path()).unwrap();
+        assert!(!rotated.is_empty());
+        std::fs::remove_file(&rotated[0]).unwrap();
+
+        let brk = sink
+            .verify()
+            .unwrap()
+            .expect_err("a removed segment must break the chain");
+        assert!(brk.seq > 0, "the break names where the trail jumps");
+    }
+
+    #[test]
+    fn retention_is_off_by_default_and_floored_when_set() {
+        // Off by default: audit records are evidence, and nothing should
+        // delete them because a default said so.
+        assert_eq!(Policy::default().effective_retain_days(), None);
+        // A too-low setting is clamped rather than honoured, so the
+        // retention control cannot erase the record of its own use.
+        let p = Policy {
+            retain_days: Some(1),
+            ..Policy::default()
+        };
+        assert_eq!(p.effective_retain_days(), Some(MIN_RETENTION_DAYS));
+        let p = Policy {
+            retain_days: Some(365),
+            ..Policy::default()
+        };
+        assert_eq!(p.effective_retain_days(), Some(365));
+    }
+
+    #[test]
+    fn pruning_never_deletes_recent_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = AuditSink::open_with(
+            dir.path(),
+            Policy {
+                rotate_bytes: Some(512),
+                rotate_after: None,
+                // Even asking for 1 day is clamped to 90, and these
+                // segments are seconds old.
+                retain_days: Some(1),
+            },
+        )
+        .unwrap();
+        for _ in 0..40 {
+            sink.append("tldb-1", ev("a")).unwrap();
+        }
+        assert_eq!(
+            sink.read_all().unwrap().len(),
+            40,
+            "freshly written segments must survive any retention setting"
+        );
+        assert!(sink.verify().unwrap().is_ok());
+    }
+
     #[test]
     fn a_healthy_log_gate_admits() {
         let dir = tempfile::tempdir().unwrap();
@@ -568,7 +914,8 @@ mod tests {
         let log = AuditLog::open(dir.path(), "tldb-1", false).unwrap();
         // Simulate a broken sink (the in-crate test can touch the flag a real
         // I/O failure would set inside `record`).
-        log.healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+        log.healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(
             log.gate().is_err(),
             "fail-closed: a known-broken sink refuses further mutations"
@@ -583,7 +930,8 @@ mod tests {
     fn fail_open_gate_admits_even_when_unhealthy() {
         let dir = tempfile::tempdir().unwrap();
         let log = AuditLog::open(dir.path(), "tldb-1", true).unwrap();
-        log.healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+        log.healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(
             log.gate().is_ok(),
             "fail-open: the operator chose to proceed despite a broken sink"

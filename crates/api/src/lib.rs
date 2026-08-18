@@ -509,7 +509,15 @@ async fn change_password<E: Engine>(
         // Every session for this principal — including this one — is
         // invalidated by the rotation, so the client must log in again.
         Ok(()) => {
-            let ev = audit_event(&session, source, "password.change", target, None, None, "ok");
+            let ev = audit_event(
+                &session,
+                source,
+                "password.change",
+                target,
+                None,
+                None,
+                "ok",
+            );
             if let Some(resp) = audit_record(&state.audit, ev) {
                 return resp;
             }
@@ -520,8 +528,15 @@ async fn change_password<E: Engine>(
             .into_response()
         }
         Err(e) => {
-            let ev =
-                audit_event(&session, source, "password.change", target, None, None, "denied");
+            let ev = audit_event(
+                &session,
+                source,
+                "password.change",
+                target,
+                None,
+                None,
+                "denied",
+            );
             let _ = state.audit.record(ev);
             (
                 StatusCode::BAD_REQUEST,
@@ -783,7 +798,15 @@ async fn admin_delete<E: Engine>(
     {
         Ok((id, seq)) => {
             let after = json!({"predicate": predicate, "tombstone_id": id, "seq": seq});
-            let ev = audit_event(&session, source, "data.delete", target, None, Some(after), "ok");
+            let ev = audit_event(
+                &session,
+                source,
+                "data.delete",
+                target,
+                None,
+                Some(after),
+                "ok",
+            );
             if let Some(resp) = audit_record(&state.audit, ev) {
                 return resp;
             }
@@ -1222,8 +1245,15 @@ async fn tokens_revoke<E: Engine>(
     }
     match state.auth.revoke_token(&id) {
         Ok(true) => {
-            let ev =
-                audit_event(&session, source, "token.revoke", Some(id.clone()), None, None, "ok");
+            let ev = audit_event(
+                &session,
+                source,
+                "token.revoke",
+                Some(id.clone()),
+                None,
+                None,
+                "ok",
+            );
             if let Some(resp) = audit_record(&state.audit, ev) {
                 return resp;
             }
@@ -1452,7 +1482,9 @@ async fn audit_list<E: Engine>(
     let matches = |r: &AuditRecord| {
         q.action.as_ref().is_none_or(|a| &r.action == a)
             && q.principal.as_ref().is_none_or(|p| &r.principal == p)
-            && q.target.as_ref().is_none_or(|t| r.target.as_deref() == Some(t.as_str()))
+            && q.target
+                .as_ref()
+                .is_none_or(|t| r.target.as_deref() == Some(t.as_str()))
             && q.since.as_ref().is_none_or(|s| r.ts.as_str() >= s.as_str())
     };
     let filtered: Vec<&AuditRecord> = records.iter().filter(|r| matches(r)).collect();

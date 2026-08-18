@@ -173,7 +173,11 @@ async fn admin_mutations_are_audited_and_the_chain_verifies() {
     let shrink = &records[1];
     assert_eq!(shrink["before"]["seconds"], 30 * 86_400);
     assert_eq!(shrink["after"]["seconds"], 10 * 86_400);
-    assert_eq!(records[0]["before"], serde_json::Value::Null, "first had none");
+    assert_eq!(
+        records[0]["before"],
+        serde_json::Value::Null,
+        "first had none"
+    );
 
     // /metrics exposes the count and a healthy sink.
     let m = metrics(&app).await;
@@ -202,7 +206,14 @@ async fn a_denied_mutation_is_recorded() {
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
 
-    let (code, v) = admin_json(&app, "GET", "/admin/audit?action=data.delete", None, &session).await;
+    let (code, v) = admin_json(
+        &app,
+        "GET",
+        "/admin/audit?action=data.delete",
+        None,
+        &session,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     let records = v["records"].as_array().unwrap();
     assert_eq!(records.len(), 1, "the denied delete is recorded");
@@ -220,7 +231,14 @@ async fn reading_the_audit_log_is_itself_audited() {
     let (code, _) = admin_json(&app, "GET", "/admin/audit", None, &session).await;
     assert_eq!(code, StatusCode::OK);
     // ...then a second read sees the first read's own record (§5.1).
-    let (code, v) = admin_json(&app, "GET", "/admin/audit?action=audit.read", None, &session).await;
+    let (code, v) = admin_json(
+        &app,
+        "GET",
+        "/admin/audit?action=audit.read",
+        None,
+        &session,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     let reads = v["records"].as_array().unwrap();
     assert!(
