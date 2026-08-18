@@ -184,7 +184,7 @@ The competitive analysis adds and re-ranks the rest:
 | P1-1 Replication/HA (C1→C2→WAL repl) | Only OSS-cluster competitor is VM; longest pole, start now | L |
 | ~~P1-2 Audit trail~~ **DONE (SR-6, 2026-08-16)** — admin mutations hash-chained + fail-closed; `GET /admin/audit?verify=1` (data-plane + login/logout deferred) | Enterprise-gated everywhere else; needs P0-3's principal | M |
 | **R-1 Targeted delete** (`DELETE WHERE` on tag/time predicates, tombstone + compaction-applied) | The GDPR answer every competitor has in some form and TimeLakeDB has none of. Fits the existing manifest/compaction machinery | M |
-| **T-1 Tributary self-telemetry** (`/metrics` + `/healthz`) | Unwatchable shippers don't survive ops review; every competitor has it; prerequisite for the L5 DaemonSet | S |
+| ~~**T-1 Tributary self-telemetry** (`/metrics` + `/healthz`)~~ **DONE 2026-08-18** — 26 series, an outage-safe liveness probe, `Tributary/bench/results/t1-self-telemetry.log` | Unwatchable shippers don't survive ops review; every competitor has it; prerequisite for the L5 DaemonSet | S |
 | ~~P1-3 per-client rate limits~~ **DONE (SEC-6)** · ~~P1-4 error redaction~~ **DONE (SEC-5)** · ~~P1-5 WAL encryption~~ **DONE (SEC-8)** — all 2026-08-15. Still open: ~~P1-6 Tributary mTLS (L4)~~ **done 2026-08-17** · ~~P1-7 queue RPO documented~~ **done 2026-08-17, measured** | as in PRODUCTION_READINESS | S–M |
 
 ### P2 — adoption levers and scale
