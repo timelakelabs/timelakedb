@@ -218,7 +218,7 @@
           <thead><tr><th>Statement</th><th>Behaviour</th></tr></thead>
           <tbody>
             <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Supported.</strong> The default catalog is named after the database, so <code>poc.public.events</code> resolves and matches what Flight SQL reports</td></tr>
-            <tr><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></td><td><strong>Refused</strong> — the surface is read-only (write with line protocol; data leaves only by retention, FR-7)</td></tr>
+            <tr><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></td><td><strong>Refused</strong> — the surface is read-only. Write with line protocol; remove data with retention (FR-7) or a targeted delete (<code>POST /admin/delete</code>)</td></tr>
             <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td><strong>Refused</strong> — the read-only guard rejects DDL before it plans, so a <code>DROP TABLE</code> no longer appears to succeed while doing nothing</td></tr>
             <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td><strong>Refused</strong> — this once wrote a file as the server process; the surface is now read-only, enforced on the plan (even inside <code>EXPLAIN ANALYZE</code>). See <a href="index.html#security">Security</a></td></tr>
           </tbody>
@@ -287,6 +287,14 @@
             <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>—</td><td>200 + <code>{"policies":[{table, seconds, duration}]}</code></td></tr>
             <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink or introduce; body <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
             <tr><td><code>DELETE /admin/retention/{table}</code></td><td>admin</td><td>—</td><td>200; the table keeps everything again</td></tr>
+            <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
+            <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
+            <tr><td><code>GET /admin/tokens</code></td><td>admin</td><td>—</td><td>200 + token records; the secret is never re-shown</td></tr>
+            <tr><td><code>POST /admin/tokens</code></td><td>admin; body <code>description</code>, <code>scope</code>, optional <code>databases</code>, <code>authorizations</code>, <code>expires_in_secs</code></td><td>—</td><td>200 + <code>{secret, token}</code> — the secret appears exactly once</td></tr>
+            <tr><td><code>DELETE /admin/tokens/{id}</code></td><td>admin</td><td>—</td><td>200; effective immediately. 404 if unknown or already revoked</td></tr>
+            <tr><td><code>GET /admin/cert-grants</code></td><td>operator</td><td>—</td><td>200 + certificate identities and their granted authorizations</td></tr>
+            <tr><td><code>PUT /admin/cert-grants/{cn}</code></td><td>admin; body <code>authorizations</code></td><td>—</td><td>200; grants <em>intersect</em> a caller's claims, never widen them</td></tr>
+            <tr><td><code>DELETE /admin/cert-grants/{cn}</code></td><td>admin</td><td>—</td><td>200; 404 if no grants were recorded</td></tr>
             <tr><td><code>GET /admin/ui</code></td><td>—</td><td>—</td><td>200 + the console (sign in / rotate / manage)</td></tr>
             <tr><td><code>POST /admin/tls/reload</code></td><td>admin</td><td>—</td><td>200 (TLS mode only)</td></tr>
           </tbody>
@@ -301,8 +309,9 @@
             <tr><td><strong>204</strong></td><td>The batch is durable in the WAL — fsynced before the response, not merely buffered</td></tr>
             <tr><td><strong>400</strong></td><td>Parse error, type conflict, bad precision, missing selector, or a failed query</td></tr>
             <tr><td><strong>422</strong></td><td>TLS reload rejected: the new pair failed validation, the last-good pair keeps serving</td></tr>
-            <tr><td><strong>429</strong></td><td>Backpressure with <code>Retry-After: 1</code> — the WAL is at <code>TIMELAKE_WAL_MAX_BYTES</code>. A named, visible limit; writes are never dropped silently</td></tr>
+            <tr><td><strong>429</strong></td><td>Backpressure with <code>Retry-After: 1</code> — the WAL is at <code>TIMELAKE_WAL_MAX_BYTES</code>, or the caller is past its per-client query cap. A named, visible limit; writes are never dropped silently</td></tr>
             <tr><td><strong>500</strong></td><td>The engine could not make the write durable</td></tr>
+            <tr><td><strong>503</strong></td><td><code>audit sink unavailable</code> — the audit trail could not append, so an administrative mutation was <strong>refused rather than performed unrecorded</strong>. Reads and the data plane are unaffected. Watch <code>timelake_audit_sink_healthy</code>; <code>TIMELAKE_AUDIT_FAIL_OPEN=1</code> inverts the policy</td></tr>
           </tbody>
         </table>
       </div>
@@ -605,7 +614,7 @@
             <tr><td><code>GET /query</code> (InfluxQL)</td><td>404 — not implemented</td></tr>
             <tr><td><code>POST /api/v2/query</code> (Flux)</td><td>404 — not implemented</td></tr>
             <tr><td><code>/api/v2/buckets</code>, <code>/api/v2/orgs</code>, <code>/api/v2/setup</code></td><td>404 — no management API</td></tr>
-            <tr><td><code>POST /api/v2/delete</code></td><td>404 — data leaves only by retention</td></tr>
+            <tr><td><code>POST /api/v2/delete</code></td><td>404 at this path. Targeted delete exists, at <code>POST /admin/delete</code> — an <code>admin</code> session, a tag/time predicate, and the rows are hidden immediately and reclaimed in the background</td></tr>
             <tr><td><code>/api/v3/query_sql</code></td><td>404 — use <code>POST /api/sql</code> or Flight SQL</td></tr>
             <tr><td><code>/debug/vars</code></td><td>404 — use <code>/metrics</code></td></tr>
           </tbody>
@@ -686,12 +695,21 @@
             <tr><td><code>timelake_data_requests_authenticated_total</code></td><td>counter</td><td>Data-plane requests that presented a valid token</td></tr>
             <tr><td><code>timelake_data_requests_anonymous_total</code></td><td>counter</td><td>Data-plane requests served without a token (only possible in off/optional). In <code>required</code> this must stay 0</td></tr>
             <tr><td><code>timelake_data_requests_rejected_total</code></td><td>counter</td><td>Data-plane requests refused — missing token in <code>required</code>, invalid token, or a scope/database violation</td></tr>
+            <tr><td><code>timelake_query_rate_limited_total</code></td><td>counter</td><td>Queries refused with 429 for exceeding the per-client concurrency cap. A rising count means the cap is too low for a legitimate client, not that anything is broken</td></tr>
+            <tr><td><code>timelake_tombstone_rewrites_total</code></td><td>counter</td><td>Files rewritten or dropped by the targeted-delete GC pass (R-1). Rises after a <code>POST /admin/delete</code> and settles once the matching data has been reclaimed</td></tr>
+            <tr><td><code>timelake_audit_records_total</code></td><td>counter</td><td>Audit records written. Recovered from disk at start, so it is continuous across a restart</td></tr>
+            <tr><td><code>timelake_audit_sink_healthy</code></td><td>gauge</td><td>1 while the audit trail can append. <strong>0 means administrative mutations are being refused with 503</strong> (unless <code>TIMELAKE_AUDIT_FAIL_OPEN=1</code>, in which case they proceed unrecorded)</td></tr>
           </tbody>
         </table>
       </div>
 
       <h3>What to alert on</h3>
       <ul>
+        <li><code>timelake_audit_sink_healthy == 0</code> — the audit trail
+            cannot append. Because it is fail-closed, this is also the reason
+            administrative changes are being refused with 503. Page on it: the
+            alternative reading, that someone is making changes you have no
+            record of, is worse.</li>
         <li><code>rate(timelake_flushes_total[15m]) == 0</code> while
             <code>timelake_buffer_rows</code> is high — maintenance is not draining the
             buffer, and the WAL will grow into backpressure.</li>

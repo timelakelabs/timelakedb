@@ -143,12 +143,28 @@
 
     <section id="quick-start">
       <h2>Quick Start</h2>
-      <p>Docker is the only prerequisite; no Rust toolchain is needed to run it.</p>
+      <p>
+        Install a package, or run the container — neither needs a Rust
+        toolchain.
+      </p>
 
       <div class="code">
-        <header>Start the server <button class="copy" type="button">Copy</button></header>
-<pre><span class="k">cd</span> TimeLakeDB/bench
-docker compose -f compose/timelakedb.yml up -d --build
+        <header>Install (Debian / Ubuntu, RHEL / Rocky / Amazon Linux 2023) <button class="copy" type="button">Copy</button></header>
+<pre><span class="c"># .deb and .rpm are attached to every release</span>
+sudo apt install ./timelakedb_<span class="n">0.1.0</span>~alpha_amd64.deb
+<span class="c"># or: sudo dnf install ./timelakedb-0.1.0~alpha-1.x86_64.rpm</span>
+
+<span class="c"># The package binds 127.0.0.1 and does NOT start on install: the data</span>
+<span class="c"># plane is unauthenticated by default, so starting it is your decision.</span>
+sudo systemctl enable --now timelakedb
+curl http://<span class="n">127.0.0.1</span>:<span class="n">1963</span>/health</pre>
+      </div>
+
+      <div class="code">
+        <header>Or start the container <button class="copy" type="button">Copy</button></header>
+<pre>git clone https://github.com/timelakelabs/timelakedb.git
+<span class="k">cd</span> timelakedb
+docker compose -f deploy/compose/timelakedb.yml up -d --build
 curl http://localhost:<span class="n">1963</span>/health
 <span class="c"># {"status":"pass","name":"timelakedb",...}</span></pre>
       </div>
@@ -399,9 +415,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <table>
           <thead><tr><th>Port</th><th>Serves</th><th>Authentication</th></tr></thead>
           <tbody>
-            <tr><td><code>1963</code></td><td>Writes, <code>/api/sql</code>, <code>/health</code>, <code>/ping</code>, <code>/metrics</code></td><td><strong>None</strong> — the data plane is open</td></tr>
+            <tr><td><code>1963</code></td><td>Writes, <code>/api/sql</code>, <code>/health</code>, <code>/ping</code>, <code>/metrics</code></td><td><strong>Token, when enabled</strong> — <code>TIMELAKE_DATA_AUTH=optional|required</code>. Default <code>off</code>, which leaves it open</td></tr>
             <tr><td><code>1963</code></td><td><code>/admin/*</code> and the console at <code>/admin/ui</code></td><td><strong>Session required</strong> (SEC-4)</td></tr>
-            <tr><td><code>1964</code></td><td>Arrow Flight SQL</td><td>None — the handshake accepts anything</td></tr>
+            <tr><td><code>1964</code></td><td>Arrow Flight SQL</td><td><strong>Token, when enabled</strong> — same setting, same default</td></tr>
+            <tr><td><code>1965</code></td><td>Intra-cluster replication and live reads</td><td><strong>None</strong>, by design — keep it on a private network</td></tr>
           </tbody>
         </table>
       </div>
@@ -458,13 +475,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
           <thead><tr><th>Control</th><th>State</th></tr></thead>
           <tbody>
             <tr><td>Transport encryption</td><td><strong>Implemented, opt-in</strong> — TLS 1.3 on both listeners with hot rotation</td></tr>
-            <tr><td>Client certificates / mTLS</td><td>Not implemented — server-side TLS only; mutual TLS is v2</td></tr>
-            <tr><td>Authentication</td><td><strong>Implemented on the admin surface</strong> — sessions (cookie or bearer) with Argon2id credentials, 30 min idle / 12 h absolute expiry, CSRF and origin checks on cookie mutations, per-principal login backoff. <strong>Not on the data plane</strong> — writes, <code>/api/sql</code>, Flight SQL and <code>/metrics</code> stay open</td></tr>
-            <tr><td>Authorization</td><td><strong>Implemented on the admin surface</strong> — ordered roles <code>viewer</code> &lt; <code>operator</code> &lt; <code>admin</code>, with destructive retention changes requiring <code>admin</code>. No per-table or per-database permissions</td></tr>
-            <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELAKE_ENCRYPTION_KEY</code> and every stored object (data and manifests) is envelope-encrypted, AES-256-GCM per object, range-read compatible; the local WAL is not covered</td></tr>
-            <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan; authorizations remain unauthenticated claims until the <em>data plane</em> requires a session — admin authentication does not cover them</td></tr>
-            <tr><td>Audit logging</td><td>Not implemented — administrative actions now have a principal to attribute, and a tamper-evident trail is specified (SR-6, phase U1), but nothing is recorded yet</td></tr>
-            <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure</td></tr>
+            <tr><td>Client certificates / mTLS</td><td><strong>Implemented, opt-in, want mode</strong> — set <code>TIMELAKE_TLS_CLIENT_CA</code> and both listeners request a client certificate, verify one if presented, and serve the connection either way, so Grafana and Telegraf need no change. A verified identity narrows that session's visibility authorizations to what it is granted. Trust anchors hot-rotate with dual-CA overlap</td></tr>
+            <tr><td>Authentication</td><td><strong>Admin surface, and the data plane by token.</strong> <code>/admin/*</code> takes a session (Argon2id, cookie or bearer, 30 min idle / 12 h absolute, CSRF and origin checks, per-principal backoff). The data plane authenticates when <code>TIMELAKE_DATA_AUTH</code> is <code>optional</code> or <code>required</code> — one token on the <code>Authorization</code> header, accepted as <code>Bearer</code>, <code>Token</code> or <code>Basic</code>. <strong>The default is <code>off</code></strong>, which leaves writes, <code>/api/sql</code>, Flight SQL and <code>/metrics</code> open</td></tr>
+            <tr><td>Authorization</td><td><strong>Roles on the admin surface; scopes and grants on data tokens.</strong> Ordered roles <code>viewer</code> &lt; <code>operator</code> &lt; <code>admin</code>, with destructive changes requiring <code>admin</code>. Data tokens carry a scope (<code>read</code>, <code>write</code>, <code>read_write</code>), an optional database allowlist, and optional visibility grants that <em>intersect</em> a caller's claims. No per-column permissions</td></tr>
+            <tr><td>Encryption at rest</td><td><strong>Implemented, opt-in</strong> — set <code>TIMELAKE_ENCRYPTION_KEY</code> (or <code>TIMELAKE_KMS_KEY_ID</code>) and every stored object is envelope-encrypted, AES-256-GCM per object, range-read compatible. <strong>The local WAL is covered too</strong>, with the same envelope key; objects written before a key was configured stay readable</td></tr>
+            <tr><td>Row visibility labels</td><td><strong>Implemented</strong> — Accumulo-style <code>_visibility</code> expressions enforced inside the scan, so aggregates cannot leak. Authorizations are self-asserted on the anonymous path; a token's grants or a verified certificate <em>narrow</em> them, never widen</td></tr>
+            <tr><td>Targeted delete / erasure</td><td><strong>Implemented, <code>admin</code> only</strong> — <code>POST /admin/delete</code> records a durable tombstone (tag equalities and a time window) that hides matching rows from every query at once, in the live buffer and in settled files, and from <code>COUNT(*)</code> as much as from <code>SELECT</code>. A background pass then rewrites the files so the bytes leave the store. An empty predicate is refused</td></tr>
+            <tr><td>Audit logging</td><td><strong>Implemented for admin mutations</strong> — every administrative change writes one fsync'd, hash-chained record naming its principal, with the resolved before and after. Fail-closed: while the sink cannot append, mutations are refused with <code>503</code>. Read it at <code>GET /admin/audit</code>, with <code>?verify=1</code> to walk the chain. Tamper-<em>evident</em>, not tamper-proof. Data-plane reads and writes are not yet attributed</td></tr>
+            <tr><td>Availability guardrails</td><td><strong>Implemented</strong> — memory pool, admission limit, query deadline, write backpressure, and a per-client concurrency cap so one client cannot take the whole admission budget</td></tr>
           </tbody>
         </table>
       </div>
@@ -474,33 +492,50 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
 
       <h3>Exposures that follow</h3>
+      <p>
+        The authoritative list, with the reasoning behind each, is
+        <a href="https://github.com/timelakelabs/timelakedb/blob/main/SECURITY.md"><code>SECURITY.md</code></a>.
+        What remains open:
+      </p>
       <ul>
-        <li><code>POST /api/sql</code> executes arbitrary DataFusion SQL, and
-            <code>COPY … TO</code> <strong>writes files as the server process</strong>.
-            Arbitrary reads are not reachable — no file-reading table functions
-            are registered and DDL does not survive a request — but treat SQL
-            access as filesystem-write access to the container.</li>
-        <li>The container runs as root; the image sets no <code>USER</code>.</li>
-        <li>The administrative surface — retention management, the console,
-            <code>POST /admin/tls/reload</code> — now requires an
-            authenticated session, so it is no longer open. Two things remain
-            true: it answers on the <strong>same port as the data plane</strong>
-            (1963), and a deployment that never rotates the seeded
-            <code>admin</code>/<code>admin</code> credential is one guess from
-            an <code>admin</code> role that can delete history. Alert on
-            <code>timelake_admin_default_credential_active</code>.</li>
-        <li>Query errors are returned verbatim, disclosing table and column names.</li>
-        <li>There is no per-client rate limit; one client can consume the whole
-            admission budget.</li>
-        <li>Visibility authorizations are self-asserted — with no
-            authentication, <code>X-TimeLake-Authorizations: admin</code> is a
-            claim, not a credential. Real isolation needs an authenticating
-            proxy that sets (and strips inbound) that header.</li>
-        <li>Encryption at rest protects the store's media, not the query
-            surface: anyone who can reach <code>/api/sql</code> reads
-            decrypted data, and the local WAL holds recent writes in
-            plaintext until flush.</li>
+        <li><strong>The data plane is unauthenticated by default.</strong> With
+            <code>TIMELAKE_DATA_AUTH</code> unset, anyone who can reach 1963 or
+            1964 can write arbitrary data, read all data and enumerate the
+            schema. Setting <code>required</code> closes it, but that breaks
+            every client not yet holding a token — which is why <code>off</code>
+            is still the default and <code>optional</code> exists as the
+            migration state between them. Until you set it, treat the port as
+            an unauthenticated shell into the data.</li>
+        <li>The administrative surface answers on the <strong>same port as the
+            data plane</strong> (1963), and a deployment that never rotates the
+            seeded <code>admin</code>/<code>admin</code> credential is one guess
+            from an <code>admin</code> role that can delete history. The seeded
+            credential may do nothing but change its own password, and
+            <code>timelake_admin_default_credential_active</code> reads 1 until
+            it does — but the mitigation is procedural, not structural.</li>
+        <li>Visibility authorizations are self-asserted on the anonymous path:
+            <code>X-TimeLake-Authorizations: admin</code> is a claim any client
+            can make. A data-plane token's grants and a verified client
+            certificate both narrow it, and both are optional under the default
+            settings, so an attacker simply declines to present one.</li>
+        <li>Want-mode client authentication grants nothing on its own, by
+            design — an attacker takes the anonymous path. Its value is that an
+            <em>authenticated</em> caller can be held to less.</li>
+        <li>The intra-cluster listener is unauthenticated and serves rows, so
+            reaching it is equivalent to read access to the object store
+            itself. Keep it on a private network.</li>
+        <li>Encryption at rest protects the media, not the query surface:
+            anyone who can reach <code>/api/sql</code> reads decrypted data.
+            That is authentication's job, not encryption's.</li>
       </ul>
+      <p>
+        Closed since earlier drafts of this page, and no longer exposures:
+        the <code>COPY … TO</code> write primitive (the SQL surface is
+        read-only, enforced on the logical plan), the root container (it runs
+        as an unprivileged user with a read-only root filesystem), verbatim
+        query errors (now one opaque reference), the missing per-client rate
+        limit, and the plaintext WAL.
+      </p>
 
       <h3>Deploying it safely</h3>
       <ul>
@@ -661,6 +696,13 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>Active per-table policies</td></tr>
             <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, admin to shrink or introduce</td><td>Set a window; persists durably, applies within 60 s</td></tr>
             <tr><td><code>DELETE /admin/retention/{table}</code></td><td>admin</td><td>Remove a window; the table keeps everything again</td></tr>
+            <tr><td><code>POST /admin/delete</code></td><td>admin</td><td>Targeted delete. Body <code>{db, table, tags{}, start_ns?, end_ns?}</code>; records a tombstone that hides matching rows immediately. An empty predicate is refused</td></tr>
+            <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td>The audit trail. Filters <code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>; <code>?verify=1</code> walks the hash chain</td></tr>
+            <tr><td><code>GET /admin/tokens</code></td><td>admin</td><td>Data-plane tokens; the secret is never shown again</td></tr>
+            <tr><td><code>POST /admin/tokens</code></td><td>admin</td><td>Issue a token — scope, database allowlist, visibility grants</td></tr>
+            <tr><td><code>DELETE /admin/tokens/{id}</code></td><td>admin</td><td>Revoke a token; effective immediately</td></tr>
+            <tr><td><code>GET /admin/cert-grants</code></td><td>operator</td><td>Certificate identities and what each is granted</td></tr>
+            <tr><td><code>PUT|DELETE /admin/cert-grants/{cn}</code></td><td>admin</td><td>Set or remove a certificate identity's visibility grants</td></tr>
             <tr><td><code>POST /admin/tls/reload</code></td><td>admin</td><td>Re-read and validate the certificate pair (TLS mode only)</td></tr>
           </tbody>
         </table>
@@ -687,8 +729,17 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELAKE_RETENTION</code></td><td>empty</td><td>Per-table retention specification; seeds the policy at first start, after which the stored policy from the console wins</td></tr>
             <tr><td><code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
             <tr><td><code>TIMELAKE_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
-            <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths)</td></tr>
+            <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths). Both or neither</td></tr>
+            <tr><td><code>TIMELAKE_TLS_CLIENT_CA</code></td><td>unset</td><td>PEM bundle of trust anchors. Setting it turns on want-mode client certificates: one is requested, verified if presented, and the connection is served either way</td></tr>
             <tr><td><code>TIMELAKE_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
+            <tr><td><code>TIMELAKE_DATA_AUTH</code></td><td><code>off</code></td><td><code>off</code> | <code>optional</code> | <code>required</code>. Turns on data-plane token authentication. An unparseable value is refused at startup rather than silently downgraded</td></tr>
+            <tr><td><code>TIMELAKE_ENCRYPTION_KEY</code> / <code>_KEY_FILE</code></td><td>unset</td><td>64 hex characters. Envelope-encrypts every stored object <em>and</em> the WAL. Mutually exclusive with <code>TIMELAKE_KMS_KEY_ID</code></td></tr>
+            <tr><td><code>TIMELAKE_KMS_KEY_ID</code></td><td>unset</td><td>AWS KMS key for the envelope, instead of a local key</td></tr>
+            <tr><td><code>TIMELAKE_OBJECT_STORE</code></td><td>local</td><td>Unset uses an <code>objects/</code> directory under the data dir; <code>s3://bucket/prefix</code> uses S3</td></tr>
+            <tr><td><code>TIMELAKE_AUDIT_FAIL_OPEN</code></td><td><code>0</code></td><td>The audit trail is fail-<em>closed</em>: while the sink cannot append, admin mutations are refused with 503. Set to 1 to keep mutating and be alerted instead — a deployment-time decision, not a console one</td></tr>
+            <tr><td><code>TIMELAKE_NODE_ID</code></td><td><code>tldb</code></td><td>Stamped on every audit record; the chain is per node</td></tr>
+            <tr><td><code>TIMELAKE_MAX_CONCURRENT_QUERIES_PER_CLIENT</code></td><td>4</td><td>Per-client concurrency cap, in front of the global admission limit. Past it a client is refused with 429 rather than queued. <code>0</code> disables</td></tr>
+            <tr><td><code>TIMELAKE_ROLE</code></td><td><code>all</code></td><td><code>all</code> | <code>ingester</code> | <code>querier</code> | <code>router</code>. Cluster role</td></tr>
           </tbody>
         </table>
       </div>
@@ -707,6 +758,17 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         <code>timelake_admin_default_credential_active</code>,
         <code>timelake_admin_logins_total</code> and
         <code>timelake_admin_login_failures_total</code>.
+        Targeted delete adds <code>timelake_tombstone_rewrites_total</code>;
+        the audit trail adds <code>timelake_audit_records_total</code> and
+        <code>timelake_audit_sink_healthy</code>; the per-client cap adds
+        <code>timelake_query_rate_limited_total</code>; row visibility adds
+        <code>timelake_visibility_rows_filtered_total</code>.
+      </p>
+      <p>
+        <strong>Alert on <code>timelake_audit_sink_healthy == 0</code>.</strong>
+        It means the audit sink cannot append, and because the trail is
+        fail-closed that is also the reason administrative changes are being
+        refused with <code>503</code>.
       </p>
 
       <h3>TLS and certificate rotation</h3>

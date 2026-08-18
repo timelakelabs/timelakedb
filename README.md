@@ -67,7 +67,18 @@ publishes the directory on every push that touches it; enable it once per
 repository under **Settings → Pages → Source: GitHub Actions**. Every figure
 on the site traces to a run under `docs/evidence/`.
 
-## Status: C2 phase 4 — the cluster reads without losing freshness
+## Status
+
+**Governance and packaging landed 2026-08-17.** Since the cluster work
+below: targeted delete (`POST /admin/delete` — a tombstone predicate that
+hides matching rows from every query at once, then reclaims the bytes in
+the background), a hash-chained **audit trail** over every administrative
+mutation (`GET /admin/audit`, fail-closed, `?verify=1` walks the chain),
+and **`.deb`/`.rpm` packages** attached to each tagged release. Earlier in
+the same stretch: query-error sanitization, a per-client query cap, and
+WAL encryption. `SECURITY.md` is the authoritative posture.
+
+### C2 phase 4 — the cluster reads without losing freshness
 
 Clustering is arriving one role at a time, each ending in a recorded
 drill. Four of the five phases are in: roles and discovery, ingester WAL
