@@ -160,9 +160,11 @@ This project is inspired by the following projects.
   block, not a code failure); mitigation is 2 self-hosted WSL runners
   (`../ops/WSL_RUNNERS.md`, scoped not applied); and the **Phase 2 public
   flip** (public repos, Pages, `v0.1.0-alpha`) is paywalled. Still open: C2
-  phase 5 compactor and T-1 Tributary metrics — **P1-6** (Tributary L4 client
-  certs) and **P1-7** (queue RPO, measured) both shipped 2026-08-17, leaving
-  T-1 as the sole v0.2-pilot gap. Full
+  phase 5 compactor — **P1-6** (Tributary L4 client certs), **P1-7** (queue
+  RPO, measured) and **T-1** (Tributary `/metrics` + `/healthz`, 2026-08-18)
+  have all shipped, which **closes the v0.2-pilot gate**. What is left is
+  the Phase 2 public flip and the CI billing block, neither of which is
+  engineering. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does
