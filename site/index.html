@@ -234,14 +234,26 @@
   <div class="shell">
     <div class="section-head">
       <h2>Quick start</h2>
-      <p>Docker is the only prerequisite. The server accepts line protocol on 1963, answers Flight SQL on 1964, and serves its management console on 1963 at <code>/admin/ui</code>.</p>
+      <p>Install a package or run the container — neither needs a Rust toolchain. The server accepts line protocol on 1963, answers Flight SQL on 1964, and serves its management console on 1963 at <code>/admin/ui</code>.</p>
     </div>
 
     <div class="code">
-      <header>Run it <button class="copy" type="button">Copy</button></header>
-<pre><span class="c"># from a clone of the repository</span>
-<span class="k">cd</span> TimeLakeDB/bench
-docker compose -f compose/timelakedb.yml up -d --build
+      <header>Install it <button class="copy" type="button">Copy</button></header>
+<pre><span class="c"># .deb and .rpm are attached to every release</span>
+sudo apt install ./timelakedb_<span class="n">0.1.0</span>~alpha_amd64.deb
+<span class="c"># or: sudo dnf install ./timelakedb-0.1.0~alpha-1.x86_64.rpm</span>
+
+<span class="c"># Binds 127.0.0.1 and does not start on install — the data plane is</span>
+<span class="c"># unauthenticated by default, so starting it is a deliberate step.</span>
+sudo systemctl enable --now timelakedb
+curl http://<span class="n">127.0.0.1</span>:<span class="n">1963</span>/health</pre>
+    </div>
+
+    <div class="code">
+      <header>Or run the container <button class="copy" type="button">Copy</button></header>
+<pre>git clone https://github.com/timelakelabs/timelakedb.git
+<span class="k">cd</span> timelakedb
+docker compose -f deploy/compose/timelakedb.yml up -d --build
 curl http://localhost:<span class="n">1963</span>/health</pre>
     </div>
 
