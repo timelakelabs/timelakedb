@@ -394,6 +394,22 @@ Audit retention has a floor: `TIMELAKE_AUDIT_MIN_RETENTION_DAYS`
 (default 90) is pinned to the property layer, so lowering it requires
 deployment access, not a console session — and the attempt is audited.
 
+**Shipped 2026-08-18**, with one deviation from the paragraph above worth
+stating plainly. Rotation is in: the live segment becomes
+`audit.<last-seq>.jsonl` at `TIMELAKE_AUDIT_ROTATE_SIZE` (default 64 MiB)
+or `TIMELAKE_AUDIT_ROTATE_EVERY`, and the hash chain runs *through* the
+boundary — `read_all` concatenates segments in order, so a removed segment
+breaks verification exactly as a removed record does. Reopening after a
+rotation recovers the head from the whole trail, never from the live
+segment alone; the latter would hand the next record a genesis `prev_hash`
+and silently split the trail in two.
+
+The floor is enforced as a **clamp rather than a refusal**:
+`TIMELAKE_AUDIT_RETAIN_DAYS` below 90 is raised to 90 rather than rejected,
+and unset means **nothing is ever deleted**. Upload-on-rotation and the
+`system.audit` exposure are still to come, so segments currently stay on
+the node.
+
 ### 5.5 Failure policy: fail closed
 
 If the audit sink cannot append, mutations are **refused** with `503
