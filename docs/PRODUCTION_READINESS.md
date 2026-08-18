@@ -15,14 +15,25 @@ proves it is named; where it is not, the gap is stated plainly.
 
 ## 0. The honest summary
 
-**TimeLakeDB is engine-complete and drill-proven, but operationally
-unshipped.** The hard parts — the storage engine, exactness under crash
-and rotation, the RR-1 "no query may kill the server" invariant, TLS
-rotation under load — are done and measured. What is missing is almost
-entirely the boring, unavoidable operational shell: the data plane has
-no authentication, the container runs as root, `/api/sql` can write
-files, nothing has ever been pushed to a remote, and there is exactly
-one node holding exactly one copy of the data.
+**TimeLakeDB is engine-complete and drill-proven; the operational shell
+is most of the way in.** The hard parts — the storage engine, exactness
+under crash and rotation, the RR-1 "no query may kill the server"
+invariant, TLS rotation under load — are done and measured.
+
+Most of the gap this document opened with has since closed: the data
+plane can authenticate (token, opt-in, still `off` by default), the
+container runs as an unprivileged user on a read-only root filesystem,
+`/api/sql` is read-only on the logical plan, every repository is pushed,
+`.deb`/`.rpm` packages ship with each tagged release, administrative
+mutations are recorded in a hash-chained audit trail, and data can be
+deleted on a predicate rather than only by retention.
+
+What remains is genuinely operational, and mostly about **more than one
+node**: there is still one node holding one copy of the data (P1-1), the
+compactor role and its singleton lease are unbuilt, and the data plane's
+default is open until an operator sets `TIMELAKE_DATA_AUTH`. Read the
+per-item sections below rather than this paragraph — each says what
+shipped and what is still owed.
 
 **Tributary is earlier but structurally sound.** Its three hardest
 correctness properties — exact counts through rotation, crash resume

@@ -148,14 +148,21 @@ This project is inspired by the following projects.
   build needs GLIBC_2.39 and would not start on RHEL 9 / Debian 12 / Ubuntu
   22.04; `packaging/verify.sh` installs + runs them on Debian 12, Ubuntu
   22.04, Rocky 9 and AL2023; packages bind loopback and do NOT auto-start;
-  deps refreshed within-semver (PR #4 open — `thrift` blocked upstream until
-  datafusion 55). Site adopted the new mountain-lake brand (teal accent;
-  `site/assets/logo.svg` + `avatar.svg` + repointed tokens). **Two live
-  blockers:** GitHub Actions hit the **spending limit** (jobs won't start) —
-  mitigation is 2 self-hosted WSL runners (`../ops/WSL_RUNNERS.md`, scoped
-  not applied); and the **Phase 2 public flip** (public repos, Pages,
-  `v0.1.0-alpha`) is paywalled. Still open: C2 phase 5 compactor,
-  P1-6/P1-7, T-1 Tributary metrics. Full
+  deps refreshed within-semver (PR #4 MERGED; `thrift` still blocked upstream
+  until datafusion 55 — a known, unreachable advisory, and the one open
+  Dependabot alert). Site adopted the new mountain-lake brand (teal accent;
+  `site/assets/logo.svg` + `avatar.svg` + repointed tokens), and the site's
+  Security/Config/Endpoint pages were reconciled 2026-08-17 — they had still
+  been claiming audit logging, mTLS, rate limiting and WAL encryption were
+  unimplemented, and both quickstarts began with a `cd` into the deleted
+  `bench/`. **Two live blockers:** GitHub Actions hit the **spending limit**
+  (jobs won't start — a PR's checks show red with `steps=0`, which is the
+  block, not a code failure); mitigation is 2 self-hosted WSL runners
+  (`../ops/WSL_RUNNERS.md`, scoped not applied); and the **Phase 2 public
+  flip** (public repos, Pages, `v0.1.0-alpha`) is paywalled. Still open: C2
+  phase 5 compactor and T-1 Tributary metrics — **P1-6** (Tributary L4 client
+  certs) and **P1-7** (queue RPO, measured) both shipped 2026-08-17, leaving
+  T-1 as the sole v0.2-pilot gap. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does
