@@ -327,10 +327,18 @@ Scope and residuals, all deliberate for this slice:
   an empty-predicate delete, a rejected password). A role-based `403` refused
   by the admin guard *before* the handler runs is not yet chained; folding
   guard denials into the trail is part of the same login/logout follow-on.
-- **Local segments only.** Object-store upload on rotation (SEC-1 encrypted),
-  the read-only `system.audit` SQL exposure, and the retention floor
-  (`TIMELAKE_AUDIT_MIN_RETENTION_DAYS`) are the next enhancements on top of
-  this chain (`docs/CONSOLE.md` §5.4).
+- **Local segments, rotated but not uploaded.** The trail rotates into
+  ordered segments (`TIMELAKE_AUDIT_ROTATE_SIZE`, default 64 MiB, and
+  `TIMELAKE_AUDIT_ROTATE_EVERY`), and **the chain verifies straight through
+  the boundaries** — `?verify=1` reads every segment in order, so removing a
+  whole segment file surfaces as a break exactly like editing a record does.
+  Deleting a file is not a way to hide anything.
+
+  **Retention deletes nothing by default.** `TIMELAKE_AUDIT_RETAIN_DAYS` is
+  opt-in and is clamped to a 90-day floor even when set lower
+  (`docs/CONSOLE.md` §5.4), so the retention control cannot erase the record
+  of its own use. Object-store upload on rotation (SEC-1 encrypted) and the
+  read-only `system.audit` SQL exposure remain the next enhancements.
 
 Pinned by `crates/audit` (the chain: link, replay, tamper detection on edit
 and deletion, fail-closed gate) and `crates/server/tests/audit.rs`

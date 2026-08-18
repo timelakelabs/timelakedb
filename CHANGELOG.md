@@ -13,6 +13,36 @@ here.
 
 ## [Unreleased]
 
+### Added — log rotation, and audit segments that stay verifiable (2026-08-18)
+
+- **The audit trail rotates**, into ordered segments named by the last seq
+  they contain (`TIMELAKE_AUDIT_ROTATE_SIZE`, default 64 MiB, and
+  `TIMELAKE_AUDIT_ROTATE_EVERY`). The hash chain runs **through** the
+  boundaries: `read_all` concatenates segments in order, so `?verify=1`
+  still walks the whole trail and **removing a segment file breaks
+  verification exactly as editing a record does**. Reopening after a
+  rotation recovers the head from the entire trail, never from the live
+  segment alone — the latter would hand the next record a genesis
+  `prev_hash` and silently split the chain in two.
+- **Audit retention deletes nothing by default.**
+  `TIMELAKE_AUDIT_RETAIN_DAYS` is opt-in, and clamped to the documented
+  90-day floor even when set lower (`docs/CONSOLE.md` §5.4), so the
+  retention control cannot erase the record of its own use.
+- **The system log can rotate itself** — `TIMELAKE_LOG_FILE` plus
+  `_ROTATE_SIZE` / `_ROTATE_EVERY` / `_KEEP`. Unset keeps the previous
+  behaviour: stdout, captured and rotated by systemd or Docker. Deliberately
+  separate from the audit trail, which is evidence and has its own policy.
+- No new dependencies. `KiB` (1024) and `KB` (1000) are both accepted and
+  are not treated as the same number.
+
+### Fixed
+
+- Four `clippy -D warnings` failures in the R-1 and P1-2 code that CI would
+  have caught had it been running: two collapsible `if`s in the server and
+  audit crates, a redundant closure in the query crate, and two more in
+  `tests/delete.rs`. Found by finally running the workspace-wide command CI
+  uses rather than targeted per-crate checks.
+
 ### Added — Linux packages for releases (2026-08-17)
 
 - **`.deb` and `.rpm`, attached to every tagged release.** A `v*` tag runs

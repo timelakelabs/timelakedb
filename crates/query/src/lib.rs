@@ -517,7 +517,7 @@ fn apply_tombstone(
 
     // Read the time column once; time-bounded tombstones need it, tag-only
     // ones do not, so its absence is only fatal to the former.
-    let time_vals = batch.column_by_name("time").and_then(|c| read_ts_nanos(c));
+    let time_vals = batch.column_by_name("time").and_then(read_ts_nanos);
 
     let mut keep = vec![true; n];
     for t in deletes {
@@ -998,8 +998,11 @@ mod tests {
 
         // Delete web-1 in [0, 1000]: drops the two early web-1 rows, keeps
         // web-2@100 and web-1@2000 (the latter is outside the window).
-        let s = QuerySession::default()
-            .with_tombstones(vec![tomb(&[("host", "web-1")], Some(0), Some(1000))]);
+        let s = QuerySession::default().with_tombstones(vec![tomb(
+            &[("host", "web-1")],
+            Some(0),
+            Some(1000),
+        )]);
         assert_eq!(count(&s, &batch).await, 2);
 
         // ...and it is the RIGHT rows, not merely the right count.
@@ -1017,14 +1020,14 @@ mod tests {
         assert_eq!(rows[1]["host"], "web-1"); // @2000 survives (outside window)
 
         // Tag-only tombstone (no time bound): every web-2 row, at any time.
-        let s = QuerySession::default()
-            .with_tombstones(vec![tomb(&[("host", "web-2")], None, None)]);
+        let s =
+            QuerySession::default().with_tombstones(vec![tomb(&[("host", "web-2")], None, None)]);
         assert_eq!(count(&s, &batch).await, 3);
 
         // A tombstone naming a tag the table lacks is unsatisfiable — it must
         // match nothing, never fall back to deleting everything.
-        let s = QuerySession::default()
-            .with_tombstones(vec![tomb(&[("region", "eu")], None, None)]);
+        let s =
+            QuerySession::default().with_tombstones(vec![tomb(&[("region", "eu")], None, None)]);
         assert_eq!(count(&s, &batch).await, 4);
     }
 
