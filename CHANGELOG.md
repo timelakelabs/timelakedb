@@ -34,6 +34,12 @@ here.
   separate from the audit trail, which is evidence and has its own policy.
 - No new dependencies. `KiB` (1024) and `KB` (1000) are both accepted and
   are not treated as the same number.
+- **Drilled against a live node** (`docs/evidence/audit-rotation-drill.log`,
+  9/9): 40 admin mutations spanning 5 segments, `?verify=1` still intact
+  after rotation, and a removed segment file reported as a break naming its
+  seq and reason. The unit tests exercise `AuditSink` directly; this proves
+  the endpoint an auditor actually uses tells the truth about a rotated
+  trail.
 
 ### Fixed
 
