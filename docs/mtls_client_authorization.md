@@ -126,3 +126,51 @@ assertion would have HELD (NOT-FALSIFIABLE); it now deviates, PROVEN.
 Rust regression coverage:
 `crates/auth/src/lib.rs::cert_grants_are_set_read_removed_and_survive_reopen`
 plus the pre-existing `QuerySession` intersection tests.
+
+---
+
+## Follow-up: the same gap existed on HTTP, and is now closed too
+
+*2026-08-18.*
+
+The resolution above wired the Flight SQL path. `/api/sql` still had the
+original shape of the problem: a client certificate was requested,
+verified and accepted at the TLS layer, and then authorized nothing — so
+the narrowing property this document describes held on one query surface
+and not the other. Two surfaces with different authorization behaviour is
+exactly the drift the codebase avoids elsewhere by routing both through
+one decision point.
+
+The obstacle was mechanical rather than conceptual. `axum-server` owns
+the HTTP accept loop, so the handler never saw the peer certificate the
+way the Flight listener's own loop does. The fix is
+`crates/server/src/tls_identity.rs`: an `Accept` implementation wrapping
+`RustlsAcceptor` that, once the handshake completes, reads the subject CN
+via `tls.get_ref().1.peer_certificates()` — borrowed, not consumed, since
+the stream still has to be served — and layers `Extension(PeerIdentity)`
+onto the service. Extraction happens **once per connection**, not once
+per request: a peer certificate cannot change mid-connection, and doing
+it per request would put an X.509 parse on the query path.
+
+From there the identity travels the path already built above:
+`PeerIdentity` → the `/api/sql` handler → `Engine::sql` →
+`sql_batches` → `QuerySession.identity` → `.resolve(granted)`. No second
+policy, no second grant store; HTTP joins the mechanism Flight already
+used.
+
+Two consequences worth naming:
+
+- **Tributary's L4 client certificate now authorizes something.** It was
+  previously proof of a handshake and nothing more on the write path.
+- **Attribution became possible.** The verified identity is recorded on
+  every query row in `_system.queries` (`docs/CONSOLE.md` §7.6), so
+  "which client is doing this to us" is answerable in SQL rather than
+  inferred from logs. An anonymous caller gets a NULL identity rather
+  than a placeholder, because a literal like `anonymous` would collide
+  with a client legitimately named that.
+
+Unchanged, deliberately: want mode still grants nothing on its own
+(exposure 9). An anonymous caller is served exactly as before, so this is
+additive rather than a flag day, and `None` grants continue to mean "no
+policy recorded" rather than "deny everything" — the latter would break a
+working client the moment it presented a certificate.

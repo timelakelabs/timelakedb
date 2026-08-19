@@ -1,0 +1,58 @@
+﻿=== A. the node is up ===
+  PASS  health answers
+  PASS  metrics answers
+  PASS  query latency histogram is exposed
+  PASS  self-monitoring counters are exposed
+
+=== B. give the node something to say about itself ===
+  PASS  writes accepted
+  ran 4 queries (2 ok, 1 refused, 1 failed)
+
+=== C. wait for a maintenance tick to store the sample ===
+
+=== D. the node has written itself into _system ===
+  PASS  _system.queries has rows
+  PASS  _system.metrics has rows
+  PASS  all four outcomes are distinguishable
+  PASS  nothing was dropped by the sampler
+
+=== E. every panel query on the dashboard actually runs ===
+  PASS  panel query 1
+  PASS  panel query 2
+  PASS  panel query 3
+  PASS  panel query 4
+  PASS  panel query 5
+  PASS  panel query 6
+  PASS  panel query 7
+  PASS  panel query 8
+  PASS  panel query 9
+  PASS  panel query 10
+  PASS  panel query 11
+  PASS  panel query 12
+  PASS  panel query 13
+  PASS  panel query 14
+  PASS  panel query 15
+  PASS  panel query 16
+  PASS  panel query 17
+  PASS  panel query 18
+  PASS  panel query 19
+  PASS  panel query 20
+  PASS  panel query 21
+  PASS  panel query 22
+  PASS  panel query 23
+  PASS  panel query 24
+  PASS  panel query 25
+  (25 panel queries ran, 0 failed)
+
+=== F. the U2 gate: stored numbers agree with /metrics ===
+  live=/metrics: 600    stored=_system.metrics: 600.0
+  PASS  stored value does not exceed the live counter
+  PASS  stored value is present and non-zero
+
+=== G. self-monitoring stays out of the user-ingest counter ===
+  timelake_lines_written_total = 600 (drill wrote 200)
+  PASS  user-ingest counter excludes _system rows
+
+================================
+  PASS: 37   FAIL: 0
+================================

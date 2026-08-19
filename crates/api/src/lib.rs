@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::net::SocketAddr;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -53,11 +53,15 @@ pub trait Engine: Send + Sync + 'static {
     /// objects (the /api/sql wire contract). `authorizations` are the
     /// session's visibility authorizations (SEC-2), from the
     /// `X-TimeLake-Authorizations` header and/or the request body.
+    /// `identity` is the verified client-certificate CN when the caller
+    /// presented one (SEC-3 v2 want mode), `None` otherwise. It can only
+    /// narrow what the session sees — see [`PeerIdentity`].
     fn sql(
         &self,
         db: String,
         query: String,
         authorizations: Vec<String>,
+        identity: Option<String>,
     ) -> impl std::future::Future<Output = Result<Value, String>> + Send;
 
     /// Authenticate a data-plane request (SEC-4 phased).
@@ -140,6 +144,21 @@ pub fn humanize_secs(secs: u64) -> String {
         format!("{secs}s")
     }
 }
+
+/// The verified client-certificate identity for a connection, as a request
+/// extension (SEC-3 v2 on the HTTP surface).
+///
+/// `None` means the caller presented no certificate, or the listener is
+/// plaintext — both are ordinary, because client authentication is **want**
+/// mode: a caller without a certificate is served exactly as before. So this
+/// can only ever *narrow* what a session sees, never widen it, which is the
+/// property exposures 7 and 9 rest on.
+///
+/// The value is the leaf's subject common name, extracted once per
+/// connection at the TLS accept (`timelake_server::tls_identity`) rather
+/// than per request — the certificate cannot change mid-connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity(pub Option<String>);
 
 /// State for the authenticated admin surface (SEC-4).
 pub struct AdminState<E: Engine> {
@@ -1025,6 +1044,10 @@ fn auths_from_headers(headers: &HeaderMap) -> Vec<String> {
 async fn sql<E: Engine>(
     State(engine): State<Arc<E>>,
     headers: HeaderMap,
+    // Optional on purpose: the plaintext listener attaches no identity, and
+    // a TLS caller that presents no certificate attaches `None`. Both are
+    // ordinary under want mode, and neither may become a refusal.
+    peer: Option<Extension<PeerIdentity>>,
     Json(req): Json<SqlRequest>,
 ) -> axum::response::Response {
     let db = req.db.unwrap_or_else(|| "poc".to_string());
@@ -1045,7 +1068,12 @@ async fn sql<E: Engine>(
     if let Some(granted) = &decision.granted {
         auths.retain(|claimed| granted.iter().any(|g| g == claimed));
     }
-    match engine.sql(db, req.sql, auths).await {
+    // SEC-3 v2: the verified certificate identity, when there is one. The
+    // engine intersects that identity's recorded grants with the claims
+    // above — a second narrowing, never a widening, and the reason a
+    // certificate is worth presenting on this surface at all.
+    let identity = peer.and_then(|Extension(PeerIdentity(id))| id);
+    match engine.sql(db, req.sql, auths, identity).await {
         Ok(rows) => Json(rows).into_response(),
         Err(msg) => err_response(StatusCode::BAD_REQUEST, &msg),
     }

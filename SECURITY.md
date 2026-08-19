@@ -69,7 +69,7 @@ above starts applying to you. Uninstalling never deletes `/var/lib/timelake`.
 | Control | Status |
 |---|---|
 | Transport encryption | **Implemented, opt-in.** TLS 1.3 on both listeners when `TIMELAKE_TLS_CERT`/`_KEY` are set, with hot rotation (SEC-3). Plaintext is the default. |
-| Client certificate / mTLS | **Implemented, opt-in, WANT mode.** Set `TIMELAKE_TLS_CLIENT_CA` and both listeners request a client certificate, verify one if presented, and serve the connection either way — so Grafana, Telegraf and the harness need no change. A verified identity narrows that session's SEC-2 authorizations to what it is granted (Flight SQL; `/api/sql` identity is still to come). Trust anchors hot-rotate with dual-CA overlap. Want mode is not itself a control — see exposure 9. |
+| Client certificate / mTLS | **Implemented, opt-in, WANT mode.** Set `TIMELAKE_TLS_CLIENT_CA` and both listeners request a client certificate, verify one if presented, and serve the connection either way — so Grafana, Telegraf and the harness need no change. A verified identity narrows that session's SEC-2 authorizations to what it is granted, on **both** Flight SQL and `/api/sql`. Trust anchors hot-rotate with dual-CA overlap. Want mode is not itself a control — see exposure 9. |
 | Authentication | **Admin surface (SEC-4) + data plane (SEC-4 phased).** `/admin/*` requires a session (Argon2id, cookie/bearer, CSRF + Origin, backoff). The **data plane** authenticates by token when `TIMELAKE_DATA_AUTH` is `optional` or `required`: one token on the `Authorization` header, accepted as `Bearer` (Grafana Flight SQL / Tributary), `Token` (Telegraf v2) or `Basic` (Telegraf v1, token as password). **Default is `off`** — the header is not examined and the data plane is open, as it always was. HTTP and Flight SQL enforce through one decision function. |
 | Authorization | **Roles on the admin surface; scopes + grants on data tokens.** Admin roles: `viewer`/`operator`/`admin`. Data tokens carry a scope (`read`, `write`, `read_write` — deliberately not a total order, so a shipper can write without being able to read back), an optional database allowlist, and optional SEC-2 grants that *intersect* a caller's claimed authorizations. No per-column permissions. |
 | First-run credential | **`admin`/`admin`, quarantined.** Seeded only when no principal exists; it may do nothing but change its own password, and every other admin route answers `403 password_change_required` until it does. Rotating it invalidates all its sessions. `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` replaces it for provisioning. Alert on `timelake_admin_default_credential_active`. |
@@ -216,6 +216,19 @@ follow from "no authentication" and are listed so you can design around them.
    guess: `timelake_flight_connections_authenticated_total` against
    `timelake_flight_connections_anonymous_total` says how much of your
    traffic would break if you required a certificate today.
+
+   *Updated 2026-08-18:* this now applies to **both** query surfaces. It
+   previously applied only to Flight SQL — `/api/sql` requested and
+   verified a client certificate and then authorized nothing with it,
+   because `axum-server` owns that accept loop and the handler could not
+   see the peer. A custom `Accept` (`crates/server/src/tls_identity.rs`)
+   reads the subject CN once per connection and layers it onto the
+   service, so the grant intersection applies identically on HTTP. The
+   practical consequence is that Tributary's L4 client certificate now
+   authorizes something on the write path instead of only proving a
+   handshake. The identity is also recorded per query in
+   `_system.queries`, so "which client is doing this to us" is an
+   answerable question rather than an inference from logs.
 
 10. **The intra-cluster listener is unauthenticated and now serves
     rows.** `TIMELAKE_CLUSTER_ADDR` carries CL-2 replication and, since
@@ -431,7 +444,7 @@ deferred.
 | TLS 1.3 both listeners, hot rotation | SEC-3 (v1 MUST) | **Shipped** — AT-7 drill 19/19 |
 | Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
 | Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`docs/evidence/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presents the token (P0-5, done — Tributary repo `docs/evidence/p05-data-auth.log`). |
-| Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session over Flight SQL. AT-7 still 19/19 with it enabled. `/api/sql` identity outstanding. |
+| Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session on **both** Flight SQL and `/api/sql` (the latter via a custom `axum-server` `Accept`, 2026-08-18). AT-7 still 19/19 with it enabled. |
 | Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |
 | Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |

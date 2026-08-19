@@ -1,0 +1,59 @@
+# U2 operator console: a TimeLakeDB node plus a Grafana reading that node's
+# own `_system` database over Flight SQL.
+#
+#   docker compose -f deploy/compose/timelakedb-console.yml up -d --build
+#   open http://localhost:3004  (admin/admin)  -> TimeLakeDB / Node Console
+#
+# Ports are offset from deploy/compose/timelakedb.yml so this can run
+# alongside a bench stack without fighting it for 1963/1964/3003.
+#
+# The drill for this stack is deploy/compose/console-drill/console_drill.sh,
+# which runs every panel's SQL against the live node — a dashboard whose
+# queries have never been executed is a mock-up, not a console.
+name: timelake-console
+services:
+  timelakedb:
+    build: ../..
+    container_name: timelake-console-db
+    ports:
+      - "4963:1963"   # HTTP: writes, /api/sql, /metrics
+      - "4964:1964"   # Flight SQL — what Grafana reads
+    environment:
+      TIMELAKE_QUERY_MEM_BYTES: "1073741824"
+      TIMELAKE_MAX_CONCURRENT_QUERIES: "4"
+      TIMELAKE_NODE_ID: "console-node"
+      # Flush often so the drill sees files, levels and per-table storage
+      # within its runtime rather than after the default age window.
+      TIMELAKE_FLUSH_ROWS: "5000"
+      TIMELAKE_FLUSH_AGE_SECS: "20"
+    mem_limit: 4g
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    volumes:
+      - console-data:/var/lib/timelake/data
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: timelake-console-grafana
+    ports:
+      - "3004:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # The console is read-only; no need for users to sign up or for
+      # Grafana to phone home from a drill rig.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ../grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    depends_on:
+      - timelakedb
+
+volumes:
+  console-data:

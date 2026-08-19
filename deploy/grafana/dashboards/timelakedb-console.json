@@ -1,0 +1,484 @@
+{
+  "uid": "timelakedb-console",
+  "title": "TimeLakeDB — Node Console",
+  "description": "Operator plane for a TimeLakeDB node, read from the node's own _system database over Flight SQL (docs/CONSOLE.md §7.3/§7.6, phase U2). Panels are grouped as Overview / Query / Ingest / Storage / Security. TWO THINGS TO KNOW. (1) This reads the database through the database: if the node is too unhealthy to serve SQL these panels go blank, and /metrics on port 1963 is the surface that still answers — scrape that for alerting. (2) Every panel here uses only metrics a node ALWAYS emits. Conditional subsystems (TLS, S3, KMS, cluster roles) emit nothing until configured, and a metric never emitted has no column in _system, so a panel referencing one fails with a query error rather than showing 'no data'. Add those panels per deployment; CONSOLE.md §7.6 has the queries.",
+  "tags": ["timelakedb", "console", "u2"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_uptime_seconds) AS uptime FROM metrics WHERE timelake_uptime_seconds IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Queries (1h)",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT COUNT(*) AS queries FROM queries WHERE time >= now() - INTERVAL '1 hour'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "p95 query latency (1h)",
+      "description": "From the per-query rows, not from histogram buckets — this is the real distribution, so it is a measurement rather than an estimate.",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 250 },
+              { "color": "red", "value": 1000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT approx_percentile_cont(duration_ms, 0.95) AS p95_ms FROM queries WHERE time >= now() - INTERVAL '1 hour'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Buffer rows",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_buffer_rows) AS buffer_rows FROM metrics WHERE timelake_buffer_rows IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Parquet files",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_parquet_files) AS files FROM metrics WHERE timelake_parquet_files IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Samples dropped",
+      "description": "Self-monitoring rows the sampler discarded because its bounded queue was full. Anything above zero means these panels have gaps — the numbers on /metrics do not.",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_selfmon_dropped_total) AS dropped FROM metrics WHERE timelake_selfmon_dropped_total IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Query — the view that pays for itself (PR-3, PR-6)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Query latency percentiles, 1-min bins",
+      "description": "p50/p95/p99 computed from actual per-query durations. Shape A's target is 250 ms (PR-3); M4 measured a 608 ms p95.",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 6 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, approx_percentile_cont(duration_ms, 0.5) AS p50, approx_percentile_cont(duration_ms, 0.95) AS p95, approx_percentile_cont(duration_ms, 0.99) AS p99 FROM queries WHERE time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Query rate by outcome, 1-min bins",
+      "description": "`refused` is the read-only guard working (P0-2), not a fault — it is charted apart from `failed` so a client probing COPY does not read as an outage.",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 6 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, outcome, COUNT(*) AS n FROM queries WHERE time >= now() - INTERVAL '3 hours' GROUP BY 1, 2 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Admission wait p95, 1-min bins",
+      "description": "Time queued on the RR-1 admission semaphore. High wait with low duration means the node is saturated, not slow — opposite remedies.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, approx_percentile_cont(wait_ms, 0.95) AS wait_p95 FROM queries WHERE time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "In-flight and queued",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_query_in_flight) AS in_flight, MAX(timelake_query_queued) AS queued FROM metrics WHERE timelake_query_in_flight IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Slowest queries (3h)",
+      "description": "`ref` matches the id in a sanitized error message (SEC-5), so a user complaint maps to the full error in the server log.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT time, db, outcome, duration_ms, rows, ref FROM queries WHERE time >= now() - INTERVAL '3 hours' ORDER BY duration_ms DESC LIMIT 20",
+          "format": "table"
+        }
+      ]
+    },
+
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Ingest",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Lines written per second, 1-min bins",
+      "description": "A counter differenced within each bin. Self-monitoring rows are deliberately excluded from this counter, so it stays comparable with Gauge's throughput numbers.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, (MAX(timelake_lines_written_total) - MIN(timelake_lines_written_total)) / 60.0 AS lines_per_sec FROM metrics WHERE timelake_lines_written_total IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Writes refused by cause, 1-min bins",
+      "description": "`backpressure` is the RR-5 WAL cap and is yours to act on; `bad_request` is the client's problem. Charting them together would hide which.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, reason, MAX(timelake_write_rejected_total) AS refused FROM metrics WHERE timelake_write_rejected_total IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1, 2 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "WAL bytes and buffer rows",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_wal_bytes) AS wal_bytes, MAX(timelake_buffer_rows) AS buffer_rows FROM metrics WHERE timelake_wal_bytes IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Flush and compaction lag",
+      "description": "Seconds since each last completed. With nothing having run yet these report the node's whole uptime, which is the honest reading — a zero would look healthy.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_flush_lag_seconds) AS flush_lag, MAX(timelake_compaction_lag_seconds) AS compaction_lag FROM metrics WHERE timelake_flush_lag_seconds IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Bytes per table, 5-min bins",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '5 minutes', time) AS time, \"table\", MAX(timelake_storage_bytes) AS bytes FROM metrics WHERE timelake_storage_bytes IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1, 2 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Files by level, 5-min bins",
+      "description": "L0 growing faster than `compacted` drains it is the compaction-lag signal (PR-6).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '5 minutes', time) AS time, level, MAX(timelake_files) AS files FROM metrics WHERE timelake_files IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1, 2 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "table",
+      "title": "Current storage by table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT \"table\", MAX(timelake_storage_bytes) AS bytes, MAX(timelake_storage_rows) AS rows FROM metrics WHERE timelake_storage_bytes IS NOT NULL AND time >= now() - INTERVAL '15 minutes' GROUP BY 1 ORDER BY 2 DESC",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "GC pending files and retention drops",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_gc_pending_files) AS gc_pending, MAX(timelake_retention_drops_total) AS retention_drops FROM metrics WHERE timelake_gc_pending_files IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Security",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "collapsed": false
+    },
+    {
+      "id": 40,
+      "type": "stat",
+      "title": "Default admin credential active",
+      "description": "SEC-4: 1 means the seeded admin/admin password has never been rotated. Alert on this.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 58 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_admin_default_credential_active) AS default_credential FROM metrics WHERE timelake_admin_default_credential_active IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "Data-plane auth mode",
+      "description": "SEC-4 phased: 0 = off (no token required), 1 = optional, 2 = required. A TLS certificate-expiry panel is NOT included by default — see the dashboard description and CONSOLE.md §7.6: a metric the node has never emitted has no column in _system, so a TLS panel errors on a plaintext node instead of showing 'no data'. Add it on TLS deployments.",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 58 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_data_auth_mode) AS auth_mode FROM metrics WHERE timelake_data_auth_mode IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "stat",
+      "title": "Audit sink healthy",
+      "description": "SR-6: 0 means admin mutations are being refused (fail-closed) until the trail can be written.",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 58 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_audit_sink_healthy) AS healthy FROM metrics WHERE timelake_audit_sink_healthy IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "type": "stat",
+      "title": "Encryption at rest",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 58 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT MAX(timelake_encryption_enabled) AS encrypted FROM metrics WHERE timelake_encryption_enabled IS NOT NULL AND time >= now() - INTERVAL '15 minutes'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Admin login failures and rate-limited queries, 1-min bins",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 62 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_admin_login_failures_total) AS login_failures, MAX(timelake_query_rate_limited_total) AS rate_limited FROM metrics WHERE timelake_admin_login_failures_total IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Rows filtered by visibility labels, 1-min bins",
+      "description": "SEC-2: rows the mandatory predicate withheld. A step change means a caller's authorizations changed, or a label did.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 62 },
+      "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "timelakedb-system" },
+          "rawSql": "SELECT date_bin(INTERVAL '1 minute', time) AS time, MAX(timelake_visibility_rows_filtered_total) AS rows_filtered FROM metrics WHERE timelake_visibility_rows_filtered_total IS NOT NULL AND time >= now() - INTERVAL '3 hours' GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

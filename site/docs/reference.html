@@ -639,8 +639,25 @@
     <section id="metrics">
       <h2>Metrics</h2>
       <p>
-        <code>GET /metrics</code> returns Prometheus exposition text. The series carry
-        <strong>no labels</strong> — one node, one value each.
+        <code>GET /metrics</code> returns Prometheus exposition text. Most series carry
+        <strong>no labels</strong> — one node, one value each. The exceptions are
+        <code>timelake_storage_bytes</code> and <code>timelake_storage_rows</code>
+        (per <code>db</code> and <code>table</code>), <code>timelake_files</code>
+        (per <code>level</code>), <code>timelake_write_rejected_total</code>
+        (per <code>reason</code>), <code>timelake_build_info</code> (per
+        <code>version</code>), and the two histograms, whose buckets carry
+        <code>le</code>.
+      </p>
+      <p>
+        The same numbers are also stored <em>inside the database</em>: a node samples
+        its own exposition into <code>_system.metrics</code> every ten seconds and
+        writes one row per query into <code>_system.queries</code>, so performance is
+        queryable in SQL and chartable in Grafana without a separate metrics stack
+        (see the <a href="https://github.com/timelakelabs/timelakedb/blob/main/docs/CONSOLE.md">console design</a>, §7.6).
+        <strong>This endpoint remains the one to scrape for alerting</strong>: it answers
+        from in-memory counters with no query path involved, so it still works when the
+        engine is too unhealthy to serve SQL — which is exactly when the stored copy
+        cannot be read.
       </p>
       <div class="table-wrap">
         <table>
@@ -699,6 +716,21 @@
             <tr><td><code>timelake_tombstone_rewrites_total</code></td><td>counter</td><td>Files rewritten or dropped by the targeted-delete GC pass (R-1). Rises after a <code>POST /admin/delete</code> and settles once the matching data has been reclaimed</td></tr>
             <tr><td><code>timelake_audit_records_total</code></td><td>counter</td><td>Audit records written. Recovered from disk at start, so it is continuous across a restart</td></tr>
             <tr><td><code>timelake_audit_sink_healthy</code></td><td>gauge</td><td>1 while the audit trail can append. <strong>0 means administrative mutations are being refused with 503</strong> (unless <code>TIMELAKE_AUDIT_FAIL_OPEN=1</code>, in which case they proceed unrecorded)</td></tr>
+            <tr><td><code>timelake_query_duration_seconds</code></td><td>histogram</td><td>End-to-end query latency, admission wait included — what the caller experienced. Buckets are dense either side of 250 ms and coarse in the tail</td></tr>
+            <tr><td><code>timelake_query_admission_wait_seconds</code></td><td>histogram</td><td>Time queued on the admission semaphore before execution. High wait with low duration means the node is saturated, not slow — the two have opposite remedies</td></tr>
+            <tr><td><code>timelake_query_in_flight</code> / <code>timelake_query_queued</code></td><td>gauge</td><td>Queries executing now, and queries waiting for admission</td></tr>
+            <tr><td><code>timelake_queries_total</code></td><td>counter</td><td>Queries finished, all outcomes</td></tr>
+            <tr><td><code>timelake_query_timeouts_total</code></td><td>counter</td><td>Queries stopped by the server-side cap (RR-2)</td></tr>
+            <tr><td><code>timelake_query_refused_total</code></td><td>counter</td><td>Statements the read-only guard refused (COPY, DDL, DML). <strong>Not an error</strong> — this is the guard working, so it is counted apart from failures</td></tr>
+            <tr><td><code>timelake_query_failed_total</code></td><td>counter</td><td>Queries that failed to plan or execute</td></tr>
+            <tr><td><code>timelake_uptime_seconds</code></td><td>gauge</td><td>Seconds since this process started</td></tr>
+            <tr><td><code>timelake_build_info{version}</code></td><td>gauge</td><td>Always 1; the running version is the label</td></tr>
+            <tr><td><code>timelake_flush_lag_seconds</code> / <code>timelake_compaction_lag_seconds</code></td><td>gauge</td><td>Seconds since each last completed. Before either has ever run these report the node's whole uptime, not 0 — a zero would read as "just ran, healthy"</td></tr>
+            <tr><td><code>timelake_gc_pending_files</code></td><td>gauge</td><td>Superseded files awaiting deletion after the GC grace window</td></tr>
+            <tr><td><code>timelake_files{level}</code></td><td>gauge</td><td>Data files by provenance: <code>flushed</code> (L0), <code>compacted</code> (L1), <code>rewritten</code> (targeted-delete GC). L0 growing faster than compaction drains it is the lag signal</td></tr>
+            <tr><td><code>timelake_storage_bytes{db,table}</code> / <code>timelake_storage_rows{db,table}</code></td><td>gauge</td><td>Catalogued Parquet bytes and rows per table. Buffered rows are not counted until they are flushed</td></tr>
+            <tr><td><code>timelake_write_rejected_total{reason}</code></td><td>counter</td><td>Writes refused, by cause: <code>backpressure</code> (the WAL cap — yours to act on), <code>bad_request</code> (the client's), <code>not_here</code> (a querier takes no writes), <code>internal</code></td></tr>
+            <tr><td><code>timelake_selfmon_written_total</code> / <code>timelake_selfmon_dropped_total</code> / <code>timelake_selfmon_pending</code></td><td>counter / counter / gauge</td><td>Self-monitoring rows stored, discarded because the bounded queue was full, and waiting for the next tick. <strong>A non-zero drop count means <code>_system</code> has gaps</strong> — these numbers do not</td></tr>
           </tbody>
         </table>
       </div>
@@ -737,6 +769,34 @@
             says it cannot answer.</li>
         <li><code>timelake_parquet_files</code> climbing without compaction — check for
             <code>maintenance stage failed</code> in the logs.</li>
+        <li><code>histogram_quantile(0.95, rate(timelake_query_duration_seconds_bucket[5m]))</code>
+            above your service target — the p95 an operator is actually asked
+            about. Pair it with the admission-wait quantile below before
+            concluding the engine got slower: the two look identical from the
+            client and need opposite responses.</li>
+        <li><code>histogram_quantile(0.95, rate(timelake_query_admission_wait_seconds_bucket[5m]))</code>
+            rising while query duration is flat — the node is saturated, not
+            slow. Queries are waiting for a slot, so raising
+            <code>TIMELAKE_MAX_CONCURRENT_QUERIES</code> or adding a querier
+            helps, and tuning the query does not.</li>
+        <li><code>rate(timelake_query_timeouts_total[5m])</code> above zero — the
+            RR-2 cap is firing. Something is asking for more than the node
+            will spend, and the caller is getting an error either way.</li>
+        <li><code>timelake_query_queued</code> persistently above zero on an
+            otherwise idle node — admission is not draining.</li>
+        <li><code>timelake_flush_lag_seconds</code> or
+            <code>timelake_compaction_lag_seconds</code> exceeding several
+            maintenance intervals — that stage has stopped running. Note that
+            before either has <em>ever</em> run these track uptime, so a brand-new
+            node reads high until its first flush; alert on sustained growth
+            rather than on a threshold at startup.</li>
+        <li><code>rate(timelake_write_rejected_total{reason="backpressure"}[5m])</code>
+            above zero — the WAL cap is shedding writes. The other
+            <code>reason</code> values are not yours to fix.</li>
+        <li><code>timelake_selfmon_dropped_total</code> increasing — the node is
+            discarding its own telemetry because the bounded queue filled, so
+            anything read from <code>_system</code> now has gaps. This endpoint
+            does not, which is the reason the counter lives here.</li>
         <li><code>timelake_admin_default_credential_active == 1</code> — the
             well-known first-run password still works; anyone who reaches the
             admin port can take the <code>admin</code> role.</li>
