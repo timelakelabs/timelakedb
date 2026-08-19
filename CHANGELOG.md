@@ -13,6 +13,43 @@ here.
 
 ## [Unreleased]
 
+### Fixed — a retention policy no longer deletes tables it was not pointed at (2026-08-19)
+
+**This is a data-loss fix.** `enforce_retention` matched a policy on table
+name and ignored `FileMeta::db`, so a window an operator set on one
+database's table quietly expired **every same-named table on the node**.
+Set `metrics` to 7 days in `poc` and `_system.metrics` — or a tenant's —
+went with it. A deletion control doing more than it was told is the one
+direction a deletion control must never fail in.
+
+- **Policies are now scoped `(db, table)`**, with `"*"` as an explicit
+  all-databases wildcard. Most specific wins: an exact-database policy
+  overrides a wildcard for the same table, so one database can be carved
+  out of a broad rule instead of forcing a choice between all and nothing.
+- **Existing stored policies migrate to the wildcard**, which preserves
+  their behaviour *exactly*. That is the only safe reading: they really
+  did apply everywhere, and narrowing them on upgrade would silently stop
+  expiring data an operator had asked to have deleted. The migration logs
+  a warning naming what happened. `retention.json` gains a version field;
+  a v1 document still loads.
+- **`db` is required** on `PUT /admin/retention`, and `DELETE` takes
+  `/admin/retention/{db}/{table}`. Omitting the scope used to be the only
+  option and silently meant "everywhere"; defaulting it now would keep
+  that footgun loaded for every policy written from here on.
+- **The audit target names the scope** (`poc.pipeline_events`), so the
+  trail distinguishes expiring one database's table from expiring that
+  table everywhere.
+- **Widening a policy to `"*"` counts as destructive** and needs `admin`,
+  even when the window is unchanged — for the databases it newly covers,
+  introducing a window is exactly what it is.
+- The console lists the database per policy, marks wildcards in red, and
+  confirms before applying one. `TIMELAKE_RETENTION` accepts
+  `db.table=90d` as well as the existing `table=90d`, which still means
+  every database.
+- This also unblocks bounding `_system` (`docs/CONSOLE.md` §7.6): setting
+  retention there was previously unsafe because the policy would have
+  reached user tables of the same name.
+
 ### Added — the database can answer how fast it is (U2, 2026-08-18)
 
 Drill: `docs/evidence/u2-console-drill.log` (37/37, every dashboard panel

@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-fn engine_cfg(retention: Vec<(String, u64)>) -> timelake_server::EngineConfig {
+fn engine_cfg(retention: Vec<timelake_server::RetentionPolicy>) -> timelake_server::EngineConfig {
     timelake_server::EngineConfig {
         query_mem_bytes: 256 * 1024 * 1024,
         flush_rows: 1_000_000, // no auto-trigger; tests flush explicitly
@@ -370,7 +370,11 @@ async fn retention_drops_expired_partitions_fr7() {
     let day = 86_400_000_000_000i64;
     let eng = timelake_server::Engine::open(
         dir.path(),
-        engine_cfg(vec![("short_lived".into(), 86_400)]), // keep 1 day
+        engine_cfg(vec![timelake_server::RetentionPolicy {
+            db: "poc".into(),
+            table: "short_lived".into(),
+            seconds: 86_400, // keep 1 day
+        }]),
     )
     .unwrap();
     let app = timelake_server::app(eng.clone());
@@ -970,7 +974,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
         &app,
         "PUT",
         "/admin/retention",
-        Some(serde_json::json!({"table": "gui_ret", "duration": "soon"})),
+        Some(serde_json::json!({"db": "poc", "table": "gui_ret", "duration": "soon"})),
         &session,
     )
     .await;
@@ -981,7 +985,7 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
         &app,
         "PUT",
         "/admin/retention",
-        Some(serde_json::json!({"table": "gui_ret", "duration": "1d"})),
+        Some(serde_json::json!({"db": "poc", "table": "gui_ret", "duration": "1d"})),
         &session,
     )
     .await;
@@ -1008,9 +1012,19 @@ async fn retention_is_manageable_at_runtime_and_persists_fr7() {
     let (_, v) = admin_json(&app, "GET", "/admin/retention", None, &session).await;
     assert_eq!(v["policies"][0]["table"], "gui_ret");
     assert_eq!(v["policies"][0]["seconds"], 86_400);
+    assert_eq!(v["policies"][0]["db"], "poc", "the scope round-trips");
+    assert_eq!(v["policies"][0]["all_databases"], false);
 
-    // remove it; the removal persists too
-    let (code, _) = admin_json(&app, "DELETE", "/admin/retention/gui_ret", None, &session).await;
+    // remove it; the removal persists too. Both segments are required —
+    // a policy is identified by (db, table).
+    let (code, _) = admin_json(
+        &app,
+        "DELETE",
+        "/admin/retention/poc/gui_ret",
+        None,
+        &session,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     drop(app);
     drop(eng);
@@ -1036,9 +1050,9 @@ async fn admin_surface_requires_auth_and_forces_the_first_password_change_sec4()
         (
             "PUT",
             "/admin/retention",
-            Some(serde_json::json!({"table":"t","duration":"1s"})),
+            Some(serde_json::json!({"db":"poc","table":"t","duration":"1s"})),
         ),
-        ("DELETE", "/admin/retention/t", None),
+        ("DELETE", "/admin/retention/poc/t", None),
     ] {
         let (code, v) = admin_json(&app, method, path, body, &anon).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED, "{method} {path} -> {v}");
@@ -1304,4 +1318,152 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// **The hazard this scoping exists to remove.**
+///
+/// Before 2026-08-19 `enforce_retention` matched on table name and ignored
+/// `FileMeta::db`, so a policy an operator set on one database's table
+/// deleted every same-named table on the node. This test writes the same
+/// table name into two databases, scopes a policy to one of them, and
+/// requires the other to survive untouched. Run against the old matcher it
+/// fails: `other.events` loses its old partition too.
+#[tokio::test]
+async fn a_policy_scoped_to_one_database_does_not_touch_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let day = 86_400_000_000_000i64;
+    let eng = engine(dir.path());
+    let app = timelake_server::app(eng.clone());
+
+    // Same table name, two databases, both with an old row and a new one.
+    for db in ["poc", "other"] {
+        let lp = format!(
+            "events,k=a v=1i {old}\nevents,k=b v=2i {new}",
+            old = t - 3 * day,
+            new = t - 1000,
+        );
+        write_lp(
+            &app,
+            &format!("/api/v3/write_lp?db={db}"),
+            lp.into_bytes(),
+            false,
+        )
+        .await;
+    }
+    eng.flush_all().unwrap();
+
+    eng.set_retention("poc", "events", 86_400).unwrap(); // keep 1 day, poc only
+    assert!(eng.enforce_retention().unwrap() >= 1);
+
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM events").await;
+    assert_eq!(rows[0]["n"], 1, "poc.events expired as instructed");
+    let (_, rows) = sql(&app, "other", "SELECT COUNT(*) AS n FROM events").await;
+    assert_eq!(
+        rows[0]["n"], 2,
+        "other.events was NEVER named in a policy and must be untouched"
+    );
+}
+
+/// The wildcard still reaches everywhere — deliberately, because that is
+/// what every pre-2026-08-19 policy meant and migrating them to anything
+/// narrower would silently stop deleting data an operator asked to expire.
+#[tokio::test]
+async fn the_wildcard_scope_still_covers_every_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let day = 86_400_000_000_000i64;
+    let eng = engine(dir.path());
+    let app = timelake_server::app(eng.clone());
+
+    for db in ["poc", "other"] {
+        let lp = format!(
+            "events,k=a v=1i {old}\nevents,k=b v=2i {new}",
+            old = t - 3 * day,
+            new = t - 1000,
+        );
+        write_lp(
+            &app,
+            &format!("/api/v3/write_lp?db={db}"),
+            lp.into_bytes(),
+            false,
+        )
+        .await;
+    }
+    eng.flush_all().unwrap();
+
+    eng.set_retention(timelake_server::RETENTION_ANY_DB, "events", 86_400)
+        .unwrap();
+    assert!(eng.enforce_retention().unwrap() >= 2);
+
+    for db in ["poc", "other"] {
+        let (_, rows) = sql(&app, db, "SELECT COUNT(*) AS n FROM events").await;
+        assert_eq!(rows[0]["n"], 1, "{db}.events expired under the wildcard");
+    }
+}
+
+/// An exact-database policy beats a wildcard for the same table, so an
+/// operator can carve one database out of a broad rule instead of having
+/// to choose between all and nothing.
+#[tokio::test]
+async fn an_exact_database_policy_overrides_a_wildcard() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let day = 86_400_000_000_000i64;
+    let eng = engine(dir.path());
+    let app = timelake_server::app(eng.clone());
+
+    for db in ["poc", "keepme"] {
+        let lp = format!(
+            "events,k=a v=1i {old}\nevents,k=b v=2i {new}",
+            old = t - 3 * day,
+            new = t - 1000,
+        );
+        write_lp(
+            &app,
+            &format!("/api/v3/write_lp?db={db}"),
+            lp.into_bytes(),
+            false,
+        )
+        .await;
+    }
+    eng.flush_all().unwrap();
+
+    // Expire everywhere after a day, EXCEPT keepme, which keeps a year.
+    eng.set_retention(timelake_server::RETENTION_ANY_DB, "events", 86_400)
+        .unwrap();
+    eng.set_retention("keepme", "events", 365 * 86_400).unwrap();
+    eng.enforce_retention().unwrap();
+
+    let (_, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM events").await;
+    assert_eq!(rows[0]["n"], 1, "poc follows the wildcard");
+    let (_, rows) = sql(&app, "keepme", "SELECT COUNT(*) AS n FROM events").await;
+    assert_eq!(
+        rows[0]["n"], 2,
+        "keepme's own policy wins over the wildcard"
+    );
+}
+
+/// A v1 config (a bare table→seconds map, no database anywhere) must load
+/// and keep doing exactly what it did: apply to every database. Migrating
+/// it to one database would silently stop expiring data elsewhere.
+#[tokio::test]
+async fn a_legacy_retention_config_migrates_to_the_wildcard() {
+    let dir = tempfile::tempdir().unwrap();
+    // Write the v1 document directly, as an older node would have left it.
+    let cfg_dir = dir.path().join("objects").join("catalog").join("config");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("retention.json"), br#"{"events":86400}"#).unwrap();
+
+    let eng = engine(dir.path());
+    let policies = eng.retention_policies();
+    assert_eq!(policies.len(), 1, "the legacy policy loaded");
+    assert_eq!(policies[0].table, "events");
+    assert_eq!(policies[0].seconds, 86_400);
+    assert_eq!(
+        policies[0].db,
+        timelake_server::RETENTION_ANY_DB,
+        "a v1 policy meant every database, and must keep meaning that"
+    );
+    assert!(policies[0].is_wildcard());
 }

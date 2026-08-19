@@ -4607,6 +4607,7 @@ dependencies = [
  "flate2",
  "http-body-util",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "timelake-api",

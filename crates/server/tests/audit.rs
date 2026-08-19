@@ -139,7 +139,7 @@ async fn admin_mutations_are_audited_and_the_chain_verifies() {
             &app,
             "PUT",
             "/admin/retention",
-            Some(serde_json::json!({"table": "pipeline_events", "duration": dur})),
+            Some(serde_json::json!({"db": "poc", "table": "pipeline_events", "duration": dur})),
             &session,
         )
         .await;
@@ -165,7 +165,11 @@ async fn admin_mutations_are_audited_and_the_chain_verifies() {
         assert_eq!(r["principal"], "admin");
         assert_eq!(r["role"], "admin");
         assert_eq!(r["action"], "retention.set");
-        assert_eq!(r["target"], "pipeline_events");
+        // The target names the SCOPE, not just the table. A trail that
+        // recorded only "pipeline_events" could not distinguish expiring
+        // one database's table from expiring that table everywhere — and
+        // those are very different acts to have to account for later.
+        assert_eq!(r["target"], "poc.pipeline_events");
         assert_eq!(r["outcome"], "ok");
         assert!(r["hash"].as_str().unwrap().starts_with("sha256:"));
     }

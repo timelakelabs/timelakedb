@@ -661,15 +661,25 @@ Absent is the truthful encoding; the cost is paid here instead.
    is the only surface. In a cluster that is where the queries run, so
    shipping querier samples to an ingester is real work — it belongs
    with the C2 role split, not with metrics.
-3. **`_system` has no retention by default, deliberately.**
-   `enforce_retention` matches on **table name alone, ignoring the
-   database** (`crates/server/src/lib.rs`, `enforce_retention`). Seeding a
-   policy for `_system`'s `metrics`/`queries` tables would therefore drop
-   any user table of the same name in any database — a data-loss hazard,
-   not a tidy default. Set retention explicitly if the table names are
-   unused in your deployment; the real fix is to make retention
-   database-scoped, which changes the stored `retention.json` format and
-   the admin API, and is its own piece of work.
+3. **`_system` has no retention by default — but it is now safe to set
+   one.** ~~`enforce_retention` matches on table name alone, ignoring the
+   database~~ — **fixed 2026-08-19**. Policies are scoped `(db, table)`,
+   so a window on `_system.metrics` no longer touches a user table that
+   happens to share the name. Until that fix, seeding one here would have
+   been a data-loss hazard rather than a tidy default, which is why this
+   shipped unbounded.
+
+   Nothing is created for you, because a deletion policy should be an
+   operator's decision and not a side effect of enabling telemetry. Two
+   calls bound it:
+
+   ```
+   PUT /admin/retention {"db": "_system", "table": "metrics", "duration": "7d"}
+   PUT /admin/retention {"db": "_system", "table": "queries", "duration": "30d"}
+   ```
+
+   At a 10-second sample interval `_system.metrics` is the one that grows
+   steadily; `_system.queries` grows with query volume.
 
 `TIMELAKE_SELFMON=off` disables the whole thing;
 `TIMELAKE_SELFMON_QUEUE` sets the queue bound (default 4096).

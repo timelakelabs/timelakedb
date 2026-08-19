@@ -482,6 +482,19 @@ This project is inspired by the following projects.
   _logins_total, _login_failures_total. **Data plane deliberately still
   open** so Telegraf/Grafana/bench work — that migration is its own
   milestone. Tests: 6 auth unit + 19 server integration.
+- **Retention is scoped by DATABASE as of 2026-08-19 — this was a data-loss
+  bug.** `enforce_retention` matched on table name and ignored
+  `FileMeta::db`, so a window set on one database's table expired every
+  same-named table on the node (setting `metrics` in `poc` would have taken
+  `_system.metrics` with it — which is why U2 self-monitoring shipped with
+  no retention at all). Policies are now `(db, table)` with an explicit
+  `"*"` wildcard; most specific wins. Stored v1 configs migrate to the
+  wildcard, which preserves their behaviour EXACTLY — narrowing them on
+  upgrade would silently stop expiring data an operator asked to delete.
+  `db` is now REQUIRED on `PUT /admin/retention`; `DELETE` takes
+  `/{db}/{table}`; the audit target names the scope; widening to `"*"`
+  counts as destructive. Bounding `_system` is now safe (`docs/CONSOLE.md`
+  §7.6 has the two calls) but is deliberately not done for you.
 - Previous: **Retention GUI SHIPPED** (2026-08-09): FR-7 is runtime-managed —
   `GET/PUT /admin/retention`, `DELETE /admin/retention/{table}`, GUI at
   `/admin/ui` (self-contained HTML in `crates/api/src/admin_ui.html`,

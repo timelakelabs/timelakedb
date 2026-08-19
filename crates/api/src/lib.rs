@@ -22,6 +22,45 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use timelake_auth::{Action, Auth, Decision, Role, Scope, SessionInfo, TokenError};
 
+/// The database wildcard in a retention policy: this table, in *every*
+/// database.
+///
+/// It exists because until 2026-08-19 it was the only behaviour there was
+/// — and it was implicit. `enforce_retention` matched on table name alone
+/// and ignored `FileMeta::db`, so a policy an operator set on `metrics`
+/// silently deleted `metrics` in every database on the node. That is a
+/// deletion control doing more than it was told to, which is the one
+/// direction a deletion control must never fail in.
+///
+/// The wildcard is kept, rather than removed, because existing stored
+/// policies mean exactly this and migrating them to anything narrower
+/// would silently stop deleting data an operator asked to have deleted.
+/// What changed is that it is now **explicit and visible**: a policy says
+/// which databases it covers, and a new one has to say so deliberately.
+pub const RETENTION_ANY_DB: &str = "*";
+
+/// One FR-7 retention policy: keep `db`.`table` for `seconds`, then drop
+/// whole expired partitions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetentionPolicy {
+    /// The database this applies to, or [`RETENTION_ANY_DB`] for all.
+    pub db: String,
+    pub table: String,
+    pub seconds: u64,
+}
+
+impl RetentionPolicy {
+    /// Does this policy govern `db`.`table`?
+    pub fn covers(&self, db: &str, table: &str) -> bool {
+        self.table == table && (self.db == RETENTION_ANY_DB || self.db == db)
+    }
+
+    /// True when this policy reaches into every database.
+    pub fn is_wildcard(&self) -> bool {
+        self.db == RETENTION_ANY_DB
+    }
+}
+
 /// Errors the write path can surface over the wire.
 pub enum WriteError {
     /// 400 — the request is at fault (parse error, type conflict, bad
@@ -93,14 +132,14 @@ pub trait Engine: Send + Sync + 'static {
     /// Prometheus exposition text (SR-4).
     fn metrics_text(&self) -> String;
 
-    /// Current per-table retention policies (FR-7), table → seconds.
-    fn retention_policies(&self) -> Vec<(String, u64)>;
+    /// Current retention policies (FR-7).
+    fn retention_policies(&self) -> Vec<RetentionPolicy>;
 
-    /// Set (upsert) one table's retention window, durably.
-    fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String>;
+    /// Set (upsert) one policy, durably. `db` may be [`RETENTION_ANY_DB`].
+    fn set_retention(&self, db: &str, table: &str, seconds: u64) -> Result<(), String>;
 
-    /// Remove one table's policy (the table keeps everything again).
-    fn remove_retention(&self, table: &str) -> Result<(), String>;
+    /// Remove one policy (that table keeps everything again).
+    fn remove_retention(&self, db: &str, table: &str) -> Result<(), String>;
 
     /// R-1 targeted delete: record a durable tombstone that hides every row
     /// matching (all `tag_equals` AND the `[min_ts_ns, max_ts_ns]` window)
@@ -221,7 +260,7 @@ pub fn app<E: Engine>(
             get(retention_list::<E>).put(retention_set::<E>),
         )
         .route(
-            "/admin/retention/{table}",
+            "/admin/retention/{db}/{table}",
             axum::routing::delete(retention_delete::<E>),
         )
         .route("/admin/delete", post(admin_delete::<E>))
@@ -578,15 +617,26 @@ async fn retention_list<E: Engine>(
     let mut policies: Vec<Value> = engine
         .retention_policies()
         .into_iter()
-        .map(|(table, seconds)| {
+        .map(|p| {
             json!({
-                "table": table,
-                "seconds": seconds,
-                "duration": humanize_secs(seconds),
+                "db": p.db,
+                "table": p.table,
+                "seconds": p.seconds,
+                "duration": humanize_secs(p.seconds),
+                // Surfaced explicitly so an operator reading this list can
+                // see which policies reach beyond one database. This was
+                // the whole content of the hazard: every policy behaved
+                // this way and nothing said so.
+                "all_databases": p.is_wildcard(),
             })
         })
         .collect();
-    policies.sort_by_key(|p| p["table"].as_str().unwrap_or("").to_string());
+    policies.sort_by_key(|p| {
+        (
+            p["table"].as_str().unwrap_or("").to_string(),
+            p["db"].as_str().unwrap_or("").to_string(),
+        )
+    });
     Json(json!({
         "policies": policies,
         "role": session.role.as_str(),
@@ -596,6 +646,14 @@ async fn retention_list<E: Engine>(
 
 #[derive(Deserialize)]
 struct RetentionSet {
+    /// Which database this governs, or `"*"` for every one of them.
+    ///
+    /// **Required, deliberately.** Omitting it used to be the only option
+    /// and meant "all databases" silently; defaulting it to the wildcard
+    /// now would keep that footgun loaded for every policy written from
+    /// here on. An operator has to say which data they are scheduling for
+    /// deletion, and `"*"` remains available for when they mean it.
+    db: Option<String>,
     table: String,
     /// "365d", "72h", "90m", or seconds.
     duration: String,
@@ -620,6 +678,14 @@ async fn retention_set<E: Engine>(
     if table.is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "table must not be empty");
     }
+    let Some(db) = set.db.as_deref().map(str::trim).filter(|d| !d.is_empty()) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "db is required: name the database this policy governs, or \"*\" for every \
+             database. It was previously implicit and always meant \"*\", which deleted \
+             same-named tables in databases the operator had not named",
+        );
+    };
     let Some(seconds) = parse_duration_secs(&set.duration) else {
         return err_response(
             StatusCode::BAD_REQUEST,
@@ -637,12 +703,23 @@ async fn retention_set<E: Engine>(
         .engine
         .retention_policies()
         .into_iter()
-        .find(|(t, _)| t == table)
-        .map(|(_, s)| s);
+        .find(|p| p.db == db && p.table == table)
+        .map(|p| p.seconds);
+    // Widening the SCOPE is destructive too, even when the window is
+    // unchanged: switching a policy to "*" starts expiring data in
+    // databases that were never covered. Treated as introducing a policy,
+    // because for those databases that is exactly what it is.
+    let widening_scope = db == RETENTION_ANY_DB
+        && current.is_none()
+        && state
+            .engine
+            .retention_policies()
+            .iter()
+            .any(|p| p.table == table && !p.is_wildcard());
     let destructive = match current {
         Some(existing) => seconds < existing,
         None => true, // unbounded -> bounded: data starts expiring
-    };
+    } || widening_scope;
     let needed = if destructive {
         Role::Admin
     } else {
@@ -655,15 +732,22 @@ async fn retention_set<E: Engine>(
         return resp;
     }
 
+    // The audit target names the SCOPE, not just the table, so the trail
+    // distinguishes "expire poc.metrics" from "expire metrics everywhere".
+    let target = format!("{db}.{table}");
     let before = current.map(|s| json!({"seconds": s, "duration": humanize_secs(s)}));
-    let after = json!({"seconds": seconds, "duration": humanize_secs(seconds)});
-    match state.engine.set_retention(table, seconds) {
+    let after = json!({
+        "db": db,
+        "seconds": seconds,
+        "duration": humanize_secs(seconds),
+    });
+    match state.engine.set_retention(db, table, seconds) {
         Ok(()) => {
             let ev = audit_event(
                 &session,
                 source,
                 "retention.set",
-                Some(table.to_string()),
+                Some(target),
                 before,
                 Some(after),
                 "ok",
@@ -672,11 +756,13 @@ async fn retention_set<E: Engine>(
                 return resp;
             }
             Json(json!({
+                "db": db,
                 "table": table,
                 "seconds": seconds,
                 "duration": humanize_secs(seconds),
                 "status": "set",
                 "destructive": destructive,
+                "all_databases": db == RETENTION_ANY_DB,
             }))
             .into_response()
         }
@@ -685,7 +771,7 @@ async fn retention_set<E: Engine>(
                 &session,
                 source,
                 "retention.set",
-                Some(table.to_string()),
+                Some(target),
                 before,
                 None,
                 "error",
@@ -698,7 +784,11 @@ async fn retention_set<E: Engine>(
 
 async fn retention_delete<E: Engine>(
     State(state): State<AdminState<E>>,
-    axum::extract::Path(table): axum::extract::Path<String>,
+    // Two segments: a policy is identified by (db, table), so removing one
+    // has to name both. `*` is a legal database here and means the
+    // all-databases policy — deleting `poc/metrics` must not silently
+    // remove the wildcard that is still expiring every other database.
+    axum::extract::Path((db, table)): axum::extract::Path<(String, String)>,
     req: axum::extract::Request,
 ) -> axum::response::Response {
     // Removing a policy makes the table grow without bound — governing
@@ -711,19 +801,20 @@ async fn retention_delete<E: Engine>(
     if let Some(resp) = audit_gate(&state.audit) {
         return resp;
     }
+    let target = format!("{db}.{table}");
     let before = state
         .engine
         .retention_policies()
         .into_iter()
-        .find(|(t, _)| *t == table)
-        .map(|(_, s)| json!({"seconds": s, "duration": humanize_secs(s)}));
-    match state.engine.remove_retention(&table) {
+        .find(|p| p.db == db && p.table == table)
+        .map(|p| json!({"db": p.db, "seconds": p.seconds, "duration": humanize_secs(p.seconds)}));
+    match state.engine.remove_retention(&db, &table) {
         Ok(()) => {
             let ev = audit_event(
                 &session,
                 source,
                 "retention.remove",
-                Some(table.clone()),
+                Some(target),
                 before,
                 None,
                 "ok",
@@ -731,14 +822,14 @@ async fn retention_delete<E: Engine>(
             if let Some(resp) = audit_record(&state.audit, ev) {
                 return resp;
             }
-            Json(json!({ "table": table, "status": "removed" })).into_response()
+            Json(json!({ "db": db, "table": table, "status": "removed" })).into_response()
         }
         Err(e) => {
             let ev = audit_event(
                 &session,
                 source,
                 "retention.remove",
-                Some(table.clone()),
+                Some(target),
                 before,
                 None,
                 "error",
