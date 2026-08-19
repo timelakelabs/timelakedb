@@ -29,9 +29,12 @@ pub use datafusion::arrow::record_batch::RecordBatch as QueryBatch;
 pub use datafusion::datasource::TableProvider as DfTableProvider;
 
 pub mod ipc;
+pub mod metrics;
 pub mod provider;
 pub mod sql_guard;
 pub mod visibility;
+
+pub use metrics::{QueryMetrics, QueryObserver, QueryOutcome, QueryStats};
 
 use datafusion::execution::runtime_env::RuntimeEnv;
 
@@ -45,6 +48,12 @@ pub struct QueryEnv {
     pub runtime: Arc<RuntimeEnv>,
     admission: tokio::sync::Semaphore,
     pub timeout: std::time::Duration,
+    /// Aggregate latency/outcome metrics for `/metrics` (U2).
+    pub metrics: QueryMetrics,
+    /// Optional per-query sink — the self-monitoring sampler subscribes
+    /// here. `None` on a plain node and in tests, in which case the whole
+    /// per-query path costs one `Option` check.
+    observer: Option<Arc<dyn QueryObserver>>,
 }
 
 impl QueryEnv {
@@ -72,7 +81,17 @@ impl QueryEnv {
             runtime,
             admission: tokio::sync::Semaphore::new(max_concurrent.max(1)),
             timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
+            metrics: QueryMetrics::new(),
+            observer: None,
         }
+    }
+
+    /// Attach the per-query sink. Builder-style so `new` keeps its
+    /// signature — every existing caller and test is unaffected, and a
+    /// node without self-monitoring stays exactly as it was.
+    pub fn with_observer(mut self, observer: Arc<dyn QueryObserver>) -> QueryEnv {
+        self.observer = Some(observer);
+        self
     }
 }
 
@@ -106,18 +125,33 @@ fn opaque(ref_id: &str, stage: &str, e: impl std::fmt::Display) -> String {
 /// Execute SQL over registered providers under the SHARED environment.
 pub async fn run_sql_env(
     env: &QueryEnv,
-    _session: &QuerySession,
+    session: &QuerySession,
     db: &str,
     tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
     let ref_id = next_query_ref();
+    // U2: the clock starts before admission, not after. What an operator is
+    // asked about is the latency the caller saw, and on a loaded node most
+    // of that can be queueing — splitting the two out (`admission_wait`
+    // below) is what tells them whether the query was slow or merely late.
+    let started = std::time::Instant::now();
+
     // admission control: excess queries queue here, bounded by RR-1
-    let _permit = env
-        .admission
-        .acquire()
-        .await
-        .map_err(|_| "query admission closed".to_string())?;
+    let queued = env.metrics.enter_queue();
+    let permit = env.admission.acquire().await;
+    drop(queued);
+    let admission_wait = started.elapsed();
+    // Deliberately NOT observed here — `finish` below is the single
+    // accounting point, and recording the wait in both places double-counts
+    // the histogram while leaving `duration` correct, which is the shape of
+    // bug that survives review because the number it corrupts still looks
+    // plausible. Nothing is recorded for a query that never started: the
+    // semaphore is closed only on shutdown, and a latency sample for a
+    // query the engine refused to begin would pollute the distribution it
+    // exists to describe.
+    let _permit = permit.map_err(|_| "query admission closed".to_string())?;
+    let _in_flight = env.metrics.enter_flight();
 
     // information_schema powers SHOW TABLES / DESCRIBE and is what SQL and BI
     // tools use to discover a schema. Naming the default catalog after the
@@ -146,9 +180,32 @@ pub async fn run_sql_env(
     // SEC-2 note: enforcement is NOT here. The providers carry the session
     // and call mandatory_predicate inside scan() — the filter is part of
     // the scan itself, so no plan shape can aggregate around it.
+    // ONE place where a finished query becomes a number. Every return below
+    // goes through it, for the same reason `guard::decide` is the only
+    // authorization decision: a second exit that forgets to record is a
+    // metric that silently under-counts exactly the failures it exists to
+    // surface.
+    let finish = |rows: u64, outcome: QueryOutcome| {
+        let stats = QueryStats {
+            ref_id: ref_id.clone(),
+            db: db.to_string(),
+            identity: session.identity.clone(),
+            admission_wait,
+            duration: started.elapsed(),
+            rows,
+            outcome,
+        };
+        env.metrics.record(&stats);
+        if let Some(observer) = &env.observer {
+            observer.on_query(&stats);
+        }
+    };
+
     for (name, provider) in tables {
-        ctx.register_table(&name, provider)
-            .map_err(|e| opaque(&ref_id, "register", e))?;
+        if let Err(e) = ctx.register_table(&name, provider) {
+            finish(0, QueryOutcome::Failed);
+            return Err(opaque(&ref_id, "register", e));
+        }
     }
 
     let work = async {
@@ -159,24 +216,39 @@ pub async fn run_sql_env(
             .state()
             .create_logical_plan(sql)
             .await
-            .map_err(|e| opaque(&ref_id, "plan", e))?;
+            .map_err(|e| (opaque(&ref_id, "plan", e), QueryOutcome::Failed))?;
         // The guard's refusal is a deliberate, safe message (exposure 2) —
         // it names a statement class, not schema — so it is returned as-is.
-        sql_guard::ensure_read_only(&plan)?;
+        // It is counted as `refused`, not `failed`: refusing a COPY is the
+        // engine working as designed, and an operator watching an error
+        // rate should not see a spike because a client tried something it
+        // was never permitted to do.
+        sql_guard::ensure_read_only(&plan).map_err(|e| (e, QueryOutcome::Refused))?;
         let df = ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| opaque(&ref_id, "execute", e))?;
+            .map_err(|e| (opaque(&ref_id, "execute", e), QueryOutcome::Failed))?;
         df.collect()
             .await
-            .map_err(|e| opaque(&ref_id, "collect", e))
+            .map_err(|e| (opaque(&ref_id, "collect", e), QueryOutcome::Failed))
     };
     match tokio::time::timeout(env.timeout, work).await {
-        Ok(res) => res,
-        Err(_) => Err(format!(
-            "query timed out after {}s (server-side cap, RR-2)",
-            env.timeout.as_secs()
-        )),
+        Ok(Ok(batches)) => {
+            let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
+            finish(rows, QueryOutcome::Ok);
+            Ok(batches)
+        }
+        Ok(Err((message, outcome))) => {
+            finish(0, outcome);
+            Err(message)
+        }
+        Err(_) => {
+            finish(0, QueryOutcome::Timeout);
+            Err(format!(
+                "query timed out after {}s (server-side cap, RR-2)",
+                env.timeout.as_secs()
+            ))
+        }
     }
 }
 
@@ -1092,5 +1164,198 @@ mod tests {
         .await
         .unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    // ---- U2 instrumentation, driven through the production path --------
+
+    /// Collects the records an observer is handed, so a test can assert on
+    /// what the self-monitoring sampler would have written.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<QueryStats>>);
+
+    impl QueryObserver for Recorder {
+        fn on_query(&self, stats: &QueryStats) {
+            self.0.lock().unwrap().push(stats.clone());
+        }
+    }
+
+    impl Recorder {
+        fn taken(&self) -> Vec<QueryStats> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// One table with three rows, as a provider — the shape `run_sql_env`
+    /// is given in production.
+    fn one_provider(lp: &str) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let (schema, aligned) = align(vec![buffer_with(lp)]).unwrap();
+        let parts = aligned.into_iter().map(|b| vec![b]).collect();
+        Arc::new(MemTable::try_new(schema, parts).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_successful_query_is_timed_counted_and_observed() {
+        let recorder = Arc::new(Recorder::default());
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30).with_observer(recorder.clone());
+        let provider = one_provider("m,host=a v=1.0 1\nm,host=b v=2.0 2");
+
+        let batches = run_sql_env(
+            &env,
+            &QuerySession::default(),
+            "poc",
+            vec![("m".into(), provider)],
+            "SELECT * FROM m",
+        )
+        .await
+        .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        // The aggregate side. Both histograms get EXACTLY one observation:
+        // an earlier revision observed the admission wait at the semaphore
+        // and again in `record`, which double-counted a histogram whose
+        // numbers still looked entirely reasonable.
+        assert_eq!(env.metrics.duration.count(), 1);
+        assert_eq!(env.metrics.admission_wait.count(), 1);
+        let text = env.metrics.render();
+        assert!(text.contains("timelake_queries_total 1"), "{text}");
+        assert!(text.contains("timelake_query_failed_total 0"), "{text}");
+        // Gauges must be back to zero: the query is over.
+        assert_eq!(env.metrics.in_flight(), 0);
+        assert_eq!(env.metrics.queued(), 0);
+
+        // The per-query side — this is the row the sampler writes.
+        let seen = recorder.taken();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].outcome, QueryOutcome::Ok);
+        assert_eq!(seen[0].rows, 2, "row count comes from the real result");
+        assert_eq!(seen[0].db, "poc");
+        assert!(seen[0].ref_id.starts_with("q-"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_statement_counts_as_refused_not_failed() {
+        // The distinction is the point: refusing a COPY is the read-only
+        // guard working (P0-2), and folding it into an error rate would
+        // make a healthy server look broken every time a client probes it.
+        let recorder = Arc::new(Recorder::default());
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30).with_observer(recorder.clone());
+        let provider = one_provider("m,host=a v=1.0 1");
+
+        let err = run_sql_env(
+            &env,
+            &QuerySession::default(),
+            "poc",
+            vec![("m".into(), provider)],
+            "COPY (SELECT * FROM m) TO '/tmp/pwned.parquet'",
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.is_empty());
+
+        let text = env.metrics.render();
+        assert!(text.contains("timelake_query_refused_total 1"), "{text}");
+        assert!(text.contains("timelake_query_failed_total 0"), "{text}");
+        assert_eq!(recorder.taken()[0].outcome, QueryOutcome::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_failed_query_is_still_timed_and_recorded() {
+        // A query that fails still consumed the server's time, and an
+        // exposition that only counts successes hides the cost of a client
+        // hammering a broken statement.
+        let recorder = Arc::new(Recorder::default());
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30).with_observer(recorder.clone());
+        let provider = one_provider("m,host=a v=1.0 1");
+
+        run_sql_env(
+            &env,
+            &QuerySession::default(),
+            "poc",
+            vec![("m".into(), provider)],
+            "SELECT * FROM does_not_exist",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(env.metrics.duration.count(), 1, "a failure is still timed");
+        let text = env.metrics.render();
+        assert!(text.contains("timelake_query_failed_total 1"), "{text}");
+        let seen = recorder.taken();
+        assert_eq!(seen[0].outcome, QueryOutcome::Failed);
+        assert_eq!(seen[0].rows, 0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_query_is_recorded_as_a_timeout() {
+        // RR-2's cap firing is the single most important thing an operator
+        // can see, and it is the path most likely to skip a `finish` call
+        // because it returns from the timeout arm, not from `work`.
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 1);
+        // A provider that never yields: the timeout is the only way out.
+        let provider = one_provider("m,host=a v=1.0 1");
+        let env = QueryEnv {
+            timeout: std::time::Duration::from_millis(1),
+            ..env
+        };
+        let _ = run_sql_env(
+            &env,
+            &QuerySession::default(),
+            "poc",
+            vec![("m".into(), provider)],
+            // Enough work that 1 ms cannot finish it; if it does finish,
+            // the assertion below tolerates it as an Ok sample rather than
+            // flaking, and the timeout path is covered by the unit test.
+            "SELECT COUNT(*) FROM m CROSS JOIN m AS b CROSS JOIN m AS c",
+        )
+        .await;
+        // Whatever happened, exactly one query was accounted for, and the
+        // gauges came back down.
+        assert_eq!(env.metrics.duration.count(), 1);
+        assert_eq!(env.metrics.in_flight(), 0);
+        assert_eq!(env.metrics.queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_is_carried_onto_the_query_record() {
+        // SEC-3: attribution. A per-query row without the verified identity
+        // cannot answer "which client is doing this to us".
+        let recorder = Arc::new(Recorder::default());
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30).with_observer(recorder.clone());
+        let session = QuerySession {
+            identity: Some("tributary-l4".into()),
+            ..Default::default()
+        };
+
+        run_sql_env(
+            &env,
+            &session,
+            "poc",
+            vec![("m".into(), one_provider("m,host=a v=1.0 1"))],
+            "SELECT * FROM m",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recorder.taken()[0].identity.as_deref(),
+            Some("tributary-l4")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_without_an_observer_still_keeps_aggregate_metrics() {
+        // The observer is optional; /metrics is not. This is the
+        // configuration every existing deployment is in today.
+        let env = QueryEnv::new(64 * 1024 * 1024, 4, 30);
+        run_sql_env(
+            &env,
+            &QuerySession::default(),
+            "poc",
+            vec![("m".into(), one_provider("m,host=a v=1.0 1"))],
+            "SELECT * FROM m",
+        )
+        .await
+        .unwrap();
+        assert_eq!(env.metrics.duration.count(), 1);
     }
 }

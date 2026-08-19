@@ -164,7 +164,37 @@ This project is inspired by the following projects.
   RPO, measured) and **T-1** (Tributary `/metrics` + `/healthz`, 2026-08-18)
   have all shipped, which **closes the v0.2-pilot gate**. What is left is
   the Phase 2 public flip and the CI billing block, neither of which is
-  engineering. Full
+  engineering. **U2 metrics + self-monitoring console shipped 2026-08-18**
+  (docs/CONSOLE.md §7.4/§7.6): the exposition had NO histograms and timed
+  NO queries, so the Query view could not be drawn and "Shape A got slow"
+  was answerable only by running Gauge. Added
+  `timelake_query_duration_seconds` + `_admission_wait_seconds`
+  (histograms), `_in_flight`/`_queued` (RAII-guarded gauges),
+  `timelake_queries_total`/`_timeouts_`/`_refused_`/`_failed_` (refused is
+  counted APART from failed — refusing a COPY is P0-2 working), uptime,
+  build_info, flush/compaction lag, gc_pending, `timelake_files{level}`,
+  `timelake_storage_{bytes,rows}{db,table}`,
+  `timelake_write_rejected_total{reason}`. Instrumented in `run_sql_env` —
+  the ONE production call site, so HTTP and Flight cannot drift.
+  **Self-monitoring** (`crates/server/src/selfmon.rs`): the node samples
+  its own `/metrics` text into `_system.metrics` every maintenance tick
+  and writes one row per query into `_system.queries`, read back by
+  Grafana over Flight SQL (`deploy/grafana/`,
+  `deploy/compose/timelakedb-console.yml`, port 3004). It CONVERTS the
+  exposition rather than keeping a second metric list, so the U2 gate
+  (stored numbers agree with `/metrics`) holds by construction and new
+  metrics are self-monitored automatically. Bounded queue, drops counted,
+  never blocks a query; `_system` rows excluded from
+  `timelake_lines_written_total` so Gauge baselines stay comparable.
+  **`/metrics` deliberately unchanged and is still the alerting surface** —
+  it answers from atomics with no query path, i.e. it works when the
+  stored copy cannot be read. KNOWN LIMITS, documented not hidden: a CL-3
+  querier stores nothing (no write path, no maintenance — `/metrics` only;
+  shipping its samples to an ingester is C2 work); `_system` gets NO
+  default retention because **`enforce_retention` matches table name
+  ignoring the database**, so seeding one would drop any user table named
+  `metrics`/`queries` — that db-scoping bug is now the top retention
+  follow-up. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does
@@ -420,9 +450,14 @@ This project is inspired by the following projects.
   **AT-7 still 19/19 with client auth on** — its first run was 18/19 and
   the DRILL was stale, not the server: it called /admin/tls/reload
   anonymously after SEC-4 guarded it; it now logs in + rotates
-  admin/admin. NOT DONE: `/api/sql` carries no identity (axum-server owns
-  that accept loop → needs a custom `Accept`); requiring mTLS is a C3
-  decision for the intra-cluster listener. SECURITY.md exposure 3 now
+  admin/admin. ~~NOT DONE: `/api/sql` carries no identity~~ — **CLOSED
+  2026-08-18**: `crates/server/src/tls_identity.rs` wraps `RustlsAcceptor`
+  with an `Accept` that reads the subject CN off the completed handshake
+  (`tls.get_ref().1.peer_certificates()`, borrowed not consumed) and
+  layers `Extension(PeerIdentity)` onto the service, so the identity is
+  extracted ONCE per connection rather than per request and the grant
+  intersection now applies identically on HTTP and Flight. Still open:
+  requiring mTLS is a C3 decision for the intra-cluster listener. SECURITY.md exposure 3 now
   CLOSED, new exposure 9 states plainly that want mode grants nothing on
   its own. Windows curl (schannel) can't drive this — drill from a Linux
   container on the compose network.

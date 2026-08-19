@@ -1,0 +1,32 @@
+# Grafana datasource for the SELF-MONITORING console (phase U2).
+#
+# Distinct from deploy/compose/grafana-datasource/timelakedb.yml, which is
+# the FR-8/AT-6 compatibility fixture and points at the `poc` database with
+# uid "influxdb3" so the fixture dashboards render unchanged. This one is
+# the operator plane: same server, same Flight SQL port, different database.
+#
+# `_system` is written by the node itself (crates/server/src/selfmon.rs) —
+# a metrics sample every maintenance tick and one row per finished query.
+apiVersion: 1
+
+datasources:
+  - name: TimeLakeDB-System
+    uid: timelakedb-system
+    type: influxdb
+    access: proxy
+    # Flight SQL (gRPC), the same surface Grafana uses for user data.
+    url: http://timelakedb:1964
+    isDefault: false
+    jsonData:
+      version: SQL
+      dbName: _system
+      httpMode: POST
+      # The drill stack runs without TLS. With TIMELAKE_TLS_CERT set, drop
+      # this and point the URL at the TLS listener.
+      insecureGrpc: true
+    secureJsonData:
+      # Only needed when TIMELAKE_DATA_AUTH is optional/required. Issue a
+      # READ-scoped token for this database and set GRAFANA_TOKEN — the
+      # console never needs to write.
+      token: $GRAFANA_TOKEN
+    editable: true

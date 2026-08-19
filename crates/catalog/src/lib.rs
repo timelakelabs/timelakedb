@@ -379,6 +379,101 @@ impl<S: Store> Catalog<S> {
             .map(Vec::len)
             .sum()
     }
+
+    /// Per-table storage totals for the Storage view (`docs/CONSOLE.md`
+    /// §7.3, phase U2).
+    ///
+    /// Folded under the catalog lock rather than built from
+    /// [`Catalog::all_files`], which clones every [`FileMeta`] — an
+    /// allocation proportional to the whole catalog, made on every
+    /// `/metrics` scrape and every self-monitoring sample. The aggregate is
+    /// bounded by the table count instead.
+    pub fn storage_summary(&self) -> Vec<TableStorage> {
+        let files = self.files.lock().expect("catalog lock");
+        let mut out: Vec<TableStorage> = files
+            .iter()
+            .map(|((db, table), metas)| TableStorage {
+                db: db.clone(),
+                table: table.clone(),
+                files: metas.len() as u64,
+                bytes: metas.iter().map(|m| m.size_bytes).sum(),
+                rows: metas.iter().map(|m| m.rows).sum(),
+            })
+            .collect();
+        // Stable order so a diff of two scrapes is readable.
+        out.sort_by(|a, b| (&a.db, &a.table).cmp(&(&b.db, &b.table)));
+        out
+    }
+
+    /// File counts by compaction level, for the Storage view's L0/L1 split
+    /// and the compaction-lag question ("is L0 growing faster than the
+    /// compactor drains it?").
+    ///
+    /// The level is derived from the filename prefix the write path
+    /// stamps — see [`level_of`]. There is no `level` field on
+    /// [`FileMeta`]; adding one is the better long-term answer, and would
+    /// let historic files report their true level instead of being
+    /// classified by a naming convention.
+    pub fn level_counts(&self) -> LevelCounts {
+        let files = self.files.lock().expect("catalog lock");
+        let mut counts = LevelCounts::default();
+        for meta in files.values().flatten() {
+            match level_of(&meta.path) {
+                Level::Flushed => counts.flushed += 1,
+                Level::Compacted => counts.compacted += 1,
+                Level::Rewritten => counts.rewritten += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Storage totals for one table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStorage {
+    pub db: String,
+    pub table: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub rows: u64,
+}
+
+/// File counts by provenance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelCounts {
+    /// L0: written straight out of a buffer flush, never merged.
+    pub flushed: u64,
+    /// L1: produced by a compaction merge.
+    pub compacted: u64,
+    /// Rewritten by the R-1b tombstone GC pass.
+    pub rewritten: u64,
+}
+
+/// How a data file came to exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Flushed,
+    Compacted,
+    Rewritten,
+}
+
+/// Classify a data file by the prefix its writer stamped on the basename.
+///
+/// This is a naming convention, not a recorded fact, so it is deliberately
+/// in one place with a test that builds paths the same way the three write
+/// sites do — change a path format and that test fails rather than this
+/// metric quietly misreporting.
+pub fn level_of(path: &str) -> Level {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.as_bytes().first() {
+        Some(b'c') => Level::Compacted,
+        Some(b't') => Level::Rewritten,
+        // The flush path writes a zero-padded sequence number with no
+        // prefix, so "starts with a digit" is the L0 case; anything
+        // unrecognized is counted as L0 rather than dropped, because a
+        // total that silently excludes files is worse than a coarse one.
+        _ => Level::Flushed,
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +492,88 @@ mod tests {
             min_ts_ns: 1,
             max_ts_ns: 2,
         }
+    }
+
+    /// The three paths the engine actually writes, built with the same
+    /// `format!` strings as `crates/server/src/lib.rs` — the flush site,
+    /// the compaction site, and the R-1b tombstone-rewrite site.
+    ///
+    /// `level_of` reads a naming convention rather than a recorded field,
+    /// so this test is the thing that keeps the convention honest: change
+    /// a path format at a write site without updating the classifier and
+    /// the level metric would otherwise start lying silently.
+    #[test]
+    fn level_is_derived_from_the_paths_the_engine_really_writes() {
+        let flushed = format!(
+            "poc/events/data/{}/{:020}-{:06}.parquet",
+            "2026080800", 7, 3
+        );
+        let compacted = format!(
+            "poc/events/data/{}/c{:020}-{:06}.parquet",
+            "2026080800", 7, 3
+        );
+        let rewritten = format!(
+            "poc/events/data/{}/t{:020}-{:06}.parquet",
+            "2026080800", 7, 3
+        );
+
+        assert_eq!(level_of(&flushed), Level::Flushed);
+        assert_eq!(level_of(&compacted), Level::Compacted);
+        assert_eq!(level_of(&rewritten), Level::Rewritten);
+
+        // The prefix is on the BASENAME. A database or table beginning with
+        // 'c' must not make every one of its files read as compacted.
+        let tricky = format!(
+            "customers/cpu/data/{}/{:020}-{:06}.parquet",
+            "2026080800", 1, 1
+        );
+        assert_eq!(level_of(&tricky), Level::Flushed);
+    }
+
+    #[test]
+    fn storage_summary_totals_bytes_and_rows_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        cat.commit_add(vec![
+            meta("poc", "events", "2026080800", "poc/events/data/p/1.parquet"),
+            meta("poc", "events", "2026080801", "poc/events/data/p/2.parquet"),
+            meta("poc", "cpu", "2026080801", "poc/cpu/data/p/3.parquet"),
+        ])
+        .unwrap();
+
+        let summary = cat.storage_summary();
+        assert_eq!(summary.len(), 2, "one row per table, not per file");
+        // Sorted, so this is stable.
+        assert_eq!(summary[0].table, "cpu");
+        assert_eq!(summary[0].files, 1);
+        assert_eq!(summary[0].bytes, 100);
+        assert_eq!(summary[1].table, "events");
+        assert_eq!(summary[1].files, 2);
+        assert_eq!(summary[1].bytes, 200, "two files of 100 bytes");
+        assert_eq!(summary[1].rows, 20);
+    }
+
+    #[test]
+    fn level_counts_split_flushed_from_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        cat.commit_add(vec![
+            meta("poc", "events", "p", "poc/events/data/p/00001.parquet"),
+            meta("poc", "events", "p", "poc/events/data/p/00002.parquet"),
+            meta("poc", "events", "p", "poc/events/data/p/c00003.parquet"),
+            meta("poc", "events", "p", "poc/events/data/p/t00004.parquet"),
+        ])
+        .unwrap();
+
+        let counts = cat.level_counts();
+        assert_eq!(counts.flushed, 2);
+        assert_eq!(counts.compacted, 1);
+        assert_eq!(counts.rewritten, 1);
+        assert_eq!(
+            counts.flushed + counts.compacted + counts.rewritten,
+            cat.file_count() as u64,
+            "every file must land in exactly one level"
+        );
     }
 
     #[test]
