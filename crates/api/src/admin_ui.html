@@ -95,7 +95,7 @@
     <div class="card">
       <h2>Retention policies</h2>
       <table id="policies"><thead>
-        <tr><th>Table</th><th>Window</th><th>Seconds</th><th></th></tr>
+        <tr><th>Database</th><th>Table</th><th>Window</th><th>Seconds</th><th></th></tr>
       </thead><tbody></tbody></table>
       <div class="stat" id="dropstat"></div>
     </div>
@@ -103,6 +103,10 @@
     <div class="card">
       <h2>Set a policy</h2>
       <form id="setform">
+        <label>Database
+          <input id="db" list="dbs" placeholder="poc" required>
+          <datalist id="dbs"></datalist>
+        </label>
         <label>Table
           <input id="table" list="tables" placeholder="pipeline_events" required>
           <datalist id="tables"></datalist>
@@ -236,18 +240,27 @@ async function loadPolicies() {
   const tb = $('#policies tbody');
   tb.innerHTML = '';
   if (!body.policies.length) {
-    tb.innerHTML = '<tr><td colspan="4" class="empty">No policies — every table keeps everything.</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">No policies — every table keeps everything.</td></tr>';
     return;
   }
   for (const p of body.policies) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="mono">${p.table}</td><td>${p.duration}</td>` +
+    // A wildcard policy reaches every database on the node. It is called
+    // out in red because it used to be the ONLY behaviour and was never
+    // shown — an operator setting a window on one table was quietly
+    // scheduling every same-named table for deletion.
+    const scope = p.all_databases
+      ? '<span class="mono" style="color:#b00">* all databases</span>'
+      : `<span class="mono">${p.db}</span>`;
+    tr.innerHTML = `<td>${scope}</td><td class="mono">${p.table}</td><td>${p.duration}</td>` +
       `<td class="mono">${p.seconds}</td><td style="text-align:right"></td>`;
     const del = document.createElement('button');
     del.className = 'ghost'; del.textContent = 'remove';
     del.onclick = async () => {
-      if (!confirm(`Remove the ${p.duration} window on ${p.table}? The table will keep everything again.`)) return;
-      const res = await api('DELETE', '/admin/retention/' + encodeURIComponent(p.table));
+      const where = p.all_databases ? 'EVERY database' : `database ${p.db}`;
+      if (!confirm(`Remove the ${p.duration} window on ${p.table} in ${where}? It will keep everything again.`)) return;
+      const res = await api('DELETE', '/admin/retention/' +
+        encodeURIComponent(p.db) + '/' + encodeURIComponent(p.table));
       if (!res.ok) alert(res.body?.error || 'failed');
       loadPolicies();
     };
@@ -321,6 +334,19 @@ async function loadTables() {
       const o = document.createElement('option'); o.value = row.table_name; dl.appendChild(o);
     }
   } catch (_) {}
+  // Databases the policies already mention, plus the wildcard, so the
+  // scope field is discoverable rather than something to guess at.
+  try {
+    const { ok, body } = await api('GET', '/admin/retention');
+    const dl = $('#dbs'); dl.innerHTML = '';
+    const seen = new Set(['*']);
+    if (ok) for (const p of body.policies) seen.add(p.db);
+    for (const d of seen) {
+      const o = document.createElement('option'); o.value = d;
+      if (d === '*') o.label = '* (every database)';
+      dl.appendChild(o);
+    }
+  } catch (_) {}
 }
 
 async function loadDrops() {
@@ -334,11 +360,20 @@ async function loadDrops() {
 $('#setform').onsubmit = async (e) => {
   e.preventDefault();
   const msg = $('#msg'); msg.className = 'msg'; msg.textContent = 'applying…';
+  const db = $('#db').value.trim();
+  // A wildcard schedules deletion in databases the operator has not named,
+  // so it asks first. Naming one database does not.
+  if (db === '*' && !confirm(
+      `Apply this window to ${$('#table').value.trim()} in EVERY database on this node?\n\n` +
+      'Data in databases you have not named will start expiring.')) {
+    msg.textContent = ''; return;
+  }
   const { ok, body } = await api('PUT', '/admin/retention', {
-    table: $('#table').value.trim(), duration: $('#amount').value + $('#unit').value });
+    db, table: $('#table').value.trim(), duration: $('#amount').value + $('#unit').value });
   if (ok) {
     msg.className = 'msg ok';
-    msg.textContent = `${body.table}: keep ${body.duration} — saved durably.`;
+    const where = body.all_databases ? 'every database' : body.db;
+    msg.textContent = `${body.table} in ${where}: keep ${body.duration} — saved durably.`;
     loadPolicies();
   } else {
     msg.className = 'msg err';
