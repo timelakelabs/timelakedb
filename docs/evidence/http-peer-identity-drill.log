@@ -1,0 +1,40 @@
+=== SEC-3 v2 · client-certificate identity on /api/sql (HTTP) ===
+    base=https://timelakedb-tls:1963 table=ident_1787153231
+
+--- A. the stack is up and mutually authenticating ---
+  PASS  health answers over TLS
+  PASS  an admin session was established
+  PASS  the server requests client certificates (want mode)
+  PASS  a client certificate is accepted on the HTTP listener
+
+--- B. grants recorded for ONE of the two identities ---
+    /admin/cert-grants -> {"cert_grants":[{"authorizations":["ops"],"identity":"narrowed-agent"}]}
+  PASS  narrowed-agent has grants recorded
+  PASS  the grant is exactly [ops]
+  PASS  ungranted-agent has no grants recorded
+
+--- C. rows behind SEC-2 visibility labels ---
+  PASS  the three labelled rows were accepted (got 204)
+
+--- D. the property: identity NARROWS, and only where granted ---
+    claims ops+audit in all three cases; only the certificate differs
+    anonymous       -> 3
+    narrowed-agent  -> 2   (granted [ops])
+    ungranted-agent -> 3   (no grant policy)
+  PASS  an anonymous caller is unaffected (want mode) (got 3)
+  PASS  a granted identity is NARROWED to claims-intersect-grants (got 2)
+  PASS  an identity with no grants recorded keeps its claims (got 3)
+
+--- E. the narrowing is enforced in the scan, not in the projection ---
+  PASS  SELECT returns the same number of rows COUNT(*) claimed (got 2)
+  PASS  the audit-labelled row is the one withheld
+
+--- F. the identity is attributed in the query log (U2) ---
+    queries attributed to narrowed-agent : 9
+    queries with no identity (anonymous) : 7
+  PASS  the certificate CN is recorded on the query rows it ran
+  PASS  anonymous queries are recorded with a NULL identity, not a placeholder
+
+================================
+  PASS: 15   FAIL: 0
+================================

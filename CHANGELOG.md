@@ -77,6 +77,18 @@ executed against a live node).
   now authorizes something on the write path instead of only proving a
   handshake. Want mode still grants nothing on its own (SECURITY.md
   exposure 9); the anonymous path is unchanged, so this is additive.
+- **Drilled 15/15 against a real handshake** (2026-08-19,
+  `docs/evidence/http-peer-identity-drill.log`). Three clients make the
+  identical claim `ops,audit` against rows labelled public / `ops` /
+  `audit`; only the certificate differs. Anonymous sees 3 rows (want mode
+  unaffected), an identity granted `[ops]` sees **2** — it saw 3 before
+  this change — and an identity with no grants recorded sees 3, because
+  `None` means "no policy", not deny-all. The drill also pins that the
+  restriction is enforced in the scan rather than the projection, so no
+  aggregate can count a withheld row. It runs from a Linux container on
+  the compose network: Windows curl is schannel and cannot present a PEM
+  client certificate, so a host-side run would exercise the anonymous
+  path three times and pass.
 
 ### Added — log rotation, and audit segments that stay verifiable (2026-08-18)
 
