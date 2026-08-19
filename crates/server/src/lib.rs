@@ -23,6 +23,9 @@ use std::sync::{Mutex, RwLock};
 
 use serde_json::Value;
 use timelake_api::WriteError;
+// Re-exported so callers and tests name the retention types through the
+// engine they configure, without depending on the api crate directly.
+pub use timelake_api::{RETENTION_ANY_DB, RetentionPolicy};
 use timelake_buffer::{TableBuffer, flush};
 use timelake_catalog::{Catalog, FileMeta};
 use timelake_ingest::{parse_lines, precision_multiplier};
@@ -50,8 +53,8 @@ pub struct EngineConfig {
     /// Compact a (table, hour) partition once it accumulates this many
     /// L0 files (PR-6 lever).
     pub compact_min_files: usize,
-    /// Per-table retention (table name → seconds); FR-7. Empty = keep all.
-    pub retention: Vec<(String, u64)>,
+    /// Retention policies (FR-7). Empty = keep everything.
+    pub retention: Vec<RetentionPolicy>,
     /// Admission control: queries beyond this queue (RR-1).
     pub max_concurrent_queries: usize,
     /// SEC-6 (exposure 6): the most concurrent queries any ONE client may
@@ -330,6 +333,48 @@ impl WalCipher for WalKms {
 /// Where runtime retention config lives in the object store (FR-7).
 const RETENTION_CONFIG_PATH: &str = "catalog/config/retention.json";
 
+/// v1 was a bare `{"table": seconds}` map with no database scope at all.
+const RETENTION_FORMAT_VERSION: u32 = 2;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RetentionDoc {
+    version: u32,
+    policies: Vec<RetentionPolicy>,
+}
+
+/// Read the stored policies, migrating a v1 document if that is what is
+/// there.
+///
+/// **A v1 entry becomes an explicit [`RETENTION_ANY_DB`] policy, and that
+/// is the only safe reading.** v1 matched on table name and ignored the
+/// database, so `{"metrics": 604800}` really did delete `metrics` in every
+/// database — migrating it to a single database would silently stop
+/// deleting data an operator asked to have deleted, which for a retention
+/// control can be a compliance failure rather than a mere surprise. The
+/// wildcard preserves the behaviour exactly; what changes is that it is
+/// now visible, and narrowing it is a deliberate edit.
+fn load_retention_doc(bytes: &[u8]) -> std::io::Result<(Vec<RetentionPolicy>, bool)> {
+    if let Ok(doc) = serde_json::from_slice::<RetentionDoc>(bytes) {
+        return Ok((doc.policies, false));
+    }
+    let legacy: std::collections::BTreeMap<String, u64> =
+        serde_json::from_slice(bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{RETENTION_CONFIG_PATH}: {e}"),
+            )
+        })?;
+    let migrated = legacy
+        .into_iter()
+        .map(|(table, seconds)| RetentionPolicy {
+            db: RETENTION_ANY_DB.to_string(),
+            table,
+            seconds,
+        })
+        .collect();
+    Ok((migrated, true))
+}
+
 /// SEC-1 key config: `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or
 /// `TIMELAKE_ENCRYPTION_KEY_FILE` (a file holding them). Key material
 /// stays out of [`EngineConfig`] so a `?cfg` log line can never leak it.
@@ -346,11 +391,17 @@ fn encryption_key_from_env() -> std::io::Result<Option<[u8; 32]>> {
     timelake_store::key_from_hex(&hex).map(Some)
 }
 
-/// Parse "pipeline_events=365d,host_metrics=90d,disk_metrics=72h" (FR-7).
-pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
+/// Parse "pipeline_events=365d,poc.host_metrics=90d,disk_metrics=72h" (FR-7).
+///
+/// A bare `table=` is scoped to [`RETENTION_ANY_DB`], which is what the
+/// setting has always meant; `db.table=` scopes it to one database, split
+/// on the FIRST dot. A table name containing a dot therefore cannot be
+/// expressed here and must be set through `/admin/retention`, which takes
+/// the two as separate fields.
+pub fn parse_retention(spec: &str) -> Vec<RetentionPolicy> {
     spec.split(',')
         .filter_map(|part| {
-            let (table, dur) = part.trim().split_once('=')?;
+            let (scope, dur) = part.trim().split_once('=')?;
             let dur = dur.trim();
             let (num, unit_secs) = if let Some(d) = dur.strip_suffix('d') {
                 (d, 86_400)
@@ -359,10 +410,16 @@ pub fn parse_retention(spec: &str) -> Vec<(String, u64)> {
             } else {
                 (dur, 1)
             };
-            Some((
-                table.trim().to_string(),
-                num.parse::<u64>().ok()? * unit_secs,
-            ))
+            let scope = scope.trim();
+            let (db, table) = match scope.split_once('.') {
+                Some((db, table)) => (db.trim().to_string(), table.trim().to_string()),
+                None => (RETENTION_ANY_DB.to_string(), scope.to_string()),
+            };
+            Some(RetentionPolicy {
+                db,
+                table,
+                seconds: num.parse::<u64>().ok()? * unit_secs,
+            })
         })
         .collect()
 }
@@ -551,7 +608,7 @@ pub struct Engine {
     /// over the env seed at boot. Plain put (last-writer-wins): admin
     /// config, not data — CAS arrives with the C1 catalog work if
     /// concurrent admins ever matter.
-    retention: RwLock<Vec<(String, u64)>>,
+    retention: RwLock<Vec<RetentionPolicy>>,
     /// Rows mid-flush: snapshotted at buffer swap-out, dropped after the
     /// catalog commit that makes their files visible. Queries union this
     /// with buffer + files, reading it BEFORE the catalog — acknowledged
@@ -678,16 +735,22 @@ impl Engine {
         // FR-7 runtime policies: the store copy (written by
         // /admin/retention) outranks the env seed — an operator's
         // durable change must survive a restart with a stale env.
-        let retention: Vec<(String, u64)> = match store.get(RETENTION_CONFIG_PATH) {
+        let retention: Vec<RetentionPolicy> = match store.get(RETENTION_CONFIG_PATH) {
             Ok(bytes) => {
-                let map: std::collections::BTreeMap<String, u64> = serde_json::from_slice(&bytes)
-                    .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{RETENTION_CONFIG_PATH}: {e}"),
-                    )
-                })?;
-                map.into_iter().collect()
+                let (policies, migrated) = load_retention_doc(&bytes)?;
+                if migrated {
+                    // Loud on purpose. The policies still do exactly what
+                    // they did, but an operator should learn today that
+                    // they reach every database, rather than the next time
+                    // a table name collides across two of them.
+                    tracing::warn!(
+                        policies = policies.len(),
+                        "migrated retention config to v2: every existing policy now reads as \
+                         db=\"*\" (all databases), which is what it already did. Narrow them \
+                         with PUT /admin/retention if that is not what you meant"
+                    );
+                }
+                policies
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => cfg.retention.clone(),
             Err(e) => return Err(e),
@@ -1134,8 +1197,22 @@ impl Engine {
         let now = Self::now_ns();
         let mut remove: Vec<String> = Vec::new();
         for f in self.catalog.all_files() {
-            if let Some((_, secs)) = policies.iter().find(|(table, _)| *table == f.table) {
-                let cutoff = flush::hour_partition(now - (*secs as i64) * 1_000_000_000);
+            // Matched on (db, table), not on table alone. Before 2026-08-19
+            // this ignored `f.db` entirely, so a policy set on one
+            // database's table silently deleted every same-named table on
+            // the node — including `_system`, which is why self-monitoring
+            // shipped with no default retention at all.
+            //
+            // Most specific wins: an exact-database policy overrides a
+            // wildcard for the same table, so an operator can carve one
+            // database out of a broad rule instead of having to choose
+            // between all and nothing.
+            let policy = policies
+                .iter()
+                .find(|p| p.db == f.db && p.table == f.table)
+                .or_else(|| policies.iter().find(|p| p.covers(&f.db, &f.table)));
+            if let Some(p) = policy {
+                let cutoff = flush::hour_partition(now - (p.seconds as i64) * 1_000_000_000);
                 // partition strings sort chronologically; a partition
                 // strictly before the cutoff hour is wholly expired
                 if f.partition.as_str() < cutoff.as_str() {
@@ -1297,24 +1374,31 @@ impl Engine {
     }
 
     /// Runtime FR-7 policy surface (backs /admin/retention).
-    pub fn retention_policies(&self) -> Vec<(String, u64)> {
+    pub fn retention_policies(&self) -> Vec<RetentionPolicy> {
         self.retention.read().expect("retention lock").clone()
     }
 
-    pub fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String> {
+    pub fn set_retention(&self, db: &str, table: &str, seconds: u64) -> Result<(), String> {
         let mut r = self.retention.write().expect("retention lock");
-        match r.iter_mut().find(|(t, _)| t == table) {
-            Some(entry) => entry.1 = seconds,
-            None => r.push((table.to_string(), seconds)),
+        // Keyed on (db, table): setting `poc.metrics` must not overwrite a
+        // separate `_system.metrics` policy, which is the same conflation
+        // that made this a hazard in the first place.
+        match r.iter_mut().find(|p| p.db == db && p.table == table) {
+            Some(entry) => entry.seconds = seconds,
+            None => r.push(RetentionPolicy {
+                db: db.to_string(),
+                table: table.to_string(),
+                seconds,
+            }),
         }
         // persisted under the write lock so concurrent admin edits
         // cannot land in the store out of order
         Self::persist_retention(&self.store, &r)
     }
 
-    pub fn remove_retention(&self, table: &str) -> Result<(), String> {
+    pub fn remove_retention(&self, db: &str, table: &str) -> Result<(), String> {
         let mut r = self.retention.write().expect("retention lock");
-        r.retain(|(t, _)| t != table);
+        r.retain(|p| !(p.db == db && p.table == table));
         Self::persist_retention(&self.store, &r)
     }
 
@@ -1385,13 +1469,18 @@ impl Engine {
         Ok((id, seq))
     }
 
-    fn persist_retention(store: &Arc<dyn Store>, policies: &[(String, u64)]) -> Result<(), String> {
-        let map: std::collections::BTreeMap<&str, u64> =
-            policies.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    fn persist_retention(
+        store: &Arc<dyn Store>,
+        policies: &[RetentionPolicy],
+    ) -> Result<(), String> {
+        let doc = RetentionDoc {
+            version: RETENTION_FORMAT_VERSION,
+            policies: policies.to_vec(),
+        };
         store
             .put(
                 RETENTION_CONFIG_PATH,
-                &serde_json::to_vec_pretty(&map).expect("retention json"),
+                &serde_json::to_vec_pretty(&doc).expect("retention json"),
             )
             .map_err(|e| format!("persist retention config: {e}"))
     }
@@ -1530,16 +1619,16 @@ impl timelake_api::Engine for Engine {
         self.metrics_text_impl()
     }
 
-    fn retention_policies(&self) -> Vec<(String, u64)> {
+    fn retention_policies(&self) -> Vec<RetentionPolicy> {
         Engine::retention_policies(self)
     }
 
-    fn set_retention(&self, table: &str, seconds: u64) -> Result<(), String> {
-        Engine::set_retention(self, table, seconds)
+    fn set_retention(&self, db: &str, table: &str, seconds: u64) -> Result<(), String> {
+        Engine::set_retention(self, db, table, seconds)
     }
 
-    fn remove_retention(&self, table: &str) -> Result<(), String> {
-        Engine::remove_retention(self, table)
+    fn remove_retention(&self, db: &str, table: &str) -> Result<(), String> {
+        Engine::remove_retention(self, db, table)
     }
 
     fn delete_where(
