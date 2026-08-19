@@ -340,6 +340,11 @@ Scope and residuals, all deliberate for this slice:
   of its own use. Object-store upload on rotation (SEC-1 encrypted) and the
   read-only `system.audit` SQL exposure remain the next enhancements.
 
+  Drilled against a live node, not only unit-tested:
+  `docs/evidence/audit-rotation-drill.log` — 40 mutations across 5 segments,
+  `?verify=1` intact after rotation, and a removed segment reported as
+  `{"ok":false,"break":{"seq":10,"reason":"prev_hash does not match …"}}`.
+
 Pinned by `crates/audit` (the chain: link, replay, tamper detection on edit
 and deletion, fail-closed gate) and `crates/server/tests/audit.rs`
 (end-to-end attribution, `?verify=1`, a recorded denial, self-audited reads,
