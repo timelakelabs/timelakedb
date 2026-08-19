@@ -96,13 +96,15 @@ sleep 28
 
 echo
 echo "=== D. the node has written itself into _system ==="
-ck "_system.queries has rows" \
-    sh -c "q() { curl -s -X POST '$BASE/api/sql' -H 'content-type: application/json' \
-        --data '{\"db\":\"_system\",\"sql\":\"SELECT COUNT(*) AS n FROM queries\"}'; }; \
-        q | grep -qv '\"n\":0'"
-ck "_system.metrics has rows" \
-    sh -c "curl -s -X POST '$BASE/api/sql' -H 'content-type: application/json' \
-        --data '{\"db\":\"_system\",\"sql\":\"SELECT COUNT(*) AS n FROM metrics\"}' | grep -q '\"n\"'"
+# Read the counts as NUMBERS. An earlier revision tested
+# `grep -qv '"n":0'` and `grep -q '"n"'`, both of which succeed on an ERROR
+# response — so had `_system` not existed yet, these would have passed while
+# proving nothing. A drill that cannot fail is not evidence.
+n_queries=$(q _system "SELECT COUNT(*) AS n FROM queries" | sed -n 's/.*"n":\([0-9]*\).*/\1/p')
+n_metrics=$(q _system "SELECT COUNT(*) AS n FROM metrics" | sed -n 's/.*"n":\([0-9]*\).*/\1/p')
+echo "  _system.queries=${n_queries:-<none>}  _system.metrics=${n_metrics:-<none>}"
+ck "_system.queries has rows" sh -c "test -n '$n_queries' && test '$n_queries' -gt 0"
+ck "_system.metrics has rows" sh -c "test -n '$n_metrics' && test '$n_metrics' -gt 0"
 ck "all four outcomes are distinguishable" \
     sh -c "curl -s -X POST '$BASE/api/sql' -H 'content-type: application/json' \
         --data '{\"db\":\"_system\",\"sql\":\"SELECT outcome, COUNT(*) AS n FROM queries GROUP BY outcome\"}' \

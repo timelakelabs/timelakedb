@@ -1,4 +1,4 @@
-﻿=== A. the node is up ===
+=== A. the node is up ===
   PASS  health answers
   PASS  metrics answers
   PASS  query latency histogram is exposed
