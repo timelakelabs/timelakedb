@@ -13,6 +13,71 @@ here.
 
 ## [Unreleased]
 
+### Added — the database can answer how fast it is (U2, 2026-08-18)
+
+Drill: `docs/evidence/u2-console-drill.log` (37/37, every dashboard panel
+executed against a live node).
+
+- **Queries are timed.** The exposition previously had no histograms and
+  timed nothing, so the Query view of `docs/CONSOLE.md` §7.3 could not be
+  drawn and "Shape A got slow" was answerable only by running Gauge. Added
+  `timelake_query_duration_seconds` and
+  `timelake_query_admission_wait_seconds` (histograms, buckets dense
+  either side of the 250 ms PR-3 target and coarse in the tail),
+  `timelake_query_in_flight` / `_queued`, and
+  `timelake_queries_total` split into `_timeouts_`, `_refused_` and
+  `_failed_`. Instrumented in `run_sql_env` — the single production call
+  site — so HTTP and Flight SQL cannot drift into different accounting.
+- **A refused statement is not a failure.** Refusing a `COPY` is the P0-2
+  read-only guard working; counting it as an error would make a healthy
+  node look broken whenever a client probes it, so the two are separate
+  counters.
+- **Storage and lifecycle**: `timelake_storage_bytes{db,table}`,
+  `_storage_rows{db,table}`, `timelake_files{level}`,
+  `timelake_flush_lag_seconds`, `_compaction_lag_seconds`,
+  `timelake_gc_pending_files`, `timelake_uptime_seconds`,
+  `timelake_build_info`, and `timelake_write_rejected_total{reason}` —
+  split so WAL backpressure (yours to fix) is distinguishable from a
+  malformed request (the client's). Lag gauges report the **whole uptime**
+  before their subsystem has ever run, because a zero would read as "just
+  ran, healthy" at exactly the wrong moment.
+- **Self-monitoring**: the node samples its own `/metrics` into
+  `_system.metrics` each maintenance tick and writes one row per query
+  into `_system.queries`, read back by Grafana over Flight SQL
+  (`deploy/grafana/`, `deploy/compose/timelakedb-console.yml`). Storing
+  exact per-query durations means p50/p95/p99 are measured rather than
+  estimated from bucket bounds, and are sliceable by database, outcome and
+  client identity. The sampler **converts the exposition** instead of
+  keeping a second metric list, so §13's U2 gate holds by construction and
+  new metrics are self-monitored the day they are added.
+- **Monitoring yields to the workload.** The query-path observer only
+  formats a line onto a bounded queue — never writes, never blocks — and
+  drops when full, with drops counted (`timelake_selfmon_dropped_total`)
+  because silent loss would make the console lie by omission at the
+  busiest moment. `_system` rows are excluded from
+  `timelake_lines_written_total` so Gauge baselines stay comparable.
+- `/metrics` is **unchanged and remains the alerting surface**: it answers
+  from in-memory atomics with no query path, so it still works when the
+  stored copy cannot be read. Known limits are documented rather than
+  discovered: a metric never emitted has no column in `_system` (so panels
+  for TLS/S3/KMS/cluster metrics must be added per deployment), a CL-3
+  querier stores nothing, and `_system` gets no default retention because
+  `enforce_retention` matches table name **ignoring the database**.
+
+### Added — a client certificate now authorizes on `/api/sql` too (2026-08-18)
+
+- **HTTP carries a verified peer identity.** `axum-server` owns the HTTP
+  accept loop, so `/api/sql` previously requested and verified a client
+  certificate and then authorized nothing with it — the SEC-3 narrowing
+  property held on Flight SQL and not on HTTP.
+  `crates/server/src/tls_identity.rs` wraps `RustlsAcceptor` with an
+  `Accept` that reads the subject CN off the completed handshake and
+  layers `Extension(PeerIdentity)` onto the service, **once per
+  connection** rather than per request. Tributary's L4 client certificate
+  now authorizes something on the write path instead of only proving a
+  handshake. Want mode still grants nothing on its own (SECURITY.md
+  exposure 9); the anonymous path is unchanged, so this is additive.
+
 ### Added — log rotation, and audit segments that stay verifiable (2026-08-18)
 
 - **The audit trail rotates**, into ordered segments named by the last seq

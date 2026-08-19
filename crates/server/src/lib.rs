@@ -36,6 +36,8 @@ pub mod querier;
 pub mod ratelimit;
 pub mod replication;
 pub mod router;
+pub mod selfmon;
+pub mod tls_identity;
 use ratelimit::ClientLimiter;
 use replication::Replicator;
 
@@ -446,6 +448,63 @@ fn tombstone_overlaps_file(t: &timelake_catalog::Tombstone, f: &FileMeta) -> boo
     lo <= f.max_ts_ns && hi >= f.min_ts_ns
 }
 
+/// Escape a Prometheus label value: backslash, double quote and newline,
+/// per the exposition format.
+///
+/// Table and database names reach `/metrics` straight from line protocol,
+/// so they are caller-controlled text. Unescaped, a measurement containing
+/// a quote would not merely look wrong — it would close the label early
+/// and let the rest of the name be parsed as further labels or a value,
+/// corrupting neighbouring series in whatever scrapes it.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Writes refused, split by cause (U2, `docs/CONSOLE.md` §7.4).
+///
+/// The split is the point. A single `write_rejected_total` cannot tell an
+/// operator whether the server is shedding load — the WAL cap of RR-5,
+/// which is theirs to fix — or a client is sending malformed line
+/// protocol, which is not. Those demand opposite responses, so they are
+/// counted apart.
+#[derive(Debug, Default)]
+pub struct WriteRejects {
+    /// RR-5: the WAL cap refused the write. This is backpressure working.
+    pub backpressure: AtomicU64,
+    /// Malformed body, bad precision, non-UTF-8 — the client's fault.
+    pub bad_request: AtomicU64,
+    /// CL-3: a querier holds no write path.
+    pub not_here: AtomicU64,
+    /// WAL append or apply failed — a real fault.
+    pub internal: AtomicU64,
+}
+
+impl WriteRejects {
+    fn render(&self) -> String {
+        format!(
+            "# HELP timelake_write_rejected_total Writes refused, by cause.\n\
+             # TYPE timelake_write_rejected_total counter\n\
+             timelake_write_rejected_total{{reason=\"backpressure\"}} {}\n\
+             timelake_write_rejected_total{{reason=\"bad_request\"}} {}\n\
+             timelake_write_rejected_total{{reason=\"not_here\"}} {}\n\
+             timelake_write_rejected_total{{reason=\"internal\"}} {}\n",
+            self.backpressure.load(Ordering::Relaxed),
+            self.bad_request.load(Ordering::Relaxed),
+            self.not_here.load(Ordering::Relaxed),
+            self.internal.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct Engine {
     dbs: RwLock<HashMap<String, HashMap<String, TableBuffer>>>,
     /// Writers hold this shared for append+apply; flush holds it
@@ -506,6 +565,22 @@ pub struct Engine {
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
+    /// U2: process start, for `timelake_uptime_seconds` and as the origin
+    /// the two lag stamps below are measured against.
+    started: std::time::Instant,
+    /// Millis since `started` at the last flush / last compaction. Zero
+    /// means "not since boot", and the lag gauge then reports the whole
+    /// uptime — which is the honest answer to "how long since the last
+    /// one" rather than a reassuring zero.
+    last_flush_ms: AtomicU64,
+    last_compaction_ms: AtomicU64,
+    /// U2: writes refused, split by cause. Backpressure is the one an
+    /// operator acts on (SR-3); a bad request is the client's problem.
+    write_rejects: WriteRejects,
+    /// U2: the self-monitoring buffer, unless `TIMELAKE_SELFMON=off`.
+    /// Also registered as the query observer, so it is the same instance
+    /// the query path pushes to.
+    selfmon: Option<std::sync::Arc<selfmon::SelfMonitor>>,
     retention_drops_total: AtomicU64,
     /// R-1b: files rewritten or dropped by the physical tombstone GC pass.
     tombstone_rewrites_total: AtomicU64,
@@ -618,11 +693,29 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
+        // Node identity, read once: it stamps the audit chain (§5.2) and
+        // tags every self-monitoring row, so a cluster's samples aggregate.
+        let node_id = std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| "tldb".to_string());
+        // U2 self-monitoring. Built before the query environment because
+        // the observer has to be attached at construction — the sampler is
+        // a plain buffer with no engine reference, so there is no cycle.
+        // `TIMELAKE_SELFMON=off` opts out entirely and leaves `/metrics`
+        // as the only surface.
+        let selfmon = match std::env::var("TIMELAKE_SELFMON").as_deref() {
+            Ok("off") | Ok("false") | Ok("0") => None,
+            _ => Some(std::sync::Arc::new(selfmon::SelfMonitor::new(
+                node_id.clone(),
+            ))),
+        };
         let query_env = timelake_query::QueryEnv::new(
             cfg.query_mem_bytes,
             cfg.max_concurrent_queries,
             cfg.query_timeout_secs,
         );
+        let query_env = match &selfmon {
+            Some(m) => query_env.with_observer(m.clone()),
+            None => query_env,
+        };
         let client_limiter = ClientLimiter::new(cfg.max_concurrent_queries_per_client);
         // SEC-4 principals live in the store like everything else, so
         // they are encrypted with it and travel with a cluster's bucket.
@@ -636,7 +729,6 @@ impl Engine {
         // beside the WAL. A per-node chain, so the node id is stamped on
         // every record. Fail-closed by default (§5.5) — an operator who
         // wants mutations to proceed when the sink is broken sets fail-open.
-        let node_id = std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| "tldb".to_string());
         let audit_fail_open = std::env::var("TIMELAKE_AUDIT_FAIL_OPEN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -684,6 +776,11 @@ impl Engine {
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            last_flush_ms: AtomicU64::new(0),
+            last_compaction_ms: AtomicU64::new(0),
+            write_rejects: WriteRejects::default(),
+            selfmon,
             retention_drops_total: AtomicU64::new(0),
             tombstone_rewrites_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
@@ -760,7 +857,14 @@ impl Engine {
                 reg.insert(key, merged);
             }
         }
-        self.lines_total.fetch_add(n as u64, Ordering::Relaxed);
+        // U2: self-monitoring rows are not user ingest. Counting them here
+        // would inflate `timelake_lines_written_total` by a steady
+        // background rate, and that counter is what Gauge's throughput
+        // numbers are compared against — a benchmark whose baseline drifts
+        // because the server is watching itself is worse than no metric.
+        if db != selfmon::SELFMON_DB {
+            self.lines_total.fetch_add(n as u64, Ordering::Relaxed);
+        }
         Ok(n)
     }
 
@@ -896,6 +1000,7 @@ impl Engine {
             );
         }
         self.flushes_total.fetch_add(1, Ordering::Relaxed);
+        self.stamp_flush();
         tracing::info!(files = n, "flush complete");
         if failed.is_empty() {
             Ok(n)
@@ -1014,6 +1119,7 @@ impl Engine {
         if done > 0 {
             self.compactions_total
                 .fetch_add(done as u64, Ordering::Relaxed);
+            self.stamp_compaction();
             tracing::info!(partitions = done, "compaction pass");
         }
         Ok(done)
@@ -1338,49 +1444,66 @@ impl timelake_api::Engine for Engine {
         body: &[u8],
         precision: Option<&str>,
     ) -> Result<usize, WriteError> {
-        // CL-3: a querier takes no writes. Checked before parsing so the
-        // answer costs nothing and cannot depend on the body.
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(WriteError::NotHere(
-                "this node is a querier (TIMELAKE_ROLE=querier) and holds no write path — \
+        // U2: one accounting point around the whole path, so a refusal is
+        // counted wherever below it originates. Counting at each
+        // `return Err` instead would mean a refusal added later silently
+        // misses the metric — the same reason `finish` is the only exit in
+        // the query path.
+        let result = (|| -> Result<usize, WriteError> {
+            // CL-3: a querier takes no writes. Checked before parsing so the
+            // answer costs nothing and cannot depend on the body.
+            if self.read_only.load(Ordering::Relaxed) {
+                return Err(WriteError::NotHere(
+                    "this node is a querier (TIMELAKE_ROLE=querier) and holds no write path — \
                  send writes to the router, or to an ingester directly"
-                    .into(),
-            ));
-        }
-        let mult = match precision {
-            None => 1,
-            Some(p) => precision_multiplier(p)
-                .ok_or_else(|| WriteError::BadRequest(format!("bad precision {p:?}")))?,
-        };
-        let text = std::str::from_utf8(body)
-            .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
+                        .into(),
+                ));
+            }
+            let mult = match precision {
+                None => 1,
+                Some(p) => precision_multiplier(p)
+                    .ok_or_else(|| WriteError::BadRequest(format!("bad precision {p:?}")))?,
+            };
+            let text = std::str::from_utf8(body)
+                .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
 
-        // validate before durability: a 400 must not land in the WAL
-        parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
+            // validate before durability: a 400 must not land in the WAL
+            parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
 
-        // RR-5: the WAL cap is a named, visible limit
-        if self.wal.lock().expect("wal lock").size() > self.cfg.wal_max_bytes {
-            return Err(WriteError::Backpressure(format!(
-                "wal exceeds {} bytes; flush in progress — retry",
-                self.cfg.wal_max_bytes
-            )));
-        }
+            // RR-5: the WAL cap is a named, visible limit
+            if self.wal.lock().expect("wal lock").size() > self.cfg.wal_max_bytes {
+                return Err(WriteError::Backpressure(format!(
+                    "wal exceeds {} bytes; flush in progress — retry",
+                    self.cfg.wal_max_bytes
+                )));
+            }
 
-        let _gate = self.ingest_gate.read().expect("ingest gate");
-        self.wal
-            .lock()
-            .expect("wal lock")
-            .append(db, mult, body)
-            .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
-        // CL-2: replicate the frame to the paired ingester BEFORE the ack, so
-        // an acknowledged write is durable on two nodes. A lone `all` node
-        // has no replicator, so this is a no-op and the path is unchanged.
-        // A down peer degrades (availability holds); it never fails the write.
-        if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
-            r.replicate(db, mult, body);
+            let _gate = self.ingest_gate.read().expect("ingest gate");
+            self.wal
+                .lock()
+                .expect("wal lock")
+                .append(db, mult, body)
+                .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
+            // CL-2: replicate the frame to the paired ingester BEFORE the ack, so
+            // an acknowledged write is durable on two nodes. A lone `all` node
+            // has no replicator, so this is a no-op and the path is unchanged.
+            // A down peer degrades (availability holds); it never fails the write.
+            if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
+                r.replicate(db, mult, body);
+            }
+            self.apply(db, text, mult, Self::now_ns())
+                .map_err(WriteError::BadRequest)
+        })();
+        if let Err(e) = &result {
+            let counter = match e {
+                WriteError::Backpressure(_) => &self.write_rejects.backpressure,
+                WriteError::BadRequest(_) => &self.write_rejects.bad_request,
+                WriteError::NotHere(_) => &self.write_rejects.not_here,
+                WriteError::Internal(_) => &self.write_rejects.internal,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
-        self.apply(db, text, mult, Self::now_ns())
-            .map_err(WriteError::BadRequest)
+        result
     }
 
     async fn sql(
@@ -1388,11 +1511,18 @@ impl timelake_api::Engine for Engine {
         db: String,
         query: String,
         authorizations: Vec<String>,
+        identity: Option<String>,
     ) -> Result<Value, String> {
-        // HTTP has no verified client-certificate identity to fold in
-        // (SEC-3 want mode is exercised on the Flight listener), so the
-        // cert-grant narrowing is a no-op here.
-        let batches = self.sql_batches(&db, &query, authorizations, None).await?;
+        // HTTP now carries a verified client-certificate identity, the same
+        // as Flight: the acceptor reads it off the TLS connection once and
+        // attaches it to every request (`tls_identity`). `sql_batches`
+        // intersects that identity's grants with the caller's claims, so a
+        // certificate narrows what the session sees and can never widen it.
+        // `None` — plaintext, or a caller that presented no certificate —
+        // takes exactly the path it always did.
+        let batches = self
+            .sql_batches(&db, &query, authorizations, identity.as_deref())
+            .await?;
         Ok(batches_to_json(&batches))
     }
 
@@ -1972,6 +2102,162 @@ impl Engine {
         }
     }
 
+    /// U2: take one self-monitoring sample and store everything queued.
+    ///
+    /// Called from the maintenance tick, never from the query or write
+    /// path. Returns the number of rows written, or `Ok(0)` when
+    /// self-monitoring is off or there is nothing to store.
+    ///
+    /// **A failure here is not a server failure.** If `_system` cannot be
+    /// written — the WAL is at its cap, the node has gone read-only — the
+    /// rows are discarded and counted, not retried and not propagated. The
+    /// whole point of the bounded queue is that telemetry yields to the
+    /// workload it is telemetry *for*.
+    pub fn selfmon_tick(&self) -> usize {
+        let Some(monitor) = &self.selfmon else {
+            return 0;
+        };
+        // A querier holds no write path (CL-3), so there is nowhere local
+        // to put a sample. `/metrics` still answers; see the module docs.
+        if self.read_only.load(Ordering::Relaxed) {
+            return 0;
+        }
+
+        monitor.sample_exposition(&self.metrics_text_impl(), Self::now_ns());
+        let lines = monitor.drain();
+        if lines.is_empty() {
+            return 0;
+        }
+
+        let body = lines.join("\n");
+        match timelake_api::Engine::write_lp(self, selfmon::SELFMON_DB, body.as_bytes(), None) {
+            Ok(n) => {
+                monitor.note_written(n as u64);
+                n
+            }
+            Err(e) => {
+                let reason = match &e {
+                    WriteError::BadRequest(m)
+                    | WriteError::Backpressure(m)
+                    | WriteError::Internal(m)
+                    | WriteError::NotHere(m) => m.as_str(),
+                };
+                // Warn, not error: the server is fine, the telemetry is
+                // not. Logging the count makes the gap in the stored
+                // history measurable after the fact.
+                tracing::warn!(
+                    rows = lines.len(),
+                    reason,
+                    "self-monitoring sample dropped; /metrics is unaffected"
+                );
+                0
+            }
+        }
+    }
+
+    /// U2 lifecycle stamps: millis since process start, recorded when a
+    /// flush or a compaction completes.
+    fn stamp_flush(&self) {
+        self.last_flush_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn stamp_compaction(&self) {
+        self.last_compaction_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    /// Seconds since the event a stamp records.
+    ///
+    /// With no event yet the stamp is zero, so this returns the uptime —
+    /// "nothing has flushed in the whole time this node has been up",
+    /// which is true and is the thing worth alerting on. Returning zero
+    /// instead would read as "just flushed", i.e. exactly healthy, at the
+    /// moment the subsystem has never run at all.
+    fn lag_secs(&self, stamp: &AtomicU64) -> f64 {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        now_ms.saturating_sub(stamp.load(Ordering::Relaxed)) as f64 / 1000.0
+    }
+
+    /// U2: per-table storage, file levels, lifecycle lag, uptime, build.
+    fn lifecycle_lines(&self) -> String {
+        let mut out = format!(
+            "# HELP timelake_uptime_seconds Seconds since this process started.\n\
+             # TYPE timelake_uptime_seconds gauge\n\
+             timelake_uptime_seconds {}\n\
+             # HELP timelake_build_info Build metadata; the value is always 1.\n\
+             # TYPE timelake_build_info gauge\n\
+             timelake_build_info{{version=\"{}\"}} 1\n\
+             # HELP timelake_flush_lag_seconds Seconds since the last completed flush.\n\
+             # TYPE timelake_flush_lag_seconds gauge\n\
+             timelake_flush_lag_seconds {:.3}\n\
+             # HELP timelake_compaction_lag_seconds Seconds since the last compaction pass.\n\
+             # TYPE timelake_compaction_lag_seconds gauge\n\
+             timelake_compaction_lag_seconds {:.3}\n\
+             # HELP timelake_gc_pending_files Files awaiting deletion after the GC grace.\n\
+             # TYPE timelake_gc_pending_files gauge\n\
+             timelake_gc_pending_files {}\n",
+            self.uptime_secs(),
+            escape_label(env!("CARGO_PKG_VERSION")),
+            self.lag_secs(&self.last_flush_ms),
+            self.lag_secs(&self.last_compaction_ms),
+            self.pending_gc.lock().expect("pending gc lock").len(),
+        );
+
+        let levels = self.catalog.level_counts();
+        out.push_str(&format!(
+            "# HELP timelake_files Data files by provenance (see catalog::level_of).\n\
+             # TYPE timelake_files gauge\n\
+             timelake_files{{level=\"flushed\"}} {}\n\
+             timelake_files{{level=\"compacted\"}} {}\n\
+             timelake_files{{level=\"rewritten\"}} {}\n",
+            levels.flushed, levels.compacted, levels.rewritten,
+        ));
+
+        // Per-table series. Cardinality is the table count, which FR-2
+        // bounds deliberately — tags are columns here, not series, so this
+        // does not inherit the high-cardinality problem the engine exists
+        // to avoid.
+        let storage = self.catalog.storage_summary();
+        out.push_str(
+            "# HELP timelake_storage_bytes Parquet bytes in the catalog, per table.\n\
+             # TYPE timelake_storage_bytes gauge\n",
+        );
+        for t in &storage {
+            out.push_str(&format!(
+                "timelake_storage_bytes{{db=\"{}\",table=\"{}\"}} {}\n",
+                escape_label(&t.db),
+                escape_label(&t.table),
+                t.bytes,
+            ));
+        }
+        out.push_str(
+            "# HELP timelake_storage_rows Rows in catalog files, per table.\n\
+             # TYPE timelake_storage_rows gauge\n",
+        );
+        for t in &storage {
+            out.push_str(&format!(
+                "timelake_storage_rows{{db=\"{}\",table=\"{}\"}} {}\n",
+                escape_label(&t.db),
+                escape_label(&t.table),
+                t.rows,
+            ));
+        }
+        out.push_str(&self.write_rejects.render());
+        // The self-monitoring counters belong on `/metrics` specifically:
+        // if the sampler is dropping rows then the STORED history is the
+        // thing that is incomplete, so it cannot be the surface that
+        // reports the gap. This one still works when that one does not.
+        if let Some(monitor) = &self.selfmon {
+            out.push_str(&monitor.render());
+        }
+        out
+    }
+
     pub fn metrics_text_impl(&self) -> String {
         let (n_dbs, n_tables, n_rows) = {
             let dbs = self.dbs.read().expect("dbs lock");
@@ -2182,7 +2468,7 @@ impl Engine {
              # TYPE timelake_audit_records_total counter\n\
              timelake_audit_records_total {}\n\
              # TYPE timelake_audit_sink_healthy gauge\n\
-             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}",
+             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -2215,6 +2501,12 @@ impl Engine {
             cl2_lines,
             cl3_lines,
             read_gate_lines,
+            // U2: latency, admission pressure and outcomes. Unconditional —
+            // unlike the cluster blocks above, every node runs queries, and
+            // this is the block that makes "the database got slow"
+            // answerable without running the harness.
+            self.query_env.metrics.render(),
+            self.lifecycle_lines(),
         )
     }
 }
