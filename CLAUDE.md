@@ -456,8 +456,16 @@ This project is inspired by the following projects.
   (`tls.get_ref().1.peer_certificates()`, borrowed not consumed) and
   layers `Extension(PeerIdentity)` onto the service, so the identity is
   extracted ONCE per connection rather than per request and the grant
-  intersection now applies identically on HTTP and Flight. Still open:
-  requiring mTLS is a C3 decision for the intra-cluster listener. SECURITY.md exposure 3 now
+  intersection now applies identically on HTTP and Flight. **DRILLED 15/15**
+  (`docs/evidence/http-peer-identity-drill.log`,
+  `deploy/compose/tls-drill/http_identity_drill.sh`): three clients make the
+  IDENTICAL claim `ops,audit` and only the certificate differs — anonymous
+  sees 3 rows (want mode unaffected), `narrowed-agent` granted `[ops]` sees
+  **2** (was 3 before this change), a cert with no grants recorded sees 3
+  (`None` = no policy, not deny-all). Also pinned: the restriction is
+  enforced in the scan (SELECT agrees with COUNT(*)), and the CN lands on
+  the `_system.queries` rows. Still open: requiring mTLS is a C3 decision
+  for the intra-cluster listener. SECURITY.md exposure 3 now
   CLOSED, new exposure 9 states plainly that want mode grants nothing on
   its own. Windows curl (schannel) can't drive this — drill from a Linux
   container on the compose network.

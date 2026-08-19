@@ -174,3 +174,35 @@ Unchanged, deliberately: want mode still grants nothing on its own
 additive rather than a flag day, and `None` grants continue to mean "no
 policy recorded" rather than "deny everything" — the latter would break a
 working client the moment it presented a certificate.
+
+### Drilled, not just unit-tested
+
+`deploy/compose/tls-drill/http_identity_drill.sh`, transcript at
+`docs/evidence/http-peer-identity-drill.log` — **15/15**. The original
+finding above was that the document described a capability the code did not
+have; the answer to that is evidence against a real handshake, not more
+unit tests, because a certificate only exists once TLS has actually run.
+
+Three clients issue the *identical* claim `ops,audit` against rows labelled
+public / `ops` / `audit`. Only the certificate differs, which is what makes
+the difference attributable to identity:
+
+| caller | grants | rows |
+|---|---|---|
+| anonymous | — | 3 |
+| `narrowed-agent` | `[ops]` | **2** |
+| `ungranted-agent` | none recorded | 3 |
+
+The middle row is the property. It also checks that `SELECT` returns the
+same count `COUNT(*)` claimed — the aggregate-leak surface SEC-2 cares
+about — and that the CN is recorded on the `_system.queries` rows.
+
+Two of the drill's own assertions were wrong on first run and are worth
+recording, because both are the failure mode this repository keeps finding:
+a check that cannot fail. `ck ... sh -c "admin GET ..."` referenced a shell
+function that does not survive into a child shell, so the positive check
+failed spuriously and the negative check `! admin GET ...` **passed
+vacuously** — "command not found" is a non-zero exit, which `!` turned into
+success. Separately, an attribution check used `grep -qv '"n":0"'`, which
+succeeds on an error response, so it would have passed had `_system` not
+existed. Both now read values and compare them.

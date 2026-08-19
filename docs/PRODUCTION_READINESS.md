@@ -335,15 +335,44 @@ certificates rotated under sustained shipping, 15,000 written read back
 exactly, a rejected renewal kept the last-good pair shipping, and an
 anonymous caller was served throughout (AT-6 not regressed).
 
-**The gap it exposed, on this side.** The certificate is verified at the
-TLS layer but its CN reaches no HTTP handler: `identity_of` is wired only
-into the Flight listener, and `/api/sql` plus the write endpoints carry no
-peer identity (`CLAUDE.md` has recorded this as NOT DONE — axum-server owns
-that accept loop, so it needs a custom `Accept`). Tributary writes over
-HTTP, so its certificate currently buys handshake-level verification, not
-identity-based authorization: no SEC-2 grant intersection and no
-per-identity attribution on the write path. Closing that is the remaining
-work before "identity" means on HTTP what it already means on Flight.
+**The gap it exposed, on this side — CLOSED 2026-08-19.** The certificate
+was verified at the TLS layer but its CN reached no HTTP handler:
+`identity_of` was wired only into the Flight listener, so `/api/sql` and
+the write endpoints carried no peer identity. `axum-server` owns that
+accept loop, which is why it needed a custom `Accept`. Tributary writes
+over HTTP, so its certificate bought handshake-level verification and
+nothing more: no SEC-2 grant intersection, no per-identity attribution.
+
+`crates/server/src/tls_identity.rs` wraps `RustlsAcceptor` with an `Accept`
+that reads the subject CN off the completed handshake
+(`tls.get_ref().1.peer_certificates()` — borrowed, not consumed, since the
+stream still has to be served) and layers `Extension(PeerIdentity)` onto
+the service. **Once per connection, not per request**: a peer certificate
+cannot change mid-connection, and doing it per request would put an X.509
+parse on the query path. From there the identity travels the path Flight
+already used — `Engine::sql` → `sql_batches` → `QuerySession.identity` →
+`.resolve(granted)`.
+
+**Drilled 15/15** against a real TLS handshake
+(`docs/evidence/http-peer-identity-drill.log`). Three clients issue the
+*identical* claim `ops,audit` against rows labelled public / `ops` /
+`audit`; only the certificate differs, which is what makes the row counts
+attributable to identity and nothing else:
+
+| caller | grants | rows seen |
+|---|---|---|
+| anonymous (no certificate) | — | **3** — want mode unaffected, so Grafana and Telegraf are not broken |
+| `narrowed-agent` | `[ops]` | **2** — claims ∩ grants, the audit row withheld. Before this change it was 3 |
+| `ungranted-agent` | none recorded | **3** — `None` means "no policy", not deny-all |
+
+The drill also confirms the restriction is enforced *in the scan*
+(`SELECT` returns the same count `COUNT(*)` claimed, so no aggregate leaks
+a hidden row) and that the CN lands on the query rows in `_system.queries`,
+which is what makes "which client is doing this to us" answerable in SQL.
+The drill runs from a Linux container on the compose network because
+Windows curl is schannel and cannot present a PEM client certificate — a
+host-side run would silently exercise the anonymous path three times and
+pass.
 
 ### P1-7 · Tributary's queue is node-local durability, not replication — DONE (2026-08-17)
 
