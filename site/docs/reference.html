@@ -284,9 +284,9 @@
             <tr><td><code>GET /admin/session</code></td><td>session</td><td>—</td><td>200 + who you are, your role, rotation state</td></tr>
             <tr><td><code>DELETE /admin/session</code></td><td>session</td><td>—</td><td>200; clears the cookie</td></tr>
             <tr><td><code>POST /admin/password</code></td><td>session; body <code>current_password</code>, <code>new_password</code></td><td>—</td><td>200; <strong>all sessions for the principal end</strong></td></tr>
-            <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>—</td><td>200 + <code>{"policies":[{table, seconds, duration}]}</code></td></tr>
-            <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink or introduce; body <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
-            <tr><td><code>DELETE /admin/retention/{table}</code></td><td>admin</td><td>—</td><td>200; the table keeps everything again</td></tr>
+            <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>—</td><td>200 + <code>{"policies":[{db, table, seconds, duration, all_databases}]}</code></td></tr>
+            <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink, introduce, or widen scope; body <code>db</code>, <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
+            <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
             <tr><td><code>GET /admin/tokens</code></td><td>admin</td><td>—</td><td>200 + token records; the secret is never re-shown</td></tr>
@@ -367,9 +367,10 @@
         seeded <code>admin</code>/<code>admin</code> credential is quarantined,
         so the console goes straight to a forced password change and returns to
         sign-in afterwards (rotation ends every session for that principal,
-        including the current one). After that it manages per-table retention:
-        the active policies, a set/remove form with table-name completion from
-        <code>SHOW TABLES</code>, the live
+        including the current one). After that it manages retention, scoped
+        per database and table: the active policies with all-databases
+        wildcards called out in red, a set/remove form with table-name
+        completion from <code>SHOW TABLES</code>, the live
         <code>timelake_retention_drops_total</code> counter, and a standing
         warning that shrinking a window deletes data on the next enforcement
         pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses. The
