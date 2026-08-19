@@ -1,0 +1,20 @@
+# Overlay for the audit-rotation drill.
+#
+# The shipped default rotates the trail at 64 MiB, which is right for a real
+# node and useless for a drill — nobody is generating 64 MiB of admin
+# mutations to watch a rename happen. This drops the trigger to 4 KiB so a
+# few dozen retention changes span several segments, and the drill can then
+# assert the properties that matter at any size:
+#
+#   * the hash chain verifies ACROSS segment boundaries
+#   * removing a whole segment file is DETECTED, not silently accepted
+#
+# Retention is deliberately left unset, which means nothing is ever deleted
+# — the drill checks that too, because "rotation quietly pruned my evidence"
+# is the failure mode worth proving absent.
+#
+#   docker compose -f compose/timelakedb.yml -f compose/audit-rotate.yml up -d
+services:
+  timelakedb:
+    environment:
+      TIMELAKE_AUDIT_ROTATE_SIZE: 4KiB

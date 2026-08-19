@@ -1,0 +1,95 @@
+Audit rotation — the chain survives it, and a deleted segment does not
+======================================================================
+
+Run:    2026-08-18
+Drill:  deploy/compose/audit-drill/rotation_drill.sh
+Stack:  deploy/compose/timelakedb.yml + compose/audit-rotate.yml
+        (TIMELAKE_AUDIT_ROTATE_SIZE=4KiB so a few dozen mutations span
+        several segments; the shipped default is 64MiB)
+Where:  inside the timelakedb container — it already has curl for its own
+        healthcheck and owns the data directory, so the drill needs no
+        extra container and no host path translation.
+
+Why this exists
+---------------
+
+`crates/audit` has unit tests for both properties. They exercise
+`AuditSink` directly. What was NOT proven until now is the thing actually
+claimed to an auditor: that `GET /admin/audit?verify=1` tells the truth
+about a trail that has rotated on a running server. R-1 and L4 each got a
+live drill; this closes the same gap for P1-2's rotation.
+
+Result
+------
+
+=== audit rotation drill ===
+  audit dir: /var/lib/timelake/data/audit
+  ok    an admin session was established
+--- baseline ---
+    segments=1 records=1
+  ok    the trail verifies before we start
+--- driving 40 admin mutations ---
+    segments=5 records=43
+  ok    the trail ROTATED (more than one segment on disk)
+  ok    every mutation is still readable across the segments
+--- the property that matters: the chain spans the boundaries ---
+  ok    verify=1 reports an intact chain AFTER rotation
+--- retention deleted nothing (it is unset) ---
+  ok    no segment disappeared on its own
+--- deleting a whole segment must be DETECTED ---
+    removing /var/lib/timelake/data/audit/audit.000000000009.jsonl
+    verify says: "verify":{"break":{"reason":"prev_hash does not match
+                 the previous record's hash","seq":10},"ok":false}
+  ok    verify=1 now reports a BREAK
+  ok    the break names the seq it happened at
+  ok    the break explains itself
+
+passed 9, failed 0
+AUDIT ROTATION DRILL PASSED
+
+What it establishes
+-------------------
+
+* **Rotation happens in production, not just in a unit test.** 40 admin
+  mutations at a 4 KiB trigger produced 5 segments, and all 43 records
+  (40 plus the baseline and the drill's own audited reads) remained
+  readable through `GET /admin/audit`. Rotation loses nothing.
+* **The chain spans the boundaries.** `?verify=1` reports an intact chain
+  after the trail has been split five ways. That is the whole design
+  requirement: `read_all` concatenates segments in order, so verification
+  runs straight through a rename that the operator never sees.
+* **Deleting a segment is caught, and located.** Removing
+  `audit.000000000009.jsonl` — a complete file, the crude way to make
+  records disappear — produced
+  `{"ok":false,"break":{"seq":10,"reason":"prev_hash does not match the
+  previous record's hash"}}`. The break names the seq where the trail
+  jumps and says why. Deleting a file is not a way to hide anything.
+* **Retention deleted nothing.** `TIMELAKE_AUDIT_RETAIN_DAYS` is unset, so
+  no segment vanished on its own. Checked explicitly, because "rotation
+  quietly pruned my evidence" is the failure mode worth proving absent
+  rather than assuming.
+
+One drill bug, recorded
+-----------------------
+
+The first run reported 6 passed / 2 failed — and the product was correct
+throughout. The failing assertions interpolated the JSON response into
+`sh -c "echo '$body' | grep ..."`, and the re-quoting of a body full of
+double quotes broke the match. The evidence that it was the drill and not
+the server is in that first run's own output, which printed the correct
+verdict immediately above the two FAILs:
+
+    verify says: {"break":{"reason":"prev_hash does not match the previous
+                 record's hash","seq":10}
+
+Fixed by writing the body to a file and grepping the file. Recorded
+because a drill that fails for its own reasons trains people to ignore
+red, which is worse than having no drill.
+
+Note on re-running
+------------------
+
+The drill ends by deliberately corrupting the trail, so a second run needs
+a fresh volume:
+
+    docker compose -f compose/timelakedb.yml -f compose/audit-rotate.yml down -v
