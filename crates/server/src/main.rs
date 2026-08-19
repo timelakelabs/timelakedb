@@ -230,6 +230,13 @@ async fn main() {
                 // the rest of the tick, so one unflushable table stopped
                 // compaction and retention for every table on the node.
                 let res = tokio::task::spawn_blocking(move || {
+                    // U2: sample first, so the numbers stored describe the
+                    // state the tick's other stages are about to change
+                    // rather than the state they left behind. It never
+                    // returns an error — a sample that cannot be stored is
+                    // logged and dropped, because telemetry must not be
+                    // able to fail maintenance.
+                    e.selfmon_tick();
                     if let Err(err) = e.flush_if_needed() {
                         tracing::error!(%err, stage = "flush", "maintenance stage failed");
                     }
@@ -351,15 +358,23 @@ async fn main() {
                 .parse()
                 .expect("TIMELAKE_ADDR must be host:port under TLS");
             let app = timelake_server::app_with_tls_admin(engine, rot);
-            axum_server::bind_rustls(
-                sock_addr,
-                axum_server::tls_rustls::RustlsConfig::from_config(http_tls),
-            )
-            // with_connect_info so the SEC-6 per-client limiter can key on
-            // the peer address when a caller presents no data-plane token.
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
-            .expect("server error (TLS)");
+            // SEC-3 v2 on HTTP: wrap the rustls acceptor so a verified
+            // client certificate's CN reaches the handlers as a request
+            // extension. Without this the connection is mutually
+            // authenticated and `/api/sql` cannot tell, so the certificate
+            // authorizes nothing — which is what it did until now.
+            let acceptor = timelake_server::tls_identity::IdentityAcceptor::new(
+                axum_server::tls_rustls::RustlsAcceptor::new(
+                    axum_server::tls_rustls::RustlsConfig::from_config(http_tls),
+                ),
+            );
+            axum_server::bind(sock_addr)
+                .acceptor(acceptor)
+                // with_connect_info so the SEC-6 per-client limiter can key on
+                // the peer address when a caller presents no data-plane token.
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+                .expect("server error (TLS)");
         }
         (None, None) => {
             tokio::spawn(async move {

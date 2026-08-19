@@ -1,0 +1,14 @@
+# Loads the self-monitoring dashboard from disk on startup.
+apiVersion: 1
+
+providers:
+  - name: timelakedb-console
+    orgId: 1
+    folder: TimeLakeDB
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

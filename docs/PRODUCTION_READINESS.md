@@ -53,9 +53,9 @@ Five axes. An item earns priority by which axis it unblocks.
 | # | Axis | Today |
 |---|---|---|
 | 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). No Helm chart; no public release cut yet |
-| 2 | **Access controlled and attributable** | No — open data plane, no audit trail |
+| 2 | **Access controlled and attributable** | Partly — the mechanisms exist but the defaults do not enforce them. Admin routes require a session (SEC-4); the data plane takes tokens but `TIMELAKE_DATA_AUTH` **defaults to `off`**, so a stock node still serves anyone who can reach it. Attribution is real: a hash-chained audit trail for every admin mutation (P1-2), client-certificate identity on both query surfaces (SEC-3 v2), and one row per query in `_system.queries` (U2). Not yet: data-plane auth on by default, and auditing of the data plane itself |
 | 3 | **Survives node loss** | No — single node, single volume, RPO = last backup |
-| 4 | **Failures visible before outages** | Mostly — good metrics, no alerting story, no audit |
+| 4 | **Failures visible before outages** | Yes — query latency/admission/outcome histograms, per-table storage, lifecycle lag and write-refusal causes on `/metrics` (U2, 2026-08-18); the hash-chained audit trail (P1-2); a documented alert list in `site/docs/reference.html`; and a self-monitoring Grafana console reading the node's own `_system` database. No alert *rules* are shipped — the list is prose, not a rules file |
 | 5 | **Safe to upgrade** | Partly — no released version, no compat policy |
 
 ---
@@ -384,9 +384,14 @@ peak and 50× better by bound.
   608 ms against a 250 ms target, and intra-run ingest decline under
   maintenance contention. Streaming execution, range reads, and
   maintenance/query isolation.
-- **Console U0–U3** — the admin listener on 1965 bound to loopback
-  (moving `/admin/*` off the data port), layered configuration with
-  provenance, cluster view.
+- **Console U0, U1 (part) and U3** — the admin listener on 1965 bound to
+  loopback (moving `/admin/*` off the data port), layered configuration
+  with provenance, cluster view. **U2 is done** (metrics + performance
+  views, 2026-08-18): see `docs/CONSOLE.md` §7.4/§7.6 and the drill
+  `docs/evidence/u2-console-drill.log`. Its own follow-ups are the
+  per-query pruning counters, a real `level` field on `FileMeta` instead
+  of the filename-prefix convention, and shipping a querier's samples to
+  an ingester so a CL-3 node can be charted at all.
 - **Tributary L5** — Consul/Kubernetes discovery, DaemonSet deployment,
   container-log metadata with the tag allowlist earning its keep, and
   workload identity (SPIFFE / projected tokens) as a third credential

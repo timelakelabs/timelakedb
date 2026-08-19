@@ -480,9 +480,22 @@ The Query view is the one that pays for itself: PR-3 and PR-6 are the
 project's contested numbers, and "Shape A got slow" is currently a
 question you answer by running the harness.
 
-### 7.4 Metrics that must be added
+### 7.4 Metrics that must be added — **BUILT 2026-08-18**
 
-ARCHITECTURE §13 promises several of these; the exposition currently has
+> **Status.** Everything in the table below is now exposed on `/metrics`,
+> with the exceptions noted after it. Before this the exposition was
+> entirely counters and gauges — nothing recorded how *long* anything
+> took, so the Query view could not be drawn at all and "Shape A got slow"
+> was a question you answered by running Gauge.
+>
+> The surfacing decision went to **self-monitoring** rather than
+> Prometheus: the node writes its own telemetry into its own `_system`
+> database (§7.6) and Grafana reads it back over Flight SQL. `/metrics`
+> is unchanged and remains the escape hatch — it answers from in-memory
+> atomics with no query path involved, which is what still works when the
+> engine is too sick to serve SQL.
+
+ARCHITECTURE §13 promises several of these; the exposition previously had
 counters and gauges for lines, buffer rows, WAL bytes, files, flushes,
 compactions, retention drops, databases/tables, encryption, visibility
 filtering, KMS, S3 and TLS. Missing, and needed for the views above:
@@ -505,12 +518,161 @@ filtering, KMS, S3 and TLS. Missing, and needed for the views above:
 These are useful to Grafana and the harness independently of the console,
 which is the argument for adding them at U2 regardless.
 
+**What was built, with the names as shipped.** The query metrics are
+instrumented in `run_sql_env` — the single production call site for both
+HTTP and Flight SQL, the same chokepoint the read-only guard uses, so the
+two surfaces cannot drift into different accounting.
+
+| Shipped | Notes |
+|---|---|
+| `timelake_query_duration_seconds` | Histogram. Buckets are dense either side of 250 ms because that is where PR-3's argument is, coarse in the tail |
+| `timelake_query_admission_wait_seconds` | Histogram. Separates *slow* from *merely queued* |
+| `timelake_query_in_flight`, `_queued` | Gauges, RAII-guarded so a cancelled query cannot leak them upward |
+| `timelake_queries_total`, `_timeouts_total`, `_refused_total`, `_failed_total` | `refused` is counted apart from `failed`: refusing a COPY is the P0-2 guard working, and folding it into an error rate makes a healthy node look broken whenever a client probes it |
+| `timelake_uptime_seconds`, `timelake_build_info` | |
+| `timelake_flush_lag_seconds`, `timelake_compaction_lag_seconds` | With nothing having run yet these report the **whole uptime**, not zero — a zero reads as "just flushed, healthy" at the exact moment the subsystem has never run |
+| `timelake_gc_pending_files` | |
+| `timelake_files{level}` | `flushed` / `compacted` / `rewritten`. See the caveat below |
+| `timelake_storage_bytes{db,table}`, `timelake_storage_rows{db,table}` | Folded under the catalog lock, not via `all_files()`, which clones every `FileMeta` on every scrape |
+| `timelake_write_rejected_total{reason}` | `backpressure` / `bad_request` / `not_here` / `internal`. The split is the point: the first is yours to act on, the second is the client's |
+| `timelake_selfmon_dropped_total`, `_written_total`, `_pending` | §7.6 |
+
+**Deferred, with reasons rather than silence:**
+
+- **`timelake_query_peak_memory_bytes`** — DataFusion's pool reports a
+  process-wide reservation, not a per-query peak; attributing it per query
+  needs a per-query pool, which is exactly the design M4 removed for
+  measured reasons (see `QueryEnv`). Not worth reintroducing for a metric.
+- **`timelake_query_files_pruned_total` / `_row_groups_pruned_total`** —
+  the pruning decisions happen inside `provider::scan`, below the seam
+  that currently carries any counters. Reachable, but it is a change to
+  the hot path and belongs with its own measurement.
+- **`timelake_config_revision` / `_divergent_settings`** — these describe
+  the layered configuration of §3, which is U0 work and does not exist yet.
+- **A real `level` field on `FileMeta`.** `timelake_files{level}` derives
+  the level from the filename prefix the write path stamps (`c` =
+  compacted, `t` = tombstone-rewritten, otherwise L0). That is a naming
+  convention, not a recorded fact. It is isolated in `catalog::level_of`
+  with a test that builds paths using the same `format!` strings as the
+  three write sites, so changing a path format fails the test rather than
+  making the metric quietly lie — but recording the level explicitly is
+  the better fix.
+
 ### 7.5 Relationship to the harness
 
 The console reports; Gauge's `bench/` remains the specification. The U2 gate is
 that the console's numbers agree with `/metrics` and with the `run.json`
 of a bench run — a console that disagrees with the harness is a bug in
 the console.
+
+Since §7.6 samples by converting the `/metrics` text itself, the first
+half of that gate holds by construction; the drill
+(`deploy/compose/console-drill/console_drill.sh`) checks it anyway,
+because "by construction" is a claim and a drill is evidence.
+
+### 7.6 Self-monitoring: the database stores its own telemetry
+
+*(Built 2026-08-18. `crates/server/src/selfmon.rs`.)*
+
+The node writes two streams into a `_system` database, and Grafana reads
+them back over Flight SQL — the same surface user data is read through.
+
+| Table | Contents |
+|---|---|
+| `_system.metrics` | The whole `/metrics` exposition, sampled every maintenance tick (10 s) |
+| `_system.queries` | One row per finished query: `db`, `outcome`, `identity`, `duration_ms`, `wait_ms`, `rows`, `ref` |
+
+**Percentiles are measured, not estimated.** Storing one row per query
+means p50/p95/p99 come from the real distribution and can be sliced by
+database, outcome and client identity — which a pre-bucketed histogram
+cannot do. The histogram on `/metrics` remains, for the case below.
+
+**The sample is a conversion of `/metrics`, not a second list.** The
+sampler parses the exposition the node already renders and re-emits it as
+line protocol. That looks roundabout and buys two things: §13's U2 gate
+(stored numbers agree with `/metrics`) becomes true by construction
+because they are the same numbers, and a metric added later is
+self-monitored the day it is added rather than silently missing from the
+dashboard forever.
+
+**It yields to the workload.** Monitoring that adds load during an
+overload makes the outage worse. The query-path observer only formats a
+line and pushes it onto a bounded queue; it never writes, never blocks,
+and **drops** when full. Drops are counted and exposed, because silent
+loss would make the dashboard lie by omission at the busiest moment. A
+failed `_system` write is logged and discarded, never retried and never
+propagated — telemetry cannot fail maintenance.
+
+**`_system` rows are excluded from `timelake_lines_written_total`.** That
+counter is what Gauge's throughput is compared against; a baseline that
+drifts upward because the server is watching itself is worse than no
+metric.
+
+#### A metric never emitted has no column
+
+Found by the drill, and worth understanding before writing panels: a
+metric becomes a **column** in `_system.metrics`, and columns are created
+on write. A subsystem that is not configured emits nothing, so its column
+never exists — and SQL cannot reference a column that does not exist. The
+panel fails with a query error rather than showing an empty graph.
+
+Prometheus degrades gracefully here (a missing series is simply no data);
+SQL does not. This is the sharpest edge of storing metrics as rows.
+
+Affected are every conditionally-emitted metric:
+
+| Metric group | Emitted only when |
+|---|---|
+| `timelake_tls_*` | `TIMELAKE_TLS_CERT` is set |
+| `timelake_tls_client_ca_*`, `timelake_flight_connections_*` | a client CA is configured (SEC-3 want mode) |
+| `timelake_s3_*` | the object store is S3 |
+| `timelake_kms_*` | the KMS key cache is active |
+| `timelake_cl2_*` | the node is an ingester with a peer |
+| `timelake_querier_*`, `timelake_catalog_head` | the node is a querier |
+| `timelake_router_*` | the node is a router |
+
+**The shipped dashboard therefore uses only always-emitted metrics**, so
+it works on a stock node out of the box. Add the rest per deployment —
+for a TLS node, for instance:
+
+```sql
+SELECT MAX(timelake_tls_cert_expiry_seconds) AS expires_in
+FROM metrics
+WHERE timelake_tls_cert_expiry_seconds IS NOT NULL
+  AND time >= now() - INTERVAL '15 minutes'
+```
+
+Note that `/metrics` was deliberately **not** changed to emit placeholder
+zeros for absent subsystems. A `timelake_tls_cert_expiry_seconds 0` on a
+plaintext node would read as "certificate expired" and fire the very
+alert §7.4 recommends, on every node that has no certificate at all.
+Absent is the truthful encoding; the cost is paid here instead.
+
+#### Three limits, stated rather than discovered later
+
+1. **It dies when you need it.** Reading the database through the
+   database means these panels go blank exactly when the engine is too
+   unhealthy to serve SQL. `/metrics` on 1963 is unchanged and answers
+   from in-memory atomics with no query path involved — that is the
+   surface to scrape for alerting, and the reason it was not replaced.
+2. **A CL-3 querier stores nothing.** A querier owns no data, refuses
+   writes and runs no maintenance, so a local buffer would grow with
+   nothing to flush it. `selfmon_tick` returns 0 there and `/metrics`
+   is the only surface. In a cluster that is where the queries run, so
+   shipping querier samples to an ingester is real work — it belongs
+   with the C2 role split, not with metrics.
+3. **`_system` has no retention by default, deliberately.**
+   `enforce_retention` matches on **table name alone, ignoring the
+   database** (`crates/server/src/lib.rs`, `enforce_retention`). Seeding a
+   policy for `_system`'s `metrics`/`queries` tables would therefore drop
+   any user table of the same name in any database — a data-loss hazard,
+   not a tidy default. Set retention explicitly if the table names are
+   unused in your deployment; the real fix is to make retention
+   database-scoped, which changes the stored `retention.json` format and
+   the admin API, and is its own piece of work.
+
+`TIMELAKE_SELFMON=off` disables the whole thing;
+`TIMELAKE_SELFMON_QUEUE` sets the queue bound (default 4096).
 
 ---
 

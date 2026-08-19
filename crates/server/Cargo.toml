@@ -25,6 +25,12 @@ timelake-compact = { path = "../compact" }
 timelake-flight = { path = "../flight" }
 timelake-tls = { path = "../tls" }
 axum-server.workspace = true
+# HTTP peer identity: the acceptor reads the rustls ServerConnection off the
+# stream, and layers the identity onto the service. Both crates are already
+# compiled in via axum-server/reqwest; these are direct declarations of what
+# is there, not new dependencies.
+tokio-rustls.workspace = true
+tower-layer = "0.3"
 reqwest.workspace = true
 flate2.workspace = true
 

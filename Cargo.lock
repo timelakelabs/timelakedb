@@ -4624,7 +4624,9 @@ dependencies = [
  "timelake-tls",
  "timelake-wal",
  "tokio",
+ "tokio-rustls",
  "tower",
+ "tower-layer",
  "tracing",
  "tracing-subscriber",
 ]
