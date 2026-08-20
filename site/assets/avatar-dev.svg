@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img"
+     shape-rendering="crispEdges" aria-label="TimeLakeDB pixel developer avatar">
+  <!-- Pixel art on a 32x32 grid; every colour is a site brand token.
+       shape-rendering=crispEdges keeps the pixels square at any size. -->
+  <rect width="200" height="200" fill="#0b1220"/>
+  <g fill="#0f1e33">
+    <rect x="143.8" y="18.75" width="6.25" height="6.25"/>
+    <rect x="162.5" y="18.75" width="6.25" height="6.25"/>
+    <rect x="131.2" y="25" width="12.5" height="6.25"/>
+    <rect x="168.8" y="25" width="12.5" height="6.25"/>
+    <rect x="118.8" y="31.25" width="12.5" height="6.25"/>
+    <rect x="181.2" y="31.25" width="12.5" height="6.25"/>
+  </g>
+  <g fill="#1c2e45">
+    <rect x="143.8" y="25" width="25" height="6.25"/>
+    <rect x="131.2" y="31.25" width="50" height="6.25"/>
+    <rect x="62.5" y="50" width="75" height="6.25"/>
+    <rect x="56.25" y="56.25" width="87.5" height="6.25"/>
+    <rect x="56.25" y="62.5" width="93.75" height="6.25"/>
+    <rect x="56.25" y="68.75" width="12.5" height="6.25"/>
+    <rect x="125" y="68.75" width="25" height="6.25"/>
+    <rect x="56.25" y="75" width="6.25" height="6.25"/>
+    <rect x="131.2" y="75" width="18.75" height="6.25"/>
+    <rect x="56.25" y="81.25" width="6.25" height="6.25"/>
+    <rect x="131.2" y="81.25" width="18.75" height="6.25"/>
+    <rect x="56.25" y="87.5" width="25" height="6.25"/>
+    <rect x="93.75" y="87.5" width="25" height="6.25"/>
+    <rect x="131.2" y="87.5" width="18.75" height="6.25"/>
+    <rect x="56.25" y="93.75" width="12.5" height="6.25"/>
+    <rect x="75" y="93.75" width="12.5" height="6.25"/>
+    <rect x="112.5" y="93.75" width="12.5" height="6.25"/>
+    <rect x="137.5" y="93.75" width="12.5" height="6.25"/>
+    <rect x="56.25" y="100" width="6.25" height="6.25"/>
+    <rect x="131.2" y="100" width="18.75" height="6.25"/>
+    <rect x="56.25" y="106.2" width="6.25" height="6.25"/>
+    <rect x="93.75" y="106.2" width="12.5" height="6.25"/>
+    <rect x="131.2" y="106.2" width="18.75" height="6.25"/>
+    <rect x="56.25" y="112.5" width="6.25" height="6.25"/>
+    <rect x="75" y="112.5" width="43.75" height="6.25"/>
+    <rect x="131.2" y="112.5" width="18.75" height="6.25"/>
+    <rect x="56.25" y="118.8" width="93.75" height="6.25"/>
+    <rect x="56.25" y="125" width="87.5" height="6.25"/>
+    <rect x="62.5" y="131.2" width="75" height="6.25"/>
+    <rect x="75" y="137.5" width="50" height="6.25"/>
+    <rect x="81.25" y="143.8" width="37.5" height="6.25"/>
+    <rect x="43.75" y="150" width="118.8" height="6.25"/>
+    <rect x="37.5" y="156.2" width="137.5" height="6.25"/>
+    <rect x="25" y="162.5" width="156.2" height="6.25"/>
+    <rect x="18.75" y="168.8" width="168.8" height="6.25"/>
+    <rect x="12.5" y="175" width="181.2" height="6.25"/>
+    <rect x="6.25" y="181.2" width="193.8" height="6.25"/>
+    <rect x="6.25" y="187.5" width="193.8" height="6.25"/>
+    <rect x="6.25" y="193.8" width="193.8" height="6.25"/>
+  </g>
+  <g fill="#3b82f6">
+    <rect x="0" y="37.5" width="200" height="6.25"/>
+    <rect x="0" y="43.75" width="25" height="6.25"/>
+    <rect x="31.25" y="43.75" width="131.2" height="6.25"/>
+    <rect x="168.8" y="43.75" width="31.25" height="6.25"/>
+  </g>
+  <g fill="#7dd3fc">
+    <rect x="25" y="43.75" width="6.25" height="6.25"/>
+    <rect x="162.5" y="43.75" width="6.25" height="6.25"/>
+  </g>
+  <g fill="#14b8a6">
+    <rect x="50" y="62.5" width="6.25" height="6.25"/>
+    <rect x="50" y="68.75" width="6.25" height="6.25"/>
+    <rect x="50" y="75" width="6.25" height="6.25"/>
+    <rect x="50" y="81.25" width="6.25" height="6.25"/>
+    <rect x="50" y="87.5" width="6.25" height="6.25"/>
+    <rect x="50" y="93.75" width="6.25" height="6.25"/>
+    <rect x="50" y="100" width="6.25" height="6.25"/>
+    <rect x="50" y="106.2" width="6.25" height="6.25"/>
+    <rect x="50" y="112.5" width="6.25" height="6.25"/>
+    <rect x="50" y="118.8" width="6.25" height="6.25"/>
+    <rect x="37.5" y="150" width="6.25" height="6.25"/>
+    <rect x="25" y="156.2" width="12.5" height="6.25"/>
+    <rect x="18.75" y="162.5" width="6.25" height="6.25"/>
+    <rect x="12.5" y="168.8" width="6.25" height="6.25"/>
+    <rect x="6.25" y="175" width="6.25" height="6.25"/>
+    <rect x="0" y="181.2" width="6.25" height="6.25"/>
+    <rect x="0" y="187.5" width="6.25" height="6.25"/>
+    <rect x="0" y="193.8" width="6.25" height="6.25"/>
+  </g>
+  <g fill="#5eead4">
+    <rect x="18.75" y="6.25" width="6.25" height="6.25"/>
+    <rect x="168.8" y="6.25" width="6.25" height="6.25"/>
+  </g>
+  <g fill="#e6edf5">
+    <rect x="150" y="12.5" width="6.25" height="6.25"/>
+    <rect x="150" y="18.75" width="12.5" height="6.25"/>
+    <rect x="68.75" y="68.75" width="56.25" height="6.25"/>
+    <rect x="62.5" y="75" width="68.75" height="6.25"/>
+    <rect x="62.5" y="81.25" width="68.75" height="6.25"/>
+    <rect x="81.25" y="87.5" width="12.5" height="6.25"/>
+    <rect x="118.8" y="87.5" width="12.5" height="6.25"/>
+    <rect x="68.75" y="93.75" width="6.25" height="6.25"/>
+    <rect x="87.5" y="93.75" width="25" height="6.25"/>
+    <rect x="125" y="93.75" width="12.5" height="6.25"/>
+    <rect x="62.5" y="100" width="68.75" height="6.25"/>
+    <rect x="62.5" y="106.2" width="31.25" height="6.25"/>
+    <rect x="106.2" y="106.2" width="25" height="6.25"/>
+    <rect x="62.5" y="112.5" width="12.5" height="6.25"/>
+    <rect x="118.8" y="112.5" width="12.5" height="6.25"/>
+  </g>
+</svg>
