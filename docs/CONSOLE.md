@@ -777,8 +777,12 @@ denials. That is the U1 gate.
 One HTML file per page plus a shared `console.css` and `console.js`,
 `include_str!`-embedded exactly as `admin_ui.html` is today, served with
 a strict CSP (`default-src 'none'; style-src 'self'; script-src 'self'`),
-no CDN, no fonts, no build step. The palette is the site's: navy `0B1320`,
-blue `2563EB`, gold `D4AF37`, mist `E6E8EC`, gray `6B7280`. Charts are
+no CDN, no fonts, no build step. The palette is the site's: navy
+`0B1220`, blue `3B82F6`, sky `7DD3FC`, **teal `14B8A6`** (the accent),
+mist `E6EDF5`, gray `6B7280` — the mountain-lake identity, canonical in
+`site/assets/style.css`. This paragraph named the pre-rebrand gold palette
+until 2026-08-20; `crates/api/src/admin_ui.html` still ships it, so the
+console is gold while the site is teal (see §14). Charts are
 hand-drawn SVG sparklines over the sample ring — a few hundred lines, no
 charting library, and no dependency that a CSP has to make an exception
 for.
