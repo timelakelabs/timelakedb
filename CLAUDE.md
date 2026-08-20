@@ -191,10 +191,12 @@ This project is inspired by the following projects.
   stored copy cannot be read. KNOWN LIMITS, documented not hidden: a CL-3
   querier stores nothing (no write path, no maintenance — `/metrics` only;
   shipping its samples to an ingester is C2 work); `_system` gets NO
-  default retention because **`enforce_retention` matches table name
-  ignoring the database**, so seeding one would drop any user table named
-  `metrics`/`queries` — that db-scoping bug is now the top retention
-  follow-up. Full
+  default retention — ~~because `enforce_retention` matches table name
+  ignoring the database~~, **that db-scoping bug was fixed 2026-08-19**
+  (see the retention entry above), so bounding `_system` is now safe and
+  `docs/CONSOLE.md` §7.6 gives the two calls. It is still not done for
+  you: a deletion policy should be an operator's decision, not a side
+  effect of enabling telemetry. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does

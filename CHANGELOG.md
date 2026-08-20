@@ -100,6 +100,8 @@ executed against a live node).
   for TLS/S3/KMS/cluster metrics must be added per deployment), a CL-3
   querier stores nothing, and `_system` gets no default retention because
   `enforce_retention` matches table name **ignoring the database**.
+  *(That last limit was itself a data-loss bug and was fixed the next day —
+  see the 2026-08-19 entry above. `_system` can now be bounded safely.)*
 
 ### Added — a client certificate now authorizes on `/api/sql` too (2026-08-18)
 
@@ -416,7 +418,7 @@ Drill: `docs/evidence/cl3-querier-drill.log` (19/19), rig
   unions every shard from the shared store, so `/api/sql` on the router
   returns 501 until CL-3 (phase 4). Queries go direct to an ingester for
   now.
-- Sharding is FNV-1a over `db measurement` mod N (deterministic across
+- Sharding is FNV-1a over `db\0measurement` mod N (deterministic across
   restarts, unlike the default hasher), with ingesters sorted by id so a
   table always lands on the same node. Discovery's `NodeInfo` gained a
   `data_address` (the public write port the router forwards to), carried in
