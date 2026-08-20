@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TimeLakeDB — A time-series database for high-cardinality data</title>
 <meta name="description" content="TimeLakeDB is a Rust time-series database for high-cardinality data: tags cost a compressed column rather than a series index, no query can exhaust the server, and retention is set per table at runtime. Built on Apache DataFusion, Arrow and Parquet.">
-<meta name="theme-color" content="#0b1320">
+<meta name="theme-color" content="#0b1220">
 <meta property="og:title" content="TimeLakeDB — Time. Stored. Forever.">
 <meta property="og:description" content="For when the number of distinct things you track outgrew the memory you have — and you need to say exactly how long each table keeps its data.">
 <meta property="og:type" content="website">
@@ -58,14 +58,19 @@
     <svg class="hero-graphic" viewBox="0 0 820 340" role="img"
          aria-label="A day of time-series data rising to a peak and settling, plotted from 00:00 to 24:00">
       <defs>
+        <!-- The mark's own gradient family (blue -> sky -> teal), swept
+             horizontally across the day instead of vertically up a spike.
+             These three stops were #2563eb/#5b9bff/#8fc2ff until
+             2026-08-20 -- the pre-rebrand blues, so the hero drew itself
+             in a palette the rest of the page had already left behind. -->
         <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#2563eb"/>
-          <stop offset="55%" stop-color="#5b9bff"/>
-          <stop offset="100%" stop-color="#8fc2ff"/>
+          <stop offset="0%" stop-color="#3b82f6"/>
+          <stop offset="55%" stop-color="#7dd3fc"/>
+          <stop offset="100%" stop-color="#5eead4"/>
         </linearGradient>
         <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#2563eb" stop-opacity=".38"/>
-          <stop offset="100%" stop-color="#2563eb" stop-opacity="0"/>
+          <stop offset="0%" stop-color="#3b82f6" stop-opacity=".38"/>
+          <stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/>
         </linearGradient>
         <filter id="glow" x="-25%" y="-45%" width="150%" height="190%">
           <feGaussianBlur stdDeviation="6" result="b"/>
@@ -74,7 +79,7 @@
       </defs>
 
       <!-- radar arcs behind the plot -->
-      <g fill="none" stroke="#5b9bff" opacity=".16">
+      <g fill="none" stroke="#7dd3fc" opacity=".16">
         <circle cx="600" cy="150" r="105"/>
         <circle cx="600" cy="150" r="150"/>
         <circle cx="600" cy="150" r="196"/>
@@ -103,7 +108,7 @@
       </g>
 
       <!-- time axis -->
-      <path d="M40 290H788" stroke="#5b9bff" stroke-width="1.5" opacity=".8"/>
+      <path d="M40 290H788" stroke="#7dd3fc" stroke-width="1.5" opacity=".8"/>
       <g fill="#93a7c4" font-family="system-ui, sans-serif" font-size="16" text-anchor="middle">
         <text x="40" y="318">00:00</text>
         <text x="227" y="318">06:00</text>

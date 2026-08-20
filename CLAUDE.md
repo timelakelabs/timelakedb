@@ -73,12 +73,19 @@ This project is inspired by the following projects.
 - The website is `site/` — hand-written HTML/CSS/SVG, no build step, all
   paths relative so it works at a project-page subpath or a domain root.
   `.github/workflows/pages.yml` publishes it (needs Settings → Pages →
-  Source: GitHub Actions, once). Brand palette: navy 0B1320, blue
-  2563EB, gold D4AF37, mist E6E8EC, gray 6B7280 — the canonical copy of
-  each value lives in `site/assets/style.css` as CSS custom properties,
-  and `site/assets/logo.svg` is the mark. (The original brand sheet is a
-  local design asset, deliberately untracked.) Site claims must trace to
-  `docs/evidence/` — no marketing numbers.
+  Source: GitHub Actions, once). **Brand palette (mountain-lake identity,
+  corrected 2026-08-20): navy `0B1220`, navy-soft `0F1E33`, navy-line
+  `1C2E45`, blue `3B82F6`, sky `7DD3FC`, TEAL `14B8A6` (the accent), mist
+  `E6EDF5`, gray `6B7280`, ink `16202F`.** The canonical copy of each
+  value lives in `site/assets/style.css` as CSS custom properties;
+  `site/assets/logo.svg` is the circular mark, `avatar.svg` the square one
+  (opaque navy corners, for platforms that composite onto their own
+  ground). ~~gold D4AF37~~ — **teal replaced gold in the rebrand**, and
+  this note recorded the pre-rebrand values until 2026-08-20: four of its
+  five were stale, so anything built from it came out gold-accented.
+  Wordmark is two parts: `TimeLake` white/ink + `DB` in teal. (The
+  original brand sheet is a local design asset, deliberately untracked.)
+  Site claims must trace to `docs/evidence/` — no marketing numbers.
 - With a local toolchain: `cargo test --workspace`,
   `cargo run -p timelake-server` (listens on TIMELAKE_ADDR,
   default 0.0.0.0:1963).
