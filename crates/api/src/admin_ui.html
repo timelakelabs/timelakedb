@@ -5,30 +5,33 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TimeLakeDB — Console</title>
 <style>
-  :root{--navy:#0B1320;--blue:#2563EB;--gold:#D4AF37;--mist:#E6E8EC;--gray:#6B7280;--red:#ef4444;--green:#34d399}
+  /* Brand tokens track the site palette (CLAUDE.md); --red/--amber/--green
+     are semantic and deliberately separate from it. */
+  :root{--navy:#0B1220;--blue:#3B82F6;--sky:#7DD3FC;--teal:#14B8A6;--mist:#E6EDF5;--gray:#6B7280;
+        --red:#ef4444;--amber:#FBBF24;--green:#34d399}
   *{box-sizing:border-box;margin:0;padding:0}
   body{font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--navy);color:var(--mist);padding:2rem 1rem;min-height:100vh}
   .shell{max-width:760px;margin:0 auto}
   h1{font-size:1.4rem;font-weight:600;margin-bottom:.25rem}
-  h1 b{color:var(--gold)}
+  h1 b{color:var(--teal)}
   .sub{color:var(--gray);margin-bottom:1.5rem;font-size:.9rem}
-  .card{background:rgba(255,255,255,.04);border:1px solid rgba(230,232,236,.12);border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
+  .card{background:rgba(255,255,255,.04);border:1px solid rgba(230,237,245,.12);border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
   h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--gray);margin-bottom:.9rem}
   table{width:100%;border-collapse:collapse}
-  th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid rgba(230,232,236,.08);font-size:.92rem}
+  th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid rgba(230,237,245,.08);font-size:.92rem}
   th{color:var(--gray);font-weight:500;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
   td.mono{font-family:ui-monospace,Consolas,monospace}
   .empty{color:var(--gray);padding:.6rem;font-style:italic}
   form{display:flex;gap:.6rem;flex-wrap:wrap;align-items:flex-end}
   form.stack{flex-direction:column;align-items:stretch;max-width:22rem}
   label{display:flex;flex-direction:column;gap:.3rem;font-size:.78rem;color:var(--gray)}
-  input,select{background:rgba(255,255,255,.06);border:1px solid rgba(230,232,236,.18);border-radius:6px;color:var(--mist);padding:.45rem .6rem;font-size:.92rem;min-width:9rem}
+  input,select{background:rgba(255,255,255,.06);border:1px solid rgba(230,237,245,.18);border-radius:6px;color:var(--mist);padding:.45rem .6rem;font-size:.92rem;min-width:9rem}
   input:focus,select:focus{outline:2px solid var(--blue);border-color:transparent}
   button{background:var(--blue);border:0;border-radius:6px;color:#fff;padding:.5rem 1rem;font-size:.92rem;cursor:pointer}
   button:hover{filter:brightness(1.1)}
-  button.ghost{background:transparent;border:1px solid rgba(230,232,236,.25);color:var(--mist);padding:.25rem .6rem;font-size:.8rem}
+  button.ghost{background:transparent;border:1px solid rgba(230,237,245,.25);color:var(--mist);padding:.25rem .6rem;font-size:.8rem}
   button.ghost:hover{border-color:var(--red);color:var(--red)}
-  .warn{border-left:3px solid var(--gold);background:rgba(212,175,55,.08);padding:.7rem .9rem;border-radius:0 8px 8px 0;font-size:.85rem;margin-top:1rem}
+  .warn{border-left:3px solid var(--amber);background:rgba(251,191,36,.10);padding:.7rem .9rem;border-radius:0 8px 8px 0;font-size:.85rem;margin-top:1rem}
   .danger{border-left-color:var(--red);background:rgba(239,68,68,.1)}
   .msg{margin-top:.8rem;font-size:.85rem;min-height:1.2em}
   .msg.err{color:var(--red)}.msg.ok{color:var(--green)}
@@ -36,7 +39,7 @@
   .stat b{color:var(--mist)}
   .who{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;font-size:.85rem;color:var(--gray)}
   .who b{color:var(--mist)}
-  .pill{display:inline-block;background:rgba(37,99,235,.18);color:#93b4fd;border-radius:99px;padding:.1rem .5rem;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
+  .pill{display:inline-block;background:rgba(59,130,246,.18);color:var(--sky);border-radius:99px;padding:.1rem .5rem;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
   [hidden]{display:none !important}
 </style>
 </head>
