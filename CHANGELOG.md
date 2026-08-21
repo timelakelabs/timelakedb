@@ -13,6 +13,45 @@ here.
 
 ## [Unreleased]
 
+### Added — the compactor role, built and deliberately not startable (2026-08-21)
+
+C2 phase 5a. `TIMELAKE_ROLE=compactor` runs rewrite work and nothing else:
+no writes, no queries, no buffer of its own. It tails the catalog, then
+compacts, applies tombstone rewrites and enforces retention on a 30 s
+cadence, and serves `/health`, `/ping` and `/metrics` — nothing more.
+
+Two things it must do that a single `all` node does not.
+
+It **tails the catalog**. `compact_once` reads the in-memory file list,
+which advances only on a node's own commits, and a compactor commits
+nothing until it compacts. Without tailing it would work forever from the
+list it booted with, choosing partitions that no longer exist. The commit
+fence makes that safe; it does not make it useful.
+
+It is **read-only for writes**. It has no WAL and no client should be
+pointed at it, so a stray write is a misconfiguration and is refused
+rather than half-accepted into a buffer nothing will flush.
+
+The HTTP surface is built additively (`timelake_api::maintenance_app`)
+rather than by removing routes from the data plane. A route removed by
+subtraction returns the moment somebody adds one to the main router
+without thinking about this caller.
+
+**`Role::implemented` still refuses `compactor`, on purpose.** The reason
+changed rather than expired: it is no longer "not built yet", it is that a
+second compactor is only *efficient* once work-avoidance exists. The
+commit fence already makes it *correct* — a merge whose inputs were
+replaced is refused. Two compactors racing every partition would do double
+the IO to land half the merges.
+
+`deploy/compose/timelakedb-compactor.yml` is committed and documented as
+not starting today, because a role nobody has tried to launch is a role
+nobody knows is wired correctly. Verified both ways: with the gate shut the
+container exits 2 naming the reason; with the gate temporarily open (local,
+uncommitted) the compactor came up, tailed to catalog head 5, logged
+`compaction pass partitions=1`, reported `timelake_compactions_total 1`,
+and returned 404 for `/api/v3/write_lp` and `/api/sql`.
+
 ### Fixed — two compactors could both commit a merge of one partition (2026-08-21)
 
 Groundwork for the compactor role split (C2 phase 5). Not reachable today,

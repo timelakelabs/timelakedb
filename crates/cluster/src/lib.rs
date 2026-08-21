@@ -240,9 +240,25 @@ mod tests {
         assert!(Role::Ingester.implemented(), "CL-2 shipped the ingester");
         assert!(Role::Router.implemented(), "phase 3 shipped the router");
         assert!(Role::Querier.implemented(), "phase 4 shipped the querier");
+        // The compactor role EXISTS as of C2 phase 5a — it has a branch in
+        // main.rs, a maintenance loop and an HTTP surface. The gate stays
+        // shut anyway, and the reason changed rather than expired.
+        //
+        // It is no longer "not built yet". It is now the only thing
+        // stopping a second compactor from being started, and a second
+        // compactor is safe only once the work-avoidance layer above the
+        // commit fence exists. The fence makes concurrent compaction
+        // CORRECT (a merge whose inputs were replaced is refused); it does
+        // not make it efficient, and two compactors racing every partition
+        // would do double the IO to land half the merges.
+        //
+        // Flipping this is a deliberate act with its own issue. If you are
+        // here because you added the role and the test failed: that is the
+        // test working.
         assert!(
             !Role::Compactor.implemented(),
-            "compactor should not be built yet"
+            "the compactor gate stays shut until the lease lands on top of \
+             the commit fence — flipping this is a decision, not a tidy-up"
         );
     }
 

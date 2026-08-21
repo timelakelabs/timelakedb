@@ -1,0 +1,82 @@
+# A compactor alongside a normal node, sharing one object store.
+#
+#   docker compose -f deploy/compose/timelakedb-compactor.yml up -d --build
+#
+# THIS DOES NOT START YET, ON PURPOSE. `Role::implemented` refuses
+# `compactor`, so that container exits 2 with a message naming the reason.
+# The topology is committed anyway, because a role nobody has ever tried to
+# launch is a role nobody knows is wired correctly — the env vars, the
+# shared volume, the health check and the port mapping are all things that
+# are wrong until someone runs them once.
+#
+# Bring it up and you should see:
+#
+#   node       | healthy, serving writes and queries on 5963
+#   compactor  | exited 2: "TIMELAKE_ROLE=compactor is not yet implemented"
+#
+# That second line is the expected result today. When the gate opens, this
+# file is what proves the role works without anyone assembling a topology
+# under time pressure.
+#
+# ## Why they share a volume and not a network path
+#
+# The compactor is not a peer in the CL-2 sense. It replicates nothing and
+# talks to nobody: it reaches the same object store, tails the catalog, and
+# rewrites files. Discovery does not carry correctness here (CL-5) and the
+# compactor consults it for nothing at all.
+#
+# That is also why this is safe to run before the lease exists. Two nodes
+# compacting the same partition is *correct* — the loser's merge is refused
+# at commit because its inputs are gone (`Catalog::commit_replace`) — it is
+# merely wasteful. `timelake_stale_merges_total` on either node counts how
+# wasteful.
+name: bench-timelakedb-compactor
+services:
+  node:
+    build: ../..
+    container_name: tl-node
+    hostname: tl-node
+    ports:
+      - "5963:1963"
+    environment:
+      TIMELAKE_ROLE: all
+      TIMELAKE_NODE_ID: tl-node
+      # Compaction off on this node: the point of the topology is that the
+      # compactor does that work. Raised rather than disabled because there
+      # is no switch for "never compact", and a threshold nothing reaches
+      # is the honest way to say it.
+      TIMELAKE_COMPACT_MIN_FILES: "1000000"
+    volumes:
+      - shared-store:/var/lib/timelake/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  compactor:
+    build: ../..
+    container_name: tl-compactor
+    hostname: tl-compactor
+    ports:
+      # health/metrics only — there is no data plane on this node
+      - "5965:1963"
+    environment:
+      TIMELAKE_ROLE: compactor
+      TIMELAKE_NODE_ID: tl-compactor
+      TIMELAKE_COMPACT_MIN_FILES: "4"
+    volumes:
+      - shared-store:/var/lib/timelake/data
+    mem_limit: 2g
+    # No `depends_on: healthy` — the compactor does not need the other node
+    # up. It reads the store, and an empty store is a valid state that it
+    # should sit quietly through rather than crash-loop against.
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  shared-store:
