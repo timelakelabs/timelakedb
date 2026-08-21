@@ -82,7 +82,13 @@ This project is inspired by the following projects.
   (opaque navy corners, for platforms that composite onto their own
   ground). ~~gold D4AF37~~ — **teal replaced gold in the rebrand**, and
   this note recorded the pre-rebrand values until 2026-08-20: four of its
-  five were stale, so anything built from it came out gold-accented.
+  five were stale, so anything built from it came out gold-accented. The
+  admin console was one of those things and shipped gold until 2026-08-21;
+  `crates/api/tests/console_palette.rs` pins it now. Note what gold was
+  doing there, because it is the general case: it was the brand accent in
+  one rule and a warning stripe in another, so it had no single
+  replacement. Brand colours and semantic ones (`--red`, `--amber`,
+  `--green`) are separate, and only the first kind moves in a rebrand.
   Wordmark is two parts: `TimeLake` white/ink + `DB` in teal. (The
   original brand sheet is a local design asset, deliberately untracked.)
   Site claims must trace to `docs/evidence/` — no marketing numbers.

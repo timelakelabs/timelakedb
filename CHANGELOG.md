@@ -13,6 +13,32 @@ here.
 
 ## [Unreleased]
 
+### Fixed — the admin console was still wearing the old brand (2026-08-21)
+
+`crates/api/src/admin_ui.html` shipped the pre-rebrand palette: gold
+accent `#D4AF37`, navy `#0B1320` (one digit off the real `#0B1220`), plus
+an old blue and mist. The site, the docs and the Grafana dashboard moved
+months earlier. The console is the only one of those a customer opens.
+
+`--gold` had no direct replacement, which is why it outlasted the rebrand.
+It was doing two jobs: brand accent on the heading, and a caution stripe on
+`.warn`. The first became `--teal`, matching the site. The second became a
+new semantic `--amber` alongside the existing `--red` and `--green` —
+painting a warning with the brand accent makes every caution box read as a
+heading, and semantic colours should not move in a rebrand at all.
+
+Hand-mixed `rgba()` values moved with their tokens. Those drift silently:
+`rgba(230,232,236,…)` was mist, `rgba(212,175,55,…)` was gold, and the role
+pill's `#93b4fd` was a light blue mixed by eye, now `var(--sky)`.
+
+`crates/api/tests/console_palette.rs` pins all of it — brand tokens match
+`CLAUDE.md`, retired values cannot reappear (including as `rgb()` triples),
+`--gold` is gone by name, and `.warn` may not use a brand colour. Verified
+red against the pre-change file and green after, because a test only ever
+seen passing says nothing about what it catches.
+
+No behaviour, API or data-path change.
+
 ### Fixed — a retention policy no longer deletes tables it was not pointed at (2026-08-19)
 
 **This is a data-loss fix.** `enforce_retention` matched a policy on table
