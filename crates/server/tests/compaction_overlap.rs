@@ -244,3 +244,121 @@ async fn compaction_is_idempotent_and_does_not_loop() {
     assert_eq!(eng.compact_once().unwrap(), 0);
     assert_eq!(count(&app, "cpu").await, 300);
 }
+
+// ---------------------------------------------------------------------
+// C2 phase 5: two compactors, one store.
+// ---------------------------------------------------------------------
+
+/// Two engines sharing one object store, as two nodes would.
+///
+/// This is the situation `Role::implemented` currently refuses to create
+/// and that #21 will make possible. The fence has to exist first, because
+/// the moment a second compactor can run, the old unconditional commit
+/// lets both of them land a merge of the same partition.
+fn pair_on_one_store(
+    dir: &std::path::Path,
+) -> (Arc<timelake_server::Engine>, Arc<timelake_server::Engine>) {
+    let store = Arc::new(timelake_store::LocalStore::new(&dir.join("shared")).unwrap())
+        as Arc<dyn timelake_store::Store>;
+    let cfg = || timelake_server::EngineConfig {
+        query_mem_bytes: 256 * 1024 * 1024,
+        flush_rows: 1_000_000,
+        flush_age_secs: u64::MAX,
+        wal_max_bytes: u64::MAX,
+        compact_min_files: 2,
+        max_concurrent_queries: 4,
+        query_timeout_secs: 120,
+        gc_grace_secs: 0,
+        ..Default::default()
+    };
+    let a =
+        timelake_server::Engine::open_with_store(&dir.join("a"), cfg(), Arc::clone(&store), false)
+            .unwrap();
+    let b =
+        timelake_server::Engine::open_with_store(&dir.join("b"), cfg(), Arc::clone(&store), false)
+            .unwrap();
+    (a, b)
+}
+
+#[tokio::test]
+async fn two_compactors_cannot_both_land_a_merge_of_one_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = pair_on_one_store(dir.path());
+    let app_a = timelake_server::app(Arc::clone(&a));
+
+    // Node a ingests and flushes twice: two files, one partition.
+    assert_eq!(write_lp(&app_a, &batch(200)).await, StatusCode::NO_CONTENT);
+    a.flush_all().unwrap();
+    let more: String = (200..400)
+        .map(|i| {
+            format!(
+                "cpu,host=h{} usage=1.0 {}\n",
+                i % 10,
+                1_700_000_000_000_000_000i64 + i * 1_000_000
+            )
+        })
+        .collect();
+    assert_eq!(write_lp(&app_a, &more).await, StatusCode::NO_CONTENT);
+    a.flush_all().unwrap();
+
+    // b sees the same store.
+    b.catch_up_catalog(a.catalog_head());
+
+    // Both compact. Whichever commits second finds its inputs gone.
+    let done_a = a.compact_once().unwrap();
+    let done_b = b.compact_once().unwrap();
+    assert_eq!(
+        done_a + done_b,
+        1,
+        "exactly one merge may be committed; got a={done_a} b={done_b}"
+    );
+
+    // The decisive assertion. Before the fence both merges landed and every
+    // row of this partition was stored twice.
+    let fresh = timelake_server::Engine::open_with_store(
+        &dir.path().join("c"),
+        timelake_server::EngineConfig {
+            query_mem_bytes: 256 * 1024 * 1024,
+            max_concurrent_queries: 4,
+            query_timeout_secs: 120,
+            ..Default::default()
+        },
+        Arc::new(timelake_store::LocalStore::new(&dir.path().join("shared")).unwrap())
+            as Arc<dyn timelake_store::Store>,
+        false,
+    )
+    .unwrap();
+    let app_c = timelake_server::app(fresh);
+    assert_eq!(
+        count(&app_c, "cpu").await,
+        400,
+        "a second merge landed: the partition holds every row twice"
+    );
+}
+
+#[tokio::test]
+async fn a_losing_compactor_reports_no_compaction_and_no_error() {
+    // Losing a race is ordinary once more than one node compacts. It must
+    // not surface as an error, and it must not be counted as a compaction
+    // -- a metric that climbed here would make normal concurrency look
+    // like a fault to whoever is watching the dashboard.
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = pair_on_one_store(dir.path());
+    let app_a = timelake_server::app(Arc::clone(&a));
+
+    assert_eq!(write_lp(&app_a, &batch(200)).await, StatusCode::NO_CONTENT);
+    a.flush_all().unwrap();
+    assert_eq!(write_lp(&app_a, &batch(200)).await, StatusCode::NO_CONTENT);
+    a.flush_all().unwrap();
+    b.catch_up_catalog(a.catalog_head());
+
+    assert_eq!(a.compact_once().unwrap(), 1);
+    let loser = b.compact_once();
+    assert!(loser.is_ok(), "a lost race is not an error: {loser:?}");
+    assert_eq!(loser.unwrap(), 0, "a stale merge is not a compaction");
+    assert!(
+        b.metrics_text_impl()
+            .contains("timelake_stale_merges_total 1"),
+        "the discarded merge should be visible, so wasted work can be measured"
+    );
+}
