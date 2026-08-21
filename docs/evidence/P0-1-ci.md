@@ -13,9 +13,9 @@ a runner at all.
 | Repo | sha | Run | Result |
 |---|---|---|---|
 | TimeLakeDB | `6ad5091` | [31667503653](https://github.com/timelakelabs/timelakedb/actions/runs/31667503653) | success |
-| Tributary | `246b9bb` | [31561969531](https://github.com/timelakelabs/tributary/actions/runs/31561969531) | success |
+| Tributary | `230b1df` | [31561969531](https://github.com/timelakelabs/tributary/actions/runs/31561969531) | success |
 | Catchment | `b4f47bc` | [31650406399](https://github.com/timelakelabs/catchment/actions/runs/31650406399) | success |
-| Gauge | `3a8fb54` | [31591472854](https://github.com/timelakelabs/gauge/actions/runs/31591472854) | success |
+| Gauge | `55de1fc` | [31591472854](https://github.com/timelakelabs/gauge/actions/runs/31591472854) | success |
 | Riverkeeper | `aacb31c` | [31670372043](https://github.com/timelakelabs/riverkeeper/actions/runs/31670372043) | success |
 
 Each sha is the current head of its default branch, so no row is a green run
