@@ -34,6 +34,7 @@ use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, Local
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::{Wal, WalCipher};
 
+pub mod compaction;
 pub mod logfile;
 pub mod querier;
 pub mod ratelimit;
@@ -1127,16 +1128,31 @@ impl Engine {
                 .or_default()
                 .push(f);
         }
-        let mut todo: Vec<_> = groups
+        // Two triggers now, not one. Count is read amplification, as it
+        // always was; overlap is CORRECTNESS -- duplicate primary keys
+        // collapse only in a compaction's cross-file last-write-wins
+        // pass, so twins in a partition that never reaches
+        // `compact_min_files` are served twice, forever
+        // (FINDING_rebalance_duplicates_replayed_writes.md). See
+        // `compaction` for why the overlap test is strict.
+        let mut todo: Vec<(compaction::Trigger, Vec<FileMeta>)> = groups
             .into_values()
-            .filter(|v| v.len() >= self.cfg.compact_min_files)
+            .filter_map(|v| compaction::trigger_for(&v, self.cfg.compact_min_files).map(|t| (t, v)))
             .collect();
-        // biggest wins first: most files = most read amplification saved
-        todo.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        // Overlap first, then most files. A partition with duplicates is
+        // serving wrong answers right now; one with four files is merely
+        // slower, and MAX_GROUPS_PER_TICK means the tail of this list may
+        // wait for the next pass.
+        todo.sort_by_key(|(trigger, v)| {
+            (
+                *trigger != compaction::Trigger::Overlap,
+                std::cmp::Reverse(v.len()),
+            )
+        });
         todo.truncate(MAX_GROUPS_PER_TICK);
 
         let mut done = 0;
-        for mut files in todo {
+        for (trigger, mut files) in todo {
             // oldest first so merge's last-write-wins favors newer files;
             // file names embed max_ts+seq, so path order is write order
             files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1177,6 +1193,14 @@ impl Engine {
             // deletion is DEFERRED (gc_grace): in-flight queries hold
             // catalog snapshots referencing the old paths (AT-3 race)
             self.defer_gc(remove);
+            // Per partition, at debug: which trigger fired is the first
+            // thing anyone investigating a duplicate count will want, and
+            // reconstructing it afterwards from file counts is guesswork.
+            tracing::debug!(
+                db = %f0.db, table = %f0.table, partition = %f0.partition,
+                trigger = trigger.as_str(), files = files.len(),
+                "compacted partition"
+            );
             done += 1;
         }
         if done > 0 {

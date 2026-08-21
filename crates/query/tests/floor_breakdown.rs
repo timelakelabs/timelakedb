@@ -32,7 +32,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use timelake_query::{run_sql_env, QueryEnv, QuerySession};
+use timelake_query::{QueryEnv, QuerySession, run_sql_env};
 
 const ROUNDS: usize = 30;
 
@@ -41,7 +41,11 @@ const ROUNDS: usize = 30;
 /// a big table would only bury it.
 fn provider() -> Arc<dyn datafusion::datasource::TableProvider> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("time", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new(
+            "time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
         Field::new("host", DataType::Utf8, true),
         Field::new("value", DataType::Float64, true),
     ]));
@@ -183,6 +187,10 @@ async fn where_the_fixed_cost_goes() {
     let e = report("4. execute + collect", &mut exec);
     let w = report("5. run_sql_env (whole)", &mut whole);
 
-    println!("\n  parts sum to {:.3} ms, whole is {:.3} ms", b + r + p + e, w);
+    println!(
+        "\n  parts sum to {:.3} ms, whole is {:.3} ms",
+        b + r + p + e,
+        w
+    );
     println!("  session build is {:.0}% of the whole\n", 100.0 * b / w);
 }

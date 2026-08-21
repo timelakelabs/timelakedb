@@ -83,8 +83,27 @@ severs it.
 
 ## Status
 
-**Open.** The C4 scenario asserts exactness across an undrained
-rebalance and will stay red until the composition holds; that standing
-red is the deliverable — it is the difference between a known limitation
-and a forgotten one. The kill-and-replay half of the seam (constant N)
-is proven exact and is not implicated.
+**Mechanism fixed 2026-08-21; the scenario has not been re-run.**
+
+Overlap-aware compaction is implemented (`crates/server/src/compaction.rs`).
+A partition is now compacted when its files' time ranges intersect,
+whatever the file count, so twins no longer wait for a fourth file that
+may never arrive. `crates/server/tests/compaction_overlap.rs` reproduces
+the mechanism in process — two files of identical rows, `compact_min_files`
+at 4, `COUNT(*)` returning 1,000 before and 500 after — and was verified
+red against the previous predicate before being made green.
+
+**That is not the same as C4 being closed.** These tests reproduce the
+*mechanism* (twins in one partition below the file threshold). They do not
+reproduce the *composition*: eight streams, a frozen ingester, an
+undrained rebalance from two nodes to three, and spooled batches
+re-shipping through a changed topology. Only Catchment's
+`router-tributary-exactness` does that, it needs a cluster, and it has not
+been run since the fix.
+
+Until it has, this finding stays open. A mechanism fixed and a scenario
+unverified is exactly the gap that a green unit test makes easy to
+forget — which is the failure this project keeps its standing reds for.
+
+The kill-and-replay half of the seam (constant N) was already exact and is
+not implicated.
