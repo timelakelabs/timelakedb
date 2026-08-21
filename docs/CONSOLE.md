@@ -781,8 +781,13 @@ no CDN, no fonts, no build step. The palette is the site's: navy
 `0B1220`, blue `3B82F6`, sky `7DD3FC`, **teal `14B8A6`** (the accent),
 mist `E6EDF5`, gray `6B7280` — the mountain-lake identity, canonical in
 `site/assets/style.css`. This paragraph named the pre-rebrand gold palette
-until 2026-08-20; `crates/api/src/admin_ui.html` still ships it, so the
-console is gold while the site is teal (see §14). Charts are
+until 2026-08-20, and `crates/api/src/admin_ui.html` still shipped it
+until 2026-08-21 — the console was gold while the site was teal. Both are
+fixed, and `crates/api/tests/console_palette.rs` now fails the build if
+either drifts again: it pins the brand tokens, refuses the retired values
+(including as `rgb()` triples, which is how the hand-mixed `rgba()`s
+slipped through the first time), and requires `.warn` to use a semantic
+colour rather than a brand one. Charts are
 hand-drawn SVG sparklines over the sample ring — a few hundred lines, no
 charting library, and no dependency that a CSP has to make an exception
 for.
