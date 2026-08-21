@@ -13,6 +13,45 @@ here.
 
 ## [Unreleased]
 
+### Changed — DataFusion 55, which removes the thrift dependency entirely (2026-08-21)
+
+Dependabot had an open medium against `thrift` 0.17.0 (excessive-size
+memory allocation, fixed in 0.23.0). We do not depend on it directly:
+DataFusion 54 pulls parquet 58.4.0, which pulls thrift.
+
+`cargo update -p thrift --precise 0.24.0` cannot work, and says so —
+parquet 58.4.0 requires `thrift = "^0.17"`, which for a 0.x crate means
+`>=0.17.0, <0.18.0`. Nothing in the 0.2x range satisfies it.
+
+parquet 59.2.0 does not depend on thrift **at all** — not a newer thrift,
+none — and DataFusion 55 uses parquet 59.2.0. So the advisory closes by
+removing the dependency rather than patching it, which also means it
+cannot come back with the next thrift CVE.
+
+The upgrade is three version strings:
+
+- `datafusion` 54 → 55 (workspace)
+- `arrow`, `arrow-flight` 58 → 59 in `crates/flight`, which was the only
+  real work: DataFusion 55 brings arrow 59, and the flight crate pinning
+  58 put two incompatible `arrow_schema::Schema` types in one tree. Two
+  compile errors, both the same cause.
+- one renamed method: `set_column_bloom_filter_ndv` →
+  `set_column_bloom_filter_max_ndv`
+
+No API churn in the query path — `SessionContext`, `TableProvider`, the
+plan split, the custom `LazyTable` and the SEC-2 mandatory-predicate hook
+in `scan()` all compiled unchanged, which was not what timelakedb#26
+predicted.
+
+Query latency is unchanged. `crates/query/tests/floor_breakdown.rs`,
+same machine, before → after: session build 0.162 → 0.174 ms, planning
+0.335 → 0.367 ms, execute+collect 1.766 → 1.620 ms, whole path 2.703 →
+2.442 ms. Single runs on a box that also runs four production containers,
+so read that as flat, not faster.
+
+`cargo tree -i thrift` now reports no such package. That is the acceptance
+test.
+
 ### Added — the compactor role, built and deliberately not startable (2026-08-21)
 
 C2 phase 5a. `TIMELAKE_ROLE=compactor` runs rewrite work and nothing else:

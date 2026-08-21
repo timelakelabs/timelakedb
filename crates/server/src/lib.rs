@@ -1199,25 +1199,25 @@ impl Engine {
                 }],
                 remove.clone(),
             );
-            if let Err(e) = &committed {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    // Someone else compacted this partition while we were
-                    // merging it. Our output is redundant, so drop it and
-                    // move on. Deliberately not an error and deliberately
-                    // not counted as a compaction: nothing is wrong, and a
-                    // metric that climbed here would make ordinary
-                    // concurrency look like a fault.
-                    tracing::debug!(
-                        db = %f0.db, table = %f0.table, partition = %f0.partition,
-                        "skipped a stale merge: inputs already replaced"
-                    );
-                    self.stale_merges.fetch_add(1, Ordering::Relaxed);
-                    // The merged blob we just wrote is unreferenced. Hand it
-                    // to the same deferred GC that cleans superseded files,
-                    // or it leaks in the store forever.
-                    self.defer_gc(vec![written_path.clone()]);
-                    continue;
-                }
+            if let Err(e) = &committed
+                && e.kind() == std::io::ErrorKind::AlreadyExists
+            {
+                // Someone else compacted this partition while we were
+                // merging it. Our output is redundant, so drop it and move
+                // on. Deliberately not an error and deliberately not
+                // counted as a compaction: nothing is wrong, and a metric
+                // that climbed here would make ordinary concurrency look
+                // like a fault.
+                tracing::debug!(
+                    db = %f0.db, table = %f0.table, partition = %f0.partition,
+                    "skipped a stale merge: inputs already replaced"
+                );
+                self.stale_merges.fetch_add(1, Ordering::Relaxed);
+                // The merged blob we just wrote is unreferenced. Hand it to
+                // the same deferred GC that cleans superseded files, or it
+                // leaks in the store forever.
+                self.defer_gc(vec![written_path.clone()]);
+                continue;
             }
             committed.map_err(|e| format!("catalog commit: {e}"))?;
             // deletion is DEFERRED (gc_grace): in-flight queries hold
