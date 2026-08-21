@@ -220,6 +220,26 @@ impl<E: Engine> Clone for AdminState<E> {
     }
 }
 
+/// Observability only: `/health`, `/ping`, `/metrics`. Nothing else.
+///
+/// For a node that does maintenance and serves no clients — the compactor
+/// role (C2 phase 5). It holds no buffer, takes no writes and answers no
+/// queries, so mounting the data plane on it would advertise four
+/// endpoints that must never be used and one (`/api/sql`) that would
+/// answer from a catalog view kept fresh only incidentally.
+///
+/// Built as its own router rather than by filtering `app`'s: a route
+/// removed by subtraction comes back the moment someone adds one to the
+/// list above and does not think about this caller. Additive is the only
+/// direction that stays correct by default.
+pub fn maintenance_app<E: Engine>(engine: Arc<E>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ping", get(ping::<E>).head(ping::<E>))
+        .route("/metrics", get(metrics::<E>))
+        .with_state(engine)
+}
+
 /// The data plane (unauthenticated — FR-1/FR-8/FR-9 clients) plus the
 /// admin surface (authenticated — SEC-4). Two routers, two states,
 /// merged: no admin route can accidentally inherit the open state.

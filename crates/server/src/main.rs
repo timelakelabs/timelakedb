@@ -207,6 +207,68 @@ async fn main() {
         ));
     }
 
+    // The compactor (C2 phase 5a) does rewrite work and nothing else: no
+    // writes, no queries, no buffer of its own. It runs here and returns,
+    // like the router does.
+    //
+    // Two things it must do that `all` does not have to.
+    //
+    // It TAILS THE CATALOG. `compact_once` reads the in-memory file list,
+    // which advances only on this node's own commits. A compactor commits
+    // nothing until it compacts, so without tailing it would work forever
+    // from the file list it booted with — choosing partitions that no
+    // longer exist and merging files another node already replaced. The
+    // commit fence catches that (it refuses a merge whose inputs are
+    // gone), so the result would be safe; it would also be a node that
+    // burns CPU and never lands anything.
+    //
+    // It is READ-ONLY for writes. It has no WAL of its own and no client
+    // should be pointed at it, so a write arriving here is a
+    // misconfiguration and should be refused loudly rather than half-
+    // accepted into a buffer nothing will ever flush.
+    if role == timelake_cluster::Role::Compactor {
+        engine.set_read_only();
+        tracing::info!(
+            %addr,
+            catalog_head = engine.catalog_head(),
+            "compactor up (maintenance only: no writes, no queries)"
+        );
+        let worker = Arc::clone(&engine);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let e = Arc::clone(&worker);
+                let res = tokio::task::spawn_blocking(move || {
+                    // Tail first. Compacting a stale view is wasted work at
+                    // best; the fence makes it harmless, not useful.
+                    e.catch_up_catalog(0);
+                    // Each stage independent, as in the `all` loop: one
+                    // failing stage must not stop the others.
+                    if let Err(err) = e.compact_once() {
+                        tracing::error!(%err, stage = "compact", "compactor stage failed");
+                    }
+                    if let Err(err) = e.apply_tombstones_once() {
+                        tracing::error!(%err, stage = "tombstones", "compactor stage failed");
+                    }
+                    if let Err(err) = e.enforce_retention() {
+                        tracing::error!(%err, stage = "retention", "compactor stage failed");
+                    }
+                })
+                .await;
+                if let Err(join) = res {
+                    tracing::error!(%join, "compactor tick panicked");
+                }
+            }
+        });
+        let listener = TcpListener::bind(&addr).await.expect("compactor bind");
+        axum::serve(listener, timelake_server::compactor_app(engine))
+            .await
+            .expect("compactor serve");
+        return;
+    }
+
     // Maintenance ticks (ARCHITECTURE §7): flush every 10 s, compaction
     // every 30 s, retention every 60 s — sequential on one blocking task
     // so background work never stacks up on itself. A querier owns no

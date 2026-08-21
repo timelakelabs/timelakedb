@@ -2752,6 +2752,18 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
     timelake_api::app(engine, auth, audit, false).layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
+/// The compactor's HTTP surface: health, ping and metrics, nothing else.
+///
+/// A compactor takes no writes and answers no queries, so it gets no data
+/// plane. It still needs to be reachable, because a maintenance node that
+/// cannot be scraped is a node nobody notices has stopped — and a
+/// compactor that has stopped is invisible by construction, since its work
+/// only shows up as the absence of file growth.
+pub fn compactor_app(engine: Arc<Engine>) -> axum::Router {
+    let limit = engine.max_body_bytes();
+    timelake_api::maintenance_app(engine).layer(axum::extract::DefaultBodyLimit::max(limit))
+}
+
 /// The intra-cluster listener for an ingester (CL-2 replication, CL-3 live
 /// reads), bound to `TIMELAKE_CLUSTER_ADDR`. NOT the public data port: it
 /// carries only peer traffic, and at C3 it moves behind required mTLS.

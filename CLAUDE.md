@@ -291,7 +291,15 @@ This project is inspired by the following projects.
   KNOWN COST (C3): a query registers providers for EVERY table in the db,
   so it fans out snapshots for tables it will not read.
   **C2 phasing:** (1) roles+discovery ✓ → (2) CL-2 ✓ → (3) router ✓ →
-  (4) CL-3 querier ✓ DONE → (5) compactor role + advisory lease (LAST).
+  (4) CL-3 querier ✓ → (5a) compactor role ✓ BUILT, GATE SHUT →
+  (5b) work-avoidance on top of the commit fence (LAST). The role has a
+  branch, a maintenance loop, an HTTP surface and a topology; what it does
+  not have is permission — `Role::implemented` still refuses `compactor`.
+  That is deliberate and the reason CHANGED rather than expired: the
+  commit fence (`Catalog::commit_replace`) already makes concurrent
+  compaction CORRECT, so the gate is now about waste, not safety. Two
+  compactors racing every partition do double the IO to land half the
+  merges. Flipping it is a decision with its own issue.
   Design: ARCHITECTURE §12.4.
   PRE-EXISTING FLAKE, not from this work: `health.rs`
   `rows_stay_visible_while_a_slow_flush_uploads` fails when run ALONE via
