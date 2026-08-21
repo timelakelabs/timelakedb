@@ -466,7 +466,7 @@ pub mod flush {
             }
             let path = datafusion::parquet::schema::types::ColumnPath::from(f.name().as_str());
             props = props.set_column_bloom_filter_enabled(path.clone(), true);
-            props = props.set_column_bloom_filter_ndv(path, ndv as u64);
+            props = props.set_column_bloom_filter_max_ndv(path, ndv as u64);
         }
         let props = props.build();
         let mut out = Vec::new();
