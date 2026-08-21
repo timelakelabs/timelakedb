@@ -13,6 +13,42 @@ here.
 
 ## [Unreleased]
 
+### Fixed — duplicate rows could be served forever, because three files never reach four (2026-08-21)
+
+A partition was compacted only when it held `compact_min_files` files
+(default 4). Duplicate primary keys from different nodes collapse in
+exactly one place — the cross-file last-write-wins pass inside a
+compaction — so twins sitting in a partition of two or three files never
+met, and the querier unioned both copies indefinitely. C4 measured 202,000
+rows where 200,000 were written and 200,000 were distinct: a COUNT
+inflated with full confidence, the inverse of what this database is for.
+
+Compaction now has a second, independent trigger: any two files in a
+partition whose time ranges intersect, regardless of count. Normal ingest
+never produces those — timestamps advance, so each flush covers a later
+range than the last. It takes a replay, a late arrival, or a crash-window
+recovery, which is precisely the set of events that produces twins.
+
+The overlap test is **strict** (`prev.max > next.min`), and that detail is
+the difference between a fix and a regression. A tick-aligned fleet has
+every host reporting at the same instant, so a flush boundary landing
+mid-tick puts one timestamp in both files. Under a non-strict test that
+is an "overlap" at nearly every boundary, and the engine would spend its
+life rewriting files containing no duplicates at all.
+
+Known gap, accepted deliberately: two files that each hold rows at exactly
+one identical timestamp and nothing else touch at a point and are caught by
+neither branch. Closing it costs more than the disease — a file holds up to
+`flush_rows` rows, so every row in it would have to share a nanosecond.
+Asserted in the tests so it stays visible.
+
+Overlapping partitions are compacted ahead of merely-numerous ones: one is
+serving wrong answers now, the other is only slower.
+
+This fixes the mechanism. `FINDING_rebalance_duplicates_replayed_writes.md`
+stays open until Catchment's C4 scenario — which needs a real cluster and an
+undrained rebalance — has been re-run.
+
 ### Fixed — the admin console was still wearing the old brand (2026-08-21)
 
 `crates/api/src/admin_ui.html` shipped the pre-rebrand palette: gold
