@@ -623,6 +623,11 @@ pub struct Engine {
     lines_total: AtomicU64,
     flushes_total: AtomicU64,
     compactions_total: AtomicU64,
+    /// Merges discarded because another writer replaced the inputs first.
+    /// Expected once more than one node compacts; a steadily climbing
+    /// value means several compactors keep choosing the same partition and
+    /// the work-avoidance layer above the fence is not doing its job.
+    stale_merges: AtomicU64,
     /// U2: process start, for `timelake_uptime_seconds` and as the origin
     /// the two lag stamps below are measured against.
     started: std::time::Instant,
@@ -840,6 +845,7 @@ impl Engine {
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
+            stale_merges: AtomicU64::new(0),
             started: std::time::Instant::now(),
             last_flush_ms: AtomicU64::new(0),
             last_compaction_ms: AtomicU64::new(0),
@@ -1171,25 +1177,49 @@ impl Engine {
                 "{}/{}/data/{}/c{:020}-{seq:06}.parquet",
                 f0.db, f0.table, f0.partition, merged.max_ts_ns
             );
+            let written_path = path.clone();
             self.store
                 .put(&path, &merged.bytes)
                 .map_err(|e| format!("store put {path}: {e}"))?;
             let remove: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-            self.catalog
-                .commit(
-                    vec![FileMeta {
-                        db: f0.db.clone(),
-                        table: f0.table.clone(),
-                        partition: f0.partition.clone(),
-                        path,
-                        rows: merged.rows,
-                        size_bytes: merged.bytes.len() as u64,
-                        min_ts_ns: merged.min_ts_ns,
-                        max_ts_ns: merged.max_ts_ns,
-                    }],
-                    remove.clone(),
-                )
-                .map_err(|e| format!("catalog commit: {e}"))?;
+            // commit_replace, not commit: the merge is only valid if its
+            // inputs are still there. Another compactor replacing them
+            // first is a normal outcome once more than one node can
+            // compact, not an error -- see the `stale` arm below.
+            let committed = self.catalog.commit_replace(
+                vec![FileMeta {
+                    db: f0.db.clone(),
+                    table: f0.table.clone(),
+                    partition: f0.partition.clone(),
+                    path,
+                    rows: merged.rows,
+                    size_bytes: merged.bytes.len() as u64,
+                    min_ts_ns: merged.min_ts_ns,
+                    max_ts_ns: merged.max_ts_ns,
+                }],
+                remove.clone(),
+            );
+            if let Err(e) = &committed {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    // Someone else compacted this partition while we were
+                    // merging it. Our output is redundant, so drop it and
+                    // move on. Deliberately not an error and deliberately
+                    // not counted as a compaction: nothing is wrong, and a
+                    // metric that climbed here would make ordinary
+                    // concurrency look like a fault.
+                    tracing::debug!(
+                        db = %f0.db, table = %f0.table, partition = %f0.partition,
+                        "skipped a stale merge: inputs already replaced"
+                    );
+                    self.stale_merges.fetch_add(1, Ordering::Relaxed);
+                    // The merged blob we just wrote is unreferenced. Hand it
+                    // to the same deferred GC that cleans superseded files,
+                    // or it leaks in the store forever.
+                    self.defer_gc(vec![written_path.clone()]);
+                    continue;
+                }
+            }
+            committed.map_err(|e| format!("catalog commit: {e}"))?;
             // deletion is DEFERRED (gc_grace): in-flight queries hold
             // catalog snapshots referencing the old paths (AT-3 race)
             self.defer_gc(remove);
@@ -2564,6 +2594,7 @@ impl Engine {
              # TYPE timelake_buffer_rows gauge\ntimelake_buffer_rows {}\n\
              # TYPE timelake_wal_bytes gauge\ntimelake_wal_bytes {}\n\
              # TYPE timelake_compactions_total counter\ntimelake_compactions_total {}\n\
+             # TYPE timelake_stale_merges_total counter\ntimelake_stale_merges_total {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
              # TYPE timelake_tombstone_rewrites_total counter\n\
              timelake_tombstone_rewrites_total {}\n\
@@ -2591,6 +2622,7 @@ impl Engine {
             n_rows,
             wal_bytes,
             self.compactions_total.load(Ordering::Relaxed),
+            self.stale_merges.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
             self.tombstone_rewrites_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },

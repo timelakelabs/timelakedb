@@ -95,6 +95,26 @@ fn read_entry<S: Store>(store: &S, path: &str) -> std::io::Result<ManifestEntry>
 
 /// Fold one entry into the in-memory file index: removals first (so a
 /// compaction's replacement is atomic to a reader), then adds.
+/// The first path that is no longer in the catalog, if any.
+///
+/// Returns the path rather than a bool so the error can name it. "Some
+/// input vanished" sends someone reading the log hunting; naming the file
+/// tells them which compaction lost, which is usually the whole question.
+fn first_absent(
+    files: &HashMap<(String, String), Vec<FileMeta>>,
+    remove_paths: &[String],
+) -> Option<String> {
+    for path in remove_paths {
+        if !files
+            .values()
+            .any(|list| list.iter().any(|f| &f.path == path))
+        {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
 fn apply_entry(
     files: &mut HashMap<(String, String), Vec<FileMeta>>,
     tombstones: &mut Vec<Tombstone>,
@@ -185,24 +205,77 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_entry(add_files, remove_paths, Vec::new())
+        self.commit_guarded(add_files, remove_paths, Vec::new(), false)
+    }
+
+    /// Commit a replacement whose inputs must still exist (C2 phase 5).
+    ///
+    /// `commit` is unconditional: it removes what it names, adds what it
+    /// carries, and a removal of something already gone is a silent no-op.
+    /// That is right for a flush, and wrong for a compaction.
+    ///
+    /// Two compactors merging one partition each read files F1..F4, each
+    /// produce their own merged file, and each commit. The CAS serialises
+    /// them, so no manifest entry is lost — but the loser retries with its
+    /// ORIGINAL entry, its removals find nothing left to remove, and its
+    /// merged file is added anyway. The partition ends up holding both
+    /// merges: every row twice, committed by a mechanism designed to make
+    /// concurrent writers safe. The CAS was never the gap; it guarantees
+    /// no commit is *overwritten*, not that a commit is still *valid*.
+    ///
+    /// So a compaction commits through here instead. Inside the same
+    /// critical section, after catching up to the true head, every path in
+    /// `remove_paths` must still be present. If any has gone, another
+    /// writer has already replaced these inputs and this merge is stale
+    /// work: `AlreadyExists` is returned and nothing is written.
+    ///
+    /// This is the fence, and it is deliberately not a lease. A lease is a
+    /// promise about wall-clock time across machines, and under skew or a
+    /// long GC pause two nodes can both believe they hold one. This checks
+    /// the thing that actually has to be true at the instant it has to be
+    /// true, using state the commit already holds a lock on. A lease on top
+    /// avoids the wasted merge; it is an optimisation, and its failure is
+    /// safe because of this.
+    pub fn commit_replace(
+        &self,
+        add_files: Vec<FileMeta>,
+        remove_paths: Vec<String>,
+    ) -> std::io::Result<u64> {
+        self.commit_guarded(add_files, remove_paths, Vec::new(), true)
     }
 
     /// Durably record a targeted-delete predicate (R-1) in the manifest log.
     /// The same CAS loop as any commit, so it composes with file adds/removes
     /// and replays/propagates identically. Returns the seq it landed at.
     pub fn commit_tombstone(&self, tombstone: Tombstone) -> std::io::Result<u64> {
-        self.commit_entry(Vec::new(), Vec::new(), vec![tombstone])
+        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], false)
     }
 
-    fn commit_entry(
+    fn commit_guarded(
         &self,
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
         tombstones: Vec<Tombstone>,
+        require_removals_present: bool,
     ) -> std::io::Result<u64> {
         let _commit = self.commit_lock.lock().expect("commit lock");
         for _ in 0..MAX_COMMIT_ATTEMPTS {
+            // Checked on every attempt, not once before the loop: a lost
+            // CAS race means someone else committed, and they are exactly
+            // the writer who may have taken these inputs. Checking only
+            // up front would validate against a view already stale by the
+            // time it mattered.
+            if require_removals_present {
+                let files = self.files.lock().expect("catalog lock");
+                if let Some(missing) = first_absent(&files, &remove_paths) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "compaction input {missing} is gone: another writer already replaced these files, so this merge is stale and was not committed"
+                        ),
+                    ));
+                }
+            }
             let seq = self.seq.load(Ordering::SeqCst) + 1;
             // Stamp each tombstone with the seq it is actually landing at, so
             // `created_seq` stays correct even when a CAS retry bumps the head.
@@ -874,5 +947,157 @@ mod tests {
             1,
             "one tombstone entry must fold to one tombstone however many callers raced"
         );
+    }
+    /// Two writers, one object store — a compactor on each of two nodes.
+    fn pair(dir: &std::path::Path) -> (Catalog<LocalStore>, Catalog<LocalStore>) {
+        (
+            Catalog::load(LocalStore::new(dir).unwrap()).unwrap(),
+            Catalog::load(LocalStore::new(dir).unwrap()).unwrap(),
+        )
+    }
+
+    fn paths(cat: &Catalog<LocalStore>) -> Vec<String> {
+        let mut got: Vec<String> = cat
+            .files_for("poc", "cpu")
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn plain_commit_lets_two_compactors_both_land_their_merge() {
+        // Not a bug being introduced -- a bug being DEMONSTRATED, so the
+        // guard below has something to be measured against. This is the
+        // lost update the CAS does not catch: it guarantees no commit is
+        // overwritten, not that a commit is still valid when it lands.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path());
+        a.commit_add(vec![
+            meta("poc", "cpu", "p", "f1"),
+            meta("poc", "cpu", "p", "f2"),
+        ])
+        .unwrap();
+        b.catch_up().unwrap();
+
+        a.commit(
+            vec![meta("poc", "cpu", "p", "merged-a")],
+            vec!["f1".into(), "f2".into()],
+        )
+        .unwrap();
+        b.commit(
+            vec![meta("poc", "cpu", "p", "merged-b")],
+            vec!["f1".into(), "f2".into()],
+        )
+        .unwrap();
+
+        let fresh = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        assert_eq!(
+            paths(&fresh),
+            vec!["merged-a".to_string(), "merged-b".to_string()],
+            "both merges landed: every row of this partition is now stored twice"
+        );
+    }
+
+    #[test]
+    fn commit_replace_refuses_a_merge_whose_inputs_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path());
+        a.commit_add(vec![
+            meta("poc", "cpu", "p", "f1"),
+            meta("poc", "cpu", "p", "f2"),
+        ])
+        .unwrap();
+        b.catch_up().unwrap();
+
+        a.commit_replace(
+            vec![meta("poc", "cpu", "p", "merged-a")],
+            vec!["f1".into(), "f2".into()],
+        )
+        .unwrap();
+
+        // b still believes f1/f2 exist. Its CAS loses, it catches up, and
+        // the guard sees the inputs are gone.
+        let err = b
+            .commit_replace(
+                vec![meta("poc", "cpu", "p", "merged-b")],
+                vec!["f1".into(), "f2".into()],
+            )
+            .expect_err("the second merge must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("f1"),
+            "the error should name the missing input: {err}"
+        );
+
+        let fresh = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        assert_eq!(paths(&fresh), vec!["merged-a".to_string()]);
+    }
+
+    #[test]
+    fn commit_replace_is_an_ordinary_commit_when_the_inputs_are_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        cat.commit_add(vec![
+            meta("poc", "cpu", "p", "f1"),
+            meta("poc", "cpu", "p", "f2"),
+        ])
+        .unwrap();
+        let seq = cat
+            .commit_replace(
+                vec![meta("poc", "cpu", "p", "merged")],
+                vec!["f1".into(), "f2".into()],
+            )
+            .unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(paths(&cat), vec!["merged".to_string()]);
+    }
+
+    #[test]
+    fn a_partial_disappearance_is_refused_too() {
+        // The dangerous shape: one input survived, so a naive "did anything
+        // change" check could conclude the merge is still valid. It is not
+        // -- the surviving file would be removed and the vanished one's rows
+        // would come back from the merge, which is worse than either.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path());
+        a.commit_add(vec![
+            meta("poc", "cpu", "p", "f1"),
+            meta("poc", "cpu", "p", "f2"),
+            meta("poc", "cpu", "p", "f3"),
+        ])
+        .unwrap();
+        b.catch_up().unwrap();
+
+        a.commit_replace(
+            vec![meta("poc", "cpu", "p", "m-a")],
+            vec!["f1".into(), "f2".into()],
+        )
+        .unwrap();
+        let err = b
+            .commit_replace(
+                vec![meta("poc", "cpu", "p", "m-b")],
+                vec!["f2".into(), "f3".into()],
+            )
+            .expect_err("overlapping input sets must not both commit");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_refused_merge_writes_no_manifest_entry() {
+        // It must not burn a sequence number. A refusal that still advanced
+        // the head would make every other writer catch up over an entry
+        // that records nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path());
+        a.commit_add(vec![meta("poc", "cpu", "p", "f1")]).unwrap();
+        b.catch_up().unwrap();
+        a.commit_replace(vec![meta("poc", "cpu", "p", "m")], vec!["f1".into()])
+            .unwrap();
+        let head_before = a.head();
+        let _ = b.commit_replace(vec![meta("poc", "cpu", "p", "m2")], vec!["f1".into()]);
+        a.catch_up().unwrap();
+        assert_eq!(a.head(), head_before, "a refusal must not advance the log");
     }
 }

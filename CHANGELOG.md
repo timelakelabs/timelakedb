@@ -13,6 +13,43 @@ here.
 
 ## [Unreleased]
 
+### Fixed — two compactors could both commit a merge of one partition (2026-08-21)
+
+Groundwork for the compactor role split (C2 phase 5). Not reachable today,
+because `Role::implemented` refuses to start a second compactor — which is
+exactly why it is worth fixing before that refusal is lifted.
+
+Catalog commits are a CAS on the next manifest sequence, so no commit can
+overwrite another. That guarantees no commit is *lost*; it does not
+guarantee a commit is still *valid* when it lands. Two compactors merging
+one partition each read files F1..F4, each produce their own merged file,
+and each commit. The CAS serialises them, the loser replays the winner's
+entry and retries with its own original entry, its removals find nothing
+left to remove, and its merged file is added anyway. The partition ends up
+holding both merges: every row twice, from the mechanism designed to make
+concurrent writers safe.
+
+`Catalog::commit_replace` is the fence. Inside the same critical section,
+after catching up to the true head, every path being removed must still be
+present; if any has gone, another writer already replaced these inputs and
+`AlreadyExists` is returned with the missing path named. No manifest entry
+is written, so a refusal does not burn a sequence number. Compaction now
+commits through it, and a refusal is treated as an ordinary outcome — the
+redundant merge is handed to the deferred GC, `timelake_stale_merges_total`
+is incremented, and it is deliberately not counted as a compaction.
+
+**This is not the singleton lease the roadmap called for, and that is on
+purpose.** A lease is a promise about wall-clock time across machines:
+under skew or a long GC pause two nodes can both believe they hold one,
+and then nothing catches the commit. It also has a failure mode this does
+not — a holder that dies mid-compaction leaves a lease nobody can break,
+turning a crash into a partition that silently stops compacting. The fence
+checks the thing that actually has to be true, at the instant it has to be
+true, using state the commit already holds a lock on. A lease on top would
+avoid the wasted merge; it is an optimisation, and its failure is safe
+because of this. `timelake_stale_merges_total` is what will say whether it
+is worth adding.
+
 ### Fixed — duplicate rows could be served forever, because three files never reach four (2026-08-21)
 
 A partition was compacted only when it held `compact_min_files` files
