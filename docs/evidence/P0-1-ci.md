@@ -12,11 +12,11 @@ a runner at all.
 
 | Repo | sha | Run | Result |
 |---|---|---|---|
-| TimeLakeDB | `fe2b45b` | [31667503653](https://github.com/timelakelabs/timelakedb/actions/runs/31667503653) | success |
-| Tributary | `5eee47d` | [31561969531](https://github.com/timelakelabs/tributary/actions/runs/31561969531) | success |
-| Catchment | `17276bf` | [31650406399](https://github.com/timelakelabs/catchment/actions/runs/31650406399) | success |
-| Gauge | `1be9c8e` | [31591472854](https://github.com/timelakelabs/gauge/actions/runs/31591472854) | success |
-| Riverkeeper | `ffe03e7` | [31670372043](https://github.com/timelakelabs/riverkeeper/actions/runs/31670372043) | success |
+| TimeLakeDB | `6ad5091` | [31667503653](https://github.com/timelakelabs/timelakedb/actions/runs/31667503653) | success |
+| Tributary | `246b9bb` | [31561969531](https://github.com/timelakelabs/tributary/actions/runs/31561969531) | success |
+| Catchment | `b4f47bc` | [31650406399](https://github.com/timelakelabs/catchment/actions/runs/31650406399) | success |
+| Gauge | `3a8fb54` | [31591472854](https://github.com/timelakelabs/gauge/actions/runs/31591472854) | success |
+| Riverkeeper | `aacb31c` | [31670372043](https://github.com/timelakelabs/riverkeeper/actions/runs/31670372043) | success |
 
 Each sha is the current head of its default branch, so no row is a green run
 on a superseded tree.
@@ -60,7 +60,7 @@ would have recurred silently.
 cause was four lines earlier: 87 MB of disk left. A 16-crate workspace built
 `--all-targets` and rebuilt instrumented for coverage does not fit beside a
 hosted runner's preinstalled images. Fixed by reclaiming ~25 GB the job never
-uses. Run 31561992129 is the failure; `fe2b45b` carries the fix.
+uses. Run 31561992129 is the failure; `6ad5091` carries the fix.
 
 **Conformance ran no scenarios and still failed late.** TimeLakeDB's
 conformance job checked out Catchment but not Tributary, so `catchment doctor`
@@ -92,7 +92,7 @@ sibling a runner does not have.
 
 ## R0 is signed, and the history was rewritten to do it
 
-Riverkeeper's `9296c05` was the only unsigned commit anywhere in the program.
+Riverkeeper's `f624c29` was the only unsigned commit anywhere in the program.
 `commit.gpgsign` is `true` globally, so it was a bypass rather than a default,
 and it was already pushed — signing it therefore meant rewriting published
 history rather than amending a local commit.
@@ -102,11 +102,11 @@ re-signed with `A0F1BE5219310A70`, then force-pushed:
 
 | was | now | |
 |---|---|---|
-| `9296c05` | `15a94a2` | R0 — was unsigned, now signed |
-| `9964ca2` | `dbcd639` | descendant, resigned because R0's sha changed |
-| `a5552dc` | `ffe03e7` | descendant, resigned because R0's sha changed |
+| `f624c29` | `f624c29` | R0 — was unsigned, now signed |
+| `a67c304` | `a67c304` | descendant, resigned because R0's sha changed |
+| `aacb31c` | `aacb31c` | descendant, resigned because R0's sha changed |
 
-`e8f8b97` is untouched. It is signed by the retired key `8386E2ED97F1E59E`,
+`0a3b9c5` is untouched. It is signed by the retired key `8386E2ED97F1E59E`,
 whose secret half no longer exists; the public half was re-imported, so it
 still verifies. Trees, message bytes, and author and committer identities and
 dates were verified byte-identical to the originals before the branch moved —
