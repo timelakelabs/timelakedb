@@ -79,14 +79,14 @@ with the metadata cache making warm Shape A 0–6 ms.
 | Object-store native | ✗ | ✗ | ✓ | Ent. | ✗ | ✓ C0, KMS-encrypted |
 | Compaction in OSS | ✓ | ✓ | **✗ Ent.** | ✓ | ✓ | **✓** |
 | Retention | ✓ RP | ✓ | ◐ | ✓ TTL | ✓ global | ✓ per-table, runtime GUI |
-| **Targeted delete** (GDPR) | ✓ | ✓ | ◐ | ◐ | ✓ API | **✗** |
+| **Targeted delete** (GDPR) | ✓ | ✓ | ◐ | ◐ | ✓ API | **✓ R-1** (2026-08-16: `POST /admin/delete`, tombstone hidden in-scan, bytes reclaimed in the background) |
 | Downsampling / rollups | ✓ CQ | ✓ tasks | ✗ plugins | ✓ mat. views | Ent. | **✗** |
 | Dedup | LWW | LWW | LWW | ✓ keys | ✓ | ✓ LWW (FR-5) |
 
-Two genuine gaps against nearly everyone: **no way to delete specific
-data** (retention is the only eraser — a GDPR request today means
-manual surgery), and **no downsampling** (the "keep 1s data for a week,
-1m forever" cost story every mature TSDB tells).
+One genuine gap against nearly everyone remains: **no downsampling** (the
+"keep 1s data for a week, 1m forever" cost story every mature TSDB
+tells). The other one this section used to name — no way to delete
+specific data — closed with R-1 on 2026-08-16.
 
 Also a genuine differentiator: compaction, object storage, and full
 retention management are OSS here, where InfluxDB 3 gates compaction
@@ -103,7 +103,7 @@ cold storage. **Do not give this up casually** — it is the positioning.
 | **Encryption at rest, OSS** | ✗ | ✗ | ✗ | ✗ | ✗ | **✓ SEC-1** |
 | TLS hot rotation | ✗ | ✗ | ◐ | ✗ | ✗ | ✓ AT-7 drilled |
 | Client certs (want mode) | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Audit trail | ◐ | ◐ | Ent. | Ent. | Ent. | ✗ planned |
+| Audit trail | ◐ | ◐ | Ent. | Ent. | Ent. | ✓ P1-2 (admin mutations, hash-chained, fail-closed; data plane + login/logout deferred) |
 
 Nobody in this field has Accumulo-style row visibility or OSS envelope
 encryption. Those two, plus the drill culture (measured exactness, not
@@ -114,12 +114,13 @@ without an Enterprise contract.
 
 | | v1 | v2 | v3 Core | influxdb-cluster | QuestDB | VM | T |
 |---|---|---|---|---|---|---|---|
-| Replication / HA | Ent. | ✗ | Ent. | ✓ | Ent. | **✓ OSS cluster** | ✗ (C1–C3 designed) |
+| Replication / HA | Ent. | ✗ | Ent. | ✓ | Ent. | **✓ OSS cluster** | **◐ C2 phases 1–4 shipped** (ingester WAL replication with zero acked loss, router, stateless querier — `docs/evidence/cl2-replication-drill.log`, `router-sharding-drill.log`, `cl3-querier-drill.log`); compactor role built and gated; C3 (Consul, required intra-cluster mTLS) open |
 | Multi-tenancy | ◐ | orgs | ◐ | ✗ | ✗ | ✓ tenants | ✗ (`org` ignored) |
 
 VictoriaMetrics' OSS clustering is why it eats Prometheus deployments.
-The C-phases close this; they are already the longest pole in
-`PRODUCTION_READINESS.md` (P1-1).
+The C-phases close this. Four of C2's five phases are in; what is left is
+the compactor's work-avoidance layer (phase 5b) and C3 — see
+`PRODUCTION_READINESS.md` P1-1.
 
 ### Non-goals, decided now so they stay decided
 
@@ -149,9 +150,9 @@ The C-phases close this; they are already the longest pole in
 | Sources beyond files (journald, syslog, docker, winlog) | ✓ 300+ | ✓ many | ✓ | ✓ | **✗ files only** |
 | Transforms (filter/sample/redact) | ✓ | ✓ VRL | ✓ | ✓ | ◐ mapping+allowlist only |
 | K8s metadata enrichment | ◐ | ✓ | ✓ strong | ✓ | ✗ (L5) |
-| Self-telemetry (/metrics) | ✓ | ✓ | ✓ | ✓ | **◐ counters, no endpoint** |
+| Self-telemetry (/metrics) | ✓ | ✓ | ✓ | ✓ | ✓ T-1 (2026-08-18: `/metrics` + `/healthz`, 26 series, outage-safe liveness) |
 | Config reload | SIGHUP | ✓ watch | ✓ | ✓ | ✗ |
-| mTLS client | ✓ | ✓ | ✓ | ✓ | ✗ (L4, server half done) |
+| mTLS client | ✓ | ✓ | ✓ | ✓ | ✓ L4 (2026-08-17: presents + rotates a client certificate; the CN now authorizes on `/api/sql` too) |
 | Secrets (Vault etc.) | ✓ stores | ✓ | ◐ | ✓ | ✗ (seam designed) |
 
 Tributary's differentiators are **watermarks** (no mainstream shipper
@@ -170,10 +171,13 @@ unmodified, FR-8).
 P0 is unchanged from `PRODUCTION_READINESS.md` — nothing competitive
 outranks "do not deploy this yet":
 
-> **P0-1** push + CI on a real runner · **P0-2** `/api/sql` sandbox +
-> non-root container ✓ (done 2026-08-10) · **P0-3** data-plane tokens (in progress,
-> mechanism fixed by the client probe) · **P0-4** catalog CAS ✓ (done 2026-08-10) ·
-> **P0-5** Tributary presents the token ✓ (done 2026-08-10)
+> **P0-1** push + CI on a real runner ✓ (recorded green 2026-08-13,
+> `docs/evidence/P0-1-ci.md`; the public flip and `v0.1.0-alpha` tag are
+> Phase 2 in `../PROJECT_PLAN.md`, paywalled) · **P0-2** `/api/sql`
+> sandbox + non-root container ✓ (done 2026-08-10) · **P0-3** data-plane
+> tokens ✓ built 2026-08-10, **still defaults `off`** · **P0-4** catalog
+> CAS ✓ (done 2026-08-10) · **P0-5** Tributary presents the token ✓ (done
+> 2026-08-10)
 
 The competitive analysis adds and re-ranks the rest:
 
@@ -181,9 +185,9 @@ The competitive analysis adds and re-ranks the rest:
 
 | Item | Why | Effort |
 |---|---|---|
-| P1-1 Replication/HA (C1→C2→WAL repl) | Only OSS-cluster competitor is VM; longest pole, start now | L |
+| P1-1 Replication/HA (C1→C2→WAL repl) — **C2 phases 1–4 shipped 2026-08-10** (roles, CL-2 WAL replication, router, CL-3 querier, each drilled); compactor role built 2026-08-21 behind a commit fence, gate shut until work-avoidance (5b); C3 open | Only OSS-cluster competitor is VM; was the longest pole | L → M remaining |
 | ~~P1-2 Audit trail~~ **DONE (SR-6, 2026-08-16)** — admin mutations hash-chained + fail-closed; `GET /admin/audit?verify=1` (data-plane + login/logout deferred) | Enterprise-gated everywhere else; needs P0-3's principal | M |
-| **R-1 Targeted delete** (`DELETE WHERE` on tag/time predicates, tombstone + compaction-applied) | The GDPR answer every competitor has in some form and TimeLakeDB has none of. Fits the existing manifest/compaction machinery | M |
+| ~~**R-1 Targeted delete**~~ **DONE 2026-08-16** — `POST /admin/delete` records a manifest-log tombstone (tag equalities + time window) hidden in-scan everywhere at once, reclaimed physically by a maintenance pass; Riverkeeper R7 control | The GDPR answer every competitor has in some form | M |
 | ~~**T-1 Tributary self-telemetry** (`/metrics` + `/healthz`)~~ **DONE 2026-08-18** — 26 series, an outage-safe liveness probe, `Tributary/bench/results/t1-self-telemetry.log` | Unwatchable shippers don't survive ops review; every competitor has it; prerequisite for the L5 DaemonSet | S |
 | ~~P1-3 per-client rate limits~~ **DONE (SEC-6)** · ~~P1-4 error redaction~~ **DONE (SEC-5)** · ~~P1-5 WAL encryption~~ **DONE (SEC-8)** — all 2026-08-15. Still open: ~~P1-6 Tributary mTLS (L4)~~ **done 2026-08-17** · ~~P1-7 queue RPO documented~~ **done 2026-08-17, measured** | as in PRODUCTION_READINESS | S–M |
 
@@ -194,7 +198,7 @@ The competitive analysis adds and re-ranks the rest:
 | **R-2 Downsampling / rollups** (continuous aggregates into ordinary tables, compaction-driven) | The storage-cost story v1 CQs, v2 tasks and QuestDB materialized views all tell; ours can be simpler because rollups are just another table behind the same store | L |
 | **R-3 Prometheus `remote_write` ingest** | One config line to capture a Prometheus fleet — VM's entire growth engine. OTLP metrics second, same seam | M |
 | **R-4 Last-value cache** | InfluxDB 3's answer to the exact workload behind the Shape A p95 carve-out (608 ms vs 250 target); attack both with one design | M |
-| C2/C3 cluster phases, real-AWS sizing, console U0–U3 | as designed | L |
+| C2 phase 5b + C3 cluster phases, real-AWS sizing, console U0/U1/U3 (U2 metrics + self-monitoring shipped 2026-08-18) | as designed | L |
 | **T-2 Transform stage** (filter/sample/redact on the mapped record) | The minimum Vector-shaped competence; redaction doubles as a security feature | M |
 | **T-3 K8s: DaemonSet + metadata enrichment** (L5) | Where log shippers live now; tag allowlist already designed for exactly the label-explosion trap | L |
 | T-4 journald + docker-json sources | The two sources that block bare-VM and container adoption most often | M |

@@ -79,9 +79,12 @@
         <p>
           <strong>Status: pre-v1.</strong> A single node is production-shaped —
           durable writes, compaction, retention, backup and restore, TLS with
-          hot certificate rotation — but replication and query high
-          availability are v2 work. Read <a href="#scaling">Scaling</a> before
-          planning a deployment.
+          hot certificate rotation — and the same binary runs as a role-split
+          cluster: ingester pairs that replicate before the ack, a stateless
+          write router, and stateless queriers, each drilled. The compactor
+          role is built but not yet startable, automatic failover is not
+          built, and the intra-cluster link is plaintext on a private network.
+          Read <a href="#scaling">Scaling</a> before planning a deployment.
         </p>
       </div>
       <div class="note warn">
@@ -262,8 +265,9 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         The response is a JSON array of row objects. SQL is DataFusion's dialect —
         the <a href="reference.html#sql">SQL reference</a> lists what is supported,
-        what is not (no <code>INSERT</code>/<code>DELETE</code>; data leaves only by
-        retention), and how each type is encoded on the wire.
+        what is not (no <code>INSERT</code>/<code>DELETE</code>; data leaves by
+        retention or by an administrator's <a href="#api">targeted delete</a>),
+        and how each type is encoded on the wire.
         <code>SHOW TABLES</code>, <code>DESCRIBE</code> and
         <code>information_schema</code> all work for schema discovery.
       </p>
@@ -314,12 +318,21 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
       <div class="code">
         <header>Per-table retention <button class="copy" type="button">Copy</button></header>
-<pre>TIMELAKE_RETENTION=<span class="s">"pipeline_events=365d,host_metrics=90d,disk_metrics=72h"</span></pre>
+<pre>TIMELAKE_RETENTION=<span class="s">"poc.pipeline_events=365d,poc.host_metrics=90d,disk_metrics=72h"</span></pre>
       </div>
       <ul>
+        <li>Policies are scoped by <strong>database and table</strong>:
+            <code>db.table=…</code>. A bare table name is the all-databases
+            wildcard (<code>*.table</code>) and the most specific policy wins.
+            Retention used to match on table name alone, which expired every
+            same-named table on the node — a data-loss bug fixed 2026-08-19; stored
+            policies from before then were migrated to the wildcard so their
+            behaviour did not change on upgrade.</li>
         <li>Durations take <code>d</code> (days), <code>h</code> (hours), or a bare number of seconds.</li>
         <li>Tables absent from the specification are kept indefinitely; an empty
-            value keeps everything.</li>
+            value keeps everything. The node's own <code>_system</code> telemetry
+            tables get no default policy either — bounding them is one
+            <code>PUT</code>, and deliberately yours to make.</li>
         <li>Enforcement drops whole <code>(table, hour)</code> partitions on the maintenance
             tick — it is a catalog operation, not a row-by-row delete.</li>
         <li>Removed files are deleted only after <code>TIMELAKE_GC_GRACE_SECS</code>
@@ -393,8 +406,9 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>What it manages today</h3>
       <p>
-        Per-table retention (FR-7): the active policies, a set/remove form with
-        table-name completion, the live
+        <strong>Retention</strong> (FR-7), scoped per database and table: the
+        active policies with all-databases wildcards called out, a set/remove
+        form with table-name completion, the live
         <code>timelake_retention_drops_total</code> counter, and an explicit
         warning that shrinking a window deletes data on the next enforcement
         pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses.
@@ -402,12 +416,21 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         (<code>catalog/config/retention.json</code>, encrypted with everything
         else) and survive a restart, so the stored policy outlives a stale
         <code>TIMELAKE_RETENTION</code> in your compose file.
+        <strong>Data-plane tokens</strong> (SEC-4): issue, list and revoke,
+        with the secret shown exactly once.
       </p>
       <p>
-        Layered configuration with visible provenance, application and audit
-        logs, metrics and performance views, and a cluster view are designed but
-        not built — the phases are U0–U3 in <code>ARCHITECTURE.md</code> §14,
-        specified in <code>docs/CONSOLE.md</code>.
+        Everything else the admin plane does is API-first for now — targeted
+        delete, the audit trail, certificate grants and TLS reload are
+        <code>curl</code> against <code>/admin/*</code> with a session, listed
+        under <a href="#api">API Reference</a>. Metrics and performance views
+        exist as a <em>Grafana</em> console rather than a page in this one: the
+        node stores its own telemetry in <code>_system</code> and
+        <code>deploy/compose/timelakedb-console.yml</code> provisions the
+        dashboard that reads it (port 3004). Layered configuration with visible
+        provenance and a cluster view are designed but not built — the phases
+        are U0–U3 in <code>ARCHITECTURE.md</code> §14, specified in
+        <code>docs/CONSOLE.md</code>.
       </p>
 
       <h3 id="console-port">Ports and exposure</h3>
@@ -418,7 +441,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>1963</code></td><td>Writes, <code>/api/sql</code>, <code>/health</code>, <code>/ping</code>, <code>/metrics</code></td><td><strong>Token, when enabled</strong> — <code>TIMELAKE_DATA_AUTH=optional|required</code>. Default <code>off</code>, which leaves it open</td></tr>
             <tr><td><code>1963</code></td><td><code>/admin/*</code> and the console at <code>/admin/ui</code></td><td><strong>Session required</strong> (SEC-4)</td></tr>
             <tr><td><code>1964</code></td><td>Arrow Flight SQL</td><td><strong>Token, when enabled</strong> — same setting, same default</td></tr>
-            <tr><td><code>1965</code></td><td>Intra-cluster replication and live reads</td><td><strong>None</strong>, by design — keep it on a private network</td></tr>
+            <tr><td><code>TIMELAKE_CLUSTER_ADDR</code> (the rigs use <code>1965</code>)</td><td>Intra-cluster replication and live-buffer reads — ingester role only, <code>/internal/v1/*</code></td><td><strong>None</strong>, by design, and no visibility filter — keep it on a private network and never publish it</td></tr>
           </tbody>
         </table>
       </div>
@@ -445,27 +468,35 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h2>Security</h2>
       <p>
         The honest version: transport encryption (TLS 1.3 with hot rotation),
-        encryption at rest, row visibility labels, and authentication on the
-        <a href="#console">admin surface</a> are finished and drilled — but the
-        <strong>data plane is still open by design</strong>, so access control
-        for writes and queries is network isolation, and visibility
-        authorizations remain claims any client can assert. Plan the deployment
-        around that rather than around what a database of this shape usually
-        offers.
+        want-mode client certificates, encryption at rest including the WAL,
+        row visibility labels, a hash-chained audit trail, and authentication
+        on both the <a href="#console">admin surface</a> and the data plane are
+        finished and drilled — but the <strong>data plane ships with
+        authentication off</strong>. Until you set
+        <code>TIMELAKE_DATA_AUTH</code>, access control for writes and queries
+        is network isolation, and visibility authorizations are claims any
+        client can assert. Plan the deployment around the default you actually
+        run, not the one the mechanism allows.
       </p>
 
       <div class="note warn">
         <p>
-          <strong>Authentication covers administration, not data.</strong> Every
-          <code>/admin/*</code> route requires a session with a role
-          (<code>viewer</code>, <code>operator</code>, <code>admin</code>) — but
-          write endpoints still accept any token and ignore it, the Flight SQL
-          handshake accepts anything and returns an empty token, and there are no
-          per-table permissions. Databases are namespaces, not security
-          boundaries. Treat an open 1963 or 1964 as equivalent to an
-          unauthenticated shell into the data. Requiring authentication on the
-          data plane is a deliberate later migration — it breaks every existing
-          client, Telegraf and Grafana included.
+          <strong>Authentication covers administration always, and data only
+          when you turn it on.</strong> Every <code>/admin/*</code> route
+          requires a session with a role (<code>viewer</code>,
+          <code>operator</code>, <code>admin</code>). The data plane — writes,
+          <code>/api/sql</code>, Flight SQL — authenticates by token when
+          <code>TIMELAKE_DATA_AUTH</code> is <code>optional</code> or
+          <code>required</code>; under the default <code>off</code> the
+          <code>Authorization</code> header is not examined, so any token works
+          and so does none, and the Flight SQL handshake accepts anything. There
+          are no per-table permissions; databases are namespaces, not security
+          boundaries. On a default install treat an open 1963 or 1964 as
+          equivalent to an unauthenticated shell into the data. The default is
+          <code>off</code> because flipping it is a breaking change for every
+          client not yet holding a token — Telegraf and Grafana included — and
+          <code>optional</code> exists so the flip can be staged on a measured
+          split (<code>timelake_data_requests_*</code>) rather than taken blind.
         </p>
       </div>
 
@@ -625,29 +656,76 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
     <section id="scaling">
       <h2>Scaling</h2>
-      <h3>Today: one node, honestly</h3>
+      <h3>One node</h3>
       <p>
-        One node handles ingest, query, compaction and retention together, and
-        sustains writes while queries run concurrently. The vertical levers are
-        the query memory pool, the admission count, the flush size and the
-        compaction trigger — each of which is a named setting rather than a
-        heuristic, so what the node will do under pressure is something you
-        configure rather than discover.
+        The default, <code>TIMELAKE_ROLE=all</code>: one process handles ingest,
+        query, compaction and retention together, and sustains writes while
+        queries run concurrently. The vertical levers are the query memory
+        pool, the admission count, the flush size and the compaction trigger —
+        each of which is a named setting rather than a heuristic, so what the
+        node will do under pressure is something you configure rather than
+        discover.
       </p>
 
-      <h3>Built to become a cluster</h3>
+      <h3>A cluster: one binary, four roles</h3>
+      <p>
+        The same binary runs as a role-split cluster over one shared object
+        store (<code>TIMELAKE_OBJECT_STORE=s3://…</code>), each role arriving
+        with its own recorded drill. Topology is static for now:
+        <code>TIMELAKE_PEERS</code> lists every node as
+        <code>id=role@cluster_addr|data_addr</code>, and
+        <code>TIMELAKE_CLUSTER_ADDR</code> is the private intra-cluster
+        listener an ingester opens for its peers. The reference rig is
+        <code>deploy/compose/timelakedb-cluster-s3.yml</code>: a router, two
+        ingesters, two queriers and LocalStack on one bucket.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>TIMELAKE_ROLE</code></th><th>Does</th><th>State</th></tr></thead>
+          <tbody>
+            <tr><td><code>router</code></td><td>Stateless. Holds no data, opens no engine. Shards each line-protocol body by <code>(db, measurement)</code> across the ingesters and forwards; forwards <code>/api/sql</code> round-robin to the queriers, falling through on a transport failure. Flight SQL is not forwarded — point Grafana at a querier</td><td>Shipped — <code>docs/evidence/router-sharding-drill.log</code> (8/8)</td></tr>
+            <tr><td><code>ingester</code></td><td>Takes writes, and replicates every frame to its paired ingester's durable replica WAL <strong>before the 204</strong>, so an acknowledged write is on two nodes. A peer that is down degrades loudly (<code>timelake_cl2_degraded</code>) rather than failing writes. Serves its live buffers to queriers as Arrow IPC on the private listener</td><td>Shipped — <code>cl2-replication-drill.log</code>: SIGKILL an ingester, recover on the peer, zero acknowledged loss (12/12)</td></tr>
+            <tr><td><code>querier</code></td><td>Stateless. Replays the catalog from the bucket, tails the manifest log, and unions the ingesters' live buffers under a freshness watermark so counts are exact seconds after ingest. Refuses writes (501). If an ingester is unreachable it <strong>refuses the query</strong> rather than returning a quietly short count (<code>timelake_querier_refusals_total</code>)</td><td>Shipped — <code>cl3-querier-drill.log</code> (19/19); the unmodified benchmark through the router returned the single-node row count exactly</td></tr>
+            <tr><td><code>compactor</code></td><td>Runs compaction, tombstone rewrites and retention and nothing else — no writes, no queries. Tails the catalog so it works from the cluster's file list rather than the one it booted with</td><td><strong>Built, not startable.</strong> A commit fence already makes two compactors <em>correct</em> (a merge whose inputs were replaced is refused); what is missing is the work-avoidance that makes them <em>efficient</em>, so the role refuses to start until then. Compaction runs on an <code>all</code>-role node meanwhile</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        A cluster stays the same database from outside — the same write
+        endpoints, the same SQL, the same Grafana datasource. Two caveats the
+        drills made explicit: the router checks every line has a measurement,
+        gzip and UTF-8 for the whole body before it forwards anything, but a
+        line that fails <em>field-level</em> parsing is refused by the one
+        ingester that receives its shard, so a body spanning several shards
+        can land partially; and a router forwards writes without the client's
+        <code>Authorization</code> header, so ingesters behind a router cannot
+        run <code>TIMELAKE_DATA_AUTH=required</code> today. Queries do carry
+        the header through.
+      </p>
+
+      <h3>What the cluster is built on, and what is still open</h3>
       <ul>
-        <li>The catalog is an append-only manifest log designed to take
-            compare-and-swap commits — the seam a second writer needs.</li>
+        <li>The catalog is an append-only manifest log whose commits are
+            compare-and-swap on the next sequence (<code>put_if_absent</code>,
+            S3 <code>If-None-Match</code>), so two writers on one bucket lose
+            nothing — drilled on both the local and S3 mechanisms
+            (<code>catalog-cas-drill.log</code>). Discovery never carries
+            correctness; that stays here.</li>
         <li>All object I/O passes through one narrow store interface — which is
-            how encryption at rest arrived as a decorator rather than a
-            rewrite, and how remote object storage (and, later, Parquet
-            modular encryption) will too.</li>
-        <li>Node discovery is a trait: a static backend now, Consul as a supported
-            option later. Discovery may never carry correctness — that stays in the
-            catalog.</li>
-        <li>Replication and query high availability are explicitly v2, and are not
-            claimed here until a drill measures them.</li>
+            how encryption at rest arrived as a decorator rather than a rewrite,
+            and how S3 with KMS envelope keys did (<code>TIMELAKE_OBJECT_STORE</code>,
+            <code>TIMELAKE_KMS_KEY_ID</code>). Parquet modular encryption would
+            land at the same seam.</li>
+        <li>Node discovery is a trait: a static backend now, Consul later (C3).</li>
+        <li>Recovery after an ingester dies is explicit — an operator or the router
+            calls <code>POST /internal/v1/recover</code> on the peer. Automatic
+            health-triggered failover is not built.</li>
+        <li>The intra-cluster listener is plaintext HTTP with no authentication
+            and no visibility filter; required mTLS on it is a C3 decision. Keep it
+            on a private network (see <a href="#security">Security</a>).</li>
+        <li>Changing the ingester count moves most table homes. Drain the
+            agents first — <code>docs/REBALANCE.md</code> says which gauges to
+            wait on and which obvious one not to.</li>
       </ul>
 
       <h3>Sizing guidance</h3>
@@ -694,11 +772,11 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>DELETE /admin/session</code></td><td>viewer</td><td>Sign out; clears the cookie</td></tr>
             <tr><td><code>POST /admin/password</code></td><td>viewer</td><td>Change your password; ends all your sessions</td></tr>
             <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>Active per-table policies</td></tr>
-            <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, admin to shrink or introduce</td><td>Set a window; persists durably, applies within 60 s</td></tr>
-            <tr><td><code>DELETE /admin/retention/{table}</code></td><td>admin</td><td>Remove a window; the table keeps everything again</td></tr>
+            <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, admin to shrink, introduce, or widen to all databases</td><td>Set a window. Body <code>{db, table, duration}</code> — <code>db</code> is required, <code>"*"</code> is the all-databases wildcard; persists durably, applies within 60 s</td></tr>
+            <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>Remove a window; the table keeps everything again. <code>*</code> is a legal <code>{db}</code></td></tr>
             <tr><td><code>POST /admin/delete</code></td><td>admin</td><td>Targeted delete. Body <code>{db, table, tags{}, start_ns?, end_ns?}</code>; records a tombstone that hides matching rows immediately. An empty predicate is refused</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td>The audit trail. Filters <code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>; <code>?verify=1</code> walks the hash chain</td></tr>
-            <tr><td><code>GET /admin/tokens</code></td><td>admin</td><td>Data-plane tokens; the secret is never shown again</td></tr>
+            <tr><td><code>GET /admin/tokens</code></td><td>operator</td><td>Data-plane tokens; the secret is never shown again</td></tr>
             <tr><td><code>POST /admin/tokens</code></td><td>admin</td><td>Issue a token — scope, database allowlist, visibility grants</td></tr>
             <tr><td><code>DELETE /admin/tokens/{id}</code></td><td>admin</td><td>Revoke a token; effective immediately</td></tr>
             <tr><td><code>GET /admin/cert-grants</code></td><td>operator</td><td>Certificate identities and what each is granted</td></tr>
@@ -715,7 +793,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
           <tbody>
             <tr><td><code>TIMELAKE_ADDR</code></td><td><code>0.0.0.0:1963</code></td><td>HTTP listener</td></tr>
             <tr><td><code>TIMELAKE_FLIGHT_ADDR</code></td><td><code>0.0.0.0:1964</code></td><td>Flight SQL listener</td></tr>
-            <tr><td><code>TIMELAKE_DATA_DIR</code></td><td><code>/var/lib/timelake/data</code></td><td>WAL, objects and catalog</td></tr>
+            <tr><td><code>TIMELAKE_DATA_DIR</code></td><td><code>/var/lib/timelake/data</code> in the container and the packages; a bare binary defaults to <code>./data</code></td><td>WAL, local objects and catalog, the audit trail, and the replica WAL</td></tr>
             <tr><td><code>TIMELAKE_QUERY_MEM_BYTES</code></td><td>1 GiB</td><td>Shared query memory pool</td></tr>
             <tr><td><code>TIMELAKE_MAX_CONCURRENT_QUERIES</code></td><td>6</td><td>Admission limit; the rest queue</td></tr>
             <tr><td><code>TIMELAKE_QUERY_TIMEOUT_SECS</code></td><td>600</td><td>Server-side query deadline</td></tr>
@@ -723,10 +801,10 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELAKE_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
             <tr><td><code>TIMELAKE_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>
             <tr><td><code>TIMELAKE_COMPACT_MIN_FILES</code></td><td>4</td><td>Files in a partition before compaction</td></tr>
-            <tr><td><code>TIMELAKE_REPL_TIMEOUT_MS</code></td><td>250</td><td>CL-2: how long a write waits for the replication peer before the node declares itself degraded and acks on local durability alone. Replication is synchronous before the ack, so this is a per-write latency ceiling — it is sub-second by design so a <em>slow</em> peer behaves like a dead one rather than stalling ingest. Raise it only with a measurement; watch <code>timelake_cl2_replication_degraded_events</code> for flapping.</td></tr>
-            <tr><td><code>TIMELAKE_MAX_BODY_BYTES</code></td><td>33554432 (32 MiB)</td><td>Largest accepted HTTP body, on the public data plane and the intra-cluster listener alike. FR-1 requires ≥10 MB batches; axum’s default of 2 MiB refused them with 413 — and refused replication frames the same way, which a peer reads as failure. Both listeners take this one value so they cannot disagree.</td></tr>
+            <tr><td><code>TIMELAKE_REPL_TIMEOUT_MS</code></td><td>250</td><td>CL-2: how long a write waits for the replication peer before the node declares itself degraded and acks on local durability alone. Replication is synchronous before the ack, so this is a per-write latency ceiling — it is sub-second by design so a <em>slow</em> peer behaves like a dead one rather than stalling ingest. Raise it only with a measurement; watch <code>timelake_cl2_degraded_events_total</code> for flapping.</td></tr>
+            <tr><td><code>TIMELAKE_MAX_BODY_BYTES</code></td><td>33554432 (32 MiB)</td><td>Largest accepted HTTP body, on the public data plane and the intra-cluster listener alike. FR-1 requires ≥10 MB batches; axum’s default of 2 MiB refused them with 413 — and refused replication frames the same way, which a peer reads as failure. Both listeners take this one value so they cannot disagree. <strong>Known gap:</strong> a <code>router</code>-role node does not yet apply it and still refuses bodies over 2 MiB; send large batches to an ingester directly until that lands.</td></tr>
             <tr><td><code>TIMELAKE_INTERNAL_MAX_CONCURRENT</code></td><td>8</td><td>Live/snapshot reads the intra-cluster listener serves at once before refusing with 503. A querier unions every ingester’s live buffer per query, so query load lands as work on the ingest tier; this bounds it. Not applied to <code>/internal/v1/replicate</code> (throttling a peer’s writes is the stall this exists to prevent) or <code>/internal/v1/health</code>. Watch <code>timelake_cl3_reads_refused_total</code>.</td></tr>
-            <tr><td><code>TIMELAKE_RETENTION</code></td><td>empty</td><td>Per-table retention specification; seeds the policy at first start, after which the stored policy from the console wins</td></tr>
+            <tr><td><code>TIMELAKE_RETENTION</code></td><td>empty</td><td>Retention seed, <code>db.table=90d,table=72h</code> (a bare table is the all-databases wildcard); applies at first start, after which the stored policy from the console wins</td></tr>
             <tr><td><code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
             <tr><td><code>TIMELAKE_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
             <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths). Both or neither</td></tr>
@@ -737,7 +815,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELAKE_KMS_KEY_ID</code></td><td>unset</td><td>AWS KMS key for the envelope, instead of a local key</td></tr>
             <tr><td><code>TIMELAKE_OBJECT_STORE</code></td><td>local</td><td>Unset uses an <code>objects/</code> directory under the data dir; <code>s3://bucket/prefix</code> uses S3</td></tr>
             <tr><td><code>TIMELAKE_AUDIT_FAIL_OPEN</code></td><td><code>0</code></td><td>The audit trail is fail-<em>closed</em>: while the sink cannot append, admin mutations are refused with 503. Set to 1 to keep mutating and be alerted instead — a deployment-time decision, not a console one</td></tr>
-            <tr><td><code>TIMELAKE_NODE_ID</code></td><td><code>tldb</code></td><td>Stamped on every audit record; the chain is per node</td></tr>
+            <tr><td><code>TIMELAKE_NODE_ID</code></td><td><code>tldb</code></td><td>This node's identity: stamped on every audit record (the chain is per node) and on its <code>_system</code> rows, and the id peers address it by in <code>TIMELAKE_PEERS</code>. Set it explicitly on every node of a cluster</td></tr>
             <tr><td><code>TIMELAKE_AUDIT_ROTATE_SIZE</code></td><td><code>64MiB</code></td><td>Rotate the audit trail into an ordered segment at this size. The hash chain verifies <em>across</em> segments, so splitting costs nothing — a removed segment still breaks verification like a removed record</td></tr>
             <tr><td><code>TIMELAKE_AUDIT_ROTATE_EVERY</code></td><td>unset</td><td>Also rotate this long after a segment was opened (<code>1d</code>, <code>12h</code>)</td></tr>
             <tr><td><code>TIMELAKE_AUDIT_RETAIN_DAYS</code></td><td>unset</td><td><strong>Unset deletes nothing</strong>, which is the right default for evidence. When set it is clamped to a 90-day floor even if you ask for less, so the retention control cannot erase the record of its own use</td></tr>
@@ -745,7 +823,13 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELAKE_LOG_ROTATE_SIZE</code> / <code>_EVERY</code></td><td><code>100MiB</code> / unset</td><td>Rotation triggers for the system log; whichever fires first. <code>KiB</code> is 1024 and <code>KB</code> is 1000, and they are not treated as the same number</td></tr>
             <tr><td><code>TIMELAKE_LOG_KEEP</code></td><td>unset</td><td>Rotated system logs to keep. Unset keeps all</td></tr>
             <tr><td><code>TIMELAKE_MAX_CONCURRENT_QUERIES_PER_CLIENT</code></td><td>4</td><td>Per-client concurrency cap, in front of the global admission limit. Past it a client is refused with 429 rather than queued. <code>0</code> disables</td></tr>
-            <tr><td><code>TIMELAKE_ROLE</code></td><td><code>all</code></td><td><code>all</code> | <code>ingester</code> | <code>querier</code> | <code>router</code>. Cluster role</td></tr>
+            <tr><td><code>TIMELAKE_ROLE</code></td><td><code>all</code></td><td><code>all</code> | <code>ingester</code> | <code>querier</code> | <code>router</code> | <code>compactor</code>. Cluster role (see <a href="#scaling">Scaling</a>). A role whose phase has not landed refuses to start with exit 2 rather than running half-built — today that is <code>compactor</code></td></tr>
+            <tr><td><code>TIMELAKE_PEERS</code></td><td>empty</td><td>Static cluster topology: comma-separated <code>id=role@cluster_addr|data_addr</code>. An ingester needs its pair here; a router needs every ingester's public data address and, to answer queries, the queriers'. A malformed entry refuses to start</td></tr>
+            <tr><td><code>TIMELAKE_CLUSTER_ADDR</code></td><td>unset</td><td>The private intra-cluster listener an <code>ingester</code> opens for replication frames and live-buffer reads (<code>/internal/v1/*</code>). Required for the ingester role; no authentication, no visibility filter — <strong>never publish it</strong></td></tr>
+            <tr><td><code>TIMELAKE_DATA_ADDR</code></td><td>unset</td><td>The public data address this node advertises to discovery — what a router forwards writes to</td></tr>
+            <tr><td><code>TIMELAKE_SELFMON</code></td><td>on</td><td><code>off</code> stops the node sampling its own <code>/metrics</code> into <code>_system.metrics</code> and writing one row per query into <code>_system.queries</code></td></tr>
+            <tr><td><code>TIMELAKE_SELFMON_QUEUE</code></td><td>4096</td><td>Bounded queue of self-monitoring rows awaiting the next maintenance tick; past it rows are dropped and counted in <code>timelake_selfmon_dropped_total</code>. Telemetry never blocks a query</td></tr>
+            <tr><td><code>TIMELAKE_KMS_CACHE</code></td><td>on</td><td><code>off</code> makes every object cost a KMS call (the measured baseline); on, one data key is reused for <code>TIMELAKE_KMS_CACHE_MAX_AGE_SECS</code> (300) or <code>TIMELAKE_KMS_CACHE_MAX_USES</code> (1000), whichever first</td></tr>
           </tbody>
         </table>
       </div>
@@ -753,22 +837,36 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Metrics</h3>
       <p>
         Types, meanings and suggested alerts are in the
-        <a href="reference.html#metrics">metrics reference</a>. The series are:
-        <code>timelake_lines_written_total</code>, <code>timelake_flushes_total</code>,
-        <code>timelake_compactions_total</code>, <code>timelake_retention_drops_total</code>,
-        <code>timelake_parquet_files</code>, <code>timelake_buffer_rows</code>,
-        <code>timelake_wal_bytes</code>, <code>timelake_databases</code>,
-        <code>timelake_tables</code>. With TLS enabled,
+        <a href="reference.html#metrics">metrics reference</a>, which lists
+        every series. In outline: the engine (<code>timelake_lines_written_total</code>,
+        <code>timelake_flushes_total</code>, <code>timelake_compactions_total</code>,
+        <code>timelake_retention_drops_total</code>, <code>timelake_parquet_files</code>,
+        <code>timelake_buffer_rows</code>, <code>timelake_wal_bytes</code>,
+        <code>timelake_databases</code>, <code>timelake_tables</code>); the query
+        side — <code>timelake_query_duration_seconds</code> and
+        <code>timelake_query_admission_wait_seconds</code> histograms, in-flight and
+        queued gauges, and finished / timed-out / refused / failed counters;
+        lifecycle — uptime, <code>timelake_build_info</code>, flush and compaction
+        lag, <code>timelake_files{level}</code>, per-table
+        <code>timelake_storage_{bytes,rows}</code>,
+        <code>timelake_write_rejected_total{reason}</code>. TLS adds
         <code>timelake_tls_cert_expiry_seconds</code> and
-        <code>timelake_tls_last_reload_ok</code> are added. The admin surface adds
+        <code>timelake_tls_last_reload_ok</code>; the admin surface adds
         <code>timelake_admin_default_credential_active</code>,
         <code>timelake_admin_logins_total</code> and
-        <code>timelake_admin_login_failures_total</code>.
-        Targeted delete adds <code>timelake_tombstone_rewrites_total</code>;
-        the audit trail adds <code>timelake_audit_records_total</code> and
+        <code>timelake_admin_login_failures_total</code>; data-plane auth adds
+        <code>timelake_data_auth_mode</code> and the
+        <code>timelake_data_requests_*</code> split. Targeted delete adds
+        <code>timelake_tombstone_rewrites_total</code>; the audit trail adds
+        <code>timelake_audit_records_total</code> and
         <code>timelake_audit_sink_healthy</code>; the per-client cap adds
         <code>timelake_query_rate_limited_total</code>; row visibility adds
-        <code>timelake_visibility_rows_filtered_total</code>.
+        <code>timelake_visibility_rows_filtered_total</code>; each cluster role
+        adds its own (<code>timelake_cl2_*</code>, <code>timelake_querier_*</code>,
+        <code>timelake_router_*</code>). The same numbers are stored in
+        <code>_system.metrics</code> for SQL and Grafana; <code>/metrics</code>
+        stays the alerting surface because it answers from in-memory counters when
+        the query path is what is broken.
       </p>
       <p>
         <strong>Alert on <code>timelake_audit_sink_healthy == 0</code>.</strong>
@@ -830,26 +928,33 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         hypothesis. See <a href="#operations">Backup &amp; Restore</a>.
       </p>
 
-      <h3>Assume the port is the perimeter</h3>
+      <h3>Assume the port is the perimeter until you turn auth on</h3>
       <p>
-        Administration is authenticated; the data plane is not. Until that
-        changes, whoever can reach 1963 or 1964 owns the data — and because the
-        console answers on 1963 too, that port also decides who can reach the
-        management surface. Bind to a private interface, keep TimeLakeDB off any
-        network you do not control, rotate the seeded credential, and read
-        <a href="#security">Security</a> in full before a deployment —
-        particularly the note that <code>/api/sql</code> can write files as the
-        server process.
+        Administration is always authenticated; the data plane is only when
+        <code>TIMELAKE_DATA_AUTH</code> says so, and it ships <code>off</code>.
+        Until you set it, whoever can reach 1963 or 1964 owns the data — and
+        because the console answers on 1963 too, that port also decides who can
+        reach the management surface. Bind to a private interface, keep
+        TimeLakeDB off any network you do not control, rotate the seeded
+        credential, stage <code>optional</code> → <code>required</code> while
+        watching <code>timelake_data_requests_anonymous_total</code>, and read
+        <a href="#security">Security</a> in full before a deployment. In a
+        cluster, the intra-cluster listener is the port that must never be
+        published.
       </p>
 
       <h3>Prove changes with the harness</h3>
       <p>
-        Gauge's <code>bench/</code> is the executable specification. Run
-        <code>python bench.py run --backend timelakedb --scale laptop</code> from
-        <code>../Gauge/</code> and compare against the recorded baselines in
-        <code>../Gauge/bench/results/</code> rather than inventing a new
-        measurement each time; that is how every claim on this site was
-        produced.
+        Gauge — the benchmark harness, its own repository under
+        <code>timelakelabs</code> — is the executable specification. Run
+        <code>python bench/bench.py run --backend timelakedb --scale laptop</code>
+        from a Gauge checkout and compare against its recorded baselines with
+        <code>bench/bench.py compare</code> rather than inventing a new
+        measurement each time; that is how every performance figure on this
+        site was produced. Correctness verdicts come from Catchment, the
+        conformance harness, and the drill transcripts under
+        <code>docs/evidence/</code> in this repository — deliberately a
+        different source, so the wrong one never gets quoted for the other.
       </p>
     </section>
   </main>

@@ -28,12 +28,17 @@ container runs as an unprivileged user on a read-only root filesystem,
 mutations are recorded in a hash-chained audit trail, and data can be
 deleted on a predicate rather than only by retention.
 
-What remains is genuinely operational, and mostly about **more than one
-node**: there is still one node holding one copy of the data (P1-1), the
-compactor role and its singleton lease are unbuilt, and the data plane's
-default is open until an operator sets `TIMELAKE_DATA_AUTH`. Read the
-per-item sections below rather than this paragraph — each says what
-shipped and what is still owed.
+What remains is genuinely operational. The cluster role split is four
+phases in (ingester pairs replicate before the ack, a router shards
+writes, stateless queriers read with exact freshness — each drilled), so
+"one node, one copy" is now a *deployment choice* (`TIMELAKE_ROLE=all`)
+rather than the only shape; the compactor role is built but gated behind
+its work-avoidance layer (C2 phase 5b), so a cluster today still runs
+compaction on an `all`-role node; C3 (Consul discovery, required
+intra-cluster mTLS) is unstarted; and the data plane's default is open
+until an operator sets `TIMELAKE_DATA_AUTH`. Read the per-item sections
+below rather than this paragraph — each says what shipped and what is
+still owed.
 
 **Tributary is earlier but structurally sound.** Its three hardest
 correctness properties — exact counts through rotation, crash resume
@@ -54,7 +59,7 @@ Five axes. An item earns priority by which axis it unblocks.
 |---|---|---|
 | 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). No Helm chart; no public release cut yet |
 | 2 | **Access controlled and attributable** | Partly — the mechanisms exist but the defaults do not enforce them. Admin routes require a session (SEC-4); the data plane takes tokens but `TIMELAKE_DATA_AUTH` **defaults to `off`**, so a stock node still serves anyone who can reach it. Attribution is real: a hash-chained audit trail for every admin mutation (P1-2), client-certificate identity on both query surfaces (SEC-3 v2), and one row per query in `_system.queries` (U2). Not yet: data-plane auth on by default, and auditing of the data plane itself |
-| 3 | **Survives node loss** | No — single node, single volume, RPO = last backup |
+| 3 | **Survives node loss** | With the role split, yes for acknowledged writes — an ingester replicates every frame to its pair before the 204 and a SIGKILL'd ingester recovers on the peer with zero acked loss (`docs/evidence/cl2-replication-drill.log`, 12/12); a querier is stateless and rebuilds from the bucket. Not yet: automatic failover (recovery is an explicit `/recover`), and a compactor that can run on its own node. A default `TIMELAKE_ROLE=all` deployment is still single node, single volume, RPO = last backup |
 | 4 | **Failures visible before outages** | Yes — query latency/admission/outcome histograms, per-table storage, lifecycle lag and write-refusal causes on `/metrics` (U2, 2026-08-18); the hash-chained audit trail (P1-2); a documented alert list in `site/docs/reference.html`; and a self-monitoring Grafana console reading the node's own `_system` database. No alert *rules* are shipped — the list is prose, not a rules file |
 | 5 | **Safe to upgrade** | Partly — no released version, no compat policy |
 
@@ -263,7 +268,39 @@ credential, a shipper that cannot present one is not deployable.
 
 You can pilot without these. You cannot run them unwatched.
 
-### P1-1 · Node loss loses data  ⟂ the biggest architectural gap
+### P1-1 · Node loss loses data  ⟂ MOSTLY DONE — C2 phases 1–4 shipped 2026-08-10, phase 5a 2026-08-21
+
+**Was Effort: L.** The original text below described a single node with
+one volume. Since then the role split has landed one phase at a time,
+each with a recorded drill:
+
+- **CL-2 ingester replication** — every write is shipped to the paired
+  ingester's durable replica WAL *before* the 204; a peer that is down
+  degrades loudly (`timelake_cl2_degraded`) rather than failing writes;
+  SIGKILL an ingester, recover on the peer, zero acknowledged loss
+  (`docs/evidence/cl2-replication-drill.log`, 12/12).
+- **Router** — stateless write sharding by `(db, measurement)`, whole
+  body validated before any forward, queries forwarded round-robin to
+  queriers (`router-sharding-drill.log`, 8/8).
+- **CL-3 querier** — stateless, replays the catalog from the shared
+  bucket, unions the ingesters' live buffers as Arrow IPC under a
+  freshness watermark, refuses rather than under-counts when an ingester
+  is unreachable (`cl3-querier-drill.log`, 19/19; the unmodified bench
+  through the router: `rows_48h` 77,806 = the single-node value).
+- **Compactor role** — built 2026-08-21 with a catalog tailer and a
+  `/health` + `/metrics`-only surface; `Role::implemented` still refuses
+  it. The reason is efficiency, not safety: the compaction commit fence
+  (`Catalog::commit_replace`) already refuses a merge whose inputs were
+  replaced, so two compactors are correct, but they would do double the
+  IO to land half the merges. Phase 5b (work-avoidance) opens the gate.
+
+**Still owed:** automatic failover (recovery is an explicit
+`POST /internal/v1/recover` by an operator or the router today), a
+startable compactor, and C3 — Consul discovery and *required* mTLS on
+the intra-cluster listener (§3). A `TIMELAKE_ROLE=all` node remains what
+the original text describes.
+
+The original text, for the record:
 
 **Effort: L.** One node, one volume. Backup and restore are drilled and
 exact (34 s backup, 13 s restore, `docs/BACKUP_RESTORE.md`), so the
@@ -402,7 +439,9 @@ peak and 50× better by bound.
 
 ## 3. P2 — scale and multi-node
 
-- **C2 role split, C3 Consul discovery + intra-cluster mTLS.** The
+- **C2 phase 5b, then C3 Consul discovery + intra-cluster mTLS.** C2
+  phases 1–4 shipped (P1-1 above); 5a built the compactor role behind the
+  commit fence; 5b is the work-avoidance that lets it start. The
   client-certificate verifier is built; C3 flips it from *want* to
   *required* on the intra-cluster listener, which is safe there
   precisely because no stock client dials it.
@@ -454,10 +493,23 @@ peak and 50× better by bound.
 Genuinely optional for production; they make it a *product*.
 
 - Flight SQL `DoPut` and prepared statements.
-- `CREATE`/`DROP TABLE` currently return `[]` and do nothing — either
-  implement or refuse them explicitly. Silently succeeding at nothing is
-  the worst of the three options.
+- ~~`CREATE`/`DROP TABLE` currently return `[]` and do nothing~~ — **done
+  with P0-2**: the read-only guard refuses DDL explicitly, so a
+  `DROP TABLE` no longer appears to succeed while doing nothing.
 - Manifest replay should skip non-`.json` files (known, small).
+- A tag or field named `time` is not refused on the write path, and the
+  buffer emits its own `time` column first, so such a line produces a
+  duplicate Arrow field name at read time. Small; refuse it at parse.
+- A router-role node carries no `DefaultBodyLimit`, so it falls back to
+  axum's 2 MiB default while the ingesters it fronts accept
+  `TIMELAKE_MAX_BODY_BYTES` (32 MiB) — the 2026-08-13 fix covered the
+  data-plane and internal routers and missed this one
+  (`crates/server/src/router.rs` `router_app`). One `.layer(...)`, but it
+  needs the config value threaded into `main.rs`'s router branch.
+- The router forwards writes without the client's `Authorization`
+  header, so a cluster behind a router cannot run
+  `TIMELAKE_DATA_AUTH=required` on its ingesters today (every forwarded
+  shard would be refused 401). Queries *do* pass the header through.
 - Helm chart, packaging, versioned upgrade/rollback policy.
 - **Tributary L6 (Arrow wire protocol) — explicitly do not start.** Its
   own roadmap gates this on L3 proving line protocol is the bottleneck.

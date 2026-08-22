@@ -470,8 +470,10 @@ in one process, bench and fixtures untouched. The specialised roles are
 built one phase at a time; **a role whose phase has not landed is refused
 at startup** (`exit 2` with a named message) rather than started
 half-built, so no one deploys an ingester that does not replicate. The
-node logs its role, id, and resolved peers at boot. Phase still to land:
-the compactor role and its singleton lease.
+node logs its role, id, and resolved peers at boot. The compactor role is
+built (phase 5a, 2026-08-21) and still refused by `Role::implemented` —
+see its bullet below for why, and why the lease this sentence used to
+promise was replaced by a commit fence.
 
 - **Router — shipped (C2 phase 3, reads added in phase 4).** Stateless, holds no data,
   opens no engine. It hashes each line's `(db, measurement)` → one
@@ -565,9 +567,30 @@ the compactor role and its singleton lease.
   Known cost, a C3 refinement: providers are registered for every table
   in the database before planning, so a query fans out snapshot requests
   for tables it will not read.
-- **Compactor** — the §7 loops (compact/retention/GC) as a role,
-  singleton by advisory `Discovery::lease`; a double-fired compaction
-  stays safe (CAS accepts one output, GC collects the loser).
+- **Compactor — built (C2 phase 5a, 2026-08-21), gate shut.**
+  `TIMELAKE_ROLE=compactor` runs the §7 loops (compact, tombstone
+  rewrites, retention, GC) and nothing else: no WAL, no buffer, writes
+  refused, an HTTP surface of `/health` + `/ping` + `/metrics` built
+  additively (`timelake_api::maintenance_app`) so a route added to the
+  data plane cannot leak onto it. It **tails the catalog** — `compact_once`
+  reads the in-memory file list, which advances only on a node's own
+  commits, so without tailing a compactor would work forever from the
+  list it booted with. Rig: `deploy/compose/timelakedb-compactor.yml`.
+  **The singleton lease this bullet used to promise was not built, on
+  purpose.** A lease is a wall-clock promise across machines; two holders
+  under clock skew would both land a merge of one partition, and catalog
+  CAS only guarantees a commit is not *overwritten*, not that it is still
+  *valid* when it lands. What ships instead is a **commit fence**:
+  `Catalog::commit_replace` re-checks, inside the CAS critical section and
+  after catching up to the true head, that every file a merge removes is
+  still present; if any has gone, another writer replaced those inputs
+  and the commit is refused without burning a sequence number. The
+  refused merge goes to deferred GC and counts in
+  `timelake_stale_merges_total` (not as a compaction). So concurrent
+  compactors are *correct* today. `Role::implemented` still refuses the
+  role because they are not yet *efficient* — two compactors racing every
+  partition do double the IO to land half the merges. Phase 5b is the
+  work-avoidance layer above the fence; flipping the gate is its gate.
 
 ### 12.5 Discovery & intra-cluster TLS
 
@@ -660,14 +683,23 @@ compaction lag, pool usage, admission queue depth, per-query peak memory),
 stats, and `system.*` virtual tables (files, partitions, retention state)
 so the harness never has to shell into a container again.
 
-Shipped so far: lines written, buffer rows, WAL bytes, Parquet files,
-flushes, compactions, retention drops, databases/tables, encryption,
-visibility filtering, KMS, S3 and TLS. The query-side series above
-(latency histogram, admission depth, per-query peak memory, pruning
-counters, storage bytes, flush/compaction lag, uptime) are still missing
-and land with the console's performance views — §17, U2, which tables
-them individually. They are worth adding for Grafana and the harness
-regardless of the console.
+Shipped: lines written, buffer rows, WAL bytes, Parquet files, flushes,
+compactions (and stale merges), retention drops, tombstone rewrites,
+databases/tables, encryption, visibility filtering, KMS, S3, TLS and
+client-certificate counters, admin and data-plane auth, the per-client
+cap, the audit sink, the cluster roles (CL-2, CL-3, router) — and, since
+U2 (2026-08-18), the query side: `timelake_query_duration_seconds` and
+`timelake_query_admission_wait_seconds` histograms, in-flight/queued
+gauges, per-outcome counters (finished / timed out / refused / failed),
+uptime, `build_info`, flush and compaction lag, GC pending, files by
+level, per-table storage bytes and rows, and write rejections by reason.
+All of it is instrumented at `run_sql_env`, the one execution point, so
+HTTP and Flight cannot drift. The same exposition is sampled into
+`_system.metrics`, with one row per query in `_system.queries`
+(`docs/CONSOLE.md` §7.6) — `/metrics` stays the alerting surface because
+it answers from atomics when the query path is what is broken. Still
+missing from the §13 list: per-query peak memory and pruning counters,
+and the `system.*` virtual tables (files, partitions, retention state).
 
 ## 14. Milestones — each one measurable by the harness
 
@@ -686,7 +718,7 @@ M0–M5 are complete. The cluster phases (§12 design):
 |---|---|---|
 | C0 | `S3Store` + `put_if_absent`, SSE-KMS + Bucket Keys, `AwsKms` + `CachingKms`; single node on LocalStack | smoke exact on S3; KMS calls measured cache-on vs cache-off; at-rest + SSE verified |
 | C1 | Catalog CAS + checkpoints, commit re-validation | two-writer race drill: one winner per seq, loser converges, no lost/dup files |
-| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Arrow IPC), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild. Phases 1–4 shipped (roles, CL-2, router, CL-3 querier); compactor role remains |
+| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Arrow IPC), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild. Phases 1–4 shipped (roles, CL-2, router, CL-3 querier); 5a shipped 2026-08-21 (compactor role built behind the commit fence, `Role::implemented` still false); 5b open (work-avoidance above the fence, which is what flips the gate) |
 | C3 | Consul discovery, intra-cluster mTLS, full scale | AT-3-style gate against the cluster; latency re-baselined off LocalStack |
 
 The console phases (§17 design, `docs/CONSOLE.md`). U0–U2 are independent
@@ -695,8 +727,8 @@ of the C track; U3 needs the C2 role split:
 | U | Deliverable | Gate (tsdb-bench + drill) |
 |---|---|---|
 | U0 | Admin listener (1965, TLS, private by default), SEC-4 auth (bootstrap, roles, sessions, tokens), `timelake-config` layered resolver with provenance/revert/pinning, retention rebuilt on it, `/admin/*` off 1963 | full scale green with every tunable set through the console, not the environment; restart with a stale property keeps overrides **and** logs the divergence; unauthenticated admin call = 401 + audit record; `gc_grace_secs ≤ query_timeout_secs` rejected by name |
-| U1 | App-log ring + SSE tail; `timelake-audit` hash-chained sink, `system.audit`, verifier | audit drill: every mutating route emits exactly one record (denials included), chain verifies, a hand-edited record is caught at the right sequence, sink survives SIGKILL, mutations fail closed when the sink is down |
-| U2 | Missing metrics (§13), 6 h sample ring, Overview/Ingest/Storage/Query/Security views | console numbers match `/metrics` and a run's `run.json` within tolerance; RR-4 idle footprint unchanged with ring + log buffer full; the Query view shows the fresh-vs-settled effect without running the harness |
+| U1 | App-log ring + SSE tail; `timelake-audit` hash-chained sink, `system.audit`, verifier | audit drill: every mutating route emits exactly one record (denials included), chain verifies, a hand-edited record is caught at the right sequence, sink survives SIGKILL, mutations fail closed when the sink is down. **Audit half shipped** as P1-2 (2026-08-16: `crates/audit`, fail-closed, `GET /admin/audit?verify=1`, rotation drilled 2026-08-18); log ring/SSE tail and `system.audit` open |
+| U2 | Missing metrics (§13), 6 h sample ring, Overview/Ingest/Storage/Query/Security views | console numbers match `/metrics` and a run's `run.json` within tolerance; RR-4 idle footprint unchanged with ring + log buffer full; the Query view shows the fresh-vs-settled effect without running the harness. **Shipped 2026-08-18** — metrics on `/metrics`, self-monitoring into `_system` (the ring is a table), Grafana console in `deploy/grafana/` (`docs/evidence/u2-console-drill.log`) |
 | U3 | Cluster view over `Discovery`, drill-in, config convergence, degraded-mode banners | node kill visible ≤ 10 s with role and health; a node held at an old revision is flagged; a stale membership view changes nothing about write/catalog correctness (CL-5 guard, drilled) |
 
 The rule from `CLAUDE.md` stands: the harness is the spec. No milestone

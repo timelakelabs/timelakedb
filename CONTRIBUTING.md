@@ -64,7 +64,7 @@ The runtime stage of `Dockerfile` must track the builder's glibc. When
 
 ## The workspace
 
-Fifteen crates, each with a single job. Boundaries are load-bearing —
+Seventeen crates, each with a single job. Boundaries are load-bearing —
 particularly `store` (the one object-I/O chokepoint, where SEC-1
 encryption lives as the `EncryptingStore` decorator) and `query` (the one
 mandatory-predicate injection point, where SEC-2 visibility labels are
@@ -84,10 +84,12 @@ a second enforcement point.
 | `query` | DataFusion integration under a shared memory budget (FR-3, RR-1). |
 | `api` | HTTP surface: writes, `/api/sql`, `/metrics`, health (FR-1, FR-9). |
 | `flight` | Flight SQL server — the Grafana read path (FR-8). |
-| `tls` | TLS 1.3 with hot certificate rotation (SEC-3). |
-| `auth` | Principals, roles and sessions for the admin surface (SEC-4). |
+| `tls` | TLS 1.3 with hot certificate rotation, want-mode client certificates (SEC-3). |
+| `auth` | Principals, roles and sessions for the admin surface; data-plane tokens and the one `guard::decide` both HTTP and Flight route through (SEC-4). |
+| `audit` | The hash-chained, fsync'd, fail-closed audit trail behind every admin mutation (P1-2 / SR-6). |
+| `cluster` | `Role` (`TIMELAKE_ROLE`), the `Discovery` trait and its static backend (`TIMELAKE_PEERS`). |
 | `discovery` | Pluggable cluster membership (CL-5 seam). |
-| `server` | The engine that composes the above, plus the binary. |
+| `server` | The engine that composes the above, plus the binary — including the router, replication, selfmon and rate-limit modules. |
 
 ## What CI enforces
 
@@ -121,9 +123,11 @@ TLDB_S3_TEST_BUCKET=timelake-it TLDB_KMS_TEST_KEY=alias/timelake \
 cargo test -p timelake-store-s3 -- --ignored
 ```
 
-Coverage headroom is thin (80.84% against the 80% gate as of the CL-3
-work), so a change that adds much untested code will fail the gate rather
-than quietly erode it. That is the intent.
+Coverage headroom is thin (82.74% against the 80% gate at the last
+recorded runner result, `docs/evidence/P0-1-ci.md`; it had dipped to
+80.84% after the CL-3 work before the router integration tests), so a
+change that adds much untested code will fail the gate rather than
+quietly erode it. That is the intent.
 
 One known wrinkle: `crates/server/tests/health.rs`'s
 `rows_stay_visible_while_a_slow_flush_uploads` passes when the test binary
@@ -179,8 +183,10 @@ Functional bugs: open an issue with the version or commit, the configuration,
 what you observed, and — ideally — a harness scenario that reproduces it.
 
 Security issues: **do not open a public issue.** Follow `SECURITY.md`. Note
-that the pre-v1 build has no authentication by design-in-progress; the posture
-documented there is known, not a vulnerability report.
+that the data plane ships with `TIMELAKE_DATA_AUTH=off` by design — the
+mechanism exists and is drilled, the default is the compatibility
+contract — so "the data plane is open on a default install" is the
+documented posture, not a vulnerability report.
 
 ## Code of conduct
 
