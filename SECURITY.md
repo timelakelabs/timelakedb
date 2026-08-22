@@ -383,30 +383,26 @@ stack (`rustls-aws-lc`, rustls 0.23), so the obsolete TLS implementation was
 being compiled into the binary beside the one actually in use. Turning that
 one feature off removes it entirely.
 
-**Open, blocked upstream — `thrift` 0.17.0, GHSA-2f9f-gq7v-9h6m** (medium,
+**Closed 2026-08-21 — `thrift` 0.17.0, GHSA-2f9f-gq7v-9h6m** (medium,
 CVSS 5.3, availability only: memory allocation with an excessive size
-value). It arrives as `thrift` → `parquet` (the non-optional `arrow`
-feature) → `datafusion` → this workspace. arrow-rs has since rewritten the
-Parquet metadata parser to drop the external `thrift` crate, and the
-removal completes in **`parquet` 59** — but the latest released
-**`datafusion` (54)** still pins `parquet ^58.3.0` and *rejects* 59.
-Verified 2026-08-15: `cargo update -p parquet --precise 59.0.0` fails with
-"candidate versions found which didn't match: 59.0.0, required by
-datafusion v54.1.0". So there is still nothing to pin here — no released
-`datafusion` reaches a thrift-free `parquet`. It resolves when
-`datafusion` 55 lands on `parquet` 59+, a major bump we take then rather
-than chase a pre-release for a deferred, unreachable advisory. The rest of
-the tree is otherwise refreshed to latest within-semver (`cargo update`);
-the other flagged crates — `paste`, `lru` — arrive down the same
-`datafusion`/`parquet` chain and clear on the same upgrade.
+value). It arrived as `thrift` → `parquet` (the non-optional `arrow`
+feature) → `datafusion` → this workspace, and for a week there was
+nothing to pin: arrow-rs had dropped the external `thrift` crate in
+**`parquet` 59**, but the then-latest `datafusion` 54 pinned `parquet
+^58.3.0` and rejected 59 (verified 2026-08-15: `cargo update -p parquet
+--precise 59.0.0` → "candidate versions found which didn't match"). It
+closed the way it was always going to: **DataFusion 55** (PR #27) brings
+`parquet` 59.2.0, and `cargo tree -i thrift` now reports no such package.
+The dependency is gone rather than patched, so the next `thrift` CVE
+cannot arrive down this chain either. `paste` and `lru`, flagged on the
+same chain, cleared with it.
 
-The reachable path would be parsing Parquet metadata from an untrusted
-source. TimeLakeDB reads Parquet that TimeLakeDB wrote, from its own object
-store, so reaching it means already holding write access to the bucket, at
-which point the object store itself is the larger problem. The assessment changes
-the moment this database is pointed at files it did not produce; if that
-becomes a supported mode, this advisory becomes blocking rather than
-deferred.
+While it was open the assessment was: the reachable path is parsing
+Parquet metadata from an untrusted source, and TimeLakeDB reads Parquet
+that TimeLakeDB wrote, from its own object store, so reaching it meant
+already holding write access to the bucket. That reasoning is kept here
+because it is the reasoning that would apply again if this database were
+ever pointed at files it did not produce.
 
 ## Deploying it safely today
 
@@ -451,7 +447,7 @@ deferred.
 | Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`docs/evidence/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presents the token (P0-5, done — Tributary repo `docs/evidence/p05-data-auth.log`). |
 | Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session on **both** Flight SQL and `/api/sql` (the latter via a custom `axum-server` `Accept`, 2026-08-18). AT-7 still 19/19 with it enabled. |
 | Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
-| Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config. Per-column keys (Parquet Modular Encryption) and KMS backends remain open at the same seam. |
+| Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config; AWS KMS as a key source (`TIMELAKE_KMS_KEY_ID`, C0) and the WAL (SEC-8) are covered. Per-column keys (Parquet Modular Encryption) remain open at the same seam. |
 | Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |
 
 `REQUIREMENTS.md` §8 is the full security specification and explains why
