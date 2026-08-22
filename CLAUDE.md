@@ -220,8 +220,8 @@ This project is inspired by the following projects.
   usage trap rather than an engine bug: `reduce: last` takes the
   positionally last row of the frame. It does not sort and does not know
   which column is time**, so a rule ending `ORDER BY time DESC` — the
-  natural phrasing, and the one most of our own examples use — thresholds
-  the OLDEST row in the window. Measured: window holding 10s then 100s
+  natural phrasing — thresholds the OLDEST row in the window. Measured:
+  window holding 10s then 100s
   against `gt 50`, rule sat in Normal reporting **`health: ok`**
   indefinitely; flipping that one word to `ASC` made it fire on the next
   tick. Nothing surfaces it — a panel on the same SQL renders fine because

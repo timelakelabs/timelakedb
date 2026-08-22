@@ -13,9 +13,8 @@
 # which column is time. So the newest sample is only the one being
 # thresholded if the query returned rows oldest-first.
 #
-# Write `ORDER BY time DESC` — the natural way to ask for recent data, and
-# the way nearly every hand-written TimeLakeDB query is phrased — and the
-# reducer silently thresholds the OLDEST row in the window. The rule
+# Write `ORDER BY time DESC` — the natural way to ask for recent data —
+# and the reducer silently thresholds the OLDEST row in the window. The rule
 # evaluates without error, reports `health: ok` forever, and never fires.
 # There is no warning anywhere in the pipeline, because nothing is wrong
 # in any way Grafana can detect: it asked for rows, it got rows, it took

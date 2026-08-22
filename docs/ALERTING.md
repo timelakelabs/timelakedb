@@ -59,8 +59,7 @@ This is the one to internalise.
 sort, and it does not know which of your columns is time.**
 
 So this rule — phrased the way almost everyone writes a "recent data"
-query, and the way most TimeLakeDB examples are written — thresholds the
-**oldest** row in the window:
+query — thresholds the **oldest** row in the window:
 
 ```sql
 SELECT time, value FROM alertprobe ORDER BY time DESC   -- BROKEN
@@ -103,8 +102,20 @@ Two other ways to get this right, if ASC does not suit the query:
   threshold rule actually means. Prefer this when "at any point in the
   window" is the real question.
 - Keep DESC and use `LIMIT 1` — the frame is one row, so position and
-  recency coincide. Fragile: someone widens the limit later to make a
-  panel look better and the rule quietly breaks again.
+  recency coincide. This is what our own fixture dashboards do
+  (`fixtures/grafana/dashboards/host_detail.json`, six panels), and it is
+  correct. It is also the one form that rots quietly: widen the limit
+  later to make a panel look better and any alert built from that query
+  breaks, with no error and no visible change to the panel.
+
+Audited 2026-08-22, because an earlier draft of this document asserted the
+opposite and was wrong. Every `ORDER BY` in the repo's dashboards is
+already safe: thirteen console panels use `ORDER BY 1` over a
+`DATE_BIN(...)` first column (ascending, SQL default), six host-detail
+panels use `DESC LIMIT 1`, one uses a bare `ORDER BY time`, and the
+remaining three order by a metric for top-N tables and are not
+alert-shaped. Nothing here teaches the broken phrasing — the trap is real,
+but it is a trap for new rules, not a defect we have shipped.
 
 ---
 
