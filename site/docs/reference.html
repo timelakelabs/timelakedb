@@ -629,11 +629,58 @@
             set to anything — the AT-6 fixture.</li>
         <li><strong>Grafana</strong>, stock InfluxDB datasource in SQL mode over Flight
             SQL on 1964; the provisioned dashboards in <code>fixtures/grafana/</code>
-            render unchanged.</li>
+            render unchanged, and alert rules evaluate, fire and notify — with one
+            sharp edge, covered under <em>Grafana alerting</em> below.</li>
       </ul>
       <p>
         Client libraries that only write line protocol over the endpoints above will
         work. Anything that calls a management, query or metadata API will not.
+      </p>
+
+      <h3>Grafana alerting</h3>
+      <p>
+        Alert rules read through the same datasource as dashboards — Flight SQL on
+        1964, with nothing extra to configure. What a dashboard never exercises is the
+        <em>reduce</em> stage: a panel plots a whole frame, whereas an alert has to
+        collapse one to a single number before it can compare it to anything. Two
+        things about that stage will each cost you an afternoon.
+      </p>
+      <p>
+        <strong>The SQL goes in <code>rawSql</code></strong> — not <code>query</code>,
+        not <code>expr</code>. The provisioning API accepts either of those, and the
+        statement then arrives at the server empty, so you get back
+        <code>Error during planning: No SQL statements were provided in the query
+        string</code> and go hunting for a fault in the engine.
+      </p>
+      <p>
+        <strong><code>reduce: last</code> is positional.</strong> It takes the last row
+        of the frame. It does not sort, and it does not know which of your columns is
+        time. So a query ending <code>ORDER BY time DESC</code> — the natural way to ask
+        for recent data — thresholds the <em>oldest</em> row in the window. The rule
+        evaluates without error, reports <code>health: ok</code> indefinitely, and never
+        fires. Nothing flags it: a panel on the identical SQL renders correctly, because
+        a panel never reduces, and rule history draws the same unbroken line whether the
+        system is quiet or the rule is dead.
+      </p>
+      <p>
+        Write <code>ORDER BY time ASC</code>, or use <code>reducer: max</code> or
+        <code>min</code>, which are order-independent and usually what a threshold rule
+        meant anyway. <code>ORDER BY time DESC LIMIT 1</code> is also correct — a
+        one-row frame makes position and recency the same thing — but it is the form
+        that rots quietly: widen that limit later and the panel looks identical while
+        every alert built from the query stops firing.
+      </p>
+      <p>
+        Alert on <strong>your data</strong> here, and on <strong>the node</strong>
+        through <code>/metrics</code> and Alertmanager (see <a href="#metrics">Metrics</a>).
+        That split is not tidiness. <code>/metrics</code> answers from in-memory
+        counters, so it still reports when the query path is the thing that has failed,
+        and a rule which must run SQL to tell you SQL is broken has an obvious ending.
+      </p>
+      <p>
+        Working provisioning, the reducer trap measured, and a drill that goes red when
+        the ordering is wrong:
+        <a href="https://github.com/timelakelabs/timelakedb/blob/main/docs/ALERTING.md">docs/ALERTING.md</a>.
       </p>
     </section>
 
@@ -655,10 +702,13 @@
         writes one row per query into <code>_system.queries</code>, so performance is
         queryable in SQL and chartable in Grafana without a separate metrics stack
         (see the <a href="https://github.com/timelakelabs/timelakedb/blob/main/docs/CONSOLE.md">console design</a>, §7.6).
-        <strong>This endpoint remains the one to scrape for alerting</strong>: it answers
-        from in-memory counters with no query path involved, so it still works when the
-        engine is too unhealthy to serve SQL — which is exactly when the stored copy
-        cannot be read.
+        <strong>This endpoint remains the one to scrape for alerting on the node
+        itself</strong>: it answers from in-memory counters with no query path involved,
+        so it still works when the engine is too unhealthy to serve SQL — which is
+        exactly when the stored copy cannot be read. Thresholds on the data you
+        <em>wrote</em> are a different job and belong in Grafana; see
+        <a href="#compatibility">Client compatibility</a>, under <em>Grafana
+        alerting</em>.
       </p>
       <div class="table-wrap">
         <table>
