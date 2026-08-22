@@ -1,0 +1,26 @@
+# The datasource the alert rules read through.
+#
+# Flight SQL, not InfluxQL or Flux: Grafana's InfluxDB datasource in `SQL`
+# mode talks Arrow Flight SQL on 1964, which is the protocol TimeLakeDB
+# actually serves. The alert rules reference this by uid, so the uid is
+# part of the contract and must not be renamed without editing rules.yml.
+#
+# `dbName` is fixed per datasource — a Flight SQL connection is bound to
+# one database — so a rule cannot query across databases and a second
+# database needs a second datasource.
+apiVersion: 1
+
+datasources:
+  - name: TimeLakeDB-Alerts
+    uid: tldb-alerts
+    type: influxdb
+    access: proxy
+    url: http://timelakedb:1964
+    isDefault: true
+    jsonData:
+      version: SQL
+      dbName: alerts
+      httpMode: POST
+      # The drill rig serves Flight without TLS. A deployment that
+      # terminates TLS on 1964 drops this and points at the CA instead.
+      insecureGrpc: true
