@@ -406,6 +406,21 @@ peak and 50× better by bound.
   client-certificate verifier is built; C3 flips it from *want* to
   *required* on the intra-cluster listener, which is safe there
   precisely because no stock client dials it.
+- **Rebalancing needs a drained fleet, and there is no code that enforces
+  it.** Change the ingester count while any agent still holds an
+  undelivered batch and row counts can come back *too high*: `shard_of` is
+  FNV-1a mod N, so a retry issued after the change lands on a different
+  node than the original write, and the two copies never meet anywhere
+  flush-time LWW would collapse them. Measured at 2,000 excess rows per
+  affected table over eight streams
+  (`FINDING_rebalance_duplicates_replayed_writes.md`). Overlap-aware
+  compaction bounds how long it lasts — twins in one partition now merge
+  on range overlap instead of waiting for a fourth file — but Catchment's
+  C4 composition has not been re-run since that fix, so the finding is
+  still open and the procedure, not the code, is what you are relying on.
+  **`docs/REBALANCE.md` is the procedure.** Note what it does *not* cover:
+  a node dying is a membership change nobody scheduled, and that is the
+  one you would most want guarded.
 - **Real-AWS sizing.** Every S3/KMS number so far is LocalStack, which
   proves correctness, call counts and recovery, and **deliberately
   proves nothing about latency.** Node-type sizing needs real AWS.
