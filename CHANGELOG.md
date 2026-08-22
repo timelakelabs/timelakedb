@@ -13,6 +13,88 @@ here.
 
 ## [Unreleased]
 
+### Fixed — the rebalance-duplicates finding is closed, and a second one found on the way (2026-08-22)
+
+Catchment's `router-tributary-exactness` composition was re-run seven
+times against overlap-aware compaction (below, 2026-08-21). The closing
+run, `...-20260822-160108`, is PASS 17/17. An undrained 2→3 ingester
+reshape still twins the batches caught mid-window — 202,000 rows observed
+— and the next overlap-triggered compaction pass collapses them to an
+exact 200,000, **cross-node**: `compact_once` groups files out of the
+shared catalog by `(db, table, partition)` with no node dimension, and
+the CAS loop teaches every node about its peers' files on the first
+commit collision. That corrects a sentence written into `REBALANCE.md`
+two days earlier, that twins only meet if they land on the same node.
+Wrong in the safe direction, still wrong; fixed.
+`docs/FINDING_rebalance_duplicates_replayed_writes.md` is closed; the
+drain rule in `docs/REBALANCE.md` stays, because what it buys now is
+avoiding the transient inflation between the reshape and that compaction
+pass, which is a different sentence than "preventing a permanent one".
+
+The better story is the bug the re-runs found. Three of the first five
+wedged in a way the rebalance finding does not describe: the reshape
+frees the router's IP, Docker hands it to a recreated *querier*, the
+agents' keep-alive connection pool follows the address (DNS is consulted
+on dial only), and the querier's 501 — which literally says "this node
+holds no write path" — was filed under retryable transport and retried on
+the same connection, about five times a second, forever. `/proc` lied
+about it (WSL2 hides `wchan`); strace did not. Kubernetes recycles pod
+IPs on every rollout, so this is not a Docker party trick.
+`docs/FINDING_agent_pools_a_reused_ip.md` has the strace, the two
+hypotheses that died first (an uncapped retry-after sleep; DNS thread
+pile-up), and the fix — shipped in Tributary: rebuild the client on a
+501 and on every third consecutive transport failure,
+`tributary_transport_rebuilds_total` makes it visible, and the unit test
+was red-proofed by neutering the fix (`conns:1`). On this side, four C4
+harness defects that had each read as a plausible product failure were
+fixed in the same campaign; the run notes have them.
+
+### Added — Grafana alerting, verified end to end, and the ORDER BY that silently kills a rule (2026-08-21/22)
+
+FR-9 covered dashboards; nothing had ever exercised alerting, which adds
+a stage a dashboard never touches — the datasource frame has to survive
+a `reduce`. It does: data written → rule evaluates → threshold breached
+→ alert fires → notification *delivered* to a webhook recorder → data
+returns to normal → alert clears, against Grafana 13.1.3 and a stock
+node. `docs/ALERTING.md`; rig `deploy/compose/timelakedb-alerting.yml`
+(Grafana on 3005, a `python:3.12-alpine` webhook sink on 9099); drill
+`deploy/compose/alert-drill/alert_drill.sh`; transcript
+`docs/evidence/grafana-alerting-drill.log`.
+
+The finding is a usage trap, not an engine bug, and nothing surfaces it.
+**`reduce: last` is positional** — it takes the last row of the frame, it
+does not sort, and it does not know which column is time — so a rule
+whose SQL ends `ORDER BY time DESC`, the natural phrasing, thresholds the
+*oldest* row in the window. Measured: a window holding 10 s then 100 s
+against `gt 50` sat in Normal reporting `health: ok` indefinitely;
+flipping that one word to `ASC` fired on the next tick. A panel on the
+same SQL renders fine because a panel never reduces, and rule history is
+an unbroken green line either way. The provisioned group therefore
+carries a deliberately-`DESC` rule asserted *not* to fire beside the real
+one, so a green drill separates "alerting works" from "nothing can
+fire"; mutation-verified (ASC→DESC ⇒ phase E fails, exit 1, and F/G
+report SKIP not PASS). Second trap: the query model field is `rawSql` —
+`query`/`expr` reach the server as an empty statement and the error
+reads like an engine fault. The drill refuses a dirty table, because
+`/api/sql` is read-only and there is no delete-database route, so it
+cannot clean up after itself and stale rows would silently invert the
+discriminator. `/metrics` + Alertmanager remains the surface for *node*
+health — it answers from atomics when the query path is what broke. The
+short version is on `site/docs/reference.html` under Client
+compatibility; keep the two in step.
+
+### Changed — the checkout directory finally matches the product name (2026-08-22)
+
+`TimelordDB/` → `TimeLakeDB/` on disk, thirteen days after the rename
+in the code. Sibling repos' path defaults (Catchment, Gauge, Riverkeeper,
+including Riverkeeper's CI checkout path) moved the same day. Historical
+records keep the old spelling where they earned it: Gauge's
+`timelorddb-*` results, `docs/evidence/**`, `ops/logs/**`. For the
+record: something on the machine held a handle on the directory object
+itself — every child including `.git` renamed freely — so it was a move
+of contents into a fresh directory. Probe the children first; it
+localises that kind of lock in one pass.
+
 ### Changed — DataFusion 55, which removes the thrift dependency entirely (2026-08-21)
 
 Dependabot had an open medium against `thrift` 0.17.0 (excessive-size
