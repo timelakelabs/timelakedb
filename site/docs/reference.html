@@ -137,6 +137,10 @@
             different type than Str("oops")</code>.</li>
         <li>New tags and fields may appear at any time; earlier rows read back as
             <code>null</code> for them.</li>
+        <li>Do not name a tag or field <code>time</code>. The server emits its own
+            <code>time</code> column first and does not yet refuse the name on the
+            write path, so such a line produces a duplicate column at read time
+            rather than a clean 400.</li>
         <li>A key repeated inside one line takes its <strong>last</strong> value, for
             both tags and fields.</li>
         <li>An empty tag value (<code>h=</code>) is stored as an empty string. InfluxDB
@@ -191,7 +195,7 @@
           <thead><tr><th>Column</th><th>Type</th><th>Null</th></tr></thead>
           <tbody>
             <tr><td><code>time</code></td><td><code>Timestamp(Nanosecond, "+00:00")</code></td><td>never</td></tr>
-            <tr><td>each tag</td><td><code>Dictionary(Int32, Utf8)</code></td><td>yes — null where the tag was absent</td></tr>
+            <tr><td>each tag</td><td><code>Utf8View</code> as the planner and <code>DESCRIBE</code> see it; stored and buffered as <code>Dictionary(Int32, Utf8)</code> and converted on the decode worker, because DataFusion's column-wise aggregation path covers string views and not dictionaries, and a <code>GROUP BY</code> on a tag is the whole workload</td><td>yes — null where the tag was absent</td></tr>
             <tr><td>each field</td><td><code>Float64</code> / <code>Int64</code> / <code>UInt64</code> / <code>Boolean</code> / <code>Utf8</code></td><td>yes</td></tr>
           </tbody>
         </table>
@@ -244,14 +248,22 @@
       <h3>Query errors</h3>
       <div class="code">
         <header>400 responses <button class="copy" type="button">Copy</button></header>
-<pre>{"error":"Error during planning: table 'poc.public.nope' not found"}
+<pre>{"error":"query could not be executed (ref: q-0000002a)"}
 {"error":"database 'nosuch' does not exist (write to it first)"}
-{"error":"query timed out after 600s (server-side cap, RR-2)"}</pre>
+{"error":"query timed out after 600s (server-side cap, RR-2)"}
+{"error":"COPY is not permitted here: this endpoint executes read-only SQL (SELECT, SHOW, DESCRIBE, EXPLAIN). See SECURITY.md."}</pre>
       </div>
       <p>
         A database exists once something has been written to it; querying an unknown
-        one is an error rather than an empty result. Planning errors are returned
-        verbatim, which discloses table and column names to any caller.
+        one is an error rather than an empty result. A query that fails to plan or
+        execute returns <strong>one opaque message with a reference</strong>
+        (SEC-5): the full DataFusion error — which would otherwise name tables and
+        list every real column — is logged server-side against that
+        <code>ref</code>, so an operator diagnoses from the reference the caller
+        quotes while the caller learns only that the query failed. The messages that
+        do come back in full are the ones that name only the caller's own input or
+        a statement class: the read-only refusal, the timeout, and the
+        missing-database error. Flight SQL returns the same text as a gRPC status.
       </p>
     </section>
 
@@ -289,7 +301,7 @@
             <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
-            <tr><td><code>GET /admin/tokens</code></td><td>admin</td><td>—</td><td>200 + token records; the secret is never re-shown</td></tr>
+            <tr><td><code>GET /admin/tokens</code></td><td>operator</td><td>—</td><td>200 + token records (id, description, scope, databases, grants, issuer, timestamps, revoked, last used); the secret is never re-shown</td></tr>
             <tr><td><code>POST /admin/tokens</code></td><td>admin; body <code>description</code>, <code>scope</code>, optional <code>databases</code>, <code>authorizations</code>, <code>expires_in_secs</code></td><td>—</td><td>200 + <code>{secret, token}</code> — the secret appears exactly once</td></tr>
             <tr><td><code>DELETE /admin/tokens/{id}</code></td><td>admin</td><td>—</td><td>200; effective immediately. 404 if unknown or already revoked</td></tr>
             <tr><td><code>GET /admin/cert-grants</code></td><td>operator</td><td>—</td><td>200 + certificate identities and their granted authorizations</td></tr>
@@ -367,17 +379,21 @@
         seeded <code>admin</code>/<code>admin</code> credential is quarantined,
         so the console goes straight to a forced password change and returns to
         sign-in afterwards (rotation ends every session for that principal,
-        including the current one). After that it manages retention, scoped
-        per database and table: the active policies with all-databases
-        wildcards called out in red, a set/remove form with table-name
-        completion from <code>SHOW TABLES</code>, the live
+        including the current one). After that it manages two things.
+        Retention, scoped per database and table: the active policies with
+        all-databases wildcards called out in red, a set/remove form with
+        table-name completion from <code>SHOW TABLES</code>, the live
         <code>timelake_retention_drops_total</code> counter, and a standing
         warning that shrinking a window deletes data on the next enforcement
-        pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses. The
+        pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses.
+        And data-plane tokens: issue one with a scope, database allowlist and
+        visibility grants, see the secret exactly once, list and revoke. The
         header shows who you are and your role, and the page states which role
         each action needs; the server is what enforces it, so an action above
         your role fails with <code>403</code> rather than being hidden. A banner
-        appears while the seeded credential is still active.
+        appears while the seeded credential is still active. Targeted delete,
+        the audit trail, certificate grants and TLS reload have no page yet —
+        they are the <code>/admin/*</code> routes above, with a session.
       </p>
       <div class="note warn">
         <p>
@@ -434,8 +450,14 @@
         what a caller sees, never widen it. An identity with no grant policy
         recorded keeps its claims — <em>no policy</em> is not <em>deny
         all</em>, or presenting a certificate would break a working client.
-        Identity currently reaches the query session over Flight SQL;
-        <code>/api/sql</code> does not carry it yet.
+        The identity reaches the query session on <strong>both</strong>
+        surfaces — over Flight SQL, and over HTTPS for <code>/api/sql</code> and
+        the write endpoints, where it is read once per connection off the
+        completed handshake rather than per request (drilled:
+        <code>docs/evidence/http-peer-identity-drill.log</code>, three clients
+        making the identical claim, only the certificate differing, 15/15). The
+        subject CN is also recorded on that query's row in
+        <code>_system.queries</code>.
       </p>
       <p>
         Anchors hot-rotate on the same triggers as the serving certificate
@@ -609,7 +631,7 @@
             <tr><td><code>POST /write</code> (v1)</td><td><strong>Implemented</strong></td></tr>
             <tr><td><code>POST /api/v2/write</code> (v2)</td><td><strong>Implemented</strong>; <code>org</code> accepted and ignored, single tenant</td></tr>
             <tr><td><code>POST /api/v3/write_lp</code> (v3)</td><td><strong>Implemented</strong></td></tr>
-            <tr><td>Authorization tokens</td><td>Accepted and ignored — any value works, including none</td></tr>
+            <tr><td>Authorization tokens</td><td>Under the default <code>TIMELAKE_DATA_AUTH=off</code>: accepted and ignored — any value works, including none. Under <code>optional</code>/<code>required</code>: verified, as <code>Bearer</code>, <code>Token</code> or <code>Basic</code> (token as the password), so Telegraf v1, v2 and Grafana all work unmodified once issued a token from the console</td></tr>
             <tr><td>Buckets / databases</td><td>Created implicitly on first write; no management API</td></tr>
             <tr><td><code>GET /ping</code></td><td>204, but the version header is <code>x-timelakedb-version</code>, <em>not</em> <code>X-Influxdb-Version</code> — clients that gate on that header will not recognise the server</td></tr>
             <tr><td><code>GET /query</code> (InfluxQL)</td><td>404 — not implemented</td></tr>
@@ -717,6 +739,8 @@
             <tr><td><code>timelake_lines_written_total</code></td><td>counter</td><td>Line-protocol records accepted since start</td></tr>
             <tr><td><code>timelake_flushes_total</code></td><td>counter</td><td>Completed flush cycles (buffer → Parquet → manifest)</td></tr>
             <tr><td><code>timelake_compactions_total</code></td><td>counter</td><td>Partitions merged L0 → L1</td></tr>
+            <tr><td><code>timelake_stale_merges_total</code></td><td>counter</td><td>Merges refused by the compaction commit fence because another writer had already replaced their input files. 0 on a single node; on a cluster it is the number that says whether a second compactor would earn its keep</td></tr>
+            <tr><td><code>timelake_cl3_reads_refused_total</code></td><td>counter</td><td>Live-buffer reads the intra-cluster listener refused with 503 because <code>TIMELAKE_INTERNAL_MAX_CONCURRENT</code> was saturated (ingester role only). Query load lands on the ingest tier as this work; a rising count means queriers are outrunning what an ingester will serve</td></tr>
             <tr><td><code>timelake_retention_drops_total</code></td><td>counter</td><td>Files dropped by per-table retention</td></tr>
             <tr><td><code>timelake_parquet_files</code></td><td>gauge</td><td>Files currently in the catalog</td></tr>
             <tr><td><code>timelake_catalog_commit_conflicts_total</code></td><td>counter</td><td>Catalog commits that lost a CAS race and retried. 0 on a single writer; climbing means real multi-writer contention on one bucket</td></tr>
