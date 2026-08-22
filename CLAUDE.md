@@ -138,7 +138,10 @@ This project is inspired by the following projects.
   and fall into plaintext passthrough = silent corruption), historical
   `docs/evidence/**` and `ops/logs/**` (records of runs that really
   happened), and `TLDB_*`/`tldb-*` identifiers (true of both names).
-  Local repo directory is still `TimelordDB/` — rename it whenever.
+  Local repo directory renamed `TimelordDB/` → `TimeLakeDB/` 2026-08-22
+  (sibling repos' path defaults updated the same day; `gauge/bench/
+  results/timelorddb-*` and `docs/evidence/**` keep the old name, being
+  records of runs that really happened).
 - Status: **Pushed & private; P0-1 CLOSED; CI green-then-billing-blocked
   (2026-08-16).** All five repos pushed, CI recorded green on real runners
   (`docs/evidence/P0-1-ci.md`). Since then: **SEC-5** query-error
