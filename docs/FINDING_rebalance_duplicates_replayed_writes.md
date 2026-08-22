@@ -74,12 +74,13 @@ severs it.
 - **Consistent hashing in the router**: a ring moves ~1/N of homes on a
   membership change instead of (N-1)/N. Reduces incidence, does not
   eliminate the window.
-- **A drain discipline for rebalances**: operationally, the duplicate
-  requires spooled batches in flight across the membership change. A
-  runbook rule — quiesce agents / drain spools before changing N — makes
-  the current behaviour safe, in the same way recover is an explicit
-  operator step. Cheapest, weakest: it guards the planned rebalance,
-  not the unplanned one.
+- **A drain discipline for rebalances** (written up 2026-08-22 as
+  [`REBALANCE.md`](REBALANCE.md)): operationally, the duplicate requires
+  spooled batches in flight across the membership change. A runbook rule —
+  quiesce agents / drain spools before changing N — makes the current
+  behaviour safe, in the same way recover is an explicit operator step.
+  Cheapest, weakest: it guards the planned rebalance, not the unplanned
+  one. It is what you are relying on while this finding stays open.
 
 ## Status
 
