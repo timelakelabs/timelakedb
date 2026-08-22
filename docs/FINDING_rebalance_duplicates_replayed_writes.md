@@ -84,6 +84,39 @@ severs it.
 
 ## Status
 
+**CLOSED 2026-08-22 — the composition was re-run and is exact.**
+
+Catchment's `router-tributary-exactness` ran seven times against the fix
+on the machine that originally produced the failure. The closing run
+(`catchment/results/router-tributary-exactness-20260822-160108`) is a
+full PASS, 17/17: eight streams, the kill-and-replay phase, and the
+frozen-ingester undrained 2→3 rebalance, every table exact at 200,000.
+
+The duplicates still *happen* — and that is the fix working as designed,
+not a residue. Run `20260822-144638` caught the window open: 202,000 rows
+on each twinned table roughly 25 s after the thaw, then 200,000 once the
+overlap-triggered compaction pass merged the twins. The closing run
+records the same collapse as `transient_rows_collapsed: 2000` per
+affected stream. The window the original finding measured as "potentially
+forever" is now one compaction pass, observed.
+
+The scenario asserts after that pass on purpose (its settle barrier spans
+a full compaction cadence): a bounded transient is the contract, and a
+count still inflated once the cadence has elapsed fails exactly as the
+unbounded version did.
+
+Two things the re-run campaign surfaced, recorded where they belong:
+re-running C4 against ten days of merges exposed a NEW, unrelated agent
+bug (`FINDING_agent_pools_a_reused_ip.md` — a reshape hands the router's
+old IP to a recreated querier and the agent's connection pool follows
+it), and four defects in the scenario's own instrumentation, each of
+which read as a plausible product failure until diagnosed. The PASS
+above postdates all of those fixes.
+
+The original text follows, unedited.
+
+---
+
 **Mechanism fixed 2026-08-21; the scenario has not been re-run.**
 
 Overlap-aware compaction is implemented (`crates/server/src/compaction.rs`).

@@ -204,22 +204,32 @@ overlapping by definition, so an undrained rebalance's duplicates now
 resolve at the next compaction pass of the affected partitions, rather
 than waiting for a fourth file that may never arrive.
 
-That bounds the window. It does not remove it, and three cautions apply:
+That bounds the window, and as of 2026-08-22 the bound is **measured, not
+promised**: Catchment's `router-tributary-exactness` (C4) re-ran the full
+composition — eight streams, a frozen ingester, an undrained 2→3
+rebalance — against the fix, caught the twinned tables at 202,000 rows
+about 25 s after the thaw, and watched them collapse to an exact 200,000
+at the next compaction pass
+(`catchment/results/router-tributary-exactness-20260822-160108`, PASS).
+`FINDING_rebalance_duplicates_replayed_writes.md` is closed on that run.
 
-1. Between the rebalance and that compaction pass, queries return inflated
-   counts.
-2. Twins only meet if they end up in the same partition on the same node.
-   The compaction fix addresses the "never reaches four files" half of the
-   problem, which was the unbounded half.
-3. **The composition has not been re-run.** Catchment's
-   `router-tributary-exactness` (C4) is what reproduces eight streams, a
-   frozen ingester and an undrained 2→3 rebalance, and it has not been run
-   since the fix. `FINDING_rebalance_duplicates_replayed_writes.md` is
-   still open on purpose.
+An earlier revision of this section claimed twins only meet "in the same
+partition on the same node". Wrong, and in the misleading direction for
+the shared-object-store topology: `compact_once` groups files by
+`(db, table, partition)` out of the **shared catalog**, which has no node
+dimension — the CAS commit loop teaches each node about its peers' files,
+so twins merge wherever they were written. On the local-store topology
+(no shared bucket) there is no unioning querier either, so the
+cross-node-duplicate case does not arise there in the first place.
 
-So do not read "it will compact eventually" as a reason to skip the drain.
-A fixed mechanism and an unverified scenario are different things, and the
-drain is the part that is actually known to work.
+Two cautions survive the re-run:
+
+1. Between the rebalance and that compaction pass, queries return
+   inflated counts — the transient is the contract, not a bug, and it is
+   an operator-visible one.
+2. The drain remains the only thing that prevents the inflation rather
+   than bounding it. "It will compact within a pass" is a recovery
+   property, not a reason to skip the procedure.
 
 ---
 

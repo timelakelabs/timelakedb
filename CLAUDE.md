@@ -211,6 +211,32 @@ This project is inspired by the following projects.
   you: a deletion policy should be an operator's decision, not a side
   effect of enabling telemetry. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
+- **C4 re-run 2026-08-22: rebalance-duplicates finding CLOSED, and a new
+  agent bug found+fixed in the process.** Seven runs of Catchment's
+  `router-tributary-exactness` against the overlap-compaction fix;
+  closing run `...-20260822-160108` PASS 17/17. The duplicates still
+  happen and now collapse at the next compaction pass — observed
+  202,000 → 200,000 exact (`transient_rows_collapsed: 2000`), cross-node
+  via the shared catalog (`compact_once` groups have NO node dimension;
+  the CAS loop teaches nodes about peers' files). **New finding, fixed
+  same day: `FINDING_agent_pools_a_reused_ip.md`** — the reshape hands
+  the router's old IP to a recreated querier, the agent's keep-alive pool
+  follows it (DNS is only consulted on dial), and 501 was filed under
+  retryable transport → four agents retried the wrong node at ~5 req/s,
+  silently, forever; caught by strace after /proc lied (WSL2 hides
+  wchan). Tributary now rebuilds its client on 501 (WrongNode) + every
+  3rd consecutive transport failure, `tributary_transport_rebuilds_total`
+  makes it visible; unit test red-proofed (neutered fix → conns:1). Also
+  four C4 harness defects fixed, each of which had read as a plausible
+  product failure: thread-death KeyError eating the hang diagnosis,
+  exactness asserted before the compaction cadence (the fix's transient
+  read as a FAIL), the fault gate firing on the rig's own probe row
+  (phase A ran against a healthy cluster), and the drain barrier
+  demanding simultaneous zeros from three selfmon-oscillating buffer
+  gauges (healthy flushing read as a flush freeze — U2 selfmon shipped
+  AFTER the barrier was written and silently turned it into a coin
+  flip). REBALANCE.md's "twins only meet on the same node" line was
+  wrong and is corrected.
 - **Grafana ALERTING verified end to end, 2026-08-21** — `docs/ALERTING.md`,
   rig `deploy/compose/timelakedb-alerting.yml` (port 3005), drill
   `deploy/compose/alert-drill/alert_drill.sh`, evidence

@@ -413,11 +413,17 @@ peak and 50× better by bound.
   node than the original write, and the two copies never meet anywhere
   flush-time LWW would collapse them. Measured at 2,000 excess rows per
   affected table over eight streams
-  (`FINDING_rebalance_duplicates_replayed_writes.md`). Overlap-aware
-  compaction bounds how long it lasts — twins in one partition now merge
-  on range overlap instead of waiting for a fourth file — but Catchment's
-  C4 composition has not been re-run since that fix, so the finding is
-  still open and the procedure, not the code, is what you are relying on.
+  (`FINDING_rebalance_duplicates_replayed_writes.md` — CLOSED 2026-08-22:
+  the C4 composition was re-run against overlap-aware compaction and the
+  duplicates now collapse at the next compaction pass, observed at
+  202,000 → 200,000 exact). What the drain buys today is avoiding the
+  transient: between an undrained rebalance and that compaction pass,
+  counts read high. The same re-run campaign found and fixed a second,
+  unrelated agent bug the reshape triggers —
+  `FINDING_agent_pools_a_reused_ip.md`, an agent wedged forever on a
+  recreated neighbor's reused IP — which is worth knowing about because
+  its trigger is any orchestrator that recycles addresses, i.e.
+  Kubernetes on an ordinary rollout.
   **`docs/REBALANCE.md` is the procedure.** Note what it does *not* cover:
   a node dying is a membership change nobody scheduled, and that is the
   one you would most want guarded.
