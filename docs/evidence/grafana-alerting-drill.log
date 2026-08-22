@@ -1,0 +1,111 @@
+Grafana alerting drill — TimeLakeDB
+2026-08-21 | Grafana 13.1.3 | deploy/compose/timelakedb-alerting.yml
+Drill: deploy/compose/alert-drill/alert_drill.sh
+Doc:   docs/ALERTING.md
+
+Two runs are recorded. The green one on its own would not be evidence of
+anything: a drill that cannot fail passes for free. The second run is the
+same drill against provisioning mutated ASC -> DESC, which is the exact
+defect the drill exists to catch.
+
+==============================================================================
+RUN 1 — stock provisioning, cold stack. Expected: pass.
+==============================================================================
+==============================================================================
+  Grafana alerting drill against TimeLakeDB
+==============================================================================
+
+=== A. the stack is up ===
+  PASS  TimeLakeDB answers /health
+  PASS  Grafana answers /api/health
+  PASS  the notification sink is listening
+  PASS  starting from an empty alertprobe table
+
+=== B. Grafana can read TimeLakeDB over Flight SQL ===
+  PASS  seeded low values (10) at t-600s..t-300s
+  PASS  the provisioned datasource returns rows
+  PASS  the frame has a time field and a numeric field (reducible)
+
+=== C. both rules are provisioned and evaluating ===
+  PASS  rule 'alertprobe value high' is loaded
+  PASS  negative control 'ordering guard (must not fire)' is loaded
+  PASS  rule evaluates without error (health=ok)
+
+=== D. below the threshold, nothing fires ===
+  PASS  value 10 vs threshold 50 -> Normal
+
+=== E. above the threshold, the correct rule fires ===
+  PASS  seeded high values (100) at t-120s..now
+  PASS  value 100 vs threshold 50 -> Alerting
+  PASS  the mis-ordered guard stayed inactive while the correct rule fired
+
+=== F. the notification was actually delivered ===
+  PASS  the sink received 1 notification group(s)
+  PASS  the delivered payload names the firing rule
+
+=== G. it resolves when the data comes back down ===
+  PASS  seeded low values (5) as the newest rows
+  PASS  the alert cleared back to Normal
+
+------------------------------------------------------------------------------
+  rule states at exit:
+    alertprobe value high              inactive   ok
+    ordering guard (must not fire)     inactive   ok
+------------------------------------------------------------------------------
+  18 passed, 0 failed
+  DRILL PASSED
+
+==============================================================================
+RUN 2 — same drill, `ORDER BY time ASC` mutated to DESC in the provisioned
+rules and nothing else changed. Expected: fail at phase E.
+
+This is the mutation that matters. The rule still evaluates, still reports
+health=ok, and never fires. Phases F and G report SKIP rather than PASS —
+delivery and recovery cannot be demonstrated for an alert that never fired,
+and scoring them green would turn one real failure into a mostly-green run.
+==============================================================================
+==============================================================================
+  Grafana alerting drill against TimeLakeDB
+==============================================================================
+
+=== A. the stack is up ===
+  PASS  TimeLakeDB answers /health
+  PASS  Grafana answers /api/health
+  PASS  the notification sink is listening
+  PASS  starting from an empty alertprobe table
+
+=== B. Grafana can read TimeLakeDB over Flight SQL ===
+  PASS  seeded low values (10) at t-600s..t-300s
+  PASS  the provisioned datasource returns rows
+  PASS  the frame has a time field and a numeric field (reducible)
+
+=== C. both rules are provisioned and evaluating ===
+  PASS  rule 'alertprobe value high' is loaded
+  PASS  negative control 'ordering guard (must not fire)' is loaded
+  PASS  rule evaluates without error (health=ok)
+
+=== D. below the threshold, nothing fires ===
+  PASS  value 10 vs threshold 50 -> Normal
+
+=== E. above the threshold, the correct rule fires ===
+  PASS  seeded high values (100) at t-120s..now
+  FAIL  the rule did NOT fire on data above its threshold
+        state=inactive health=ok -- note health is 'ok': that is the ORDER BY trap, see docs/ALERTING.md
+  SKIP  whether the mis-ordered guard held (it is inactive)
+        the correct rule never fired, so nothing distinguishes the guard from it
+
+=== F. the notification was actually delivered ===
+  SKIP  notification delivery
+        the rule never fired, so Grafana had nothing to send and a silent sink proves nothing
+
+=== G. it resolves when the data comes back down ===
+  SKIP  recovery to Normal
+        the rule never left Normal, so returning to it demonstrates nothing
+
+------------------------------------------------------------------------------
+  rule states at exit:
+    alertprobe value high              inactive   ok
+    ordering guard (must not fire)     inactive   ok
+------------------------------------------------------------------------------
+  12 passed, 1 failed, 3 skipped
+  DRILL FAILED

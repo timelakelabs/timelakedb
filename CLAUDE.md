@@ -211,6 +211,33 @@ This project is inspired by the following projects.
   you: a deletion policy should be an operator's decision, not a side
   effect of enabling telemetry. Full
   milestone reconciliation: `../PROJECT_PLAN.md` §0.
+- **Grafana ALERTING verified end to end, 2026-08-21** — `docs/ALERTING.md`,
+  rig `deploy/compose/timelakedb-alerting.yml` (port 3005), drill
+  `deploy/compose/alert-drill/alert_drill.sh`, evidence
+  `docs/evidence/grafana-alerting-drill.log`. FR-9 covered dashboards;
+  nothing had ever exercised alerting, which adds a stage a dashboard never
+  touches — the datasource frame has to survive a `reduce`. **Finding, a
+  usage trap rather than an engine bug: `reduce: last` takes the
+  positionally last row of the frame. It does not sort and does not know
+  which column is time**, so a rule ending `ORDER BY time DESC` — the
+  natural phrasing, and the one most of our own examples use — thresholds
+  the OLDEST row in the window. Measured: window holding 10s then 100s
+  against `gt 50`, rule sat in Normal reporting **`health: ok`**
+  indefinitely; flipping that one word to `ASC` made it fire on the next
+  tick. Nothing surfaces it — a panel on the same SQL renders fine because
+  a panel never reduces, and rule history is an unbroken green line either
+  way. Also: the query model field is **`rawSql`** (`query`/`expr` reach the
+  server as an empty statement → "No SQL statements were provided", which
+  reads as an engine fault). The provisioned group carries a
+  deliberately-DESC rule asserted NOT to fire while the real one does, so a
+  green drill separates "alerting works" from "nothing can fire"; the drill
+  was mutation-verified (ASC→DESC ⇒ fails at phase E, exit 1, and F/G report
+  SKIP not PASS). It checks DELIVERY to a webhook recorder, not just rule
+  state, and REFUSES a dirty table — `/api/sql` is read-only and there is no
+  delete-database route, so it cannot clean up after itself and stale rows
+  silently invert the discriminator. `/metrics` + Alertmanager stays the
+  surface for NODE health: it answers from atomics and works when the query
+  path is what is broken.
 - Previous: **P0-1 PREPARED — CI verified on a cold runner, push is yours**
   (2026-08-10). NOT closed: the push needs GitHub credentials this box does
   not hold (no `gh`, no remotes). What IS done: every CI step run against a

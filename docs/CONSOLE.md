@@ -896,8 +896,16 @@ TimeLake DB · tldb-1                    [healthy]  v0.5.0  up 6d 04:11
 
 - Not a query IDE. `/api/sql`, Flight SQL and Grafana cover that; the
   console shows *queries the server ran*, not a workbench for new ones.
-- No dashboard builder and no alerting engine — `/metrics` plus
-  Alertmanager, and the named alarms the engine already raises.
+- No dashboard builder and no alerting engine *in the console*. Alerting
+  on the node's own health stays `/metrics` plus Alertmanager and the
+  named alarms the engine already raises — that path answers from atomics
+  and keeps working when the query path does not, which is exactly when
+  an alert matters most.
+  Alerting on **stored data** is Grafana's, over Flight SQL, and is now
+  verified end to end rather than assumed: `docs/ALERTING.md`, drilled by
+  `deploy/compose/alert-drill/alert_drill.sh`. Read that before writing a
+  rule — a rule whose query ends `ORDER BY time DESC` evaluates clean,
+  reports `health: ok`, and never fires.
 - No data browsing or editing. The console administers the server; SEC-2
   labels govern the data.
 - No cross-node log aggregation before U3, and even then by proxying, not

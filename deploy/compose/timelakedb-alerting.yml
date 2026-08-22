@@ -1,0 +1,81 @@
+# Grafana alerting over TimeLakeDB: a node, a Grafana with rules
+# provisioned from the repo, and a recorder that catches what Grafana sends.
+#
+#   docker compose -f deploy/compose/timelakedb-alerting.yml up -d --build
+#   docker run --rm --network timelake-alerting_default -v "$PWD:/repo:ro" \
+#       alpine sh -c 'apk add --no-cache curl >/dev/null && sh /repo/deploy/compose/alert-drill/alert_drill.sh'
+#
+#   open http://localhost:3005  (admin/admin)  -> Alerting / Alert rules
+#
+# The drill is the point of this stack. Standing it up by hand shows two
+# rules in the UI; only deploy/compose/alert-drill/alert_drill.sh proves one
+# of them changes state when the data changes, which is the entire claim.
+#
+# Ports are offset from timelakedb.yml (1963/1964/3003) and
+# timelakedb-console.yml (4963/4964/3004) so all three can run at once.
+name: timelake-alerting
+services:
+  timelakedb:
+    build: ../..
+    container_name: timelake-alert-db
+    ports:
+      - "5963:1963"   # HTTP: writes, /api/sql, /metrics
+      - "5964:1964"   # Flight SQL — what Grafana's alert queries read
+    environment:
+      TIMELAKE_NODE_ID: "alert-node"
+      TIMELAKE_QUERY_MEM_BYTES: "1073741824"
+      TIMELAKE_MAX_CONCURRENT_QUERIES: "4"
+      # An alert rule reads a 15-minute window and the drill writes a
+      # handful of rows into it, so the node must make those rows visible
+      # in seconds rather than at the default age window. Without this the
+      # drill's first evaluation lands on an empty table and the rule goes
+      # to NoData — which is a real state, not a failure, and would make
+      # the drill flaky for a reason that has nothing to do with alerting.
+      TIMELAKE_FLUSH_ROWS: "1000"
+      TIMELAKE_FLUSH_AGE_SECS: "5"
+    mem_limit: 4g
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    volumes:
+      - alert-data:/var/lib/timelake/data
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: timelake-alert-grafana
+    ports:
+      - "3005:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Default since Grafana 9, stated anyway: the whole stack is
+      # meaningless if a future image ships with it off, and an explicit
+      # setting fails loudly instead of quietly serving no rules.
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+    volumes:
+      - ./alert-drill/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./alert-drill/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+    restart: unless-stopped
+    depends_on:
+      - timelakedb
+      - alert-sink
+
+  # Stands in for PagerDuty/Slack/Alertmanager. See alert-drill/sink.py for
+  # why rule state alone is not evidence that anyone was notified.
+  alert-sink:
+    image: python:3.12-alpine
+    container_name: timelake-alert-sink
+    command: ["python", "-u", "/app/sink.py"]
+    ports:
+      - "9099:9099"
+    volumes:
+      - ./alert-drill/sink.py:/app/sink.py:ro
+    read_only: true
+    restart: unless-stopped
+
+volumes:
+  alert-data:

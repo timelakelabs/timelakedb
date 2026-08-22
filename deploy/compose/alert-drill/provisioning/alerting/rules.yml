@@ -1,0 +1,199 @@
+# Grafana unified-alerting rules over TimeLakeDB, provisioned from the repo.
+#
+# Two rules read the same table through the same datasource with the same
+# threshold. They differ in one clause — `ORDER BY time ASC` versus
+# `ORDER BY time DESC` — and that clause decides whether alerting works at
+# all. See docs/ALERTING.md; the short version is below, because anyone
+# editing this file needs it before they touch the SQL.
+#
+# A Grafana alert is a pipeline: a datasource query produces a frame, a
+# `reduce` stage collapses that frame to one number, and a `threshold`
+# stage compares it. The `last` reducer means "the last row in the frame" —
+# positional, not chronological. It does not sort, and it does not know
+# which column is time. So the newest sample is only the one being
+# thresholded if the query returned rows oldest-first.
+#
+# Write `ORDER BY time DESC` — the natural way to ask for recent data, and
+# the way nearly every hand-written TimeLakeDB query is phrased — and the
+# reducer silently thresholds the OLDEST row in the window. The rule
+# evaluates without error, reports `health: ok` forever, and never fires.
+# There is no warning anywhere in the pipeline, because nothing is wrong
+# in any way Grafana can detect: it asked for rows, it got rows, it took
+# the last one.
+#
+# Hence the second rule. `ordering-guard` is deliberately written the wrong
+# way and is asserted to STAY NORMAL while `value-high` fires on the same
+# data. That is what makes the drill's pass meaningful:
+#
+#   both fire      -> the trap is gone (Grafana changed `last`, or began
+#                     sorting frames). Good news, but docs/ALERTING.md is
+#                     now wrong and must be corrected.
+#   neither fires  -> the harness is broken, not the alerting. A rule that
+#                     cannot fire passes a "did not fire" check for free.
+#   guard fires,
+#   value-high not -> something is very wrong; read the drill output.
+#
+# Only "value-high fires, guard stays Normal" is a pass.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: tldb
+    folder: TimeLakeDB
+    # 10s so a drill finishes in under a minute. Production has no reason
+    # to evaluate a threshold this hard; 1m is the Grafana default and is
+    # the right starting point for a real rule.
+    interval: 10s
+    rules:
+      # ---------------------------------------------------------------
+      # The rule under test. Fires when the newest sample exceeds 50.
+      # ---------------------------------------------------------------
+      - uid: tldb-value-high
+        title: alertprobe value high
+        condition: C
+        for: 0s
+        # NoData is a distinct state from Alerting, and keeping it that way
+        # is what lets the drill tell "the engine answered with a low
+        # number" apart from "the engine did not answer". Mapping NoData to
+        # Alerting here would make an unreachable database look identical
+        # to a breached threshold.
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            alertprobe on {{ $labels.host }} last read
+            {{ humanize $values.B.Value }}, above the threshold of 50.
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: tldb-alerts
+            model:
+              refId: A
+              # `rawSql`, not `query` and not `expr`. The Grafana InfluxDB
+              # datasource in SQL mode reads this field and no other; the
+              # other two reach the server as an empty statement and
+              # TimeLakeDB answers "No SQL statements were provided in the
+              # query string", which reads as an engine fault rather than a
+              # misnamed field.
+              #
+              # ASC is load-bearing. See the header.
+              rawSql: SELECT time, value FROM alertprobe ORDER BY time ASC
+              intervalMs: 1000
+              maxDataPoints: 100
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              datasource:
+                type: __expr__
+                uid: __expr__
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [50]
+
+      # ---------------------------------------------------------------
+      # Negative control. Identical except for DESC, and asserted NOT to
+      # fire. Do not "fix" this rule — fixing it deletes the check.
+      # ---------------------------------------------------------------
+      - uid: tldb-ordering-guard
+        title: ordering guard (must not fire)
+        condition: C
+        for: 0s
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          severity: none
+        annotations:
+          summary: >-
+            This rule is deliberately mis-ordered and must never fire. If it
+            did, Grafana's `last` reducer no longer takes the positionally
+            last row, and docs/ALERTING.md needs correcting.
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: tldb-alerts
+            model:
+              refId: A
+              rawSql: SELECT time, value FROM alertprobe ORDER BY time DESC
+              intervalMs: 1000
+              maxDataPoints: 100
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              datasource:
+                type: __expr__
+                uid: __expr__
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [50]
+
+# A firing rule that notifies nobody is not an alert, so the drill checks
+# delivery too, not just rule state. The sink is a recorder — it stores
+# what arrives and serves it back — which turns "did Grafana notify?" into
+# an assertion instead of a screenshot.
+contactPoints:
+  - orgId: 1
+    name: alert-sink
+    receivers:
+      - uid: alert-sink-webhook
+        type: webhook
+        settings:
+          url: http://alert-sink:9099/hook
+
+policies:
+  - orgId: 1
+    receiver: alert-sink
+    # Grafana requires both of these in group_by for the default policy.
+    group_by:
+      - alertname
+      - grafana_folder
+    # Tuned for a drill, not for a human's inbox: send almost immediately
+    # so the delivery check does not have to wait out a 30s group_wait.
+    group_wait: 1s
+    group_interval: 5s
+    repeat_interval: 1h
