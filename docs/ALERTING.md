@@ -12,6 +12,11 @@ clears. The drill that proves it is
 `deploy/compose/alert-drill/alert_drill.sh`; the transcript is
 `docs/evidence/grafana-alerting-drill.log`.
 
+The short public version of §2 and §3 lives in `site/docs/reference.html`
+under Client compatibility → Grafana alerting. Keep the two in step: that
+page is what an external user reads before wiring up a rule, and it is the
+only warning they get.
+
 ---
 
 ## 1. How a Grafana alert reads TimeLakeDB
