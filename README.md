@@ -69,20 +69,34 @@ on the site traces to a run under `docs/evidence/`.
 
 ## Status
 
-**Governance and packaging landed 2026-08-17.** Since the cluster work
-below: targeted delete (`POST /admin/delete` — a tombstone predicate that
-hides matching rows from every query at once, then reclaims the bytes in
-the background), a hash-chained **audit trail** over every administrative
-mutation (`GET /admin/audit`, fail-closed, `?verify=1` walks the chain),
-and **`.deb`/`.rpm` packages** attached to each tagged release. Earlier in
-the same stretch: query-error sanitization, a per-client query cap, and
-WAL encryption. `SECURITY.md` is the authoritative posture.
+**As of 2026-08-22.** Since the cluster work below, in order of landing:
+query-error sanitization, a per-client query cap and WAL encryption
+(2026-08-15); targeted delete (`POST /admin/delete` — a tombstone
+predicate that hides matching rows from every query at once, then
+reclaims the bytes in the background) and a hash-chained **audit trail**
+over every administrative mutation (`GET /admin/audit`, fail-closed,
+`?verify=1` walks the chain) (2026-08-16); **`.deb`/`.rpm` packages**
+built for each tagged release (2026-08-17); query latency and admission
+histograms on `/metrics` plus **self-monitoring** into `_system.metrics`
+/ `_system.queries` with a provisioned Grafana console, and
+client-certificate identity on `/api/sql` (2026-08-18); retention scoped
+by `(db, table)` — it had matched on table name alone, which was a
+data-loss bug (2026-08-19); overlap-aware compaction, a **commit fence**
+on compaction (`Catalog::commit_replace`) so two compactors cannot both
+land a merge of one partition, the **compactor role** built but
+deliberately not startable, and DataFusion 55 which removes the `thrift`
+dependency (2026-08-21); Grafana **alerting** verified end to end
+(`docs/ALERTING.md`), the rebalance drain rule (`docs/REBALANCE.md`),
+and the rebalance-duplicates finding closed by a seven-run C4 re-run
+(2026-08-22). `SECURITY.md` is the authoritative posture; `CHANGELOG.md`
+has each of these with its measurement.
 
-### C2 phase 4 — the cluster reads without losing freshness
+### C2 — the cluster reads without losing freshness
 
 Clustering is arriving one role at a time, each ending in a recorded
 drill. Four of the five phases are in: roles and discovery, ingester WAL
-replication, the router, and now the stateless querier.
+replication, the router, and the stateless querier. The fifth, the
+compactor, is built and gated — see below.
 
 - **One binary, five roles** (`TIMELAKE_ROLE`): `all` is the default and
   unchanged — the whole stack in one process. A role whose phase has not
@@ -107,12 +121,22 @@ replication, the router, and now the stateless querier.
 - Drills: `docs/evidence/cl2-replication-drill.log` (12/12),
   `router-sharding-drill.log` (8/8), `cl3-querier-drill.log` (19/19).
 
-Still to come in C2: the compactor role and its singleton lease.
+**The compactor (phase 5) is built and gated.** `TIMELAKE_ROLE=compactor`
+has a branch in `main.rs`, a maintenance loop that tails the catalog, and
+a `/health` + `/ping` + `/metrics`-only HTTP surface
+(`deploy/compose/timelakedb-compactor.yml`) — and `Role::implemented`
+still refuses to start it, on purpose. The singleton *lease* the design
+called for was replaced by a **commit fence** (`Catalog::commit_replace`):
+a merge whose input files have already been replaced is refused at commit,
+so two compactors are *correct* today; what they are not yet is
+*efficient* — both would rewrite every partition and one would lose each
+race (`timelake_stale_merges_total`). Work-avoidance above the fence is
+what opens the gate (phase 5b).
 
-**Next:** finish C2 with the compactor role, then C3 (Consul discovery and
-required intra-cluster mTLS, `ARCHITECTURE.md` §12); re-baseline the
-benchmark inside the container network, because ~94% of the reported
-Shape A latency is Docker Desktop port forwarding
+**Next:** C2 phase 5b, then C3 (Consul discovery and required
+intra-cluster mTLS, `ARCHITECTURE.md` §12); re-baseline the benchmark
+inside the container network, because ~94% of the reported Shape A
+latency is Docker Desktop port forwarding
 (`../Gauge/PERFORMANCE_LOG.md`).
 
 ### Previous: SEC-4 — authentication, admin surface and data plane
@@ -162,7 +186,9 @@ Shape A latency is Docker Desktop port forwarding
 - `GET`/`PUT` `/admin/retention` and `DELETE /admin/retention/{table}`
   manage per-table windows at runtime; policies persist through the
   `Store` (so they are encrypted with everything else) and outlive a
-  restart with a stale environment.
+  restart with a stale environment. (Since 2026-08-19 policies are scoped
+  `(db, table)` and the delete path is `/admin/retention/{db}/{table}` —
+  the table-only match was a data-loss bug, see `CHANGELOG.md`.)
 - A self-contained management page at `/admin/ui` — no build step, no
   external assets.
 
