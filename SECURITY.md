@@ -154,6 +154,19 @@ follow from "no authentication" and are listed so you can design around them.
    the timeout and the "database does not exist" message name the caller's
    own input — none discloses schema.
 
+   *Amended 2026-08-23 (#47):* one failure escaped `run_sql_env` and so its
+   sanitizer. Before a query runs, the read path unions the schemas of a
+   table's live batches, and a schema conflict there — `column 'x' has
+   conflicting types Utf8 vs Float64`, naming a column and both Arrow types
+   — was raised in `Engine::sql_batches` and returned verbatim. Narrow to
+   reach (two live batches of one table must disagree on a type, which
+   first-writer-wins typing prevents within a node, but a pre-#43 leftover
+   table or a cross-node querier union can produce), but a real schema
+   disclosure on the read surface. That one call site now routes through
+   `timelake_query::opaque_read_error`, the same opaque policy with its own
+   ref. The *write*-path union keeps its verbatim message on purpose — a
+   write that conflicts with a stored type is told which field, by design.
+
 6. **~~No rate limiting per client.~~ CLOSED (SEC-6).** The memory pool and
    admission semaphore (RR-1) bound the TOTAL number of concurrent queries;
    they did nothing to stop one client from taking every permit and starving
