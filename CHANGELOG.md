@@ -105,6 +105,28 @@ on the file, as it was before — reload makes the loss visible sooner
 rather than causing it. CAS on the token file is the fix, and its own
 issue.
 
+### Fixed — `TIMELAKE_NODE_ID` has one default, read in one place (2026-08-23)
+
+Two reads of one variable, two fallbacks, written two phases apart:
+discovery (C2 phase 1) fell back to `node-local`, the engine (U2
+self-monitoring, then the audit chain) to `tldb`. An unset node had two
+names — the boot log and its peers said one, every audit record and
+`_system` row said the other — and an operator correlating a log line
+with the audit trail had to read the source to learn they were one
+process. The cluster rigs all set the variable, which is why nobody saw
+it; every package install and the stock compose file do not (#40).
+
+`timelake_cluster::node_id_from_env()` is the one read, with
+`DEFAULT_NODE_ID = "tldb"` — the name already in the evidence logs, in
+`_system.queries` on every drilled node, and in the site's configuration
+table, so the one that keeps the most things true. `StaticDiscovery::from_env`
+and `Engine::open` both call it; a cluster test pins the constant and
+the discovery default. The audit chain is per node and stamps `node_id`
+on every record: a fresh unset node stamps `tldb` from its first record,
+which the engine side already did, and nothing touches existing audit
+segments — a rewritten record is indistinguishable from tampering, which
+is what `?verify=1` exists to catch.
+
 ### Fixed — the router forwards the client's `Authorization` on writes, so `required` auth works behind it (2026-08-22)
 
 The router's `/api/sql` forward had carried `authorization` and
