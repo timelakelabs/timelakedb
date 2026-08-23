@@ -1394,6 +1394,17 @@ impl Engine {
         self.auth.clone()
     }
 
+    /// Pick up tokens issued or revoked on another node sharing this store
+    /// (#46). Called from the maintenance tick on ingesters and `all`
+    /// nodes, and from the querier's tail loop, which is the only periodic
+    /// thing a querier runs. A store error is logged, not propagated: the
+    /// token set in memory stays what it was, which is the safe direction.
+    pub fn reload_tokens(&self) {
+        if let Err(e) = self.auth.reload_tokens() {
+            tracing::warn!(error = %e, stage = "tokens", "token reload failed; keeping the loaded set");
+        }
+    }
+
     /// P1-2 audit trail, shared with the admin router so every mutating
     /// handler records through the same chain.
     pub fn audit_log(&self) -> Arc<timelake_audit::AuditLog> {
@@ -2607,6 +2618,8 @@ impl Engine {
              timelake_admin_logins_total {}\n\
              # TYPE timelake_admin_login_failures_total counter\n\
              timelake_admin_login_failures_total {}\n\
+             # TYPE timelake_auth_token_reloads_total counter\n\
+             timelake_auth_token_reloads_total {}\n\
              # TYPE timelake_query_rate_limited_total counter\n\
              timelake_query_rate_limited_total {}\n\
              # TYPE timelake_audit_records_total counter\n\
@@ -2634,6 +2647,7 @@ impl Engine {
             },
             self.auth.logins_total.load(Ordering::Relaxed),
             self.auth.login_failures_total.load(Ordering::Relaxed),
+            self.auth.token_reloads_total.load(Ordering::Relaxed),
             self.client_limiter.rejected(),
             self.audit.records_total(),
             if self.audit.healthy() { 1 } else { 0 },

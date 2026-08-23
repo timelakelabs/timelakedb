@@ -22,6 +22,13 @@ x-node: &node
   mem_limit: 2g
   environment: &node-env
     TIMELAKE_OBJECT_STORE: s3://timelake-cluster/objects
+    # Off by default so every existing drill is unchanged. The token
+    # propagation drill (#46) brings the rig up with TLDB_DATA_AUTH=required:
+    # a token issued on one ingester's console must authenticate on the
+    # other ingester and on the queriers within one tick, and a revocation
+    # must stop it there too. One setting for every data node so they
+    # cannot disagree; the router ignores it.
+    TIMELAKE_DATA_AUTH: ${TLDB_DATA_AUTH:-off}
     AWS_ENDPOINT_URL: http://localstack:4566
     AWS_ACCESS_KEY_ID: test
     AWS_SECRET_ACCESS_KEY: test

@@ -1,0 +1,57 @@
+#46 — tokens issued or revoked on one node take effect on every node sharing the store
+2026-08-23 · rig deploy/compose/timelakedb-cluster-s3.yml, brought up with
+TLDB_DATA_AUTH=required (router :5970, ingester-a :5971, ingester-b :5972,
+querier-a :5973, one LocalStack bucket) · drill cluster-drill/token_reload_drill.sh
+branch token-reload on top of cd18a36 (#45)
+================================================================================
+
+THE CLAIM: a token issued on ingester-a's console authenticates on ingester-b
+and on querier-a without either restarting — on first presentation (the
+on-miss re-read) and in any case within one maintenance tick — and a token
+REVOKED on ingester-a stops working on both within one tick. Before this
+change every node read catalog/config/tokens.json exactly once, at open, so
+the file was shared and the in-memory copy was not: a token issued on A was
+401 on B until B restarted, and a token revoked on A kept working on B, which
+is not revocation.
+
+UNIT: crates/auth/src/lib.rs
+  tokens_issued_and_revoked_on_one_node_reach_another_through_the_store
+  an_unknown_token_triggers_one_bounded_reload_so_a_fresh_token_works_on_first_use
+  — the first one went RED on the first gate run for a real reason: on a
+    fresh store `open` recorded no hash for the absent file, so the first
+    reload counted "nothing → empty file" as a change. An absent file now
+    hashes as the empty file. 23/23 after.
+
+Mechanism: one `get` of tokens.json per maintenance tick per node (the
+querier on its catalog tail, the only periodic thing it has), hashed before
+it is parsed; plus one re-read on an unknown token, rate-limited to one per
+second node-wide so a flood of bad tokens costs the store one read a second.
+timelake_auth_token_reloads_total counts the reloads that changed the set.
+
+TRANSCRIPT (re-taken against the final build — the querier reloads every 10th tail tick; an earlier run against an every-tick build also passed 14/14)
+--------------------------------------------------------------------------------
+== #46: tokens propagate across the cluster through the shared store ==
+-- the rig is up, in required mode --
+  PASS  ingester-a, ingester-b, querier-a, router healthy
+  PASS  required mode on both ingesters and the querier
+-- issue a token on ingester-a's console (admin/admin, rotated once as the quarantine requires) --
+  PASS  admin session on ingester-a
+  PASS  token issued on ingester-a (id tok-1787459330-49c3c7ad)
+-- first use on the OTHER ingester, immediately: the on-miss re-read --
+  PASS  ingester-b accepts a token it never saw issued, on first presentation (was 401 until restart)
+  PASS  ingester-b's timelake_auth_token_reloads_total moved
+-- through the router, a body that shards to both ingesters --
+  PASS  router write with the token -> 204 on every shard (#37 + #46 together)
+-- reads on a querier with the same token --
+  PASS  querier-a answers with the token (it reloads on its tail loop / on miss)
+  PASS  querier-a's timelake_auth_token_reloads_total moved
+-- revoke on ingester-a; every other node must refuse within one tick --
+  PASS  revoked on ingester-a
+  PASS  ingester-a refuses at once (its own store write)
+    waiting 15s for one maintenance tick on the others...
+  PASS  ingester-b refuses the revoked token after one tick, no restart (the half that makes revocation real)
+  PASS  querier-a refuses the revoked token for reads too
+  PASS  through the router: refused on whichever shard it lands
+== #46 verdict ==
+14 passed, 0 failed
+TOKEN-RELOAD: PASS

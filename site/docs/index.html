@@ -704,9 +704,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         queries — it dropped it on writes until 2026-08-22, which made
         <code>TIMELAKE_DATA_AUTH=required</code> impossible behind a router;
         the rig <code>deploy/compose/timelakedb-router-auth.yml</code> and its
-        drill pin the fix.) Note that each node loads its token store at boot,
-        so a token issued on one ingester's console is not seen by its peer
-        until that peer restarts.
+        drill pin the fix.) Tokens are cluster-wide through the shared store:
+        a node re-reads the token file on its maintenance tick (a querier, on
+        its catalog tail) and once on an unknown token, so a token issued or
+        revoked on any node's console takes effect everywhere within about
+        ten seconds — drilled on the S3 cluster rig,
+        <code>docs/evidence/token-reload-drill.log</code>.
       </p>
 
       <h3>What the cluster is built on, and what is still open</h3>

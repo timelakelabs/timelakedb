@@ -353,11 +353,26 @@ impl RemoteBuffers {
 pub async fn tail(engine: Arc<crate::Engine>, remote: Arc<RemoteBuffers>, period: Duration) {
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut n: u64 = 0;
     loop {
         tick.tick().await;
+        n += 1;
         let head = remote.refresh_live().await;
         let e = Arc::clone(&engine);
-        if let Err(join) = tokio::task::spawn_blocking(move || e.catch_up_catalog(head)).await {
+        // A querier runs no maintenance, so this loop is the only periodic
+        // thing it has — and it authenticates reads, so a token revoked on
+        // an ingester must stop working here too (#46). Every tenth tail
+        // tick, so the cadence matches the ingesters' 10 s maintenance tick
+        // rather than re-reading the token file once a second for nothing.
+        let reload = n.is_multiple_of(10);
+        if let Err(join) = tokio::task::spawn_blocking(move || {
+            if reload {
+                e.reload_tokens();
+            }
+            e.catch_up_catalog(head)
+        })
+        .await
+        {
             tracing::error!(%join, "catalog tail task panicked");
         }
     }
