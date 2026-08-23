@@ -13,6 +13,55 @@ here.
 
 ## [Unreleased]
 
+### Fixed — tokens issued or revoked on one node take effect on every node within a tick (2026-08-23)
+
+Every node in a cluster shares one bucket and so one
+`catalog/config/tokens.json` — and each node read it exactly once, at
+`Auth::open`. The file was shared; the in-memory copy was not. A token
+issued on ingester-a's console was 401 on ingester-b until ingester-b
+restarted, which made `TIMELAKE_DATA_AUTH=required` a one-ingester
+feature, and — the half that actually matters — a token *revoked* on A
+kept working on B, and on every querier Grafana reads through. The
+reference page said revocation was "effective immediately"; it was true
+of one process. #45's drill rig has one ingester precisely to keep this
+out of that test, which was the polite way of saying the two-ingester
+version would fail (#46).
+
+`Auth::reload_tokens` re-reads the file and swaps the set in if it
+changed: one small `get`, hashed before it is parsed, so an unchanged
+file costs a comparison. The maintenance tick calls it on ingesters and
+`all` nodes; the querier's catalog-tail loop calls it every tenth
+iteration (the tail runs at 1 s, so the cadence matches), because a
+querier runs no maintenance and is the node that authenticates reads.
+`verify_token` also calls it once on an *unknown* token, rate-limited to
+one attempt a second node-wide, so a token issued elsewhere a moment ago
+works on its first presentation and a client spraying bad tokens costs
+the store one read a second rather than one per request. A store error
+leaves the loaded set in place and is logged — a bucket blip must never
+turn `required` into `open`. `persist_tokens` records the hash of what
+it wrote, so a node's own issue or revoke is not a "change" on its next
+tick. `timelake_auth_token_reloads_total` counts reloads that changed
+something.
+
+Red first, for a real reason: on a fresh store `open` recorded no hash
+for the absent file, so the first reload counted "no file → empty file"
+as a change. An absent file now hashes as the empty file.
+
+Drilled on `timelakedb-cluster-s3.yml`, which gained
+`TIMELAKE_DATA_AUTH: ${TLDB_DATA_AUTH:-off}` on every data node (off by
+default, so nothing existing changes): `cluster-drill/token_reload_drill.sh`,
+14/14 in `docs/evidence/token-reload-drill.log` — issue on A; first use
+on B 204 with `token_reloads_total` moved (was 401 until restart); a
+router write sharded across both 204; a read on querier-a 200 and its
+counter moved; revoke on A → A 401 at once, B 401 after one tick,
+querier-a 401, router 401 on whichever shard. No restarts anywhere.
+
+Known, not done here: `persist_tokens` is still a plain `put`. Two
+consoles issuing at the same instant on one bucket is a last-writer-wins
+on the file, as it was before — reload makes the loss visible sooner
+rather than causing it. CAS on the token file is the fix, and its own
+issue.
+
 ### Fixed — the router forwards the client's `Authorization` on writes, so `required` auth works behind it (2026-08-22)
 
 The router's `/api/sql` forward had carried `authorization` and

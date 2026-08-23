@@ -172,6 +172,17 @@ pub struct Auth {
     store: Arc<dyn Store>,
     principals: RwLock<BTreeMap<String, Principal>>,
     tokens: RwLock<TokenIndex>,
+    /// Hash of the `tokens.json` bytes this node last loaded or wrote, so a
+    /// reload can tell "unchanged" from "changed" with one `get` and no
+    /// parse. `None` until the first load.
+    tokens_loaded_hash: Mutex<Option<u64>>,
+    /// When the last on-miss reload was attempted (see [`Auth::verify_token`]).
+    /// Bounded to one attempt per second so a flood of bad tokens cannot
+    /// turn into a flood of store reads.
+    token_miss_reload_at: Mutex<Option<Instant>>,
+    /// Reloads that actually changed the in-memory token set, for /metrics —
+    /// the number a drill watches to see propagation happen.
+    pub token_reloads_total: AtomicU64,
     /// CN -> the authorizations a verified client certificate is granted.
     cert_grants: RwLock<BTreeMap<String, Vec<String>>>,
     sessions: RwLock<HashMap<String, Session>>,
@@ -179,6 +190,15 @@ pub struct Auth {
     /// Successful and failed logins, for /metrics.
     pub logins_total: AtomicU64,
     pub login_failures_total: AtomicU64,
+}
+
+/// Content hash of a token file, for change detection only — not a
+/// security property, so the std hasher is the right tool.
+fn bytes_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 fn now_secs() -> u64 {
@@ -221,14 +241,23 @@ impl Auth {
             Err(e) => return Err(e),
         };
 
-        let tokens: Vec<TokenRecord> = match store.get(TOKENS_PATH) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{TOKENS_PATH}: {e}"),
-                )
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let (tokens, tokens_hash): (Vec<TokenRecord>, Option<u64>) = match store.get(TOKENS_PATH) {
+            Ok(bytes) => (
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{TOKENS_PATH}: {e}"),
+                    )
+                })?,
+                Some(bytes_hash(&bytes)),
+            ),
+            // An absent file is the empty token set, and must hash as such:
+            // `reload_tokens` reads "not found" as empty bytes, and if this
+            // stayed `None` the first reload on a fresh store would count
+            // nothing-to-nothing as a change.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (Vec::new(), Some(bytes_hash(&[])))
+            }
             Err(e) => return Err(e),
         };
 
@@ -247,6 +276,9 @@ impl Auth {
             store,
             principals: RwLock::new(principals),
             tokens: RwLock::new(TokenIndex::from_records(tokens)),
+            tokens_loaded_hash: Mutex::new(tokens_hash),
+            token_miss_reload_at: Mutex::new(None),
+            token_reloads_total: AtomicU64::new(0),
             cert_grants: RwLock::new(cert_grants),
             sessions: RwLock::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
@@ -298,7 +330,69 @@ impl Auth {
     fn persist_tokens(&self) -> Result<()> {
         let t = self.tokens.read().expect("tokens lock");
         let bytes = serde_json::to_vec_pretty(&t.records()).expect("tokens json");
-        self.store.put(TOKENS_PATH, &bytes)
+        self.store.put(TOKENS_PATH, &bytes)?;
+        // What we wrote is what we hold: the next reload sees the same
+        // bytes and does nothing, rather than re-parsing our own write.
+        *self.tokens_loaded_hash.lock().expect("hash lock") = Some(bytes_hash(&bytes));
+        Ok(())
+    }
+
+    /// Re-read the token file from the store and swap it in if it changed.
+    /// Returns `Ok(true)` when the in-memory set was replaced.
+    ///
+    /// Why this exists: every node in a cluster shares one bucket and
+    /// therefore one `tokens.json`, but each node read it exactly once, at
+    /// `open`. A token issued on one ingester's console was unknown to its
+    /// peer until that peer restarted — and a token *revoked* on one node
+    /// kept working on every other, which is not revocation. The
+    /// maintenance tick (and the querier's tail loop, which has no
+    /// maintenance) calls this every ~10 s; [`Auth::verify_token`] also
+    /// calls it once, rate-limited, when a token is unknown, so a fresh
+    /// token works on first use without waiting a tick.
+    ///
+    /// Cost: one `get` of a small file per tick per node; the bytes are
+    /// hashed before they are parsed, so an unchanged file is a
+    /// comparison and nothing else. A store error leaves the current set
+    /// in place and is returned, never swallowed into "no tokens".
+    pub fn reload_tokens(&self) -> Result<bool> {
+        let bytes = match self.store.get(TOKENS_PATH) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let hash = bytes_hash(&bytes);
+        if *self.tokens_loaded_hash.lock().expect("hash lock") == Some(hash) {
+            return Ok(false);
+        }
+        let records: Vec<TokenRecord> = if bytes.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{TOKENS_PATH}: {e}"),
+                )
+            })?
+        };
+        let n = records.len();
+        *self.tokens.write().expect("tokens lock") = TokenIndex::from_records(records);
+        *self.tokens_loaded_hash.lock().expect("hash lock") = Some(hash);
+        self.token_reloads_total.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(tokens = n, "SEC-4: token set reloaded from the store");
+        Ok(true)
+    }
+
+    /// One on-miss reload per second, node-wide. Enough that a token issued
+    /// elsewhere a moment ago works on its first presentation; bounded so
+    /// a client spraying bad tokens costs the store one read a second, not
+    /// one per request.
+    fn on_miss_reload_due(&self) -> bool {
+        let mut at = self.token_miss_reload_at.lock().expect("miss lock");
+        let due = at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if due {
+            *at = Some(Instant::now());
+        }
+        due
     }
 
     /// The authorizations a verified client-certificate identity is
@@ -422,10 +516,30 @@ impl Auth {
     /// no KDF (see token.rs for why that is the right call rather than a
     /// shortcut).
     pub fn verify_token(&self, secret: &str) -> std::result::Result<TokenIdentity, TokenError> {
-        self.tokens
+        let first = self
+            .tokens
             .read()
             .expect("tokens lock")
-            .verify(secret, now_secs())
+            .verify(secret, now_secs());
+        if first.is_ok() || !self.on_miss_reload_due() {
+            return first;
+        }
+        // Unknown here may mean issued elsewhere a moment ago. One bounded
+        // re-read, then the same answer the lookup gives; a store error is
+        // logged and the token stays refused — a bucket blip must never
+        // turn `required` into `open`.
+        match self.reload_tokens() {
+            Ok(true) => self
+                .tokens
+                .read()
+                .expect("tokens lock")
+                .verify(secret, now_secs()),
+            Ok(false) => first,
+            Err(e) => {
+                tracing::warn!(error = %e, "SEC-4: on-miss token reload failed; refusing");
+                first
+            }
+        }
     }
 
     /// The one entry point for data-plane authentication. HTTP and
@@ -800,6 +914,63 @@ mod tests {
             auth.login("admin", "admin"),
             Err(LoginError::RateLimited(_))
         ));
+    }
+
+    #[test]
+    fn tokens_issued_and_revoked_on_one_node_reach_another_through_the_store() {
+        // Two Auths over ONE store = two nodes sharing a bucket. Before
+        // reload_tokens existed, B learned about A's tokens at boot and
+        // never again, so a token revoked on A kept working on B.
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn Store> = Arc::new(LocalStore::new(dir.path()).unwrap());
+        let a = Auth::open(Arc::clone(&store), None).unwrap();
+        let b = Auth::open(Arc::clone(&store), None).unwrap();
+
+        // Nothing to do: same bytes, no swap, no count.
+        assert!(!b.reload_tokens().unwrap());
+        assert_eq!(b.token_reloads_total.load(Ordering::Relaxed), 0);
+
+        let (secret, rec) = a
+            .issue_token("shipper", Scope::Write, vec![], vec![], None, "admin")
+            .unwrap();
+        // A's own write is not a change to A.
+        assert!(!a.reload_tokens().unwrap());
+        // B: a tick-style reload picks it up, once.
+        assert!(b.reload_tokens().unwrap());
+        assert!(
+            !b.reload_tokens().unwrap(),
+            "second reload sees the same bytes"
+        );
+        assert_eq!(b.token_reloads_total.load(Ordering::Relaxed), 1);
+        assert_eq!(b.verify_token(&secret).unwrap().id, rec.id);
+
+        // Revoke on A; B still holds the stale record until its next reload —
+        // and then refuses. This is the half that makes revocation real.
+        assert!(a.revoke_token(&rec.id).unwrap());
+        assert!(b.reload_tokens().unwrap());
+        assert!(b.verify_token(&secret).is_err());
+        assert_eq!(b.token_reloads_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn an_unknown_token_triggers_one_bounded_reload_so_a_fresh_token_works_on_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn Store> = Arc::new(LocalStore::new(dir.path()).unwrap());
+        let a = Auth::open(Arc::clone(&store), None).unwrap();
+        let b = Auth::open(Arc::clone(&store), None).unwrap();
+
+        let (secret, rec) = a
+            .issue_token("grafana", Scope::Read, vec![], vec![], None, "admin")
+            .unwrap();
+        // No explicit reload on B: the miss itself re-reads the store.
+        assert_eq!(b.verify_token(&secret).unwrap().id, rec.id);
+        assert_eq!(b.token_reloads_total.load(Ordering::Relaxed), 1);
+
+        // A second unknown token within the same second does NOT re-read —
+        // the miss path is rate-limited — and is simply refused.
+        let before = b.token_reloads_total.load(Ordering::Relaxed);
+        assert!(b.verify_token("tldb_nope").is_err());
+        assert_eq!(b.token_reloads_total.load(Ordering::Relaxed), before);
     }
 
     #[test]

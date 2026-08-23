@@ -305,6 +305,10 @@ async fn main() {
                     // logged and dropped, because telemetry must not be
                     // able to fail maintenance.
                     e.selfmon_tick();
+                    // #46: tokens issued or revoked on a peer sharing this
+                    // store take effect here within one tick. Cheap — one
+                    // small get, hashed before it is parsed.
+                    e.reload_tokens();
                     if let Err(err) = e.flush_if_needed() {
                         tracing::error!(%err, stage = "flush", "maintenance stage failed");
                     }

@@ -525,8 +525,16 @@
         grants</strong> that intersect the caller's claimed authorizations
         — so a token can only ever narrow what its holder sees. A token
         with no grants recorded leaves claims untouched (no policy is not
-        deny-all). Revocation is immediate and a tombstone: the record
-        stays so an operator can still see the credential existed.
+        deny-all). Revocation is immediate on the node that revoked and a
+        tombstone: the record stays so an operator can still see the
+        credential existed. In a cluster every node shares one token file
+        through the object store and re-reads it on its maintenance tick
+        (a querier, on its catalog tail), so a token issued or revoked on
+        one node's console takes effect everywhere within about ten
+        seconds — and a node that is shown an unknown token re-reads once,
+        rate-limited, so a fresh token works on its first presentation.
+        <code>timelake_auth_token_reloads_total</code> counts the reloads
+        that changed something.
       </p>
       <div class="note warn">
         <p>
@@ -789,6 +797,7 @@
             <tr><td><code>timelake_admin_default_credential_active</code></td><td>gauge</td><td>1 while the seeded <code>admin</code>/<code>admin</code> password is still in place (SEC-4)</td></tr>
             <tr><td><code>timelake_admin_logins_total</code></td><td>counter</td><td>Successful admin sign-ins since start</td></tr>
             <tr><td><code>timelake_admin_login_failures_total</code></td><td>counter</td><td>Rejected sign-in attempts since start</td></tr>
+            <tr><td><code>timelake_auth_token_reloads_total</code></td><td>counter</td><td>Times this node replaced its in-memory token set from the shared store — on the maintenance tick (querier: the catalog tail) when the file changed, or once on an unknown token. 0 on a single node that only ever issues its own tokens; rising on a peer is propagation working</td></tr>
             <tr><td><code>timelake_data_auth_mode</code></td><td>gauge</td><td>Data-plane auth mode: 0 off, 1 optional, 2 required (SEC-4 phased)</td></tr>
             <tr><td><code>timelake_data_requests_authenticated_total</code></td><td>counter</td><td>Data-plane requests that presented a valid token</td></tr>
             <tr><td><code>timelake_data_requests_anonymous_total</code></td><td>counter</td><td>Data-plane requests served without a token (only possible in off/optional). In <code>required</code> this must stay 0</td></tr>

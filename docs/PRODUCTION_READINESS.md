@@ -510,11 +510,12 @@ Genuinely optional for production; they make it a *product*.
   header~~ — **done 2026-08-22 (#37).** Every shard now carries it; rig
   `deploy/compose/timelakedb-router-auth.yml` + drill
   `cluster-drill/router_auth_drill.sh` (`docs/evidence/router-auth-drill.log`).
-  Still true and now its own question: each node loads
-  `catalog/config/tokens.json` at boot only, so a token issued on one
-  ingester's console is unknown to its peer until that peer restarts —
-  with a shared object store the file is shared, the in-memory copy is
-  not.
+  The question that rig was shaped to avoid — each node loaded
+  `catalog/config/tokens.json` at boot only — is **#46, done
+  2026-08-23**: nodes re-read the file on the maintenance tick (querier:
+  the catalog tail) and once on an unknown token, so issue and revoke
+  propagate within a tick. Drilled on the S3 cluster rig,
+  `docs/evidence/token-reload-drill.log`.
 - Helm chart, packaging, versioned upgrade/rollback policy.
 - **Tributary L6 (Arrow wire protocol) — explicitly do not start.** Its
   own roadmap gates this on L3 proving line protocol is the bottleneck.
