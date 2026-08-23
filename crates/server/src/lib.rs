@@ -764,7 +764,10 @@ impl Engine {
 
         // Node identity, read once: it stamps the audit chain (§5.2) and
         // tags every self-monitoring row, so a cluster's samples aggregate.
-        let node_id = std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| "tldb".to_string());
+        // Through the cluster crate's reader, so the name here and the name
+        // discovery advertises to peers cannot differ — they did, when this
+        // line carried its own fallback (#40).
+        let node_id = timelake_cluster::node_id_from_env();
         // U2 self-monitoring. Built before the query environment because
         // the observer has to be attached at construction — the sampler is
         // a plain buffer with no engine reference, so there is no cycle.

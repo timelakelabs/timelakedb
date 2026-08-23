@@ -132,6 +132,23 @@ pub struct StaticDiscovery {
     peers: Vec<NodeInfo>,
 }
 
+/// The node id when `TIMELAKE_NODE_ID` is unset.
+///
+/// One constant, read through [`node_id_from_env`] by discovery *and* by
+/// the engine (audit chain, `_system` rows). There used to be two reads
+/// with two fallbacks — `node-local` here, `tldb` in the engine — written
+/// two phases apart, so an unset node had two names: the boot log and its
+/// peers said one, every audit record and telemetry row said the other
+/// (#40). `tldb` won because it is the name already in the evidence logs,
+/// the `_system.queries` rows of every drilled node, and the site's
+/// configuration table.
+pub const DEFAULT_NODE_ID: &str = "tldb";
+
+/// `TIMELAKE_NODE_ID`, or [`DEFAULT_NODE_ID`]. The one place it is read.
+pub fn node_id_from_env() -> String {
+    std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| DEFAULT_NODE_ID.to_string())
+}
+
 impl StaticDiscovery {
     /// Construct directly (used by tests and by `from_env`).
     pub fn new(this: NodeInfo, peers: Vec<NodeInfo>) -> StaticDiscovery {
@@ -141,12 +158,13 @@ impl StaticDiscovery {
     /// Build from the environment. Env reading stays at this edge so the
     /// rest is pure and testable.
     ///
-    /// - `TIMELAKE_NODE_ID` — this node's id (default `node-local`).
+    /// - `TIMELAKE_NODE_ID` — this node's id (default [`DEFAULT_NODE_ID`],
+    ///   via [`node_id_from_env`] — the same read the engine uses).
     /// - `TIMELAKE_CLUSTER_ADDR` — this node's intra-cluster address
     ///   (default empty; a lone node needs none).
     /// - `TIMELAKE_PEERS` — comma-separated `id=role@host:port`.
     pub fn from_env(role: Role) -> Result<StaticDiscovery, ClusterError> {
-        let id = std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| "node-local".to_string());
+        let id = node_id_from_env();
         let address = std::env::var("TIMELAKE_CLUSTER_ADDR").unwrap_or_default();
         let peers = match std::env::var("TIMELAKE_PEERS") {
             Ok(v) => parse_peers(&v)?,
@@ -220,6 +238,21 @@ fn parse_peer(entry: &str) -> Result<NodeInfo, ClusterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_node_id_is_one_constant_read_in_one_place() {
+        // Two reads with two fallbacks (`node-local` here, `tldb` in the
+        // engine) gave an unset node two names (#40). The engine now calls
+        // `node_id_from_env` too, so this pins the one fallback it will see.
+        assert_eq!(DEFAULT_NODE_ID, "tldb");
+        // Only meaningful when the variable is genuinely unset in the test
+        // environment; a set value is the operator's, not a default.
+        if std::env::var_os("TIMELAKE_NODE_ID").is_none() {
+            assert_eq!(node_id_from_env(), DEFAULT_NODE_ID);
+            let d = StaticDiscovery::from_env(Role::All).unwrap();
+            assert_eq!(d.this_node().id, DEFAULT_NODE_ID);
+        }
+    }
 
     #[test]
     fn role_parsing_defaults_to_all_and_rejects_typos() {
