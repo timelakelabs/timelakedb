@@ -1847,7 +1847,17 @@ impl Engine {
             // about which columns exist.
             let mut schema = self.table_schema(db, &name);
             for b in &buffer {
-                schema = Some(timelake_query::schema_union(schema, b.schema())?);
+                // SEC-5 (exposure 5): a schema_union conflict names a column
+                // and two Arrow types. This is the read path — the error
+                // returns straight to /api/sql and Flight — and it happens
+                // before run_sql_env, so it must be sanitized at the source
+                // or it leaks (#47). The write-path union sites keep their
+                // verbatim message on purpose; only this one is caller-facing
+                // read output.
+                schema = Some(
+                    timelake_query::schema_union(schema, b.schema())
+                        .map_err(|e| timelake_query::opaque_read_error("schema-union", e))?,
+                );
             }
             let Some(schema) = schema else { continue };
 

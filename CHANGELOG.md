@@ -13,6 +13,45 @@ here.
 
 ## [Unreleased]
 
+### Fixed — SEC-5 had a hole: a schema-union conflict leaked a column and its types (2026-08-23)
+
+SEC-5 sanitizes query failures at `run_sql_env`, the one execution point,
+so a bad table or column name comes back as `query could not be executed
+(ref: q-…)`. One failure never reached it. Before a query runs, the read
+path unions the schemas of a table's live batches (`Engine::sql_batches`),
+and a conflict there returns `column 'reading' has conflicting types Utf8
+vs Float64` — a column name and both Arrow types — straight to `/api/sql`
+and Flight, because the `?` propagates out of `sql_batches` before
+`run_sql_env` is called. SECURITY.md said exposure 5 was CLOSED; it had a
+hole (#47).
+
+The one read-path union now routes through
+`timelake_query::opaque_read_error` — the same policy `opaque` applies,
+its own ref, the full error logged server-side. The write-path union
+sites keep their verbatim message on purpose: a write that conflicts with
+a stored type is told which field, and that is on the reference page. The
+deliberately-safe assembly messages — `database … does not exist`, the
+stale-catalog refusal — stay verbatim too; they name the caller's own
+input or cluster state, not schema.
+
+Narrow to reach, which is why it survived: two live batches of one table
+have to disagree on a column's type, and first-writer-wins typing
+prevents that within a node. It is reachable on real data — a table that
+took a pre-#43 `time`-field line still carries the conflict until
+compaction, and a CL-3 querier unioning several ingesters' snapshots can
+produce it — which is exactly the case a "closed" label stops anyone
+watching for.
+
+Pinned by `crates/query`
+`a_schema_union_conflict_is_named_in_full_then_sanitized_for_the_wire`:
+`schema_union`'s own message names the column and both types (the write
+path wants that), and `opaque_read_error` over it is the ref with none of
+it. The existing `query_errors_are_opaque_sec5` covers the plan/execute
+paths. What no in-process test covers is a live 1850 conflict end to end,
+because the write path cannot construct one on a single node; Riverkeeper's
+`query-errors-are-sanitized` control runs the same single topology and so
+has the same limit, documented there rather than faked.
+
 ### Fixed — no two compose rigs publish the same host port any more (2026-08-23)
 
 Three pairs did: the alerting rig and the CL-2 cluster rig (and the

@@ -122,6 +122,25 @@ fn opaque(ref_id: &str, stage: &str, e: impl std::fmt::Display) -> String {
     format!("query could not be executed (ref: {ref_id})")
 }
 
+/// Sanitize an error raised while *assembling* a query — before
+/// [`run_sql_env`] runs and can sanitize its own plan/execute failures.
+///
+/// The one that matters is [`schema_union`]: its conflict message names a
+/// column and both Arrow types, the exact schema disclosure `opaque` exists
+/// to stop (SEC-5, exposure 5) — but the read path unions schemas in
+/// `Engine::sql_batches`, *outside* `run_sql_env`, so that call site cannot
+/// rely on the run-time sanitizer and must collapse the error here instead.
+/// Mints a fresh ref, logs the full error server-side, returns only the
+/// opaque message — the same contract a plan or execute failure gets.
+///
+/// Do NOT use this for the deliberately-safe assembly messages
+/// (`database … does not exist`, the stale-catalog refusal): those name the
+/// caller's own input or cluster state, not discovered schema, and SEC-5
+/// keeps them verbatim on purpose.
+pub fn opaque_read_error(stage: &str, e: impl std::fmt::Display) -> String {
+    opaque(&next_query_ref(), stage, e)
+}
+
 /// Execute SQL over registered providers under the SHARED environment.
 pub async fn run_sql_env(
     env: &QueryEnv,
@@ -984,6 +1003,44 @@ mod tests {
         assert!(
             !err.contains("host") && !err.contains("value"),
             "enumerated schema: {err}"
+        );
+    }
+
+    #[test]
+    fn a_schema_union_conflict_is_named_in_full_then_sanitized_for_the_wire() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        // The read path unions the schemas of a table's live batches, and two
+        // nodes can legitimately disagree about a column's type. The union's
+        // OWN message is deliberately explicit — the write path shows it to
+        // the writer — so first prove it is exactly the disclosure SEC-5
+        // forbids on a read: it names the column and both Arrow types.
+        let a = Arc::new(Schema::new(vec![Field::new(
+            "reading",
+            DataType::Utf8,
+            true,
+        )]));
+        let b = Arc::new(Schema::new(vec![Field::new(
+            "reading",
+            DataType::Float64,
+            true,
+        )]));
+        let raw = schema_union(Some(a), b).unwrap_err();
+        assert!(
+            raw.contains("reading") && raw.contains("Utf8") && raw.contains("Float64"),
+            "the union message is supposed to be explicit: {raw}"
+        );
+
+        // opaque_read_error is what `sql_batches` wraps that call with. On the
+        // wire the caller must get the ref and nothing enumerable — no column
+        // name, neither type. (#47)
+        let wire = opaque_read_error("schema-union", &raw);
+        assert!(
+            wire.contains("query could not be executed") && wire.contains("ref: q-"),
+            "not opaque: {wire}"
+        );
+        assert!(
+            !wire.contains("reading") && !wire.contains("Utf8") && !wire.contains("Float64"),
+            "the sanitized message still leaks the conflict: {wire}"
         );
     }
 
