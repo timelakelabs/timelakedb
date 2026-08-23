@@ -360,7 +360,9 @@
         The new password must be at least 8 characters and cannot be the
         username or <code>admin</code>. Set
         <code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code> to provision a real
-        password instead, and alert on
+        password instead — the seeded principal is still quarantined until
+        that password has been rotated once, because an environment variable
+        is not a secret store — and alert on
         <code>timelake_admin_default_credential_active</code>.
       </p>
       <p>

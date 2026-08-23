@@ -13,6 +13,54 @@ here.
 
 ## [Unreleased]
 
+### Fixed — the router forwards the client's `Authorization` on writes, so `required` auth works behind it (2026-08-22)
+
+The router's `/api/sql` forward had carried `authorization` and
+`x-timelake-authorizations` from day one, because the querier is where
+SEC-2 and SEC-4 are decided. Its *write* forward sent each shard with
+`db`, `precision` and the bytes — nothing else — so every shard arrived
+at the ingester anonymous. Behind a router, `TIMELAKE_DATA_AUTH=required`
+was therefore impossible: a client with a good token got its 401 back
+through the router. `optional` was quieter and worse: the ingesters'
+`timelake_data_requests_{authenticated,anonymous}_total` split — the
+number SECURITY.md tells an operator to flip to `required` on — counted
+every router write as anonymous, so it measured the router, not the
+clients (#37). Nobody had hit it because every cluster rig runs with
+auth off, which is the default.
+
+One header, `Authorization`, copied onto each shard's forward. Not
+`X-TimeLake-Authorizations`: the write path does not read it — a
+write's visibility label is the `_visibility` tag in the body. And the
+router still authenticates nothing itself; it has no token store and
+must not grow one.
+
+Unit: `tests/router.rs::a_write_carries_the_clients_authorization_to_every_shard`
+— red with the fix stashed (`ing-a must see the client's credential on
+its shard`), green with it; an anonymous write is pinned to arrive
+anonymous, so the router invents nothing either. Live: new rig
+`deploy/compose/timelakedb-router-auth.yml` (router + one ingester in
+`required` mode, ports 6962/6963 — checked against every other rig,
+#42) and `cluster-drill/router_auth_drill.sh`, 15/15 in
+`docs/evidence/router-auth-drill.log`: token issued on the ingester's
+console, Bearer through the router 204, none 401, wrong 401, Telegraf's
+`Token` spelling 204, both accepted writes exactly 50 rows on the
+ingester, `authenticated_total` +4, `anonymous_total` +0,
+`rejected_total` +2, `router_forwarded_total` 4.
+
+Two things the drill taught, recorded in its transcript: a
+`TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` principal is still quarantined until
+it rotates once (by design — `crates/auth` pins it; the docs now say
+so), and LWW dedup is flush-time, so sending one body twice reads back
+as 100 rows from the live buffer, not 50. Both were the drill being
+wrong, and both are the kind of wrong the next person would repeat.
+
+One ingester in the rig on purpose. Each node loads
+`catalog/config/tokens.json` at boot and nothing reloads it, so a token
+issued on one ingester is unknown to its peer until that peer restarts
+— with a shared bucket the file is shared and the in-memory copy is
+not. That is its own issue, and a pair would have confounded it with
+this one.
+
 ### Fixed — a router-role node accepts `TIMELAKE_MAX_BODY_BYTES`, not axum's 2 MiB (2026-08-22)
 
 The 2026-08-13 entry below says bodies over 2 MiB were refused and that

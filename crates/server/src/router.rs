@@ -396,6 +396,21 @@ async fn write(
         if let Some(p) = &precision {
             req = req.query(&[("precision", p.as_str())]);
         }
+        // The client's credential travels with every shard. The ingester
+        // is where SEC-4 data auth is decided for a write — the router has
+        // no token store and must not grow one — so dropping the header
+        // here made a cluster behind a router unable to run
+        // TIMELAKE_DATA_AUTH=required at all: every forwarded shard arrived
+        // anonymous and was refused 401, which came back to a client
+        // holding a perfectly good token. In `optional` mode it was quieter
+        // and worse: the ingesters' authenticated/anonymous split, the
+        // measurement an operator flips to `required` on, counted every
+        // router write as anonymous (#37). Only `Authorization` — the write
+        // path reads nothing else; SEC-2 on a write is the `_visibility`
+        // tag in the body.
+        if let Some(v) = headers.get("authorization") {
+            req = req.header("authorization", v);
+        }
         match req
             .header("content-type", "text/plain; charset=utf-8")
             .body(sub.clone())

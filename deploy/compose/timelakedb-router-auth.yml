@@ -1,0 +1,63 @@
+# Router in front of an ingester that REQUIRES data-plane auth (#37).
+#
+# One ingester, deliberately: with a peer, each node holds its own token
+# store (`catalog/config/tokens.json` via the Store, loaded at boot), so a
+# token issued on A is unknown to B until B restarts — a separate question
+# from the one this rig asks, which is whether the router carries the
+# client's Authorization header to the shard at all. It did not, so a
+# cluster behind a router could not run `required` and, in `optional`,
+# counted every router write as anonymous. An ingester without a peer runs
+# without replication (main.rs says so at boot) and is otherwise the same
+# write path.
+#
+# The admin is provisioned with TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD so the
+# drill does not have to walk the admin/admin quarantine; the drill only
+# needs a session that can issue a token.
+#
+#   docker compose -f compose/timelakedb-router-auth.yml up -d --build
+#   sh cluster-drill/router_auth_drill.sh
+#
+# Host ports 6962 (router) / 6963 (ingester) — checked against every other
+# rig in this directory before choosing (#42 is the reason to check).
+name: bench-timelakedb-router-auth
+services:
+  ingester:
+    build: ../..
+    container_name: ra-ingester
+    hostname: ingester
+    ports:
+      - "6963:1963"   # public data port; the drill reads back here with the token
+      # TIMELAKE_CLUSTER_ADDR (:1965) is deliberately NOT published
+      # (SECURITY.md exposure 10).
+    environment:
+      TIMELAKE_ROLE: ingester
+      TIMELAKE_NODE_ID: ingester
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
+      TIMELAKE_DATA_AUTH: required
+      TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD: router-auth-drill-2026
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  router:
+    build: ../..
+    container_name: ra-router
+    hostname: router
+    ports:
+      - "6962:1963"   # the single public write endpoint clients see
+    environment:
+      TIMELAKE_ROLE: router
+      TIMELAKE_NODE_ID: router
+      TIMELAKE_PEERS: ingester=ingester@ingester:1965|ingester:1963
+    mem_limit: 512m
+    depends_on:
+      ingester:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

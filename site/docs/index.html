@@ -699,10 +699,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         gzip and UTF-8 for the whole body before it forwards anything, but a
         line that fails <em>field-level</em> parsing is refused by the one
         ingester that receives its shard, so a body spanning several shards
-        can land partially; and a router forwards writes without the client's
-        <code>Authorization</code> header, so ingesters behind a router cannot
-        run <code>TIMELAKE_DATA_AUTH=required</code> today. Queries do carry
-        the header through.
+        can land partially. (A router <em>does</em> carry the client's
+        <code>Authorization</code> header to every shard, on writes as on
+        queries — it dropped it on writes until 2026-08-22, which made
+        <code>TIMELAKE_DATA_AUTH=required</code> impossible behind a router;
+        the rig <code>deploy/compose/timelakedb-router-auth.yml</code> and its
+        drill pin the fix.) Note that each node loads its token store at boot,
+        so a token issued on one ingester's console is not seen by its peer
+        until that peer restarts.
       </p>
 
       <h3>What the cluster is built on, and what is still open</h3>
@@ -807,7 +811,7 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
             <tr><td><code>TIMELAKE_MAX_BODY_BYTES</code></td><td>33554432 (32 MiB)</td><td>Largest accepted HTTP body, on the public data plane and the intra-cluster listener alike. FR-1 requires ≥10 MB batches; axum’s default of 2 MiB refused them with 413 — and refused replication frames the same way, which a peer reads as failure. Both listeners take this one value so they cannot disagree, and since 2026-08-22 so does a <code>router</code>-role node — it had been left on axum's 2 MiB default while the ingesters behind it took 32 MiB.</td></tr>
             <tr><td><code>TIMELAKE_INTERNAL_MAX_CONCURRENT</code></td><td>8</td><td>Live/snapshot reads the intra-cluster listener serves at once before refusing with 503. A querier unions every ingester’s live buffer per query, so query load lands as work on the ingest tier; this bounds it. Not applied to <code>/internal/v1/replicate</code> (throttling a peer’s writes is the stall this exists to prevent) or <code>/internal/v1/health</code>. Watch <code>timelake_cl3_reads_refused_total</code>.</td></tr>
             <tr><td><code>TIMELAKE_RETENTION</code></td><td>empty</td><td>Retention seed, <code>db.table=90d,table=72h</code> (a bare table is the all-databases wildcard); applies at first start, after which the stored policy from the console wins</td></tr>
-            <tr><td><code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default</td></tr>
+            <tr><td><code>TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD</code></td><td>unset</td><td>Password for the seeded <code>admin</code> principal; unset means the quarantined <code>admin</code>/<code>admin</code> default. Either way the seeded principal is quarantined until it has rotated its password once — the value came from the environment, which is not a secret store</td></tr>
             <tr><td><code>TIMELAKE_GC_GRACE_SECS</code></td><td>900</td><td>Delay before superseded files are deleted</td></tr>
             <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths). Both or neither</td></tr>
             <tr><td><code>TIMELAKE_TLS_CLIENT_CA</code></td><td>unset</td><td>PEM bundle of trust anchors. Setting it turns on want-mode client certificates: one is requested, verified if presented, and the connection is served either way</td></tr>

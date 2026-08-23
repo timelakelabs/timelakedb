@@ -1,0 +1,59 @@
+#37 — the router carries the client's Authorization header to every write shard
+2026-08-22 · rig deploy/compose/timelakedb-router-auth.yml (router :6962 → ingester :6963,
+TIMELAKE_DATA_AUTH=required, plaintext) · drill cluster-drill/router_auth_drill.sh
+branch router-forward-auth on top of bf4767d
+================================================================================
+
+THE CLAIM: a write sent THROUGH THE ROUTER with a valid data-plane token is
+accepted by an ingester in `required` mode, one without is refused, one with
+a wrong token is refused, and the ingester's own authenticated/anonymous
+split attributes the router's clients rather than the router. Before this
+change the first write was a 401 — the router forwarded each shard with
+`db` and `precision` only — and in `optional` mode every router write was
+counted anonymous, which is the measurement an operator flips on.
+
+One ingester on purpose: each node loads catalog/config/tokens.json at boot,
+so a token issued on one ingester's console is unknown to a peer until the
+peer restarts. That is a separate question from this one and a rig with a
+pair would have confounded the two.
+
+UNIT: crates/server/tests/router.rs
+  a_write_carries_the_clients_authorization_to_every_shard
+  — RED with the fix stashed (ing-a must see the client's credential on its
+    shard: left None, right Some("Bearer tldb_not-a-real-secret")), GREEN with it.
+
+Two honest notes on the drill itself, both corrected before this transcript:
+  * TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD provisions the password but the
+    principal is still quarantined until rotated once — the first run got
+    403 password_change_required from POST /admin/tokens. The drill now
+    rotates, then signs in again.
+  * The first version sent the same 50 lines twice (Bearer, then Token) and
+    expected COUNT=50; it got 100. Correct: LWW dedup is a flush-time
+    property and the live buffer shows both copies. Two tables now.
+
+TRANSCRIPT (run 3, the passing one)
+--------------------------------------------------------------------------------
+== #37: the router forwards the client's Authorization on writes ==
+-- both nodes up --
+  PASS  ingester healthy
+  PASS  router healthy
+  PASS  ingester is in required mode (timelake_data_auth_mode=2)
+-- issue a token on the ingester's console --
+  PASS  admin session (bootstrap password rotated once, as the quarantine requires)
+  PASS  read_write token issued (prefix tldb_, shown once)
+-- write THROUGH THE ROUTER --
+  PASS  valid token through the router -> 204 (was 401 before #37: the header was dropped)
+  PASS  no token through the router -> 401 (the router invents no credential)
+  PASS  wrong token through the router -> 401 (forwarded as given, refused by the ingester)
+  PASS  Telegraf's 'Token' spelling survives the hop too
+-- the rows are on the ingester, exactly --
+  PASS  COUNT(*) of the Bearer write on the ingester = 50 (the two 401s landed nothing)
+  PASS  COUNT(*) of the Token write on the ingester = 50
+-- the ingester's split saw the router's clients, not the router --
+  PASS  authenticated_total rose by >=2 (got +4)
+  PASS  anonymous_total unchanged: in required mode it must stay at its floor
+  PASS  rejected_total rose by >=2 (got +2)
+  PASS  router forwarded the accepted writes (forwarded_total=4)
+== #37 verdict ==
+15 passed, 0 failed
+ROUTER-AUTH: PASS
