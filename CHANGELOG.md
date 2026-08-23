@@ -13,6 +13,38 @@ here.
 
 ## [Unreleased]
 
+### Fixed — a router-role node accepts `TIMELAKE_MAX_BODY_BYTES`, not axum's 2 MiB (2026-08-22)
+
+The 2026-08-13 entry below says bodies over 2 MiB were refused and that
+the fix applied the limit "to **both** routers from one config value".
+It did — to both routers that live in `lib.rs`. The router *role* is
+built in `router.rs`, and `router_app` never got the layer, so for nine
+days the single write endpoint a cluster's clients are told to use
+refused anything over axum's default while the ingesters behind it took
+32 MiB. FR-1's ≥10 MB batches, 413'd at the front door (#36). Nobody
+hit it because the drills use small bodies and the bench goes through
+the router with batches under the default.
+
+The limit now lives on `RouterState` (default: the engine's
+`EngineConfig::default().max_body_bytes`, set from
+`TIMELAKE_MAX_BODY_BYTES` in `main.rs` through the same
+`config_from_env` the engine uses) and `router_app` applies it. On the
+state rather than as a parameter on purpose: the failure was a router
+built with *no* limit argument silently inheriting axum's, and a field
+with the engine's default cannot do that. It still caps bytes on the
+wire — gzip is decompressed inside the handler, as everywhere else.
+
+The router opens no engine (that is the point of the role), so it reads
+the one setting it shares with the ingesters from the environment
+parser rather than re-deriving a default here that could drift.
+
+Pinned in `crates/server/tests/router.rs`: a 3 MiB body is forwarded
+whole and every line arrives once, and a router told to take 1 KiB
+refuses 4 KiB with 413 and forwards nothing — the second test is what
+proves the limit is the configured one and not merely a bigger
+constant. The stub node in that file gained its own 64 MiB limit, or it
+would have been the thing under test.
+
 ### Fixed — a tag or field named `time` is refused at parse; it used to wedge the table (2026-08-22)
 
 `time` is the timestamp column every table gets as field 0, and nothing

@@ -72,6 +72,9 @@ async fn stub_node(reply: &'static str, status: StatusCode) -> (String, Log) {
                     },
                 ),
             )
+            // The stub must take what the router forwards, or a large-body
+            // test would measure the stub's limit rather than the router's.
+            .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
             .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -339,6 +342,94 @@ async fn a_write_body_is_sharded_and_forwarded_unaltered() {
         received.lines().count(),
         20,
         "every line exactly once, no duplication across shards"
+    );
+}
+
+#[tokio::test]
+async fn a_body_over_two_megabytes_passes_through_the_router() {
+    // FR-1 wants batches of 10 MB and up, through the single write
+    // endpoint clients keep seeing — which in a cluster is this router.
+    // The 2026-08-13 fix raised the limit on the data plane and the
+    // internal listener from axum's 2 MiB default to TIMELAKE_MAX_BODY_BYTES
+    // and missed this router, so for nine days a router-role node refused
+    // exactly the batches the ingesters behind it were built to take (#36).
+    let (addr, log) = stub_node("", StatusCode::NO_CONTENT).await;
+    let app = router_app(Arc::new(RouterState::new(vec![("ing-a".into(), addr)])));
+
+    let mut body = String::with_capacity(3 << 20);
+    let mut i = 0i64;
+    while body.len() < (3 << 20) {
+        body.push_str(&format!(
+            "cpu,host=h{i} v={i}i {}\n",
+            1_786_179_600_000_000_000i64 + i
+        ));
+        i += 1;
+    }
+    assert!(
+        body.len() > (2 << 20),
+        "the probe must exceed axum's 2 MiB default"
+    );
+    let sent = body.lines().count();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "a {sent}-line body over 2 MiB must pass through the router, not 413"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let received = log.lock().unwrap().bodies.concat();
+    assert_eq!(
+        received.lines().count(),
+        sent,
+        "every line forwarded exactly once"
+    );
+}
+
+#[tokio::test]
+async fn the_router_body_limit_is_the_configured_one_not_axums() {
+    // The default moving from 2 MiB to 32 MiB is the visible half. The
+    // half that keeps it honest is that the limit is a setting: a router
+    // told to take 1 KiB refuses 4 KiB with 413 and forwards nothing, so a
+    // router and its ingesters can never disagree about the cap by
+    // accident — they read the same variable.
+    let (addr, log) = stub_node("", StatusCode::NO_CONTENT).await;
+    let app = router_app(Arc::new(
+        RouterState::new(vec![("ing-a".into(), addr)]).with_max_body_bytes(1024),
+    ));
+    let body: String = (0..200)
+        .map(|i| {
+            format!(
+                "cpu,host=h{i} v={i}i {}\n",
+                1_786_179_600_000_000_000i64 + i
+            )
+        })
+        .collect();
+    assert!(body.len() > 4096);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        log.lock().unwrap().bodies.is_empty(),
+        "nothing may be forwarded from a refused body"
     );
 }
 

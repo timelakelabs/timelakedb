@@ -63,6 +63,17 @@ pub struct RouterState {
     /// running more than one.
     next_querier: AtomicU64,
     client: reqwest::Client,
+    /// Largest request body the router accepts — the same
+    /// `TIMELAKE_MAX_BODY_BYTES` the ingesters apply, so the front door
+    /// cannot refuse what the nodes behind it would take. Defaults to the
+    /// engine's default (32 MiB); `main.rs` sets it from the environment.
+    ///
+    /// This lives on the state rather than as a `router_app` parameter so
+    /// the default is the engine's and not axum's: the 2026-08-13 fix that
+    /// raised the limit on the data plane and the internal listener missed
+    /// this router entirely, and for nine days a router-role node refused
+    /// anything over axum's 2 MiB while its ingesters took 32 (#36).
+    max_body_bytes: usize,
     pub stats: RouterStats,
 }
 
@@ -103,8 +114,21 @@ impl RouterState {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("router client"),
+            max_body_bytes: crate::EngineConfig::default().max_body_bytes,
             stats: RouterStats::default(),
         }
+    }
+
+    /// Accept request bodies up to `n` bytes. Set from
+    /// `TIMELAKE_MAX_BODY_BYTES` in `main.rs`, so the router and the
+    /// ingesters it fronts cannot disagree about what a client may send.
+    pub fn with_max_body_bytes(mut self, n: usize) -> RouterState {
+        self.max_body_bytes = n;
+        self
+    }
+
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
     }
 
     pub fn target_ids(&self) -> Vec<String> {
@@ -135,7 +159,14 @@ impl RouterState {
 
 /// The router's HTTP surface: the write endpoints, query forwarding, and
 /// health/ping/metrics.
+///
+/// The body limit is applied here, as it is on the data plane and the
+/// internal listener (`lib.rs`), because the `Bytes` extractor in `write`
+/// carries axum's 2 MiB default otherwise — and FR-1 wants batches of
+/// 10 MB and more through exactly this endpoint. It caps the bytes on the
+/// wire: gzip is decompressed inside the handler, same as everywhere else.
 pub fn router_app(state: Arc<RouterState>) -> axum::Router {
+    let limit = state.max_body_bytes;
     axum::Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ping", get(|| async { StatusCode::NO_CONTENT }))
@@ -144,6 +175,7 @@ pub fn router_app(state: Arc<RouterState>) -> axum::Router {
         .route("/api/v2/write", post(write))
         .route("/api/v3/write_lp", post(write))
         .route("/api/sql", post(sql))
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
         .with_state(state)
 }
 
