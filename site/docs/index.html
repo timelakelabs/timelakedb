@@ -694,12 +694,14 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </div>
       <p>
         A cluster stays the same database from outside — the same write
-        endpoints, the same SQL, the same Grafana datasource. Two caveats the
-        drills made explicit: the router checks every line has a measurement,
-        gzip and UTF-8 for the whole body before it forwards anything, but a
-        line that fails <em>field-level</em> parsing is refused by the one
-        ingester that receives its shard, so a body spanning several shards
-        can land partially. (A router <em>does</em> carry the client's
+        endpoints, the same SQL, the same Grafana datasource. The router
+        parses the whole body with the ingesters' own parser, under the
+        precision the client asked for, before it forwards anything — so a
+        poison line anywhere in a batch is a 400 at the router and nothing
+        lands on any shard. (Until 2026-08-23 it checked only that each line
+        had a measurement, and a line with a bad field value was refused by
+        the one ingester that received its shard after every other shard had
+        been acknowledged — a partial landing. A router <em>does</em> carry the client's
         <code>Authorization</code> header to every shard, on writes as on
         queries — it dropped it on writes until 2026-08-22, which made
         <code>TIMELAKE_DATA_AUTH=required</code> impossible behind a router;

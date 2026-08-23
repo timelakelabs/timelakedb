@@ -508,6 +508,107 @@ async fn a_write_carries_the_clients_authorization_to_every_shard() {
 }
 
 #[tokio::test]
+async fn a_field_level_poison_line_writes_nothing_anywhere_either() {
+    // The test below proves a line with NO measurement is refused before
+    // any forward. This one is the case that was not true: a line with a
+    // measurement and a bad field value passed the router's check, reached
+    // exactly one shard and was refused there — after every other shard
+    // had been acknowledged (#38). The router now parses the whole body as
+    // an ingester would, so the bad line is a 400 before anything is sent.
+    let (addr_a, log_a) = stub_node("", StatusCode::NO_CONTENT).await;
+    let (addr_b, log_b) = stub_node("", StatusCode::NO_CONTENT).await;
+    let app = router_app(Arc::new(RouterState::new(vec![
+        ("ing-a".into(), addr_a),
+        ("ing-b".into(), addr_b),
+    ])));
+    // Many good lines across both shards, then one with a bad field value.
+    let mut body: String = (0..20)
+        .map(|i| {
+            format!(
+                "table_{i},host=h{i} v={i}i {}\n",
+                1_786_179_600_000_000_000i64 + i
+            )
+        })
+        .collect();
+    body.push_str("table_0,host=bad v=notanumber 1786179600000000000\n");
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let text =
+        String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned();
+    assert!(
+        text.contains("line 21") && text.contains("bad float"),
+        "the refusal names the line and the fault, like an ingester's: {text}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        log_a.lock().unwrap().bodies.is_empty() && log_b.lock().unwrap().bodies.is_empty(),
+        "a body refused by the router must reach no shard at all"
+    );
+}
+
+#[tokio::test]
+async fn the_router_validates_under_the_clients_precision_not_a_default() {
+    // A precision=s body carries second-scale timestamps; validated under
+    // ns they parse, but a precision=s body with ns-scale values would
+    // overflow the multiplier — and the reverse trap, refusing a valid
+    // seconds body under a default, is the one the ticket warned about.
+    // Both directions: the client's precision is used, and an unknown one
+    // is a 400 at the router with nothing forwarded.
+    let (addr, log) = stub_node("", StatusCode::NO_CONTENT).await;
+    let app = router_app(Arc::new(RouterState::new(vec![("ing-a".into(), addr)])));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc&precision=s")
+                .header("content-type", "text/plain")
+                .body(Body::from("cpu,host=h1 v=1i 1786179600\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "seconds body under precision=s"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(log.lock().unwrap().bodies.len(), 1, "and it was forwarded");
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc&precision=bogus")
+                .header("content-type", "text/plain")
+                .body(Body::from("cpu,host=h1 v=1i 1786179600\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "an unknown precision is refused at the router"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        log.lock().unwrap().bodies.len(),
+        1,
+        "nothing more was forwarded"
+    );
+}
+
+#[tokio::test]
 async fn a_poison_line_writes_nothing_anywhere() {
     // Atomicity across shards: the whole body is validated before any of it
     // is forwarded, so a bad line cannot leave half a batch written.

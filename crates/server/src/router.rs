@@ -355,8 +355,37 @@ async fn write(
         Err(_) => return err(StatusCode::BAD_REQUEST, "body is not utf-8"),
     };
 
-    // Validate the WHOLE body before forwarding anything (atomicity), and
-    // group original lines by their shard target in the same pass.
+    // Parse the WHOLE body exactly as an ingester would, before forwarding
+    // anything (#38). The loop below only checked that each line had a
+    // measurement, so "poison line writes zero" was true of a line with no
+    // measurement and false of one with a bad field value: that line
+    // reached one shard and was refused there, after every other shard
+    // had already been acknowledged — a partial landing the client saw as
+    // a 400, which an agent then quarantined as poison while the rest of
+    // its batch sat durable in the database. Same parser, same precision
+    // the client asked for (a seconds-precision body must not be refused
+    // for "bad timestamp" under a default of ns), same error text, so the
+    // router's 400 reads like an ingester's. Cost: one extra parse per
+    // body, measured with Gauge through the router before this landed.
+    let mult = match precision.as_deref() {
+        None => 1,
+        Some(p) => match timelake_ingest::precision_multiplier(p) {
+            Some(m) => m,
+            None => {
+                state.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return err(StatusCode::BAD_REQUEST, &format!("bad precision {p:?}"));
+            }
+        },
+    };
+    if let Err(e) = timelake_ingest::parse_lines(text, mult, 0) {
+        state.stats.rejected.fetch_add(1, Ordering::Relaxed);
+        return err(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+
+    // Group original lines by their shard target. (Every line has a
+    // measurement now — the parse above refused any that did not — but the
+    // check stays as the loop's own guard rather than an assumption about
+    // the code twenty lines up.)
     let mut shards: Vec<String> = vec![String::new(); state.targets.len()];
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
