@@ -220,7 +220,9 @@ fn sql_info() -> &'static SqlInfoData {
         let mut b = SqlInfoDataBuilder::new();
         b.append(SqlInfo::FlightSqlServerName, "TimeLakeDB");
         b.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
-        b.append(SqlInfo::FlightSqlServerArrowVersion, "58");
+        // The arrow crate's own version, not a literal: "58" sat here through
+        // the DataFusion 55 bump that took arrow to 59 (#39).
+        b.append(SqlInfo::FlightSqlServerArrowVersion, arrow::ARROW_VERSION);
         b.append(SqlInfo::FlightSqlServerReadOnly, true);
         b.append(SqlInfo::SqlDdlCatalog, false);
         b.append(SqlInfo::SqlDdlSchema, false);

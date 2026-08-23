@@ -105,6 +105,13 @@ async fn health_payload_is_the_adapter_contract() {
     assert_eq!(v["status"], "pass");
     assert_eq!(v["name"], "timelakedb");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    // And nothing that rots: a `milestone` field said "M3" for two weeks
+    // after M5 and five cluster phases had shipped (#39). If a status
+    // field comes back, it needs a source of truth, not a literal.
+    assert!(
+        v.get("milestone").is_none(),
+        "/health must not carry a hand-typed milestone: {v}"
+    );
 }
 
 #[tokio::test]

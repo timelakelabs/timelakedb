@@ -4,8 +4,12 @@
 //! Two streams land in the `_system` database:
 //!
 //! * **`_system.metrics`** — a periodic snapshot of the whole `/metrics`
-//!   exposition, one sample every `TIMELAKE_SELFMON_SECS` (default 10, the
-//!   interval §7.2 specifies).
+//!   exposition, one sample per maintenance tick (10 s, the interval §7.2
+//!   specifies). Deliberately no knob of its own: this comment used to name
+//!   a `TIMELAKE_SELFMON_SECS` that nothing read (#39), and a real one would
+//!   break the property that makes the stored numbers trustworthy — one
+//!   sample per tick, taken before the tick's other stages run, is what
+//!   keeps `_system.metrics` and `/metrics` describing the same moment.
 //! * **`_system.queries`** — one row per finished query, from the
 //!   [`timelake_query::QueryObserver`] hook. Exact durations rather than
 //!   bucket bounds, so a p99 is computed from the real distribution and can

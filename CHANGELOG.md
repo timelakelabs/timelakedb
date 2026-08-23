@@ -56,6 +56,21 @@ measurement-presence loop always did; if a future body size makes that
 visible, `spawn_blocking` is the next move and the number to beat is
 written down.
 
+### Fixed — three literals that were true when typed and never again (2026-08-23)
+
+`/health` reported `"milestone":"M3"` — typed on 2026-08-08 and untouched
+while M4, M5 and five cluster phases shipped, so the first thing a new
+user curls told them something false. Gone, not bumped: nothing parsed
+it (grep of every sibling repo), and there is no milestone concept that
+survives the cluster phases, so any value would rot the same way. The
+`/health` test now pins its absence. Flight `SqlInfo` reported Arrow
+`"58"` against arrow 59.2 — a literal that sat through the DataFusion 55
+bump; it is `arrow::ARROW_VERSION` now, and cannot drift again. And the
+self-monitoring module's doc comment named a `TIMELAKE_SELFMON_SECS`
+that no code read — an operator who set it because the source told them
+to got a knob that silently did nothing, which RR-5 names as a failure.
+The sentence says why there is deliberately no such knob instead (#39).
+
 ### Fixed — tokens issued or revoked on one node take effect on every node within a tick (2026-08-23)
 
 Every node in a cluster shares one bucket and so one

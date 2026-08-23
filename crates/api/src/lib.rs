@@ -976,12 +976,18 @@ async fn admin_delete<E: Engine>(
     }
 }
 
+/// `status`, `name`, `version` — the contract Gauge's adapter and the
+/// compose healthchecks read. There used to be a fourth field, `milestone`,
+/// typed as `"M3"` in August and never touched again while M4, M5 and five
+/// cluster phases shipped: the first thing a new user curls told them
+/// something false. Nothing parsed it (grep of every sibling repo), and
+/// there is no milestone concept that survives the cluster phases, so it
+/// is gone rather than bumped to a value that would rot the same way (#39).
 async fn health() -> Json<Value> {
     Json(json!({
         "status": "pass",
         "name": "timelakedb",
         "version": env!("CARGO_PKG_VERSION"),
-        "milestone": "M3",
     }))
 }
 
