@@ -43,7 +43,7 @@ services:
     container_name: timelake-grafana-tls
     profiles: ["grafana"]
     ports:
-      - "3004:3000"
+      - "3006:3000"   # was 3004 — the console rig's Grafana (#42); at6_grafana_mtls.py follows
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin

@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-GRAFANA = "http://localhost:3004"
+GRAFANA = "http://localhost:3006"  # the TLS rig's Grafana; 3004 is the console rig's (#42)
 AUTH = "admin:admin"
 CONTAINER = "timelakedb-tls"
 DASHBOARDS = pathlib.Path(__file__).resolve().parents[3] / "fixtures" / "grafana" / "dashboards"

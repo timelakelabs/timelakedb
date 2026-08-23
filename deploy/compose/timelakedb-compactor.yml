@@ -11,7 +11,7 @@
 #
 # Bring it up and you should see:
 #
-#   node       | healthy, serving writes and queries on 5963
+#   node       | healthy, serving writes and queries on 7965
 #   compactor  | exited 2: "TIMELAKE_ROLE=compactor is not yet implemented"
 #
 # That second line is the expected result today. When the gate opens, this
@@ -37,7 +37,7 @@ services:
     container_name: tl-node
     hostname: tl-node
     ports:
-      - "5963:1963"
+      - "7965:1963"   # was 5963 — the CL-2 cluster rig's ingester-a (#42)
     environment:
       TIMELAKE_ROLE: all
       TIMELAKE_NODE_ID: tl-node
@@ -61,7 +61,7 @@ services:
     hostname: tl-compactor
     ports:
       # health/metrics only — there is no data plane on this node
-      - "5965:1963"
+      - "7966:1963"
     environment:
       TIMELAKE_ROLE: compactor
       TIMELAKE_NODE_ID: tl-compactor
