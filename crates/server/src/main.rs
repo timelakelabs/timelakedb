@@ -95,9 +95,15 @@ async fn main() {
                  (a query must union every shard, so no ingester can answer it)"
             );
         }
-        let state = Arc::new(timelake_server::router::RouterState::with_queriers(
-            ingesters, queriers,
-        ));
+        // The router opens no engine, so it reads the one engine setting it
+        // shares with the ingesters — TIMELAKE_MAX_BODY_BYTES — from the
+        // same parser the engine uses, rather than re-deriving a default
+        // here that could drift (#36).
+        let max_body_bytes = timelake_server::config_from_env().max_body_bytes;
+        let state = Arc::new(
+            timelake_server::router::RouterState::with_queriers(ingesters, queriers)
+                .with_max_body_bytes(max_body_bytes),
+        );
         tracing::info!(
             ingesters = ?state.target_ids(),
             queriers = ?state.querier_ids(),

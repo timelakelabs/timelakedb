@@ -501,12 +501,11 @@ Genuinely optional for production; they make it a *product*.
   **done 2026-08-22 (#41).** Measured first: the line was accepted, every
   `SELECT` on the table failed, and the table could no longer *flush*, so
   the WAL held it forever. Now a 400 at parse, before the WAL.
-- A router-role node carries no `DefaultBodyLimit`, so it falls back to
-  axum's 2 MiB default while the ingesters it fronts accept
-  `TIMELAKE_MAX_BODY_BYTES` (32 MiB) — the 2026-08-13 fix covered the
-  data-plane and internal routers and missed this one
-  (`crates/server/src/router.rs` `router_app`). One `.layer(...)`, but it
-  needs the config value threaded into `main.rs`'s router branch.
+- ~~A router-role node carries no `DefaultBodyLimit`, so it falls back to
+  axum's 2 MiB default~~ — **done 2026-08-22 (#36).** The limit lives on
+  `RouterState`, defaults to the engine's, and `main.rs` sets it from
+  `TIMELAKE_MAX_BODY_BYTES` through `config_from_env`; pinned by a 3 MiB
+  pass-through and a 1 KiB-configured 413 in `tests/router.rs`.
 - The router forwards writes without the client's `Authorization`
   header, so a cluster behind a router cannot run
   `TIMELAKE_DATA_AUTH=required` on its ingesters today (every forwarded
