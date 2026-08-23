@@ -16,8 +16,12 @@ services:
     build: ../..
     container_name: timelake-console-db
     ports:
-      - "4963:1963"   # HTTP: writes, /api/sql, /metrics
-      - "4964:1964"   # Flight SQL — what Grafana reads
+      # 4973/4974 — were 4963/4964, shared with timelakedb-dataauth.yml, which
+      # Riverkeeper and Catchment reach by those numbers; this rig moved
+      # because nothing outside the repo reaches it by port (#42). Grafana
+      # stays on 3004, which CLAUDE.md and the site cite.
+      - "4973:1963"   # HTTP: writes, /api/sql, /metrics
+      - "4974:1964"   # Flight SQL — what Grafana reads
     environment:
       TIMELAKE_QUERY_MEM_BYTES: "1073741824"
       TIMELAKE_MAX_CONCURRENT_QUERIES: "4"

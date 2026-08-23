@@ -11,16 +11,21 @@
 # rules in the UI; only deploy/compose/alert-drill/alert_drill.sh proves one
 # of them changes state when the data changes, which is the entire claim.
 #
-# Ports are offset from timelakedb.yml (1963/1964/3003) and
-# timelakedb-console.yml (4963/4964/3004) so all three can run at once.
+# Host ports 7963/7964 + 3005. They used to be 5963/5964, which is the
+# CL-2 cluster rig's ingester pair (and the compactor rig's node): a
+# leftover cluster container made this `up` fail, or — worse — let the
+# drill write its probe rows into an ingester and wait for a rule on a
+# different rig to fire. `deploy/compose/check-ports.sh` lists every host
+# port in this directory and fails on a duplicate; run it before choosing
+# a number (#42).
 name: timelake-alerting
 services:
   timelakedb:
     build: ../..
     container_name: timelake-alert-db
     ports:
-      - "5963:1963"   # HTTP: writes, /api/sql, /metrics
-      - "5964:1964"   # Flight SQL — what Grafana's alert queries read
+      - "7963:1963"   # HTTP: writes, /api/sql, /metrics
+      - "7964:1964"   # Flight SQL — what Grafana's alert queries read
     environment:
       TIMELAKE_NODE_ID: "alert-node"
       TIMELAKE_QUERY_MEM_BYTES: "1073741824"

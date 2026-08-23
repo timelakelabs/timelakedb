@@ -8,6 +8,9 @@ services:
     build: ../..
     container_name: timelakedb-da
     ports:
+      # 4963/4964 stay: Riverkeeper's and Catchment's stack tables point at
+      # this rig by these numbers (riverkeeper/stack.py, catchment/stack.py).
+      # The console rig, which used to share them, moved instead (#42).
       - "4963:1963"
       - "4964:1964"
     environment:

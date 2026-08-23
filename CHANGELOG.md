@@ -13,6 +13,32 @@ here.
 
 ## [Unreleased]
 
+### Fixed — no two compose rigs publish the same host port any more (2026-08-23)
+
+Three pairs did: the alerting rig and the CL-2 cluster rig (and the
+compactor rig's node) on 5963/5964, the console and data-auth rigs on
+4963/4964, the TLS and console rigs' Grafanas on 3004. Each rig was added
+on a different day and picked a free-looking number; nobody grepped. The
+cost is not the "port is already allocated" — that one at least fails —
+it is the half-down case, where the second rig's drill writes its probe
+rows into the first rig's node and waits for something on a different
+stack to react (#42).
+
+Moved: alerting → 7963/7964, compactor → 7965/7966, the console rig's
+data ports → 4973/4974, TLS Grafana → 3006 (`at6_grafana_mtls.py`
+follows). Left alone, deliberately: `timelakedb.yml` (1963/1964/3003 —
+every external document points at it), the cluster rigs (every cluster
+drill, and Catchment's `ingester_kill`, reach them by number), the
+data-auth rig's 4963/4964 — the first cut moved *that* one, and a grep of
+the sibling repos found Riverkeeper's and Catchment's stack tables both
+pointing at it, so the console moved instead — the console's Grafana on
+3004 (cited in CLAUDE.md and on the site), and `docs/evidence/**`, which
+are transcripts of runs on the old numbers and keep saying so.
+
+`deploy/compose/check-ports.sh` lists every host port in the directory
+and exits non-zero on a duplicate — the ticket's done-when, now a
+command rather than a sentence. Run it before choosing a number.
+
 ### Fixed — the router parses the whole body before it forwards, so a poison line writes zero on every shard (2026-08-23)
 
 The router's pre-forward check was "does each line have a measurement",
