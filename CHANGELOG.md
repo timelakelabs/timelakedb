@@ -13,6 +13,46 @@ here.
 
 ## [Unreleased]
 
+### Fixed — a tag or field named `time` is refused at parse; it used to wedge the table (2026-08-22)
+
+`time` is the timestamp column every table gets as field 0, and nothing
+reserved the name. Found by reading the buffer (#41); measured before the
+fix landed, because the issue said to write the test first and watch it:
+
+```
+write "tt,h=a time=1,v=1 ..."   -> 204 No Content
+SELECT * FROM tt                -> 400 query could not be executed (ref: q-00000000)
+DESCRIBE tt                     -> time Timestamp(ns) | h Utf8View | time Float64 | v Float64
+flush_all()                     -> ERR flush incomplete for poc.tt, poc.tg
+COUNT(*) after the flush        -> 400 column 'time' has conflicting types Dictionary(Int32, Utf8) vs Timestamp(...)
+```
+
+So: accepted, unreadable, **unflushable** — which means the WAL holds the
+frame forever, the frame replays on every restart, and the table is wedged
+durably by one line. The same shape as the ragged-column bug of
+2026-08-08, and it has the same fix: a parse error in `crates/ingest`,
+which is a 400 *before* the WAL append. A check in the buffer would have
+been too late — the frame is fsynced by then, and the fix would have had
+to be another "skip unreplayable frame" path.
+
+`tag 'time' is reserved: it is the timestamp column of every table` /
+`field 'time' is reserved: …`, with the line number like every other
+parse error. Only `time` is reserved — InfluxDB also refuses it; it
+additionally reserves Flux's `_measurement`/`_field`/`_time`, which are
+not columns here and a migrated dataset may legitimately carry. A
+measurement called `time`, a tag *value* of `time`, and keys such as
+`time_ms` or `uptime` are untouched (pinned).
+
+One consequence, deliberate: a WAL written before this change that holds
+such a line will log `skipping unreplayable WAL frame` on the next start
+instead of replaying the poison. That is the existing path for a frame
+the parser refuses, and the right one — the frame was never readable.
+
+Pinned by `crates/ingest` (both key positions, line numbers, the
+not-reserved neighbours) and `crates/server/tests/health.rs`
+`a_tag_or_field_named_time_is_refused_before_the_wal` (400 on both
+surfaces, nothing durable, a restart finds no table).
+
 ### Fixed — the rebalance-duplicates finding is closed, and a second one found on the way (2026-08-22)
 
 Catchment's `router-tributary-exactness` composition was re-run seven

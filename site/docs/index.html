@@ -237,9 +237,11 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <h3>Schema rules</h3>
       <p>
         Tags become dictionary-encoded string columns and fields become typed
-        columns; new columns may appear at any time. Rows sharing a primary key
-        (tag set plus timestamp) are de-duplicated last-write-wins at flush, and
-        again across files during compaction.
+        columns; new columns may appear at any time. One key is reserved:
+        <code>time</code> is the timestamp column, so a tag or field named
+        <code>time</code> is refused with a 400 rather than colliding with it.
+        Rows sharing a primary key (tag set plus timestamp) are de-duplicated
+        last-write-wins at flush, and again across files during compaction.
       </p>
       <p>
         The exact grammar, escape set, field-type syntax, timestamp precisions and
