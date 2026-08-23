@@ -493,7 +493,11 @@ promise was replaced by a commit fence.
   never on an HTTP status, which is a real answer — including a querier's
   own refusal to answer from an incomplete cluster. Credential headers
   pass through untouched: the querier is where SEC-2 visibility and SEC-4
-  data auth are decided. A router with no queriers configured still
+  data auth are decided — and on **writes** the client's `Authorization`
+  travels with every shard for the same reason, the ingester being where
+  a write is authenticated (it was dropped there until 2026-08-22, #37,
+  which made `required` mode impossible behind a router; drilled by
+  `deploy/compose/timelakedb-router-auth.yml`). A router with no queriers configured still
   answers 501 rather than guessing at an ingester. Flight SQL is served by
   queriers directly, not forwarded — the router speaks HTTP only.
   Metrics `timelake_router_{forwarded,forward_errors,rejected,ingesters,

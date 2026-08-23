@@ -506,10 +506,15 @@ Genuinely optional for production; they make it a *product*.
   `RouterState`, defaults to the engine's, and `main.rs` sets it from
   `TIMELAKE_MAX_BODY_BYTES` through `config_from_env`; pinned by a 3 MiB
   pass-through and a 1 KiB-configured 413 in `tests/router.rs`.
-- The router forwards writes without the client's `Authorization`
-  header, so a cluster behind a router cannot run
-  `TIMELAKE_DATA_AUTH=required` on its ingesters today (every forwarded
-  shard would be refused 401). Queries *do* pass the header through.
+- ~~The router forwards writes without the client's `Authorization`
+  header~~ — **done 2026-08-22 (#37).** Every shard now carries it; rig
+  `deploy/compose/timelakedb-router-auth.yml` + drill
+  `cluster-drill/router_auth_drill.sh` (`docs/evidence/router-auth-drill.log`).
+  Still true and now its own question: each node loads
+  `catalog/config/tokens.json` at boot only, so a token issued on one
+  ingester's console is unknown to its peer until that peer restarts —
+  with a shared object store the file is shared, the in-memory copy is
+  not.
 - Helm chart, packaging, versioned upgrade/rollback policy.
 - **Tributary L6 (Arrow wire protocol) — explicitly do not start.** Its
   own roadmap gates this on L3 proving line protocol is the bottleneck.

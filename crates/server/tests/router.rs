@@ -35,47 +35,51 @@ type Log = Arc<Mutex<Received>>;
 async fn stub_node(reply: &'static str, status: StatusCode) -> (String, Log) {
     let log: Log = Arc::new(Mutex::new(Received::default()));
     let state = Arc::clone(&log);
-    let app =
-        axum::Router::new()
-            .route(
-                "/api/v3/write_lp",
-                axum::routing::post(
-                    |axum::extract::State(log): axum::extract::State<Log>,
-                     body: axum::body::Bytes| async move {
-                        log.lock()
-                            .unwrap()
-                            .bodies
-                            .push(String::from_utf8_lossy(&body).into_owned());
-                        StatusCode::NO_CONTENT
-                    },
-                ),
-            )
-            .route(
-                "/api/sql",
-                axum::routing::post(
-                    move |axum::extract::State(log): axum::extract::State<Log>,
-                          headers: axum::http::HeaderMap,
-                          body: axum::body::Bytes| async move {
-                        {
-                            let mut r = log.lock().unwrap();
-                            r.bodies.push(String::from_utf8_lossy(&body).into_owned());
-                            r.authorization = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_string);
-                            r.authorizations = headers
-                                .get("x-timelake-authorizations")
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_string);
-                        }
-                        (status, reply)
-                    },
-                ),
-            )
-            // The stub must take what the router forwards, or a large-body
-            // test would measure the stub's limit rather than the router's.
-            .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
-            .with_state(state);
+    let app = axum::Router::new()
+        .route(
+            "/api/v3/write_lp",
+            axum::routing::post(
+                |axum::extract::State(log): axum::extract::State<Log>,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    let mut r = log.lock().unwrap();
+                    r.bodies.push(String::from_utf8_lossy(&body).into_owned());
+                    // Recorded per write so a test can see whether the
+                    // client's credential reached the node (#37).
+                    r.authorization = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        )
+        .route(
+            "/api/sql",
+            axum::routing::post(
+                move |axum::extract::State(log): axum::extract::State<Log>,
+                      headers: axum::http::HeaderMap,
+                      body: axum::body::Bytes| async move {
+                    {
+                        let mut r = log.lock().unwrap();
+                        r.bodies.push(String::from_utf8_lossy(&body).into_owned());
+                        r.authorization = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        r.authorizations = headers
+                            .get("x-timelake-authorizations")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                    }
+                    (status, reply)
+                },
+            ),
+        )
+        // The stub must take what the router forwards, or a large-body
+        // test would measure the stub's limit rather than the router's.
+        .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -431,6 +435,76 @@ async fn the_router_body_limit_is_the_configured_one_not_axums() {
         log.lock().unwrap().bodies.is_empty(),
         "nothing may be forwarded from a refused body"
     );
+}
+
+#[tokio::test]
+async fn a_write_carries_the_clients_authorization_to_every_shard() {
+    // The ingester is where a write is authenticated (SEC-4); the router
+    // holds no token store and must not grow one. It used to forward a
+    // shard with only `db` and `precision`, so behind a router an ingester
+    // in `required` mode refused every write 401 and in `optional` mode
+    // counted every router write as anonymous — the split an operator
+    // flips on measured the router, not the clients (#37). The /api/sql
+    // forward had carried the header from day one; this pins that writes
+    // do too, to *each* shard, and that a write without one forwards none.
+    let (addr_a, log_a) = stub_node("", StatusCode::NO_CONTENT).await;
+    let (addr_b, log_b) = stub_node("", StatusCode::NO_CONTENT).await;
+    let app = router_app(Arc::new(RouterState::new(vec![
+        ("ing-a".into(), addr_a),
+        ("ing-b".into(), addr_b),
+    ])));
+    let body: String = (0..20)
+        .map(|i| {
+            format!(
+                "table_{i},host=h{i} v={i}i {}\n",
+                1_786_179_600_000_000_000i64 + i
+            )
+        })
+        .collect();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain")
+                .header("authorization", "Bearer tldb_not-a-real-secret")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    for (name, log) in [("ing-a", &log_a), ("ing-b", &log_b)] {
+        let r = log.lock().unwrap();
+        assert!(!r.bodies.is_empty(), "{name} received a shard");
+        assert_eq!(
+            r.authorization.as_deref(),
+            Some("Bearer tldb_not-a-real-secret"),
+            "{name} must see the client's credential on its shard"
+        );
+    }
+
+    // And the router invents nothing: an anonymous write arrives anonymous.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    for (name, log) in [("ing-a", &log_a), ("ing-b", &log_b)] {
+        assert_eq!(
+            log.lock().unwrap().authorization,
+            None,
+            "{name}: an anonymous write must not acquire a credential in transit"
+        );
+    }
 }
 
 #[tokio::test]
