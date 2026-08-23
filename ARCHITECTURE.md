@@ -481,7 +481,11 @@ promise was replaced by a commit fence.
   table's primary and replicates to its CL-2 peer, so durability is
   unchanged. It is the single write endpoint the bench adapter, Telegraf
   and Grafana keep seeing (FR-8/FR-9). Atomicity holds: the whole body is
-  validated before any shard is forwarded, so a poison line writes zero;
+  parsed with the ingesters' own parser, under the client's precision,
+  before any shard is forwarded, so a poison line writes zero (until
+  2026-08-23 the check was measurement-presence only and a bad *field*
+  landed every shard but its own — #38; the cost of the full parse was
+  measured with Gauge through the router before it landed);
   a shard forward that fails for infrastructure reasons is returned for an
   idempotent retry (LWW dedup). Sharding is FNV-1a over `db\0measurement`
   mod N (stable across restarts), with the ingester list sorted so a table

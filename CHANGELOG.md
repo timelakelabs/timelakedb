@@ -13,6 +13,49 @@ here.
 
 ## [Unreleased]
 
+### Fixed — the router parses the whole body before it forwards, so a poison line writes zero on every shard (2026-08-23)
+
+The router's pre-forward check was "does each line have a measurement",
+plus gzip and UTF-8 for the body. `ARCHITECTURE.md` §12.4 and the README
+said "the whole body is validated before any shard is forwarded, so a
+poison line writes zero", and that was true of the poison line the drill
+used (no measurement) and false of the ordinary kind: a line with a bad
+field value passed the router, reached exactly one shard and was refused
+there — after every other shard had already been acknowledged. The
+client saw a 400; the rest of its batch was durable. An agent treating
+a 400 as poison then quarantines rows that are already in the database
+(#38).
+
+The router now runs `timelake_ingest::parse_lines` over the decompressed
+body, under the precision the client asked for, before it sends
+anything; a parse error is a 400 in the ingester's own words (`line 21:
+bad float "notanumber" in …`) and nothing leaves the router. An unknown
+`precision` is a 400 at the router too. The measurement-presence loop
+stays as the sharding pass.
+
+**Cost, measured with Gauge through the router before landing** (the
+router + 2 ingesters + 2 queriers rig, `--scale laptop`, fresh rig per
+run, two before and two after on an idle box): ingest 530,176 / 522,969
+→ 500,610 / 502,434 lines/s, **−4.8%** on the pair medians, batch p95
+unchanged (102–106 ms), `rows_48h` exact on both after runs. Host ingest
+and burst within noise. Runs `timelakedb-router-validate-{before-1,
+before-2,after-3,after-4}` in Gauge's results; the reasoning and the
+lesson are in `gauge/PERFORMANCE_LOG.md`. The lesson is worth repeating
+here: the first two "after" runs read 110K and 251K lines/s — a 2–5×
+collapse — because the test suite was compiling on the same box. Not
+recorded. A delta that looks like a story usually is one.
+
+Pinned: `tests/router.rs` —
+`a_field_level_poison_line_writes_nothing_anywhere_either` (20 good
+lines across both shards plus one bad float → 400 naming line 21 and the
+fault, and neither stub received a byte) and
+`the_router_validates_under_the_clients_precision_not_a_default`
+(`precision=s` body accepted and forwarded; `precision=bogus` a 400 with
+nothing forwarded). The parse runs on the request task, as the
+measurement-presence loop always did; if a future body size makes that
+visible, `spawn_blocking` is the next move and the number to beat is
+written down.
+
 ### Fixed — tokens issued or revoked on one node take effect on every node within a tick (2026-08-23)
 
 Every node in a cluster shares one bucket and so one
