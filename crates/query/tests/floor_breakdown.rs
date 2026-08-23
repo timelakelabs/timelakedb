@@ -65,7 +65,7 @@ fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn report(label: &str, samples: &mut Vec<f64>) -> f64 {
+fn report(label: &str, samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
     println!(
