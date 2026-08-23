@@ -37,32 +37,22 @@ permissions:
 jobs:
   rust:
     name: fmt · clippy · tests · coverage
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, wsl]
     steps:
       - uses: actions/checkout@v4
 
-      # A 16-crate workspace built --all-targets, then rebuilt instrumented
-      # for coverage, does not fit on a hosted runner beside its preinstalled
-      # images: run 31561992129 reached 87 MB free and `ld` died with SIGBUS
-      # mid-link. That reads as a test failure in the log and is not one —
-      # the same sha passes in a stock rust:1-slim container. None of what is
-      # removed below is used by this job.
-      #
-      # The original list (dotnet/ghc/android/CodeQL) left the margin thin
-      # enough that a lockfile refresh alone re-crossed it (run 31901364946:
-      # "No space left on device" in the same llvm-cov link). Freeing the
-      # rest of the language runtimes this job never touches, plus the
-      # preloaded Docker images, restores real headroom (~10+ GB).
-      - name: Reclaim runner disk
-        run: |
-          echo "before: $(df -h --output=avail / | tail -1) available"
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost /usr/lib/jvm /usr/local/graalvm \
-                      /usr/local/share/powershell /usr/share/swift \
-                      /usr/local/share/chromium
-          sudo docker image prune -af || true
-          echo "after:  $(df -h --output=avail / | tail -1) available"
+      # There used to be a "Reclaim runner disk" step here that rm -rf'd
+      # /usr/share/dotnet, /opt/ghc, /usr/lib/jvm and friends and pruned
+      # every Docker image, because a 16-crate --all-targets build plus an
+      # instrumented rebuild for coverage did not fit on a GitHub-hosted
+      # runner beside its preinstalled images (runs 31561992129 and
+      # 31901364946: `ld` died at 87 MB free). On an ephemeral runner that
+      # is free. On the self-hosted WSL runner this job now lands on it is
+      # destructive — a persistent box that would lose system directories
+      # and every cached image on every push — and unnecessary: the distro
+      # has ~950 GB free, which is the whole reason it exists
+      # (ops/WSL_RUNNERS.md in the umbrella repo, umbrella#2). If this job
+      # ever moves back to ubuntu-latest, the step must come back with it.
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -88,7 +78,7 @@ jobs:
 
   store-s3:
     name: store-s3 · S3 + KMS against LocalStack
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, wsl]
     # The three #[ignore]d tests in timelake-store-s3 are the only ones that
     # touch a real object store: the Store contract over S3 (including range
     # reads), the KMS envelope round-trip, and the P0-4 two-writer catalog
@@ -139,7 +129,7 @@ jobs:
 
   conformance:
     name: catchment · conformance (tier 1)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, wsl]
     steps:
       - uses: actions/checkout@v4
 
@@ -229,7 +219,7 @@ jobs:
 
   publish:
     name: publish · ghcr image for downstream conformance
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, wsl]
     # Only from the default branch, and only once every gate is green.
     # Tributary's conformance job consumes this image rather than
     # compiling the database on every one of its pull requests — the one

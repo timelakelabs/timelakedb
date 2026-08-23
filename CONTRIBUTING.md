@@ -93,7 +93,13 @@ a second enforcement point.
 
 ## What CI enforces
 
-`.github/workflows/ci.yml` runs, and a pull request must pass:
+`.github/workflows/ci.yml` runs on two self-hosted runners (the
+`timelakelabs` org's `wsl-*` pair — a WSL2 Ubuntu distro on the
+maintainer's machine, `ops/WSL_RUNNERS.md` in the umbrella repo), because
+GitHub-hosted minutes hit the org's spending limit in August 2026 and the
+jobs stopped starting without ever going red. Self-hosted is unmetered;
+the trade is that CI runs only while that machine is on. If a PR's checks
+sit queued, that is the machine, not your change. A pull request must pass:
 
 ```bash
 cargo fmt --all --check
