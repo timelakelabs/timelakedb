@@ -137,10 +137,13 @@
             different type than Str("oops")</code>.</li>
         <li>New tags and fields may appear at any time; earlier rows read back as
             <code>null</code> for them.</li>
-        <li>Do not name a tag or field <code>time</code>. The server emits its own
-            <code>time</code> column first and does not yet refuse the name on the
-            write path, so such a line produces a duplicate column at read time
-            rather than a clean 400.</li>
+        <li><code>time</code> is reserved: it is the timestamp column of every
+            table, so a tag or field with that key is refused with a 400 naming
+            the line, before anything is made durable. (Before 2026-08-22 it was
+            accepted, produced a second <code>time</code> column, and the table
+            could no longer be read or flushed.) A <em>measurement</em> called
+            <code>time</code>, a tag <em>value</em> of <code>time</code>, and keys
+            like <code>time_ms</code> or <code>uptime</code> are all fine.</li>
         <li>A key repeated inside one line takes its <strong>last</strong> value, for
             both tags and fields.</li>
         <li>An empty tag value (<code>h=</code>) is stored as an empty string. InfluxDB
@@ -176,6 +179,7 @@
 {"error":"line 1: no field set in \"probe,h=a\""}
 {"error":"line 1: tag 'h' has no value in \"probe,h v=1\""}
 {"error":"line 1: bad timestamp \"abc\" in \"probe,h=a v=1 abc\""}
+{"error":"line 1: field 'time' is reserved: it is the timestamp column of every table in \"probe,h=a time=1,v=1\""}
 {"error":"bad precision \"bogus\""}
 {"error":"missing 'db' parameter"}</pre>
       </div>

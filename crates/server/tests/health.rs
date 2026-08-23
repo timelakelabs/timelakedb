@@ -59,6 +59,19 @@ async fn write_lp(
         .status()
 }
 
+/// Like `write_lp`, but hands back the body too — for asserting *what* a
+/// refusal says, not only that it refused.
+async fn write_lp_full(app: &axum::Router, path: &str, body: &str) -> (StatusCode, String) {
+    let req = Request::post(path)
+        .header("content-type", "text/plain")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn sql(app: &axum::Router, db: &str, q: &str) -> (StatusCode, serde_json::Value) {
     let req = Request::post("/api/sql")
         .header("content-type", "application/json")
@@ -630,6 +643,55 @@ async fn a_rejected_write_cannot_poison_the_table_or_the_engine() {
     let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
     assert_eq!(code, StatusCode::OK, "restart must not replay the poison");
     assert_eq!(rows[0]["n"], 2);
+}
+
+#[tokio::test]
+async fn a_tag_or_field_named_time_is_refused_before_the_wal() {
+    // `time` is the timestamp column every table gets as field 0. A user
+    // tag or field with the same name produced a second `time` column in
+    // the Arrow schema — and because the check lived nowhere, the line was
+    // fsynced to the WAL first and replayed on every restart. Same shape as
+    // the ragged-column bug above; same rule: refuse it at parse, before
+    // the engine sees it (#41).
+    let dir = tempfile::tempdir().unwrap();
+    let t = now_ns();
+    let app = timelake_server::app(engine(dir.path()));
+
+    for (what, line) in [
+        ("field", format!("tt,h=a time=1,v=1 {t}")),
+        ("tag", format!("tt,time=x v=1 {t}")),
+    ] {
+        let (code, body) = write_lp_full(&app, "/api/v3/write_lp?db=poc", &line).await;
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "a {what} named time is a 400: {body}"
+        );
+        assert!(
+            body.contains("'time'") && body.contains("line 1"),
+            "the refusal names the key and the line: {body}"
+        );
+    }
+
+    // still an ordinary name everywhere else: a *measurement* called time,
+    // a tag *value* of time, and keys that merely contain it
+    let (code, body) = write_lp_full(
+        &app,
+        "/api/v3/write_lp?db=poc",
+        &format!("time,h=time time_ms=1,uptime=2 {t}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+
+    // nothing from the refused lines reached the WAL: after a restart the
+    // table `tt` does not exist
+    drop(app);
+    let app = timelake_server::app(engine(dir.path()));
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM tt").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "tt must not exist: {rows}");
+    let (code, rows) = sql(&app, "poc", "SELECT COUNT(*) AS n FROM time").await;
+    assert_eq!(code, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["n"], 1);
 }
 
 /// /api/sql with an authorizations header — the SEC-2 wire contract.

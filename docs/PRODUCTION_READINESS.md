@@ -497,9 +497,10 @@ Genuinely optional for production; they make it a *product*.
   with P0-2**: the read-only guard refuses DDL explicitly, so a
   `DROP TABLE` no longer appears to succeed while doing nothing.
 - Manifest replay should skip non-`.json` files (known, small).
-- A tag or field named `time` is not refused on the write path, and the
-  buffer emits its own `time` column first, so such a line produces a
-  duplicate Arrow field name at read time. Small; refuse it at parse.
+- ~~A tag or field named `time` is not refused on the write path~~ —
+  **done 2026-08-22 (#41).** Measured first: the line was accepted, every
+  `SELECT` on the table failed, and the table could no longer *flush*, so
+  the WAL held it forever. Now a 400 at parse, before the WAL.
 - A router-role node carries no `DefaultBodyLimit`, so it falls back to
   axum's 2 MiB default while the ingesters it fronts accept
   `TIMELAKE_MAX_BODY_BYTES` (32 MiB) — the 2026-08-13 fix covered the

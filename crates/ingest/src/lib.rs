@@ -92,6 +92,7 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
         if pos >= bytes.len() || bytes[pos] != b'=' {
             return Err(format!("tag '{key}' has no value"));
         }
+        reject_reserved_key("tag", &key)?;
         pos += 1;
         let val = take_escaped(bytes, &mut pos, b",")?;
         tags.push((key, val));
@@ -109,6 +110,7 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
         if pos >= bytes.len() || bytes[pos] != b'=' {
             return Err(format!("field '{key}' has no value"));
         }
+        reject_reserved_key("field", &key)?;
         pos += 1;
         let val = take_field_value(bytes, &mut pos)?;
         fields.push((key, val));
@@ -146,6 +148,36 @@ fn parse_line(line: &str, mult: i64, default_ts_ns: i64) -> Result<ParsedLine, S
         fields,
         timestamp_ns,
     })
+}
+
+/// The one key a tag or field may not use.
+///
+/// `time` is the timestamp column every table gets as field 0 — the
+/// buffer emits it unconditionally and then the tag and field columns by
+/// name, so a user key called `time` produced a schema with two `time`
+/// columns. Measured before this check existed: the write was a 204,
+/// every `SELECT` on the table failed, `DESCRIBE` listed `time` twice,
+/// and **the table could no longer flush** (`flush incomplete for
+/// poc.tt`), which means the WAL held its frame forever and replayed it
+/// on every restart. One line, one table wedged durably — the same shape
+/// as the ragged-column bug of 2026-08-08, and the reason the check lives
+/// here in the parser rather than in the buffer: a parse error is a 400
+/// *before* the WAL append, so nothing is ever made durable that cannot be
+/// read back.
+///
+/// Only `time` is reserved. InfluxDB refuses it too (`invalid field name:
+/// time`); it also reserves Flux's `_measurement`/`_field`/`_time`, but
+/// this read surface is SQL over the schema as written, and a migrated
+/// dataset with a tag called `_field` is legitimate here.
+const RESERVED_KEY: &str = "time";
+
+fn reject_reserved_key(kind: &str, key: &str) -> Result<(), String> {
+    if key == RESERVED_KEY {
+        return Err(format!(
+            "{kind} '{key}' is reserved: it is the timestamp column of every table"
+        ));
+    }
+    Ok(())
 }
 
 /// Read until an unescaped stop byte or space (exclusive); unescapes
@@ -301,6 +333,38 @@ mod tests {
             vec![("city".to_string(), "Köln, Deutschland".to_string())]
         );
         assert_eq!(rows[0].fields[0].1, FieldValue::Str("ü\"ü".into()));
+    }
+
+    #[test]
+    fn a_tag_or_field_named_time_is_refused_and_names_itself() {
+        // The timestamp column is `time`; a user key of the same name made
+        // a second `time` column and wedged the table (see RESERVED_KEY).
+        for (lp, kind) in [
+            ("tt,h=a time=1,v=1 100", "field"),
+            ("tt,h=a v=1,time=1 100", "field"),
+            ("tt,time=x v=1 100", "tag"),
+            ("tt,h=a,time=x v=1 100", "tag"),
+        ] {
+            let err = parse_lines(lp, 1, 0).unwrap_err();
+            assert_eq!(err.line_no, 1, "{lp}");
+            assert!(
+                err.msg.starts_with(&format!("{kind} 'time' is reserved")),
+                "{lp}: {}",
+                err.msg
+            );
+        }
+        // The rejection is per line, with the line number, like every
+        // other parse error — so a client learns which line to fix.
+        let err = parse_lines("ok v=1 100\nbad,time=x v=1 100", 1, 0).unwrap_err();
+        assert_eq!(err.line_no, 2);
+
+        // Still an ordinary name everywhere it is not a column key: a
+        // measurement called `time`, a tag *value* of `time`, and keys that
+        // merely contain it.
+        let rows = parse_lines("time,h=time time_ms=1,uptime=2i 100", 1, 0).unwrap();
+        assert_eq!(rows[0].table, "time");
+        assert_eq!(rows[0].tags, vec![("h".to_string(), "time".to_string())]);
+        assert_eq!(rows[0].fields.len(), 2);
     }
 
     #[test]
