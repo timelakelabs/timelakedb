@@ -156,6 +156,27 @@ pub fn owns_partition(
     if count <= 1 {
         return true;
     }
+    (fnv1a(&[db.as_bytes(), table.as_bytes(), partition.as_bytes()]) % count as u64) as usize
+        == ordinal
+}
+
+/// Which of `count` compactors owns rollup `(db, name)` — the same FNV-1a
+/// scheme as [`owns_partition`], keyed on the rollup identity. With more than
+/// one compactor each rollup is materialised by **exactly one**, so two
+/// compactors never both seal a bucket. That matters: the watermark model
+/// writes each bucket once and does not dedup (§18.3), so two writers would
+/// double it — the very thing seal-once exists to avoid.
+pub fn owns_rollup(db: &str, name: &str, ordinal: usize, count: usize) -> bool {
+    if count <= 1 {
+        return true;
+    }
+    (fnv1a(&[db.as_bytes(), name.as_bytes()]) % count as u64) as usize == ordinal
+}
+
+/// FNV-1a over the chunks joined by a `\0` separator — the router's write
+/// hash (`router::shard_of`), factored so partition and rollup ownership use
+/// exactly the same mixing.
+fn fnv1a(chunks: &[&[u8]]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
     let mut mix = |bytes: &[u8]| {
         for &b in bytes {
@@ -163,12 +184,13 @@ pub fn owns_partition(
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
         }
     };
-    mix(db.as_bytes());
-    mix(&[0]);
-    mix(table.as_bytes());
-    mix(&[0]);
-    mix(partition.as_bytes());
-    (h % count as u64) as usize == ordinal
+    for (i, c) in chunks.iter().enumerate() {
+        if i > 0 {
+            mix(&[0]); // the \0 between fields
+        }
+        mix(c);
+    }
+    h
 }
 
 #[cfg(test)]
@@ -320,5 +342,36 @@ mod tests {
             .collect();
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn rollup_ownership_is_a_total_deterministic_partition() {
+        // count 0 and 1 are unsharded: one compactor owns every rollup.
+        assert!(owns_rollup("poc", "sensor_1m", 0, 0));
+        assert!(owns_rollup("poc", "sensor_1m", 0, 1));
+
+        // Over many rollups and 3 compactors: each rollup owned by exactly
+        // one ordinal, stable, every ordinal getting a share — so no rollup
+        // is materialised by two compactors (which would double a sealed
+        // bucket) and none is orphaned.
+        const N: usize = 3;
+        let mut per_ordinal = [0usize; N];
+        for i in 0..200 {
+            let name = format!("rollup_{i}");
+            let owners: Vec<usize> = (0..N)
+                .filter(|&o| owns_rollup("poc", &name, o, N))
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "rollup {name} owned by {owners:?}, want one"
+            );
+            assert!(owns_rollup("poc", &name, owners[0], N)); // stable
+            per_ordinal[owners[0]] += 1;
+        }
+        assert!(
+            per_ordinal.iter().all(|&c| c > 0),
+            "every compactor should own some rollups, got {per_ordinal:?}"
+        );
     }
 }

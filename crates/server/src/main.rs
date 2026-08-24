@@ -260,17 +260,70 @@ async fn main() {
             compactors = count,
             "compactor up (maintenance only: no writes, no queries; owns 1/{count} of partitions)"
         );
+        // Rollup materialisation (§18.6, the cluster half) reads the SAME
+        // shard union a querier does, so a rollup over a source sharded across
+        // ingesters aggregates every shard, not just the files one node can
+        // see. Set up the live-buffer union from the ingesters in discovery
+        // and keep it fresh the querier's way. With no ingesters (a lone
+        // compactor beside an `all` node) there is no union to build — it
+        // reads files only, which is complete for buckets old enough to have
+        // flushed, and rollups only seal buckets that have aged past lookback.
+        {
+            use timelake_cluster::Discovery;
+            let ingesters: Vec<(String, String)> = discovery
+                .peers_with_role(timelake_cluster::Role::Ingester)
+                .into_iter()
+                .filter(|n| !n.address.is_empty())
+                .map(|n| (n.id, n.address))
+                .collect();
+            if !ingesters.is_empty() {
+                let remote = Arc::new(timelake_server::querier::RemoteBuffers::new(ingesters));
+                engine.set_remote_buffers(Arc::clone(&remote));
+                tracing::info!(
+                    ingesters = ?remote.peer_ids(),
+                    "compactor reads the shard union for rollup materialisation"
+                );
+                tokio::spawn(timelake_server::querier::tail(
+                    Arc::clone(&engine),
+                    remote,
+                    Duration::from_secs(1),
+                ));
+            }
+        }
         let worker = Arc::clone(&engine);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
+                // Pick up rollup definitions made on any node's console — the
+                // compactor serves no admin surface and would otherwise seal
+                // only what it seeded at boot (§18.6). A small store get, off
+                // the async runtime.
+                {
+                    let e = Arc::clone(&worker);
+                    let _ = tokio::task::spawn_blocking(move || e.reload_rollups()).await;
+                }
+                // Materialise the rollups this compactor owns first (§18.6).
+                // It is a QUERY over the source union, so it is async and
+                // lives outside the blocking closure; its fresh target rows
+                // flush in the same tick's flush stage below.
+                if let Err(err) = Arc::clone(&worker).materialize_rollups_once().await {
+                    tracing::error!(%err, stage = "rollup", "compactor stage failed");
+                }
                 let e = Arc::clone(&worker);
                 let res = tokio::task::spawn_blocking(move || {
                     // Tail first. Compacting a stale view is wasted work at
-                    // best; the fence makes it harmless, not useful.
+                    // best; the fence makes it harmless, not useful. (When an
+                    // ingester union is up, the querier tail above already
+                    // keeps the catalog fresh; this covers the no-union case.)
                     e.catch_up_catalog(0);
+                    // Flush what materialisation just wrote, so queriers and
+                    // the next pass's watermark see the sealed buckets — the
+                    // compactor has no other writes, so this is cheap.
+                    if let Err(err) = e.flush_all() {
+                        tracing::error!(%err, stage = "flush", "compactor stage failed");
+                    }
                     // Each stage independent, as in the `all` loop: one
                     // failing stage must not stop the others.
                     if let Err(err) = e.compact_once() {
@@ -301,6 +354,12 @@ async fn main() {
     // so background work never stacks up on itself. A querier owns no
     // data and commits nothing, so it runs none of this.
     let maint = Arc::clone(&engine);
+    // Rollups materialise HERE only on an `all` node. In a role-split cluster
+    // the ingesters also run this tick, but materialisation belongs to the
+    // compactor (§18.6): if an ingester materialised too, it and the compactor
+    // would both seal the same bucket and — the watermark model not deduping —
+    // double it. A cluster with no compactor simply does not downsample.
+    let materialise_here = role == timelake_cluster::Role::All;
     if role != timelake_cluster::Role::Querier {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -315,12 +374,14 @@ async fn main() {
                 // path, since R-1a already hides the rows at read time.
                 let tombstones = n.is_multiple_of(3);
                 // R-2 (§18.3): materialise BEFORE the flush+compact below, so
-                // this pass's rollup rows are flushed to a file and their
-                // cross-pass duplicates collapsed by the overlap-triggered
-                // compaction in THIS tick rather than a later one. It reads
-                // through SQL (async), so it can't live in the blocking
-                // closure; per-rollup failures are logged inside, never fatal.
-                if compact && let Err(err) = Arc::clone(&maint).materialize_rollups_once().await {
+                // this pass's rollup rows flush in the same tick. It reads
+                // through SQL (async), so it can't live in the blocking closure;
+                // per-rollup failures are logged inside, never fatal. Gated to
+                // the `all` node — the compactor owns this in a cluster.
+                if materialise_here
+                    && compact
+                    && let Err(err) = Arc::clone(&maint).materialize_rollups_once().await
+                {
                     tracing::error!(%err, stage = "rollup", "maintenance stage failed");
                 }
                 let e = Arc::clone(&maint);
@@ -339,6 +400,10 @@ async fn main() {
                     // store take effect here within one tick. Cheap — one
                     // small get, hashed before it is parsed.
                     e.reload_tokens();
+                    // R-2: a rollup defined on a peer's console propagates the
+                    // same way, so every node's /admin/rollups agrees and the
+                    // compactor materialising it stays current (§18.6).
+                    e.reload_rollups();
                     if let Err(err) = e.flush_if_needed() {
                         tracing::error!(%err, stage = "flush", "maintenance stage failed");
                     }

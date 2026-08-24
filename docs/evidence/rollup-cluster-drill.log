@@ -1,0 +1,64 @@
+Downsampling, cluster half — rollups materialise on the compactor (#64, §18.6)
+2026-08-24 · router + ingester×2 + querier×2 + compactor + one S3 bucket, NO
+             all-node (deploy/compose/timelakedb-cluster-s3.yml)
+             driven by deploy/compose/cluster-drill/rollup_cluster_drill.sh
+================================================================================
+
+THE CLAIM UNDER TEST: a role-split cluster downsamples correctly. There is no
+`all`-node, so the COMPACTOR materialises the rollup — reading the source
+through the same shard union a querier does (it holds the ingesters as peers
+and reuses RemoteBuffers + the querier tail), writing the target back to the
+shared store through an internal write that bypasses its read-only guard.
+
+What a green run shows:
+  - the compactor comes up in the cluster (shard_count=1, a lone compactor
+    owning every rollup) and reads the ingesters' union;
+  - a write through the router shards to an ingester; the compactor seals the
+    aged-out buckets and writes rollup rows (rows_written > 0) with no
+    all-node anywhere;
+  - the target read back THROUGH A QUERIER is exact: one row per host, the
+    right avg/count, and the counts sum to every source row — none dropped
+    (a missed shard) or doubled (two materialisers);
+  - a second pass writes nothing and the target is unchanged (exactly-once
+    holds through the cluster).
+
+Transcript:
+--------------------------------------------------------------------------------
+
+=== bring the cluster up (router + ingesters + queriers + compactor + S3) ===
+
+=== wait for the public endpoint, a querier, and the compactor ===
+  PASS  cluster up; compactor sees shard_count=1 (1 = lone compactor, owns every rollup)
+
+=== write 6 source rows (3 hosts x 2), pre-aged past the 60s lookback, via the router ===
+  PASS  router accepted the write (204), sharded to an ingester
+
+=== wait for the compactor to materialise the sealed buckets (flush 15s, tick 30s) ===
+  t+8s: compactor rows_written=0; target rows via querier=0
+  t+16s: compactor rows_written=0; target rows via querier=0
+  t+24s: compactor rows_written=0; target rows via querier=0
+  t+32s: compactor rows_written=0; target rows via querier=0
+  t+40s: compactor rows_written=3; target rows via querier=0
+  t+48s: compactor rows_written=3; target rows via querier=0
+  t+56s: compactor rows_written=3; target rows via querier=0
+  t+64s: compactor rows_written=3; target rows via querier=3
+
+=== the compactor materialised it (not an all-node — there is none) ===
+  compactor: rollup_rows_written_total=3  materializations_total=2
+  PASS  the compactor wrote rollup rows — a cluster with no all-node downsampled
+
+=== the target is exact, read back through a querier and the shard union ===
+  [{"host":"h1","v_avg":15.0,"v_count":2},{"host":"h2","v_avg":35.0,"v_count":2},{"host":"h3","v_avg":55.0,"v_count":2}]
+  PASS  one target row per host (3) — every shard's rows reached the compactor
+  PASS  h1 avg=15 count=2 (mean of 10,20)
+  PASS  h3 avg=55 count=2 (mean of 50,60)
+  PASS  counts sum to 6 — all source rows accounted for, none dropped or doubled
+
+=== idempotent: another pass changes nothing ===
+  rows_written before=3 after=3; target rows=3
+  PASS  no new rows written and still 3 target rows — sealed buckets are not re-materialised
+
+=== verdict ===
+  ALL CHECKS PASSED
+
+=== tear down ===
