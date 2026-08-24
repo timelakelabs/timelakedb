@@ -1093,6 +1093,48 @@ impl Engine {
         if need { self.flush_all() } else { Ok(0) }
     }
 
+    /// The write body of [`Engine::write_lp`](timelake_api::Engine::write_lp)
+    /// without the client-facing guards. A rollup materialising on a
+    /// read-only compactor writes its target through this: the write is
+    /// server-generated, not a client write, so the `read_only` refusal and
+    /// the data-plane reject accounting (both in the trait `write_lp`) do not
+    /// apply to it. Everything durability-critical stays — parse before the
+    /// WAL, the WAL cap, replication, the buffer apply.
+    pub fn write_lp_internal(
+        &self,
+        db: &str,
+        body: &[u8],
+        precision: Option<&str>,
+    ) -> Result<usize, WriteError> {
+        let mult = match precision {
+            None => 1,
+            Some(p) => precision_multiplier(p)
+                .ok_or_else(|| WriteError::BadRequest(format!("bad precision {p:?}")))?,
+        };
+        let text = std::str::from_utf8(body)
+            .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
+        // validate before durability: a 400 must not land in the WAL
+        parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
+        // RR-5: the WAL cap is a named, visible limit
+        if self.wal.lock().expect("wal lock").size() > self.cfg.wal_max_bytes {
+            return Err(WriteError::Backpressure(format!(
+                "wal exceeds {} bytes; flush in progress — retry",
+                self.cfg.wal_max_bytes
+            )));
+        }
+        let _gate = self.ingest_gate.read().expect("ingest gate");
+        self.wal
+            .lock()
+            .expect("wal lock")
+            .append(db, mult, body)
+            .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
+        if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
+            r.replicate(db, mult, body);
+        }
+        self.apply(db, text, mult, Self::now_ns())
+            .map_err(WriteError::BadRequest)
+    }
+
     /// Flush every non-empty buffer to Parquet. Returns files written.
     pub fn flush_all(&self) -> Result<usize, String> {
         // 1. The handover — buffer out, holding area in — is ONE critical
@@ -1553,6 +1595,28 @@ impl Engine {
         }
     }
 
+    /// Reload rollup definitions from the shared store, so a definition made
+    /// on one node (`/admin/rollups`) reaches the compactor that materialises
+    /// it within a tick — the same propagation `reload_tokens` gives data-plane
+    /// tokens (#46). Without it a role-split cluster's rollups would only take
+    /// effect after a compactor restart, because the compactor serves no admin
+    /// surface and seeds its definitions once at boot. A missing config object
+    /// (nothing was ever set) or an unreadable one keeps the current set — the
+    /// safe direction, matching `reload_tokens`.
+    pub fn reload_rollups(&self) {
+        // A missing config object (nothing was ever set via /admin/rollups)
+        // is the store's `Err`, and the safe response is to keep the boot seed
+        // — so `if let Ok`, with nothing to do otherwise.
+        if let Ok(bytes) = self.store.get(ROLLUPS_CONFIG_PATH) {
+            match load_rollups_doc(&bytes) {
+                Ok(defs) => *self.rollups.write().expect("rollups lock") = defs,
+                Err(e) => {
+                    tracing::warn!(error = %e, stage = "rollups", "rollups config unreadable; keeping current")
+                }
+            }
+        }
+    }
+
     /// P1-2 audit trail, shared with the admin router so every mutating
     /// handler records through the same chain.
     pub fn audit_log(&self) -> Arc<timelake_audit::AuditLog> {
@@ -1715,8 +1779,17 @@ impl Engine {
     /// deterministically instead of racing the clock.
     pub async fn materialize_rollups_at(&self, now_nanos: i64) -> Result<usize, String> {
         let defs = self.rollups.read().expect("rollups lock").clone();
+        // With more than one compactor, each rollup is owned by exactly one of
+        // them (`owns_rollup`) — otherwise two compactors would seal the same
+        // bucket and, because the watermark model never dedups, double it. The
+        // `all` node and a lone compactor are unsharded (count<=1) and own
+        // every rollup, so single-node behaviour is unchanged.
+        let (ordinal, count) = self.compactor_shard();
         let mut total = 0usize;
         for def in &defs {
+            if !compaction::owns_rollup(&def.db, &def.name, ordinal, count) {
+                continue;
+            }
             match self.materialize_one(def, now_nanos).await {
                 Ok(n) => total += n,
                 // One bad rollup must not stop the others, exactly as one
@@ -1796,14 +1869,18 @@ impl Engine {
         if lp.is_empty() {
             return Ok(0);
         }
-        let n = timelake_api::Engine::write_lp(self, &def.db, lp.as_bytes(), Some("ns")).map_err(
-            |e| match e {
+        // Internal write: bypasses the read-only guard so materialisation
+        // works on a compactor (the cluster maintenance node), where the data
+        // plane refuses client writes. On an `all` node it is the same path a
+        // client write takes, minus the reject accounting.
+        let n = self
+            .write_lp_internal(&def.db, lp.as_bytes(), Some("ns"))
+            .map_err(|e| match e {
                 WriteError::BadRequest(s)
                 | WriteError::Backpressure(s)
                 | WriteError::Internal(s)
                 | WriteError::NotHere(s) => format!("rollup write to {}: {s}", def.target),
-            },
-        )?;
+            })?;
         self.rollup_rows_written_total
             .fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
@@ -1945,51 +2022,22 @@ impl timelake_api::Engine for Engine {
         // `return Err` instead would mean a refusal added later silently
         // misses the metric — the same reason `finish` is the only exit in
         // the query path.
-        let result = (|| -> Result<usize, WriteError> {
-            // CL-3: a querier takes no writes. Checked before parsing so the
-            // answer costs nothing and cannot depend on the body.
-            if self.read_only.load(Ordering::Relaxed) {
-                return Err(WriteError::NotHere(
-                    "this node is a querier (TIMELAKE_ROLE=querier) and holds no write path — \
-                 send writes to the router, or to an ingester directly"
-                        .into(),
-                ));
-            }
-            let mult = match precision {
-                None => 1,
-                Some(p) => precision_multiplier(p)
-                    .ok_or_else(|| WriteError::BadRequest(format!("bad precision {p:?}")))?,
-            };
-            let text = std::str::from_utf8(body)
-                .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
-
-            // validate before durability: a 400 must not land in the WAL
-            parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
-
-            // RR-5: the WAL cap is a named, visible limit
-            if self.wal.lock().expect("wal lock").size() > self.cfg.wal_max_bytes {
-                return Err(WriteError::Backpressure(format!(
-                    "wal exceeds {} bytes; flush in progress — retry",
-                    self.cfg.wal_max_bytes
-                )));
-            }
-
-            let _gate = self.ingest_gate.read().expect("ingest gate");
-            self.wal
-                .lock()
-                .expect("wal lock")
-                .append(db, mult, body)
-                .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
-            // CL-2: replicate the frame to the paired ingester BEFORE the ack, so
-            // an acknowledged write is durable on two nodes. A lone `all` node
-            // has no replicator, so this is a no-op and the path is unchanged.
-            // A down peer degrades (availability holds); it never fails the write.
-            if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
-                r.replicate(db, mult, body);
-            }
-            self.apply(db, text, mult, Self::now_ns())
-                .map_err(WriteError::BadRequest)
-        })();
+        //
+        // CL-3: a querier (or a compactor) takes no CLIENT writes. Checked
+        // here, before the shared body, so the answer costs nothing and
+        // cannot depend on the request. Internal writers — rollup
+        // materialisation — call `write_lp_internal` directly and are not
+        // gated by this, because a rollup target is server-generated, not a
+        // client write.
+        let result = if self.read_only.load(Ordering::Relaxed) {
+            Err(WriteError::NotHere(
+                "this node is read-only (TIMELAKE_ROLE=querier or compactor) and holds no \
+                 write path — send writes to the router, or to an ingester directly"
+                    .into(),
+            ))
+        } else {
+            self.write_lp_internal(db, body, precision)
+        };
         if let Err(e) = &result {
             let counter = match e {
                 WriteError::Backpressure(_) => &self.write_rejects.backpressure,

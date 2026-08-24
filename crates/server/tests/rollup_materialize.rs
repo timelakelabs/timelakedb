@@ -282,6 +282,59 @@ async fn the_extended_grammar_filters_counts_distinct_and_takes_a_percentile() {
 }
 
 #[tokio::test]
+async fn a_read_only_node_still_materialises_but_refuses_client_writes() {
+    // The compactor's posture: read-only to the data plane, but it is where
+    // rollups run in a cluster (§18.6). Materialisation writes the target
+    // through the INTERNAL path, which bypasses the read-only guard because a
+    // rollup target is server-generated, not a client write.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let app = timelake_server::app(Arc::clone(&eng));
+
+    // Seed the source while writes are still open, then flip read-only.
+    assert_eq!(
+        write(
+            &app,
+            &format!(
+                "sensor_reading,host=h1 value=10 {}\nsensor_reading,host=h1 value=20 {}",
+                B0 + 1_000_000_000,
+                B0 + 2_000_000_000
+            )
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    eng.set_rollup(def()).unwrap();
+    eng.set_read_only();
+
+    // A CLIENT write is now refused — the data plane is closed.
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v3/write_lp?db=poc&precision=ns")
+                .header("content-type", "text/plain")
+                .body(Body::from("sensor_reading,host=h1 value=99 1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(
+        refused,
+        StatusCode::NO_CONTENT,
+        "a read-only node must refuse client writes"
+    );
+
+    // Materialisation still works and writes the sealed bucket.
+    let now = B0 + LOOKBACK_S as i64 * 1_000_000_000 + 5 * IV;
+    let n = eng.materialize_rollups_at(now).await.unwrap();
+    assert!(n >= 1, "materialisation must work on a read-only node");
+    let rows = query(&app, "SELECT v_avg, v_count FROM sensor_reading_1m").await;
+    assert_eq!(rows[0]["v_avg"], 15.0);
+    assert_eq!(rows[0]["v_count"], 2);
+}
+
+#[tokio::test]
 async fn an_empty_group_by_seals_every_source_tag() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

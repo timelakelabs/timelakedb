@@ -155,6 +155,39 @@ services:
       timeout: 3s
       retries: 20
 
+  # ---- compactor: maintenance, and rollup materialisation (§18.6) --------
+  # One compactor, so it is unsharded — it owns every partition and every
+  # rollup. It reads the ingesters' live buffers (TIMELAKE_PEERS below) the
+  # way a querier does, so a rollup over a source sharded across the two
+  # ingesters aggregates BOTH shards before it seals a bucket.
+  compactor:
+    <<: *node
+    container_name: cl3-compactor
+    hostname: compactor
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "5975:1963"   # /health + /metrics only; no data plane
+    environment:
+      <<: *node-env
+      TIMELAKE_ROLE: compactor
+      TIMELAKE_NODE_ID: compactor
+      TIMELAKE_CLUSTER_ADDR: 0.0.0.0:1965
+      TIMELAKE_PEERS: >-
+        ingester-a=ingester@ingester-a:1965|ingester-a:1963,
+        ingester-b=ingester@ingester-b:1965|ingester-b:1963
+      # Empty by default so the CL-3 drill sees no rollups. The rollup drill
+      # (cluster-drill/rollup_cluster_drill.sh) sets TLDB_ROLLUPS to seed one
+      # here — a definition would normally arrive via /admin/rollups and
+      # propagate through the store (reload_rollups), which needs no restart.
+      TIMELAKE_ROLLUPS: ${TLDB_ROLLUPS:-}
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   # ---- router: the one public endpoint ----------------------------------
   router:
     build: ../..

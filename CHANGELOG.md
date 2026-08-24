@@ -13,6 +13,47 @@ here.
 
 ## [Unreleased]
 
+### Added — downsampling in a cluster: rollups materialise on the compactor (R-2, #64) (2026-08-24)
+
+The cluster half of downsampling. A role-split cluster (router + ingesters +
+queriers, no `all` node) had nowhere to run rollups; now the **compactor**
+does it, next to compaction and retention.
+
+Four things it needed beyond the single-node path:
+
+- **The shard union.** The compactor reads the source the way a querier does
+  — it holds the ingesters as peers and reuses `RemoteBuffers` + the querier
+  tail — so a rollup over a source sharded across ingesters aggregates every
+  shard before it seals. The querier's refuse-rather-than-undercount rule
+  applies for free: an unreachable ingester fails the pass rather than sealing
+  an incomplete bucket, and the next tick retries.
+- **An internal write.** The compactor is read-only to the data plane, but a
+  rollup target is server-generated, not a client write. The write body split
+  into `write_lp_internal` (WAL, buffer, replication, apply) which
+  materialisation calls directly; the trait `write_lp` keeps the read-only
+  refusal and the reject accounting for actual clients. A read-only node now
+  materialises but still refuses client writes — pinned by a test.
+- **Rollup ownership.** With more than one compactor each rollup is owned by
+  exactly one (`owns_rollup`, the partition-ownership hash keyed on the
+  rollup), or two would seal the same bucket and — the watermark model not
+  deduping — double it. The FNV hash factored into one helper shared with
+  partition ownership.
+- **Runtime propagation.** Rollups loaded only at boot; a definition made on a
+  console never reached the compactor (which serves no admin surface) until a
+  restart. `reload_rollups` reads the shared store each tick, like token
+  reload (#46).
+
+Also: the `all`-node tick still materialises for a single node, but an
+ingester's tick now does not — in a cluster the compactor owns it, and an
+ingester materialising too would double it.
+
+Drilled on `deploy/compose/timelakedb-cluster-s3.yml` with a compactor and no
+`all` node (`cluster-drill/rollup_cluster_drill.sh`,
+`docs/evidence/rollup-cluster-drill.log`): source written through the router
+and sharded to an ingester, the compactor seals it, and the target read back
+**through a querier** is exact (one row per host, counts summing to every
+source row) and idempotent. This closes downsampling (R-2) end to end.
+
 ### Added — the compactor gate opens: partition ownership (C2 phase 5b) (2026-08-24)
 
 `TIMELAKE_ROLE=compactor` starts now. Phase 5a built the role and left the

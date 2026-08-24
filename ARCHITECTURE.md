@@ -612,6 +612,12 @@ was replaced by that fence.
   fence-safe — sharding them is a later refinement, not correctness. Drill:
   `deploy/compose/compactor-drill/` — two compactors divide the partitions,
   duplicates collapse, `stale_merges` stays ~0.
+  **It also materialises rollups** (§18.6, timelakedb#64): a role-split
+  cluster has no `all` node, so downsampling runs here, reading the source
+  through the ingesters' shard union and writing the target back to the store.
+  Rollups are owned one-per-compactor (`owns_rollup`) so two never seal the
+  same bucket; the target write bypasses the read-only guard
+  (`write_lp_internal`), being server-generated not a client write.
 
 ### 12.5 Discovery & intra-cluster TLS
 
@@ -1044,12 +1050,27 @@ rollup misses them. So a standing invariant, checked and named the way
   `quantile`), each still recomputable-from-source (§18.1), so exactness
   and exactly-once are untouched; pinned by a combined
   filter + `count_distinct` + `percentile` materialisation test.
-  **Cluster — blocked on C2 phase 5b.** Materialisation is maintenance
-  work, so it moves to the **compactor role** (§12.4) — which reads the
-  shard union the way a querier does and writes the target the way any
-  node does — once the compactor is startable. Until then a role-split
-  cluster has no `all` node to run rollups on, so a cluster downsamples
-  only after 5b lands.
+  **Cluster — shipped (timelakedb#64), on the compactor (C2 phase 5b).**
+  A role-split cluster has no `all` node, so materialisation — maintenance
+  work — runs on the **compactor** (§12.4). It reads the source through the
+  **same shard union a querier does** (it holds the ingesters as peers,
+  reuses `RemoteBuffers` and the querier tail), so a rollup over a source
+  sharded across ingesters aggregates every shard before it seals — the
+  refuse-rather-than-undercount rule (§12.4) applies for free, an
+  unreachable ingester failing the pass rather than sealing an incomplete
+  bucket. Three things this needed beyond the `all`-node path: **(a)** the
+  target write goes through an *internal* path (`write_lp_internal`) that
+  bypasses the compactor's read-only guard, because a rollup target is
+  server-generated, not a client write; **(b)** with more than one compactor
+  each rollup is owned by exactly one (`owns_rollup`, the partition-ownership
+  hash keyed on the rollup), so two of them never seal the same bucket and
+  double it; **(c)** definitions **propagate through the store**
+  (`reload_rollups`, like token reload) so one made on a console reaches the
+  compactor without a restart. The `all`-node tick still materialises for a
+  single node; an ingester's does not (it would double the compactor's work).
+  Drilled on the cluster-s3 rig, no `all` node present: the compactor seals a
+  rollup over sharded source, the target read back through a querier is exact
+  and idempotent (`docs/evidence/rollup-cluster-drill.log`).
 
 ### 18.7 Decisions and alternatives considered
 
