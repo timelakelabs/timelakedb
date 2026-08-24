@@ -32,9 +32,10 @@ pub fn merge_files(batch_sets: Vec<Vec<RecordBatch>>) -> Result<MergeResult, Str
     let combined = concat_batches(&schema, &aligned).map_err(|e| e.to_string())?;
 
     // Cluster settled files by the highest-cardinality tag column so
-    // row-group statistics on it become tight, prunable ranges (Shape A
-    // without bloom filters — the arrow writer emits none for dictionary
-    // columns). Self-tuning: no per-workload config.
+    // row-group statistics on it become tight, prunable ranges — a complement
+    // to the entity blooms the writer already emits (settled files are also
+    // written with SMALL 64K groups, so both stats and blooms prune at a fine
+    // grain, unlike coarse-grouped L0; #68). Self-tuning: no per-workload config.
     let cluster: Option<String> = {
         use datafusion::arrow::array::DictionaryArray;
         use datafusion::arrow::datatypes::{DataType, Int32Type};

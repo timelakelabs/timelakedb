@@ -13,6 +13,37 @@ here.
 
 ## [Unreleased]
 
+### Added — scan-pruning telemetry, and the Shape A p95 diagnosis (#69) (2026-08-24)
+
+Phase 1 of the Shape A p95 carve-out (#68): instrument the read path so a
+lookup's cost is a metric, and find out where it actually goes before building
+a fix. It went somewhere other than the ticket assumed.
+
+Eight `/metrics` counters from a new `ScanStats`, threaded through the scan
+like `filtered_rows`: `timelake_scan_files_{considered,time_pruned}_total`,
+`timelake_scan_row_groups_{considered,stats_pruned,bloom_pruned,scanned}_total`,
+and `timelake_scan_meta_cache_{hits,misses}_total`. `considered = stats_pruned
++ bloom_pruned + scanned` per file, so a single lookup on an idle node reads as
+the delta and names its own dominant cost — pruning that leaves no trace was
+indistinguishable from pruning that doesn't happen.
+
+**The finding, which re-scopes #70.** M4's carve-out reasoning was "the arrow
+writer emits no blooms for dictionary columns, so L0 can't prune by
+`product_id`." The code contradicts it: `to_parquet_bytes_rg` explicitly
+enables blooms on entity columns (NDV ≥ 1024), on both the L0 and compaction
+paths, and the buffer's own `dict_columns_do_get_blooms` test proves every row
+group gets one. So L0 files ARE bloom-prunable by entity; the 608 ms predates
+blooms-on-dict. The real gap is that **L0 flush uses the writer's coarse
+default row-group size** while compaction uses 64K — so L0 blooms exclude at a
+coarse grain, and a present entity's lookup decodes a ~1M-row group to return a
+handful of rows. Pinned by
+`provider::tests::scan_stats_attribute_pruning_and_prove_l0_blooms_work` (an
+unclustered, small-group L0 file: a present pid scans 1 group of ~78, an absent
+pid scans 0, the counters attribute it). The stale "arrow emits no blooms"
+comments in `buffer` and `compact` are corrected. Full write-up:
+`docs/evidence/shape-a-p95-characterization.md`. #70 is now "flush L0 with
+finer row groups," not "add blooms."
+
 ### Added — downsampling in a cluster: rollups materialise on the compactor (R-2, #64) (2026-08-24)
 
 The cluster half of downsampling. A role-split cluster (router + ingesters +

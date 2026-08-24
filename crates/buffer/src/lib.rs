@@ -315,10 +315,13 @@ pub mod flush {
 
     /// Like [`prepare`] but with `leading` (a tag column) as the primary
     /// sort key — compaction uses this to CLUSTER settled files by their
-    /// hottest entity column, so row-group statistics on that column
-    /// become tight ranges and Shape-A pruning works without bloom
-    /// filters (which the arrow writer does not emit for dictionary
-    /// columns — proven by test, ARCHITECTURE §9 rung 3).
+    /// hottest entity column, so row-group *statistics* on that column
+    /// become tight ranges. This is a COMPLEMENT to the bloom filters
+    /// [`to_parquet_bytes_rg`] writes on entity columns (`dict_columns_do_get_
+    /// blooms` proves they are written): stats are free once clustered, blooms
+    /// work on unclustered L0 too. An earlier note here claimed the arrow
+    /// writer emits no blooms for dictionary columns — it emits none *by
+    /// default*, but the writer is asked, so it does.
     /// Dedup semantics are unchanged: the sort key SET is the same PK,
     /// only the order differs, so equal PKs remain adjacent.
     pub fn prepare_ordered(
@@ -423,8 +426,10 @@ pub mod flush {
 
     /// `rg_rows` bounds row-group size: compaction writes SMALL groups
     /// (64K) over entity-clustered data so per-group statistics become
-    /// tight, prunable ranges. (Bloom filters would be preferable but the
-    /// arrow writer does not emit them for dictionary columns.)
+    /// tight, prunable ranges. **L0 flush leaves this `None`, so L0 uses the
+    /// writer's default (coarse) group size** — its blooms (below) still
+    /// exclude a group, but at a coarse grain, so a present entity's lookup
+    /// reads a whole large group to return a few rows (#68/#70).
     pub fn to_parquet_bytes_rg(
         batch: &RecordBatch,
         rg_rows: Option<usize>,
