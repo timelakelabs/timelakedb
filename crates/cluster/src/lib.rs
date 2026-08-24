@@ -53,13 +53,14 @@ impl Role {
 
     /// Whether this role's behaviour exists yet. Roles are enabled one C2
     /// phase at a time; selecting an unbuilt role is a startup refusal, not
-    /// a silent half-node. `all` (foundation), `ingester` (CL-2, WAL
-    /// replication), `router` (write sharding) and `querier` (CL-3, stateless
-    /// reads) are built; `compactor` is not yet.
+    /// a silent half-node. Every role is now built: `all` (foundation),
+    /// `ingester` (CL-2, WAL replication), `router` (write sharding),
+    /// `querier` (CL-3, stateless reads) and `compactor` (C2 phase 5a role +
+    /// 5b partition ownership above the commit fence).
     pub fn implemented(self) -> bool {
         matches!(
             self,
-            Role::All | Role::Ingester | Role::Router | Role::Querier
+            Role::All | Role::Ingester | Role::Router | Role::Querier | Role::Compactor
         )
     }
 }
@@ -268,30 +269,21 @@ mod tests {
     }
 
     #[test]
-    fn implemented_roles_are_everything_but_the_compactor() {
+    fn every_role_is_implemented() {
         assert!(Role::All.implemented());
         assert!(Role::Ingester.implemented(), "CL-2 shipped the ingester");
         assert!(Role::Router.implemented(), "phase 3 shipped the router");
         assert!(Role::Querier.implemented(), "phase 4 shipped the querier");
-        // The compactor role EXISTS as of C2 phase 5a — it has a branch in
-        // main.rs, a maintenance loop and an HTTP surface. The gate stays
-        // shut anyway, and the reason changed rather than expired.
-        //
-        // It is no longer "not built yet". It is now the only thing
-        // stopping a second compactor from being started, and a second
-        // compactor is safe only once the work-avoidance layer above the
-        // commit fence exists. The fence makes concurrent compaction
-        // CORRECT (a merge whose inputs were replaced is refused); it does
-        // not make it efficient, and two compactors racing every partition
-        // would do double the IO to land half the merges.
-        //
-        // Flipping this is a deliberate act with its own issue. If you are
-        // here because you added the role and the test failed: that is the
-        // test working.
+        // The compactor gate opened in C2 phase 5b. 5a built the role (a
+        // branch in main.rs, a maintenance loop, an HTTP surface); 5b added
+        // what the gate was actually waiting on — partition ownership above
+        // the commit fence, so N compactors divide the partitions instead of
+        // racing every one of them for double the IO. The fence remains the
+        // correctness floor (a merge whose inputs were replaced is refused);
+        // ownership is the efficiency layer that let this open.
         assert!(
-            !Role::Compactor.implemented(),
-            "the compactor gate stays shut until the lease lands on top of \
-             the commit fence — flipping this is a decision, not a tidy-up"
+            Role::Compactor.implemented(),
+            "phase 5b shipped the compactor"
         );
     }
 

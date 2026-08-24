@@ -13,6 +13,39 @@ here.
 
 ## [Unreleased]
 
+### Added — the compactor gate opens: partition ownership (C2 phase 5b) (2026-08-24)
+
+`TIMELAKE_ROLE=compactor` starts now. Phase 5a built the role and left the
+gate shut on purpose: the commit fence already makes two compactors *correct*
+(a merge whose inputs were replaced is refused), but not *efficient* — both
+would race every partition and do double the IO to land half the merges. 5b is
+the work-avoidance layer the gate was waiting on.
+
+Each compactor owns a disjoint slice of partitions — FNV-1a over
+`db\0table\0partition` mod N, the same hash the router shards writes with,
+keyed on the partition (`compaction::owns_partition`) — so `compact_once`
+skips what it does not own and N compactors never race the same merge. Every
+node computes the same ordinal by sorting its id with the discovered compactor
+peers; no coordination. The fence stays the floor: if ownership ever overlaps
+(a membership change mid-flight, a mismatched N) the loser's merge is still
+refused, so ownership only has to be good, not perfect.
+`timelake_compactor_shard_{ordinal,count}` on `/metrics` shows the split.
+
+Scoped to compaction merges, the IO-heavy stage the gate names; retention and
+tombstone GC still run on every compactor and stay fence-safe (cheaper work,
+sharding them is a later refinement, not correctness).
+
+Pinned by a unit test (ownership is a total, deterministic partition), an
+integration test (`compact_once` merges only owned partitions; an unsharded
+node owns everything), and a two-compactor drill
+(`deploy/compose/compactor-drill/shard_drill.sh`,
+`docs/evidence/c2-phase5b-shard-drill.log`): 8 tables split 4/4, both
+compactors busy, `stale_merges` 0, the store settling to one file per table,
+48 rows in and out. `ARCHITECTURE.md` §12.4 updated; the single-compactor
+rig's stale "does not start yet" comment corrected. This unblocks the cluster
+half of downsampling (#64), which moves rollup materialisation onto the
+compactor.
+
 ### Added — downsampling: a filter and two more aggregates (R-2, #60) (2026-08-24)
 
 The grammar half of #60, on top of the part-2 mechanism. Three additions to
@@ -50,7 +83,6 @@ describing the recompute-and-overwrite design that part 2 replaced: §18.3
 now documents watermark-finalization and why recompute-plus-LWW was unsound
 here, §18.5 marks which metrics actually shipped, and §18.6 marks phase 1 and
 this grammar half done.
-
 ### Added — downsampling, part 2: rollup materialisation (R-2, #59) (2026-08-23)
 
 The second half of #59: a defined rollup now **runs**. On the maintenance

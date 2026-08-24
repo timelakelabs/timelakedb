@@ -234,10 +234,31 @@ async fn main() {
     // accepted into a buffer nothing will ever flush.
     if role == timelake_cluster::Role::Compactor {
         engine.set_read_only();
+        // C2 phase 5b: find this compactor's place among its peers so it owns
+        // a disjoint slice of partitions. Every compactor sorts the same id
+        // list (itself plus the discovered compactor peers) and reads its own
+        // index, so the assignment agrees across nodes with no coordination.
+        let (ordinal, count) = {
+            use timelake_cluster::Discovery;
+            let self_id = discovery.this_node().id.clone();
+            let mut ids: Vec<String> = discovery
+                .peers_with_role(timelake_cluster::Role::Compactor)
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
+            ids.push(self_id.clone());
+            ids.sort();
+            ids.dedup();
+            let ordinal = ids.iter().position(|id| *id == self_id).unwrap_or(0);
+            (ordinal, ids.len())
+        };
+        engine.set_compactor_shard(ordinal, count);
         tracing::info!(
             %addr,
             catalog_head = engine.catalog_head(),
-            "compactor up (maintenance only: no writes, no queries)"
+            ordinal,
+            compactors = count,
+            "compactor up (maintenance only: no writes, no queries; owns 1/{count} of partitions)"
         );
         let worker = Arc::clone(&engine);
         tokio::spawn(async move {
