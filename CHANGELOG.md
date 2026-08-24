@@ -13,6 +13,44 @@ here.
 
 ## [Unreleased]
 
+### Added — downsampling: a filter and two more aggregates (R-2, #60) (2026-08-24)
+
+The grammar half of #60, on top of the part-2 mechanism. Three additions to
+a rollup definition, all still recomputable from a bucket's own rows so the
+exactly-once argument is untouched:
+
+- **`filter`** — a SQL boolean expression on the source (`region = 'eu'`,
+  `status_code >= 500`), ANDed into the bucket scan before aggregation. Same
+  predicate every pass, so it does not disturb idempotency; parenthesised so
+  its own `OR` can't rebind against the time bounds; run under the read-only
+  guard, so it selects but can't write. A malformed filter fails that one
+  rollup's pass loudly and the others carry on, rather than writing a wrong
+  number — the same rule the tick already uses for a bad rollup.
+- **`count_distinct`** — distinct count over the bucket. It is *not*
+  algebraically combinable, which is exactly why it is safe here and would
+  not be under an accumulating scheme: materialisation never combines
+  partials, it computes each sealed bucket once from raw rows.
+- **`percentile`** — `approx_percentile_cont`, with a `quantile` (0.0–1.0) on
+  the aggregation. Approximate on purpose: an exact percentile over a wide
+  `lookback` is too expensive, and the recompute-each-pass property holds
+  either way. `quantile` is enforced both directions in `validate` — a
+  percentile without one, or a quantile on any other function, is a 400 at
+  definition rather than a rollup that fails silently forever.
+
+`RollupAgg`/`RollupDef` lost their `Eq` derive because `quantile` is an
+`f64` (no total equality); `PartialEq` is all the upserts and tests use.
+Pinned by `crates/server/tests/rollup_materialize.rs` (a combined
+filter + `count_distinct` + `percentile` rollup, exact and idempotent) and
+four new rejection cases in `rollups.rs`. The cluster half of #60 —
+materialising from the shard union in the compactor role — is blocked on the
+compactor role becoming startable (C2 phase 5b) and is not in this change.
+
+Also reconciles ARCHITECTURE §18, which merged (timelakedb#58) still
+describing the recompute-and-overwrite design that part 2 replaced: §18.3
+now documents watermark-finalization and why recompute-plus-LWW was unsound
+here, §18.5 marks which metrics actually shipped, and §18.6 marks phase 1 and
+this grammar half done.
+
 ### Added — downsampling, part 2: rollup materialisation (R-2, #59) (2026-08-23)
 
 The second half of #59: a defined rollup now **runs**. On the maintenance
