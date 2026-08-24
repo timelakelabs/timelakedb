@@ -38,13 +38,16 @@ fn valid() -> RollupDef {
                 function: RollupFn::Avg,
                 source_column: "value".into(),
                 target_column: "value_avg".into(),
+                quantile: None,
             },
             RollupAgg {
                 function: RollupFn::Max,
                 source_column: "value".into(),
                 target_column: "value_max".into(),
+                quantile: None,
             },
         ],
+        filter: None,
     }
 }
 
@@ -116,6 +119,17 @@ fn structurally_invalid_definitions_are_refused() {
         ("target column named time", |d| {
             d.aggregations[0].target_column = "time".into()
         }),
+        ("percentile without a quantile", |d| {
+            d.aggregations[0].function = RollupFn::Percentile
+        }),
+        ("quantile out of range", |d| {
+            d.aggregations[0].function = RollupFn::Percentile;
+            d.aggregations[0].quantile = Some(1.5);
+        }),
+        ("quantile on a non-percentile", |d| {
+            d.aggregations[0].quantile = Some(0.5)
+        }),
+        ("blank filter", |d| d.filter = Some("   ".into())),
     ];
     for (label, mutate) in cases {
         let mut def = valid();

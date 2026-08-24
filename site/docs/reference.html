@@ -305,7 +305,7 @@
             <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
             <tr><td><code>GET /admin/rollups</code></td><td>viewer</td><td>—</td><td>200 + <code>{"rollups":[{db, name, source, target, interval, lookback, group_by, aggregations[]}]}</code></td></tr>
-            <tr><td><code>PUT /admin/rollups</code></td><td><strong>admin</strong>; body <code>db</code>, <code>name</code>, <code>source</code>, <code>interval</code>, <code>aggregations[]</code>, optional <code>target</code>, <code>lookback</code>, <code>group_by[]</code></td><td>—</td><td>200; upserts by <code>(db, name)</code>, persists durably, first pass on the next maintenance tick. 400 on a structural error or a lookback that outlives the source's retention</td></tr>
+            <tr><td><code>PUT /admin/rollups</code></td><td><strong>admin</strong>; body <code>db</code>, <code>name</code>, <code>source</code>, <code>interval</code>, <code>aggregations[]</code> (each <code>function</code>, <code>source_column</code>, <code>target_column</code>, and <code>quantile</code> for <code>percentile</code>), optional <code>target</code>, <code>lookback</code>, <code>group_by[]</code>, <code>filter</code></td><td>—</td><td>200; upserts by <code>(db, name)</code>, persists durably, first pass on the next maintenance tick. 400 on a structural error, a percentile missing its quantile, or a lookback that outlives the source's retention</td></tr>
             <tr><td><code>DELETE /admin/rollups/{db}/{name}</code></td><td><strong>admin</strong></td><td>—</td><td>200; stops materialising. The target table is left exactly as it stands — its rows are ordinary data, so remove them with retention or a targeted delete if you want them gone. 404 if unknown</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
             <tr><td><code>GET /admin/tokens</code></td><td>operator</td><td>—</td><td>200 + token records (id, description, scope, databases, grants, issuer, timestamps, revoked, last used); the secret is never re-shown</td></tr>
@@ -387,11 +387,23 @@
         <code>aggregations</code>: each names a <code>function</code>, a
         <code>source_column</code> and the <code>target_column</code> to write.
         <code>target</code> defaults to <code>{source}_{interval}</code>. The
-        function set is the seven that a bucket's own rows determine exactly —
+        function set is the ones a bucket's own rows determine from scratch —
         <code>avg</code>, <code>min</code>, <code>max</code>, <code>sum</code>,
-        <code>count</code>, <code>first</code>, <code>last</code> — where
+        <code>count</code>, <code>first</code>, <code>last</code>,
+        <code>count_distinct</code>, and <code>percentile</code> — where
         <code>first</code>/<code>last</code> mean earliest/latest by time in the
-        bucket.
+        bucket. <code>percentile</code> takes a <code>quantile</code> (0.0–1.0)
+        on the aggregation and is <em>approximate</em>
+        (<code>approx_percentile_cont</code>): exact over a wide window is too
+        expensive, and the recompute-each-pass property holds either way.
+      </p>
+      <p>
+        An optional <code>filter</code> — a SQL boolean expression on the source
+        rows, <code>region = 'eu'</code> or <code>status_code &gt;= 500</code> —
+        restricts what a pass aggregates. It runs under the read-only guard like
+        the rest of the pass, and being the same predicate every pass it leaves
+        exactly-once untouched. A malformed expression fails that rollup's pass
+        loudly (logged, the others carry on) rather than writing a wrong number.
       </p>
       <p>
         Materialisation runs on the maintenance tick and is
