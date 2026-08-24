@@ -770,6 +770,9 @@ pub struct Engine {
     meta_cache: Arc<timelake_query::provider::MetaCache>,
     /// SEC-2: rows the mandatory predicate dropped, across all queries.
     visibility_filtered: Arc<AtomicU64>,
+    /// #69: per-scan pruning telemetry (files/row-groups considered vs skipped
+    /// by time/stats/bloom, meta-cache hits) — where a lookup's cost goes.
+    scan_stats: Arc<timelake_query::provider::ScanStats>,
     /// §12.2: KMS call/cache counters, when the key cache is active.
     kms_stats: Option<Arc<KmsStats>>,
     /// §12.1: S3 request counters, when the backend is S3.
@@ -992,6 +995,7 @@ impl Engine {
             pending_gc: Mutex::new(Vec::new()),
             meta_cache: Arc::new(Default::default()),
             visibility_filtered: Arc::new(AtomicU64::new(0)),
+            scan_stats: Arc::new(timelake_query::provider::ScanStats::default()),
             kms_stats,
             s3_stats,
             tls: RwLock::new(None),
@@ -2277,6 +2281,7 @@ impl Engine {
                     .clone()
                     .with_tombstones(self.catalog.tombstones_for(db, &name)),
                 self.visibility_filtered.clone(),
+                self.scan_stats.clone(),
             );
             tables.push((name, Arc::new(provider)));
         }
@@ -3048,6 +3053,14 @@ impl Engine {
              # TYPE timelake_encryption_enabled gauge\ntimelake_encryption_enabled {}\n\
              # TYPE timelake_visibility_rows_filtered_total counter\n\
              timelake_visibility_rows_filtered_total {}\n\
+             # TYPE timelake_scan_files_considered_total counter\ntimelake_scan_files_considered_total {}\n\
+             # TYPE timelake_scan_files_time_pruned_total counter\ntimelake_scan_files_time_pruned_total {}\n\
+             # TYPE timelake_scan_row_groups_considered_total counter\ntimelake_scan_row_groups_considered_total {}\n\
+             # TYPE timelake_scan_row_groups_stats_pruned_total counter\ntimelake_scan_row_groups_stats_pruned_total {}\n\
+             # TYPE timelake_scan_row_groups_bloom_pruned_total counter\ntimelake_scan_row_groups_bloom_pruned_total {}\n\
+             # TYPE timelake_scan_row_groups_scanned_total counter\ntimelake_scan_row_groups_scanned_total {}\n\
+             # TYPE timelake_scan_meta_cache_hits_total counter\ntimelake_scan_meta_cache_hits_total {}\n\
+             # TYPE timelake_scan_meta_cache_misses_total counter\ntimelake_scan_meta_cache_misses_total {}\n\
              # TYPE timelake_admin_default_credential_active gauge\n\
              timelake_admin_default_credential_active {}\n\
              # TYPE timelake_admin_logins_total counter\n\
@@ -3081,6 +3094,20 @@ impl Engine {
             self.tombstone_rewrites_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),
+            self.scan_stats.files_considered.load(Ordering::Relaxed),
+            self.scan_stats.files_time_pruned.load(Ordering::Relaxed),
+            self.scan_stats
+                .row_groups_considered
+                .load(Ordering::Relaxed),
+            self.scan_stats
+                .row_groups_stats_pruned
+                .load(Ordering::Relaxed),
+            self.scan_stats
+                .row_groups_bloom_pruned
+                .load(Ordering::Relaxed),
+            self.scan_stats.row_groups_scanned.load(Ordering::Relaxed),
+            self.scan_stats.meta_cache_hits.load(Ordering::Relaxed),
+            self.scan_stats.meta_cache_misses.load(Ordering::Relaxed),
             if self.auth.default_credential_active() {
                 1
             } else {

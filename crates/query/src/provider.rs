@@ -377,11 +377,20 @@ pub type MetaCache = std::sync::Mutex<
 /// One file's Parquet footer, from the cache or by a range read (never by
 /// fetching the file). The cache is the M5 metadata cache: footers are
 /// immutable, so a hit is always valid.
+/// Returns the metadata and whether it came from the cache (`true`) or a cold
+/// footer read (`false`) — the caller on the scan path counts that (#69), a
+/// schema read at registration ignores it.
 fn cached_metadata(
     file: &StoreFile,
     path: &str,
     meta_cache: &Arc<MetaCache>,
-) -> Result<Arc<datafusion::parquet::file::metadata::ParquetMetaData>, String> {
+) -> Result<
+    (
+        Arc<datafusion::parquet::file::metadata::ParquetMetaData>,
+        bool,
+    ),
+    String,
+> {
     use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     if let Some(md) = meta_cache
         .lock()
@@ -389,7 +398,7 @@ fn cached_metadata(
         .get(path)
         .cloned()
     {
-        return Ok(md);
+        return Ok((md, true));
     }
     // footer only — a range read, not the file
     let loaded = ArrowReaderMetadata::load(file, ArrowReaderOptions::default())
@@ -400,7 +409,7 @@ fn cached_metadata(
         cache.clear(); // crude bound; files are few post-compaction
     }
     cache.insert(path.to_string(), md.clone());
-    Ok(md)
+    Ok((md, false))
 }
 
 /// The Arrow schema of one cataloged file, read from its footer alone.
@@ -417,10 +426,38 @@ pub fn file_schema(
 ) -> Result<SchemaRef, String> {
     use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     let file = StoreFile::with_len(store.clone(), path, size_bytes);
-    let md = cached_metadata(&file, path, meta_cache)?;
+    let (md, _) = cached_metadata(&file, path, meta_cache)?; // schema read, not a scan
     let arrow_md = ArrowReaderMetadata::try_new(md, ArrowReaderOptions::default())
         .map_err(|e| e.to_string())?;
     Ok(arrow_md.schema().clone())
+}
+
+/// Per-scan pruning telemetry (#69): where a lookup's cost actually goes —
+/// how many files and row groups a scan considered versus skipped, by which
+/// mechanism, and whether the footer was already cached. Engine-wide running
+/// totals; a single lookup on an idle node reads as the delta. The point is
+/// to make "Shape A scanned every row group" show up in a counter rather than
+/// only under a profiler, and to tell time-pruning from stats-pruning from
+/// bloom-pruning apart — which is the whole question #68 turns on.
+#[derive(Default)]
+pub struct ScanStats {
+    /// Files a scan opened (passed the query's file list).
+    pub files_considered: std::sync::atomic::AtomicU64,
+    /// Of those, skipped whole by the catalog time bounds before any read.
+    pub files_time_pruned: std::sync::atomic::AtomicU64,
+    /// Row groups in the files that survived file-level time pruning.
+    pub row_groups_considered: std::sync::atomic::AtomicU64,
+    /// Excluded because a tag literal fell outside the group's min/max stats
+    /// (tight only on entity-clustered/settled files).
+    pub row_groups_stats_pruned: std::sync::atomic::AtomicU64,
+    /// Excluded because a bloom said the tag is definitely absent (works on
+    /// unclustered L0 too — the mechanism #68's premise assumed was missing).
+    pub row_groups_bloom_pruned: std::sync::atomic::AtomicU64,
+    /// Actually fetched and decoded. This is the number Shape A must shrink.
+    pub row_groups_scanned: std::sync::atomic::AtomicU64,
+    /// Footer served from the metadata cache (warm) vs read cold.
+    pub meta_cache_hits: std::sync::atomic::AtomicU64,
+    pub meta_cache_misses: std::sync::atomic::AtomicU64,
 }
 
 pub struct LazyTable {
@@ -430,6 +467,8 @@ pub struct LazyTable {
     files: Vec<FileMeta>,
     store: Arc<dyn Store>,
     meta_cache: Arc<MetaCache>,
+    /// #69 scan telemetry, engine-wide, threaded like `filtered_rows`.
+    scan_stats: Arc<ScanStats>,
     /// Loads run on the blocking pool with this deadline: a slow scan is
     /// abandoned between files instead of pinning the async runtime
     /// forever (the M4 hang that wedged a whole Docker VM).
@@ -468,6 +507,7 @@ impl LazyTable {
         meta_cache: Arc<MetaCache>,
         session: crate::QuerySession,
         filtered_rows: Arc<std::sync::atomic::AtomicU64>,
+        scan_stats: Arc<ScanStats>,
     ) -> Self {
         LazyTable {
             name,
@@ -480,6 +520,7 @@ impl LazyTable {
             meta_cache,
             session,
             filtered_rows,
+            scan_stats,
         }
     }
 }
@@ -579,17 +620,22 @@ fn load_one_file(
     pruning: &Pruning,
     needed: Option<&[String]>,
     meta_cache: &Arc<MetaCache>,
+    scan_stats: &Arc<ScanStats>,
     reservation: &std::sync::Mutex<datafusion::execution::memory_pool::MemoryReservation>,
 ) -> Result<Option<Vec<RecordBatch>>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    scan_stats.files_considered.fetch_add(1, Relaxed);
     // file-level time pruning (catalog bounds)
     if let Some(min) = pruning.min_ts_ns
         && meta.max_ts_ns < min
     {
+        scan_stats.files_time_pruned.fetch_add(1, Relaxed);
         return Ok(None);
     }
     if let Some(max) = pruning.max_ts_ns
         && meta.min_ts_ns > max
     {
+        scan_stats.files_time_pruned.fetch_add(1, Relaxed);
         return Ok(None);
     }
 
@@ -599,18 +645,38 @@ fn load_one_file(
     // ever leave the store.
     use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     let mut file = StoreFile::with_len(store.clone(), &meta.path, meta.size_bytes);
-    let md: Arc<_> = cached_metadata(&file, &meta.path, meta_cache)?;
+    let (md, cache_hit): (Arc<_>, bool) = cached_metadata(&file, &meta.path, meta_cache)?;
+    if cache_hit {
+        scan_stats.meta_cache_hits.fetch_add(1, Relaxed);
+    } else {
+        scan_stats.meta_cache_misses.fetch_add(1, Relaxed);
+    }
 
+    let n_rg = md.num_row_groups();
+    scan_stats
+        .row_groups_considered
+        .fetch_add(n_rg as u64, Relaxed);
     let keep: Vec<usize> = if pruning.tag_equals.is_empty() {
-        (0..md.num_row_groups()).collect()
+        (0..n_rg).collect()
     } else {
         // statistics first (free — already in the footer), then blooms
         // for whatever survives. On fresh L0 data statistics prune
         // nothing, because an unclustered group's min/max spans the
-        // whole entity space; the bloom is what actually excludes.
+        // whole entity space; the bloom is what actually excludes (#68).
         let by_stats = stats_keep_row_groups(&md, &pruning.tag_equals);
-        bloom_keep_row_groups(&file, &md, &pruning.tag_equals, by_stats)
+        let n_stats = by_stats.len();
+        scan_stats
+            .row_groups_stats_pruned
+            .fetch_add((n_rg - n_stats) as u64, Relaxed);
+        let after_bloom = bloom_keep_row_groups(&file, &md, &pruning.tag_equals, by_stats);
+        scan_stats
+            .row_groups_bloom_pruned
+            .fetch_add((n_stats - after_bloom.len()) as u64, Relaxed);
+        after_bloom
     };
+    scan_stats
+        .row_groups_scanned
+        .fetch_add(keep.len() as u64, Relaxed);
     if keep.is_empty() {
         return Ok(None);
     }
@@ -722,6 +788,7 @@ fn load_pruned(
     pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     table: &str,
     meta_cache: &Arc<MetaCache>,
+    scan_stats: &Arc<ScanStats>,
 ) -> Result<
     (
         Vec<RecordBatch>,
@@ -779,7 +846,15 @@ fn load_pruned(
                         );
                         return;
                     }
-                    match load_one_file(meta, store, pruning, needed, meta_cache, &reservation) {
+                    match load_one_file(
+                        meta,
+                        store,
+                        pruning,
+                        needed,
+                        meta_cache,
+                        scan_stats,
+                        &reservation,
+                    ) {
                         Ok(None) => {}
                         Ok(Some(b)) => {
                             *slots[i].lock().expect("scan slot lock") = Some(b);
@@ -916,6 +991,7 @@ impl TableProvider for LazyTable {
         let pool = self.pool.clone();
         let table_name = self.name.clone();
         let meta_cache = self.meta_cache.clone();
+        let scan_stats = self.scan_stats.clone();
         let (batches, reservation) = tokio::task::spawn_blocking(move || {
             load_pruned(
                 &buffer,
@@ -927,6 +1003,7 @@ impl TableProvider for LazyTable {
                 &pool,
                 &table_name,
                 &meta_cache,
+                &scan_stats,
             )
         })
         .await
@@ -1175,6 +1252,7 @@ mod tests {
             &pool,
             "m",
             &Arc::new(MetaCache::default()),
+            &Arc::new(ScanStats::default()),
         )
         .expect("scan");
 
@@ -1241,6 +1319,7 @@ mod tests {
                 &pool,
                 "m",
                 &Arc::new(MetaCache::default()),
+                &Arc::new(ScanStats::default()),
             )
             .expect("scan")
         };
@@ -1258,6 +1337,124 @@ mod tests {
         // and one that IS present still returns its row
         let (batches, _r) = scan("p00042");
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn scan_stats_attribute_pruning_and_prove_l0_blooms_work() {
+        // #69 characterisation: an UNCLUSTERED, L0-shaped file (pids
+        // scattered across time, not entity-sorted) with SMALL row groups
+        // and blooms. The M4 premise was that L0 cannot prune by entity; this
+        // shows it can — the bloom excludes the groups that don't hold the
+        // pid — and that the ScanStats counters attribute it correctly. The
+        // real L0 flush uses COARSE row groups, which is the actual gap #70
+        // is about, not a missing bloom.
+        use std::sync::atomic::Ordering::Relaxed;
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
+
+        let t = 1_786_179_600_000_000_000i64;
+        // i -> (i*7919)%20000 is a bijection (7919 prime, coprime to 20000),
+        // so each pid appears exactly once, scattered across time.
+        let lp: String = (0..20_000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", (i * 7919) % 20_000, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
+        // small row groups (256) so pruning is at a fine grain and visible in
+        // the counters; this is exactly the lever #70 would pull for L0.
+        let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(256)).unwrap();
+        let file_len = bytes.len() as u64;
+
+        let path = "poc/m/data/2026080809/f.parquet";
+        let store: Arc<dyn Store> = CountingStore::with(path, bytes);
+        let meta = FileMeta {
+            db: "poc".into(),
+            table: "m".into(),
+            partition: "2026080809".into(),
+            path: path.into(),
+            rows: 20_000,
+            size_bytes: file_len,
+            min_ts_ns: t,
+            max_ts_ns: t + 20_000,
+        };
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let cache = Arc::new(MetaCache::default());
+        let stats = Arc::new(ScanStats::default());
+        let scan = |pid: &str| {
+            load_pruned(
+                &[],
+                std::slice::from_ref(&meta),
+                &store,
+                &Pruning {
+                    tag_equals: vec![("pid".into(), pid.into())],
+                    ..Default::default()
+                },
+                None,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                &pool,
+                "m",
+                &cache,
+                &stats,
+            )
+            .expect("scan");
+        };
+
+        // A pid that IS present sits in exactly one row group; the bloom
+        // prunes all the others.
+        scan("p00042");
+        let considered = stats.row_groups_considered.load(Relaxed);
+        assert!(
+            considered > 10,
+            "small row groups: expected many, got {considered}"
+        );
+        assert_eq!(stats.files_considered.load(Relaxed), 1);
+        assert_eq!(stats.files_time_pruned.load(Relaxed), 0);
+        assert_eq!(
+            stats.meta_cache_misses.load(Relaxed),
+            1,
+            "first read is cold"
+        );
+        assert_eq!(stats.meta_cache_hits.load(Relaxed), 0);
+        let scanned = stats.row_groups_scanned.load(Relaxed);
+        let bloom = stats.row_groups_bloom_pruned.load(Relaxed);
+        let by_stats = stats.row_groups_stats_pruned.load(Relaxed);
+        // The point: pruning collapses ~78 groups to a handful, and the BLOOM
+        // does real work on unclustered data — the mechanism M4 thought was
+        // missing. (Stats prune some too: a group whose scattered pids all
+        // fall on one side of the target excludes it by min/max — correct, not
+        // a bug, so we do not require it to be zero.)
+        assert!(
+            scanned >= 1 && scanned < considered,
+            "pruning should scan few of {considered}, scanned {scanned}"
+        );
+        assert!(
+            bloom > 0,
+            "blooms must exclude some L0 groups (the #69 point)"
+        );
+        // the arithmetic ties out: considered = stats + bloom + scanned
+        assert_eq!(considered, by_stats + bloom + scanned);
+
+        // A second scan warms the footer cache: a hit, no new miss.
+        scan("p00007");
+        assert_eq!(
+            stats.meta_cache_hits.load(Relaxed),
+            1,
+            "second read is a cache hit"
+        );
+        assert_eq!(stats.meta_cache_misses.load(Relaxed), 1, "no new cold read");
+
+        // An ABSENT pid: every row group bloom-pruned, nothing scanned.
+        let before = stats.row_groups_scanned.load(Relaxed);
+        scan("p99999");
+        assert_eq!(
+            stats.row_groups_scanned.load(Relaxed),
+            before,
+            "an absent pid must scan no row groups"
+        );
     }
 
     /// The SEC-2 acceptance shape: labels written through the normal
@@ -1322,6 +1519,7 @@ mod tests {
                     Arc::new(MetaCache::default()),
                     session,
                     c,
+                    Arc::new(ScanStats::default()),
                 );
                 let ctx = SessionContext::new();
                 ctx.register_table("m", Arc::new(table)).unwrap();
@@ -1396,6 +1594,7 @@ mod tests {
             Arc::new(MetaCache::default()),
             crate::QuerySession::default(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(ScanStats::default()),
         );
 
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
@@ -1482,6 +1681,7 @@ mod tests {
             Arc::new(MetaCache::default()),
             crate::QuerySession::default(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(ScanStats::default()),
         );
         for f in table.schema().fields() {
             let expected = match f.name().as_str() {
