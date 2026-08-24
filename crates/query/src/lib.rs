@@ -852,6 +852,204 @@ pub async fn run_sql(
 /// Render result batches as a JSON array of row objects — the /api/sql
 /// wire contract the bench adapter reads (numbers as numbers; timestamps,
 /// strings, and dictionary values as strings; NULL as null).
+/// The tag columns of a table's schema: the `Dictionary(Int32, Utf8)`
+/// columns (FR-2). Used to resolve a rollup's `group_by` when it is left
+/// empty ("every source tag", ARCHITECTURE §18) — a string *field* is
+/// `Utf8`, a tag is a dictionary, so the two are distinguishable here.
+pub fn tag_columns(schema: &QuerySchema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            matches!(f.data_type(),
+                DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8)
+        })
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// Escape a line-protocol tag key, tag value, or field key: `,`, `=` and a
+/// space are the delimiters the parser honours (`crates/ingest`).
+fn lp_escape_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == ',' || c == '=' || c == ' ' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escape a quoted string field value: `"` and `\`.
+fn lp_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The column-0, row-0 `Timestamp(Nanosecond)` value of the first non-empty
+/// batch, or `None` if there is no such row or it is null. Used to read a
+/// scalar timestamp aggregate — a rollup reads `SELECT max(time) …` off its
+/// target to find the watermark (the next bucket to seal). Lives here so the
+/// arrow downcast stays in the crate that depends on arrow; `timelake-server`
+/// does not link datafusion directly.
+pub fn scalar_timestamp_ns(batches: &[RecordBatch]) -> Option<i64> {
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    for b in batches {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()?;
+        if col.is_null(0) {
+            return None;
+        }
+        return Some(col.value(0));
+    }
+    None
+}
+
+/// Serialise aggregated batches back to line protocol for a rollup's target
+/// table (ARCHITECTURE §18.3). The result columns are `time` (the bucket
+/// start, `Timestamp(ns)`), the tag columns named in `tag_cols`, and the
+/// aggregate columns (everything else) as typed fields. A row with no
+/// non-null field is skipped — line protocol has no field-less record.
+///
+/// This exists so materialisation reuses the ordinary durable write path
+/// (WAL, LWW dedup, replication) rather than a bespoke store write: the
+/// rollup rows go in exactly as a client's would, so re-materialising a
+/// bucket overwrites its previous row on the `(time, tags)` primary key.
+pub fn batches_to_line_protocol(
+    measurement: &str,
+    tag_cols: &[String],
+    batches: &[RecordBatch],
+) -> Result<String, String> {
+    use datafusion::arrow::array::TimestampNanosecondArray;
+
+    let tagset: std::collections::HashSet<&str> = tag_cols.iter().map(String::as_str).collect();
+    let mut out = String::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let time_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "time")
+            .ok_or_else(|| "rollup result has no time column".to_string())?;
+        let time = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| "rollup time column is not Timestamp(nanosecond)".to_string())?;
+
+        for row in 0..batch.num_rows() {
+            if time.is_null(row) {
+                continue;
+            }
+            let mut line = String::from(measurement);
+            // tags
+            for (ci, field) in schema.fields().iter().enumerate() {
+                if ci == time_idx || !tagset.contains(field.name().as_str()) {
+                    continue;
+                }
+                let col = batch.column(ci);
+                if col.is_null(row) {
+                    continue;
+                }
+                let v = array_value_to_string(col.as_ref(), row).map_err(|e| e.to_string())?;
+                line.push(',');
+                line.push_str(&lp_escape_key(field.name()));
+                line.push('=');
+                line.push_str(&lp_escape_key(&v));
+            }
+            // fields — the aggregates
+            let mut fields = String::new();
+            for (ci, field) in schema.fields().iter().enumerate() {
+                if ci == time_idx || tagset.contains(field.name().as_str()) {
+                    continue;
+                }
+                let col = batch.column(ci);
+                if col.is_null(row) {
+                    continue;
+                }
+                let val = match col.data_type() {
+                    DataType::Float64 => {
+                        let v = col
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap()
+                            .value(row);
+                        if !v.is_finite() {
+                            continue; // no NaN/inf in line protocol
+                        }
+                        format!("{v}")
+                    }
+                    DataType::Int64 => {
+                        format!(
+                            "{}i",
+                            col.as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(row)
+                        )
+                    }
+                    DataType::UInt64 => {
+                        format!(
+                            "{}u",
+                            col.as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .unwrap()
+                                .value(row)
+                        )
+                    }
+                    DataType::Boolean => {
+                        if col
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .unwrap()
+                            .value(row)
+                        {
+                            "t".to_string()
+                        } else {
+                            "f".to_string()
+                        }
+                    }
+                    // string aggregates (first/last of a string field), and
+                    // anything else arrow can render.
+                    _ => {
+                        let s =
+                            array_value_to_string(col.as_ref(), row).map_err(|e| e.to_string())?;
+                        format!("\"{}\"", lp_escape_str(&s))
+                    }
+                };
+                if !fields.is_empty() {
+                    fields.push(',');
+                }
+                fields.push_str(&lp_escape_key(field.name()));
+                fields.push('=');
+                fields.push_str(&val);
+            }
+            if fields.is_empty() {
+                continue; // no field set — not a valid record
+            }
+            line.push(' ');
+            line.push_str(&fields);
+            line.push(' ');
+            line.push_str(&time.value(row).to_string());
+            line.push('\n');
+            out.push_str(&line);
+        }
+    }
+    Ok(out)
+}
+
 pub fn batches_to_json(batches: &[RecordBatch]) -> Value {
     let mut rows = Vec::new();
     for batch in batches {
