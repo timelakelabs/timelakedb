@@ -13,6 +13,31 @@ here.
 
 ## [Unreleased]
 
+### Added — a finer-L0-row-group knob for the Shape A path (#70, mechanism) (2026-08-24)
+
+The lever #69 pointed at. `EngineConfig.l0_row_group_rows` /
+`TIMELAKE_L0_ROW_GROUP_ROWS` sets the row-group size for **L0 flush**, which
+until now used the parquet writer's coarse default (~1M rows) while compaction
+used 64K. A small value makes fresh data's blooms and stats prune at a fine
+grain, so a point lookup decodes a small group instead of a huge one — the
+Shape A p95 fix (#68).
+
+Proven at the mechanism level (`provider::tests::finer_l0_row_groups_read_far_
+less_for_a_present_entity`): the same unclustered L0 data written with fine
+(256-row) vs coarse groups, a **present** entity's lookup — the case blooms
+can't skip — reads **~3× fewer bytes** fine vs coarse at 20K rows, and the gap
+widens sharply at scale where a coarse group is megabytes. Correctness is
+unchanged (the entity's row comes back either way).
+
+**Off by default, deliberately.** M4 once measured finer row groups as a
+regression — before range reads existed, when a scan pulled the whole object.
+That regime is gone (the scan fetches only surviving groups), but the write
+cost of finer groups (more per-group metadata) is real, so flipping the
+default waits on a **full-scale Gauge run** confirming Shape A p95 < 250 ms AND
+no ingest/storage regression (RR-1/PR-1). That run — and the default flip it
+justifies — is the remaining step to close #68; the knob and the
+`timelake_scan_*` counters (#69) are what make it measurable.
+
 ### Added — scan-pruning telemetry, and the Shape A p95 diagnosis (#69) (2026-08-24)
 
 Phase 1 of the Shape A p95 carve-out (#68): instrument the read path so a

@@ -54,6 +54,14 @@ pub struct EngineConfig {
     /// Compact a (table, hour) partition once it accumulates this many
     /// L0 files (PR-6 lever).
     pub compact_min_files: usize,
+    /// Row-group size for L0 flush, in rows. `None` = the parquet writer's
+    /// coarse default (~1M). A small value (e.g. 65_536, matching compaction)
+    /// makes L0 blooms and stats prune at a fine grain, so a point lookup
+    /// decodes a small group instead of a huge one (#68/#70) — at the cost of
+    /// more per-group metadata on the write path, which M4 once measured as a
+    /// regression *before* range reads existed. Off by default until a Gauge
+    /// run shows it is a net win; `TIMELAKE_L0_ROW_GROUP_ROWS` sets it.
+    pub l0_row_group_rows: Option<usize>,
     /// Retention policies (FR-7). Empty = keep everything.
     pub retention: Vec<RetentionPolicy>,
     /// Admission control: queries beyond this queue (RR-1).
@@ -141,6 +149,7 @@ impl Default for EngineConfig {
             flush_age_secs: 60,
             wal_max_bytes: 2 << 30, // RR-3 replay bound / RR-5 backpressure
             compact_min_files: 4,
+            l0_row_group_rows: None,
             retention: Vec::new(),
             max_concurrent_queries: 6,
             // Below the global 6, so two permits are always reachable by
@@ -1280,7 +1289,9 @@ impl Engine {
         let mut metas = Vec::new();
         for (partition, part) in flush::prepare(batch)? {
             let (min_ts, max_ts) = flush::time_bounds(&part);
-            let bytes = flush::to_parquet_bytes(&part)?;
+            // L0 row-group size (#70): None = coarse default; a small value
+            // makes fresh data prune at a fine grain like settled files do.
+            let bytes = flush::to_parquet_bytes_rg(&part, self.cfg.l0_row_group_rows)?;
             let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
             let path = format!(
                 "{db}/{table}/data/{partition}/{:020}-{seq:06}.parquet",
@@ -3504,6 +3515,10 @@ pub fn config_from_env() -> EngineConfig {
         flush_age_secs: env("TIMELAKE_FLUSH_AGE_SECS", d.flush_age_secs),
         wal_max_bytes: env("TIMELAKE_WAL_MAX_BYTES", d.wal_max_bytes),
         compact_min_files: env("TIMELAKE_COMPACT_MIN_FILES", d.compact_min_files),
+        l0_row_group_rows: std::env::var("TIMELAKE_L0_ROW_GROUP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(d.l0_row_group_rows),
         retention: std::env::var("TIMELAKE_RETENTION")
             .map(|s| parse_retention(&s))
             .unwrap_or_default(),

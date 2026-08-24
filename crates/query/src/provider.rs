@@ -1457,6 +1457,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finer_l0_row_groups_read_far_less_for_a_present_entity() {
+        // #70: the fix. A PRESENT entity is the case fine groups help — the
+        // bloom can't skip a group that holds it, so with coarse groups the
+        // lookup decodes a huge group for a few rows; with fine groups it
+        // decodes a small one. Same unclustered L0 data, written both ways;
+        // measure the bytes each lookup pulls from the store.
+        use timelake_buffer::{TableBuffer, flush};
+        use timelake_ingest::parse_lines;
+
+        let t = 1_786_179_600_000_000_000i64;
+        let lp: String = (0..20_000)
+            .map(|i| format!("m,pid=p{:05} v=1.0 {}\n", (i * 7919) % 20_000, t + i))
+            .collect();
+        let mut buf = TableBuffer::default();
+        for line in parse_lines(&lp, 1, 0).unwrap() {
+            buf.append(&line).unwrap();
+        }
+        let snap = buf.snapshot().unwrap();
+        let part = &flush::prepare(&snap).unwrap()[0].1;
+
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        // bytes one present-entity lookup pulls from a file written with the
+        // given row-group size.
+        let bytes_read = |rg: Option<usize>| -> u64 {
+            let bytes = flush::to_parquet_bytes_rg(part, rg).unwrap();
+            let path = "poc/m/data/2026080809/f.parquet";
+            let store = CountingStore::with(path, bytes.clone());
+            let store_dyn: Arc<dyn Store> = store.clone();
+            let meta = FileMeta {
+                db: "poc".into(),
+                table: "m".into(),
+                partition: "2026080809".into(),
+                path: path.into(),
+                rows: 20_000,
+                size_bytes: bytes.len() as u64,
+                min_ts_ns: t,
+                max_ts_ns: t + 20_000,
+            };
+            let (batches, _r) = load_pruned(
+                &[],
+                std::slice::from_ref(&meta),
+                &store_dyn,
+                &Pruning {
+                    tag_equals: vec![("pid".into(), "p10000".into())],
+                    ..Default::default()
+                },
+                None,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                &pool,
+                "m",
+                &Arc::new(MetaCache::default()),
+                &Arc::new(ScanStats::default()),
+            )
+            .expect("scan");
+            // correctness holds either way: the entity's one row comes back.
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            store.read()
+        };
+
+        let coarse = bytes_read(None); // writer default: one big group
+        let fine = bytes_read(Some(256)); // fine groups, like settled files
+        // >2x less even here, where the 20K-row file is small enough that
+        // fine's per-group metadata is a big fraction; at full scale a coarse
+        // group is megabytes and the gap widens sharply.
+        assert!(
+            fine * 2 < coarse,
+            "fine L0 groups should read far less for a present entity: fine {fine} vs coarse {coarse}"
+        );
+    }
+
     /// The SEC-2 acceptance shape: labels written through the normal
     /// ingest path, flushed to Parquet, scanned by a real DataFusion
     /// session — and COUNT(*) (the empty-projection fast path that never
