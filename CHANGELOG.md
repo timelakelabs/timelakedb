@@ -45,6 +45,12 @@ four new rejection cases in `rollups.rs`. The cluster half of #60 —
 materialising from the shard union in the compactor role — is blocked on the
 compactor role becoming startable (C2 phase 5b) and is not in this change.
 
+Also reconciles ARCHITECTURE §18, which merged (timelakedb#58) still
+describing the recompute-and-overwrite design that part 2 replaced: §18.3
+now documents watermark-finalization and why recompute-plus-LWW was unsound
+here, §18.5 marks which metrics actually shipped, and §18.6 marks phase 1 and
+this grammar half done.
+
 ### Added — downsampling, part 2: rollup materialisation (R-2, #59) (2026-08-23)
 
 The second half of #59: a defined rollup now **runs**. On the maintenance
