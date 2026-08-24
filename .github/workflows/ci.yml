@@ -84,7 +84,20 @@ jobs:
       #               workspace-wide once excluded, against 76.7% with it
       #               counted — i.e. this gate would have failed for a file
       #               whose tests all pass elsewhere.
+      #
+      # Strip full DWARF from the instrumented rebuild. The plain `cargo test`
+      # above fits; this coverage build does not, and freeing more runner disk
+      # (dotnet/ghc/android above) was a losing race against a workspace that
+      # only grows — datafusion + arrow + aws-sdk instrumented AND carrying
+      # `-C debuginfo=2` produced object files that OOM'd `ld` mid-link
+      # (SIGBUS, "ld terminated with signal 7", on whichever test binary drew
+      # the short straw). llvm-cov's line counts come from the embedded
+      # coverage map, not from DWARF, so line-tables-only is all it needs and
+      # cuts the link 3–5×. `--fail-under-lines` is unaffected.
       - run: cargo llvm-cov --workspace --ignore-filename-regex 'main\.rs|store-s3/src/lib\.rs' --fail-under-lines 80
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
   store-s3:
     name: store-s3 · S3 + KMS against LocalStack
