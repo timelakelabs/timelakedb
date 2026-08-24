@@ -25,7 +25,7 @@ use serde_json::Value;
 use timelake_api::WriteError;
 // Re-exported so callers and tests name the retention types through the
 // engine they configure, without depending on the api crate directly.
-pub use timelake_api::{RETENTION_ANY_DB, RetentionPolicy};
+pub use timelake_api::{RETENTION_ANY_DB, RetentionPolicy, RollupAgg, RollupDef, RollupFn};
 use timelake_buffer::{TableBuffer, flush};
 use timelake_catalog::{Catalog, FileMeta};
 use timelake_ingest::{parse_lines, precision_multiplier};
@@ -343,6 +343,43 @@ struct RetentionDoc {
     policies: Vec<RetentionPolicy>,
 }
 
+/// R-2 rollup definitions (ARCHITECTURE §18), persisted beside retention.
+const ROLLUPS_CONFIG_PATH: &str = "catalog/config/rollups.json";
+const ROLLUPS_FORMAT_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RollupDoc {
+    version: u32,
+    rollups: Vec<RollupDef>,
+}
+
+fn load_rollups_doc(bytes: &[u8]) -> std::io::Result<Vec<RollupDef>> {
+    let doc: RollupDoc = serde_json::from_slice(bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{ROLLUPS_CONFIG_PATH}: {e}"),
+        )
+    })?;
+    Ok(doc.rollups)
+}
+
+/// Seed rollups from `TIMELAKE_ROLLUPS` — a JSON array of definitions (the
+/// same shape `/admin/rollups` and `rollups.json` use), because a rollup is
+/// too structured for a compact env grammar. The stored copy outranks this
+/// at boot, exactly like retention. Unset or unparseable ⇒ none.
+fn parse_rollups_env() -> Vec<RollupDef> {
+    match std::env::var("TIMELAKE_ROLLUPS") {
+        Ok(s) if !s.trim().is_empty() => match serde_json::from_str::<Vec<RollupDef>>(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "TIMELAKE_ROLLUPS is not a JSON array of rollup definitions; ignoring");
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Read the stored policies, migrating a v1 document if that is what is
 /// there.
 ///
@@ -610,6 +647,12 @@ pub struct Engine {
     /// config, not data — CAS arrives with the C1 catalog work if
     /// concurrent admins ever matter.
     retention: RwLock<Vec<RetentionPolicy>>,
+    /// R-2 rollup definitions (ARCHITECTURE §18), runtime-mutable via
+    /// `/admin/rollups`. Seeded from `TIMELAKE_ROLLUPS`; changes persist to
+    /// [`ROLLUPS_CONFIG_PATH`] through the store, the stored copy winning at
+    /// boot — the retention pattern exactly. Materialisation reads this on
+    /// the maintenance tick.
+    rollups: RwLock<Vec<RollupDef>>,
     /// Rows mid-flush: snapshotted at buffer swap-out, dropped after the
     /// catalog commit that makes their files visible. Queries union this
     /// with buffer + files, reading it BEFORE the catalog — acknowledged
@@ -762,6 +805,14 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
+        // R-2 rollups: same seed rule as retention — stored copy outranks
+        // the env, absent file falls back to TIMELAKE_ROLLUPS (§18.2).
+        let rollups: Vec<RollupDef> = match store.get(ROLLUPS_CONFIG_PATH) {
+            Ok(bytes) => load_rollups_doc(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => parse_rollups_env(),
+            Err(e) => return Err(e),
+        };
+
         // Node identity, read once: it stamps the audit chain (§5.2) and
         // tags every self-monitoring row, so a cluster's samples aggregate.
         // Through the cluster crate's reader, so the name here and the name
@@ -843,6 +894,7 @@ impl Engine {
             auth,
             audit,
             retention: RwLock::new(retention),
+            rollups: RwLock::new(rollups),
             flushing: RwLock::new(HashMap::new()),
             cfg,
             lines_total: AtomicU64::new(0),
@@ -1470,6 +1522,70 @@ impl Engine {
         Self::persist_retention(&self.store, &r)
     }
 
+    /// R-2 rollup surface (ARCHITECTURE §18), the retention pattern reused.
+    pub fn rollups(&self) -> Vec<RollupDef> {
+        self.rollups.read().expect("rollups lock").clone()
+    }
+
+    /// Upsert a rollup by `(db, name)`. Validates structurally and enforces
+    /// the retention invariant (§18.4) — a rejected definition returns Err
+    /// and the admin surface maps it to 400.
+    pub fn set_rollup(&self, def: RollupDef) -> Result<(), String> {
+        def.validate()?;
+        // The source's retention must outlast the rollup's lookback, or the
+        // oldest buckets under-count as retention drops the source out from
+        // under a materialisation pass. Most-specific policy wins, matching
+        // enforcement; a source with no policy (kept forever) always passes.
+        let source_ret = {
+            let policies = self.retention.read().expect("retention lock");
+            policies
+                .iter()
+                .find(|p| p.db == def.db && p.table == def.source)
+                .map(|p| p.seconds)
+                .or_else(|| {
+                    policies
+                        .iter()
+                        .find(|p| p.is_wildcard() && p.table == def.source)
+                        .map(|p| p.seconds)
+                })
+        };
+        if let Some(secs) = source_ret
+            && secs <= def.lookback_secs
+        {
+            return Err(format!(
+                "source {}.{} keeps {secs}s but the rollup lookback is {}s; the lookback must be \
+                 shorter than the source's retention, or the oldest buckets under-count as \
+                 retention drops the source (ARCHITECTURE §18.4)",
+                def.db, def.source, def.lookback_secs
+            ));
+        }
+        let mut r = self.rollups.write().expect("rollups lock");
+        match r.iter_mut().find(|x| x.db == def.db && x.name == def.name) {
+            Some(entry) => *entry = def,
+            None => r.push(def),
+        }
+        Self::persist_rollups(&self.store, &r)
+    }
+
+    pub fn remove_rollup(&self, db: &str, name: &str) -> Result<(), String> {
+        let mut r = self.rollups.write().expect("rollups lock");
+        r.retain(|x| !(x.db == db && x.name == name));
+        Self::persist_rollups(&self.store, &r)
+    }
+
+    fn persist_rollups(store: &Arc<dyn Store>, rollups: &[RollupDef]) -> Result<(), String> {
+        let doc = RollupDoc {
+            version: ROLLUPS_FORMAT_VERSION,
+            rollups: rollups.to_vec(),
+        };
+        store
+            .put(
+                ROLLUPS_CONFIG_PATH,
+                &serde_json::to_vec_pretty(&doc).expect("rollups json"),
+            )
+            .map_err(|e| format!("persist rollups config: {e}"))
+    }
+
     /// R-1 targeted delete: record a durable tombstone predicate that hides
     /// every matching row from every query, immediately and cluster-wide,
     /// before the physical GC (R-1b) reclaims the bytes. Returns the
@@ -1697,6 +1813,18 @@ impl timelake_api::Engine for Engine {
 
     fn remove_retention(&self, db: &str, table: &str) -> Result<(), String> {
         Engine::remove_retention(self, db, table)
+    }
+
+    fn rollups(&self) -> Vec<RollupDef> {
+        Engine::rollups(self)
+    }
+
+    fn set_rollup(&self, def: RollupDef) -> Result<(), String> {
+        Engine::set_rollup(self, def)
+    }
+
+    fn remove_rollup(&self, db: &str, name: &str) -> Result<(), String> {
+        Engine::remove_rollup(self, db, name)
     }
 
     fn delete_where(
@@ -2620,6 +2748,7 @@ impl Engine {
              # TYPE timelake_compactions_total counter\ntimelake_compactions_total {}\n\
              # TYPE timelake_stale_merges_total counter\ntimelake_stale_merges_total {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
+             # TYPE timelake_rollups gauge\ntimelake_rollups {}\n\
              # TYPE timelake_tombstone_rewrites_total counter\n\
              timelake_tombstone_rewrites_total {}\n\
              # TYPE timelake_encryption_enabled gauge\ntimelake_encryption_enabled {}\n\
@@ -2650,6 +2779,7 @@ impl Engine {
             self.compactions_total.load(Ordering::Relaxed),
             self.stale_merges.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
+            self.rollups.read().expect("rollups lock").len(),
             self.tombstone_rewrites_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),
