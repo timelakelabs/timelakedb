@@ -367,6 +367,55 @@ fn load_rollups_doc(bytes: &[u8]) -> std::io::Result<Vec<RollupDef>> {
 /// same shape `/admin/rollups` and `rollups.json` use), because a rollup is
 /// too structured for a compact env grammar. The stored copy outranks this
 /// at boot, exactly like retention. Unset or unparseable ⇒ none.
+/// The aggregation query for one rollup pass (ARCHITECTURE §18.3):
+/// bucket by `date_bin`, group by the tags, aggregate the v1 set, over the
+/// half-open window `[lower, high)` of buckets being sealed this pass.
+/// Identifiers are quoted; `first`/`last` order by time so they mean
+/// earliest/latest in the bucket.
+///
+/// The bounds are computed by the caller and pinned as nanosecond literals
+/// rather than left as SQL `now()`: `now()` is timezone-aware and `time` is
+/// timezone-naive, so the comparison would lean on DataFusion's naive/aware
+/// coercion — and a coercion error here would be swallowed as a non-fatal
+/// rollup failure, leaving the target silently empty. `arrow_cast` to
+/// `Timestamp(Nanosecond, None)` matches the column type exactly. `lower` is
+/// absent only on the first pass against an empty target.
+fn build_rollup_sql(def: &RollupDef, tags: &[String], lower: Option<i64>, high: i64) -> String {
+    let bucket = format!("date_bin(INTERVAL '{} seconds', time)", def.interval_secs);
+    let mut select = format!("SELECT {bucket} AS time");
+    for t in tags {
+        select.push_str(&format!(", \"{}\"", t.replace('"', "\"\"")));
+    }
+    for a in &def.aggregations {
+        let col = a.source_column.replace('"', "\"\"");
+        let expr = match a.function {
+            RollupFn::Avg => format!("avg(\"{col}\")"),
+            RollupFn::Min => format!("min(\"{col}\")"),
+            RollupFn::Max => format!("max(\"{col}\")"),
+            RollupFn::Sum => format!("sum(\"{col}\")"),
+            RollupFn::Count => format!("count(\"{col}\")"),
+            RollupFn::First => format!("first_value(\"{col}\" ORDER BY time)"),
+            RollupFn::Last => format!("last_value(\"{col}\" ORDER BY time)"),
+        };
+        select.push_str(&format!(
+            ", {expr} AS \"{}\"",
+            a.target_column.replace('"', "\"\"")
+        ));
+    }
+    let mut group = format!("GROUP BY {bucket}");
+    for t in tags {
+        group.push_str(&format!(", \"{}\"", t.replace('"', "\"\"")));
+    }
+    let mut where_ = format!("time < arrow_cast({high}, 'Timestamp(Nanosecond, None)')");
+    if let Some(lo) = lower {
+        where_ = format!("time >= arrow_cast({lo}, 'Timestamp(Nanosecond, None)') AND {where_}");
+    }
+    format!(
+        "{select} FROM \"{}\" WHERE {where_} {group}",
+        def.source.replace('"', "\"\""),
+    )
+}
+
 fn parse_rollups_env() -> Vec<RollupDef> {
     match std::env::var("TIMELAKE_ROLLUPS") {
         Ok(s) if !s.trim().is_empty() => match serde_json::from_str::<Vec<RollupDef>>(&s) {
@@ -688,6 +737,10 @@ pub struct Engine {
     /// the query path pushes to.
     selfmon: Option<std::sync::Arc<selfmon::SelfMonitor>>,
     retention_drops_total: AtomicU64,
+    /// R-2: rollup materialisation passes run, and target rows written by
+    /// them (ARCHITECTURE §18).
+    rollup_materializations_total: AtomicU64,
+    rollup_rows_written_total: AtomicU64,
     /// R-1b: files rewritten or dropped by the physical tombstone GC pass.
     tombstone_rewrites_total: AtomicU64,
     file_seq: AtomicU64,
@@ -907,6 +960,8 @@ impl Engine {
             write_rejects: WriteRejects::default(),
             selfmon,
             retention_drops_total: AtomicU64::new(0),
+            rollup_materializations_total: AtomicU64::new(0),
+            rollup_rows_written_total: AtomicU64::new(0),
             tombstone_rewrites_total: AtomicU64::new(0),
             file_seq: AtomicU64::new(0),
             pending_gc: Mutex::new(Vec::new()),
@@ -1584,6 +1639,136 @@ impl Engine {
                 &serde_json::to_vec_pretty(&doc).expect("rollups json"),
             )
             .map_err(|e| format!("persist rollups config: {e}"))
+    }
+
+    /// R-2 materialisation (ARCHITECTURE §18.3): finalize every rollup's
+    /// newly-aged-out buckets into its target. Returns the number of target
+    /// rows written across all rollups. Uses the wall clock; see
+    /// [`materialize_rollups_at`](Self::materialize_rollups_at) for the body
+    /// and the finalization model.
+    pub async fn materialize_rollups_once(&self) -> Result<usize, String> {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.materialize_rollups_at(now_nanos).await
+    }
+
+    /// Materialise every rollup as if the wall clock read `now_nanos`.
+    ///
+    /// **Exactly-once by construction.** Each bucket is written to the target
+    /// once — only after its whole span has aged past `lookback` (so late
+    /// data arriving within `lookback` of a bucket is still counted before
+    /// the bucket is sealed) — and never rewritten. The watermark is the
+    /// target's own `max(time)`, so re-running finalizes nothing already
+    /// present and the target never carries a duplicate primary key. That is
+    /// deliberate: relying on compaction to dedup re-emitted buckets is
+    /// unsound here, because a rollup whose data lands in a single bucket
+    /// writes single-instant files (`min_ts == max_ts`) and the overlap
+    /// compactor is strict on a shared boundary — those files would never
+    /// merge and the duplicate would stand forever.
+    ///
+    /// The cost is the honest limitation: a row arriving after its bucket has
+    /// already been sealed is not reflected. `lookback` is exactly the grace
+    /// period for that, and the retention invariant (`set_rollup`) keeps the
+    /// source alive longer than the grace so a sealing bucket still has its
+    /// rows. Taken explicitly rather than from `SystemTime::now` so a test —
+    /// or a future point-in-time backfill — drives finalization
+    /// deterministically instead of racing the clock.
+    pub async fn materialize_rollups_at(&self, now_nanos: i64) -> Result<usize, String> {
+        let defs = self.rollups.read().expect("rollups lock").clone();
+        let mut total = 0usize;
+        for def in &defs {
+            match self.materialize_one(def, now_nanos).await {
+                Ok(n) => total += n,
+                // One bad rollup must not stop the others, exactly as one
+                // unflushable table must not stop compaction (the tick's rule).
+                Err(e) => {
+                    tracing::error!(rollup = %def.name, error = %e, "rollup materialisation failed")
+                }
+            }
+        }
+        if !defs.is_empty() {
+            self.rollup_materializations_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(total)
+    }
+
+    /// The next bucket a rollup should finalize: the target's `max(time)`
+    /// (a bucket start) plus one interval, or `None` when the target does not
+    /// exist yet or holds no rows (finalize from the beginning of source).
+    async fn target_watermark(&self, db: &str, target: &str) -> Option<i64> {
+        if !self.table_names(db).iter().any(|t| t == target) {
+            return None;
+        }
+        let sql = format!(
+            "SELECT max(time) AS m FROM \"{}\"",
+            target.replace('"', "\"\"")
+        );
+        let batches = self.sql_batches(db, &sql, Vec::new(), None).await.ok()?;
+        timelake_query::scalar_timestamp_ns(&batches)
+    }
+
+    async fn materialize_one(&self, def: &RollupDef, now_nanos: i64) -> Result<usize, String> {
+        // Resolve group_by against the live schema when it was left empty
+        // ("every source tag"). A source with no schema yet has nothing to
+        // roll up — skip, not error.
+        let Some(schema) = self.table_schema(&def.db, &def.source) else {
+            return Ok(0);
+        };
+        let tags: Vec<String> = if def.group_by.is_empty() {
+            timelake_query::tag_columns(&schema)
+        } else {
+            def.group_by.clone()
+        };
+
+        let interval_ns = def.interval_secs as i64 * 1_000_000_000;
+        // Finalization horizon floored to a bucket boundary: buckets whose
+        // start is < `high` have their whole span older than `now - lookback`
+        // and are safe to seal. `div_euclid` floors toward negative infinity,
+        // so a clock near the epoch just yields an empty window rather than a
+        // bucket straddling zero.
+        let horizon = now_nanos.saturating_sub(def.lookback_secs as i64 * 1_000_000_000);
+        let high = horizon.div_euclid(interval_ns) * interval_ns;
+
+        // The target already holds every sealed bucket, so its max bucket
+        // start + one interval is the next bucket to write. Contiguous: we
+        // always seal up to `high`, so there is never a gap to backfill.
+        let lower = self
+            .target_watermark(&def.db, &def.target)
+            .await
+            .map(|m| m + interval_ns);
+        if let Some(lo) = lower
+            && lo >= high
+        {
+            return Ok(0); // nothing new has aged out since the last pass
+        }
+
+        let sql = build_rollup_sql(def, &tags, lower, high);
+        // Empty authorizations: the pass sees public rows only, exactly as an
+        // anonymous reader does. A source with SEC-2 labels rolls up only its
+        // unlabelled rows — the safe direction (never surfacing a hidden
+        // row's contribution in a public target), documented as a v1 limit.
+        let batches = self.sql_batches(&def.db, &sql, Vec::new(), None).await?;
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(0);
+        }
+        let lp = timelake_query::batches_to_line_protocol(&def.target, &tags, &batches)?;
+        if lp.is_empty() {
+            return Ok(0);
+        }
+        let n = timelake_api::Engine::write_lp(self, &def.db, lp.as_bytes(), Some("ns")).map_err(
+            |e| match e {
+                WriteError::BadRequest(s)
+                | WriteError::Backpressure(s)
+                | WriteError::Internal(s)
+                | WriteError::NotHere(s) => format!("rollup write to {}: {s}", def.target),
+            },
+        )?;
+        self.rollup_rows_written_total
+            .fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
     }
 
     /// R-1 targeted delete: record a durable tombstone predicate that hides
@@ -2749,6 +2934,10 @@ impl Engine {
              # TYPE timelake_stale_merges_total counter\ntimelake_stale_merges_total {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
              # TYPE timelake_rollups gauge\ntimelake_rollups {}\n\
+             # TYPE timelake_rollup_materializations_total counter\n\
+             timelake_rollup_materializations_total {}\n\
+             # TYPE timelake_rollup_rows_written_total counter\n\
+             timelake_rollup_rows_written_total {}\n\
              # TYPE timelake_tombstone_rewrites_total counter\n\
              timelake_tombstone_rewrites_total {}\n\
              # TYPE timelake_encryption_enabled gauge\ntimelake_encryption_enabled {}\n\
@@ -2780,6 +2969,8 @@ impl Engine {
             self.stale_merges.load(Ordering::Relaxed),
             self.retention_drops_total.load(Ordering::Relaxed),
             self.rollups.read().expect("rollups lock").len(),
+            self.rollup_materializations_total.load(Ordering::Relaxed),
+            self.rollup_rows_written_total.load(Ordering::Relaxed),
             self.tombstone_rewrites_total.load(Ordering::Relaxed),
             if self.store_encrypted { 1 } else { 0 },
             self.visibility_filtered.load(Ordering::Relaxed),

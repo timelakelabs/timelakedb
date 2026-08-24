@@ -13,6 +13,61 @@ here.
 
 ## [Unreleased]
 
+### Added — downsampling, part 2: rollup materialisation (R-2, #59) (2026-08-23)
+
+The second half of #59: a defined rollup now **runs**. On the maintenance
+tick a pass re-aggregates the source into the target table, so part 1's
+`/admin/rollups` surface stops being inert. It is on the public reference
+page now, because it works.
+
+The design sketch in §18.3 said "recompute the trailing window every pass
+and let last-write-wins collapse the re-emitted buckets." That is wrong
+here, and the reason is worth writing down so nobody restores it: LWW
+dedup in this engine happens at compaction, and compaction's overlap
+trigger is *strict on a shared boundary* (`compaction::has_overlap`). A
+rollup row sits exactly on its bucket start, so a rollup whose data lands
+in one bucket writes single-instant files — `min_ts == max_ts` — and two
+of those never register as overlapping. The re-emitted bucket would sit
+there duplicated forever, and a `sum`/`count` over the target would read
+double. Widening the source data hides it; a single-bucket rollup shows
+it every time.
+
+So materialisation is **exactly-once by construction** instead. A bucket
+is written once, only after its whole span has aged past `lookback`, and
+never rewritten. The watermark is the target's own `max(time)` + one
+interval — no side table, correct across a restart for free — so a
+re-run finalizes nothing already present and the target never carries a
+duplicate primary key. No compaction is in the correctness path at all.
+
+`lookback` now has a precise meaning: the grace an open bucket is held for
+late data before it seals. A row landing within `lookback` of its bucket
+is counted; one landing after the seal is not — the honest limitation,
+and exactly what the retention invariant from part 1 protects (the source
+outlives the grace, so a sealing bucket still has its rows). Same shape as
+a TimescaleDB continuous aggregate with a refresh lag.
+
+Order matters in the tick: materialise runs **before** flush and compaction,
+not after, so a pass's target rows are flushed and settled in the same
+tick rather than lingering a cycle. Materialisation is a query, so it runs
+in the async loop, not the blocking maintenance closure. One rollup's
+failure is logged and skipped, never fatal to the others or the tick.
+
+The window bounds are pinned into the SQL as `arrow_cast(<ns>, 'Timestamp
+(Nanosecond, None)')` literals rather than left as `now()`: `now()` is
+timezone-aware and `time` is not, and a coercion error would be swallowed
+as a non-fatal rollup failure, silently leaving the target empty. The pass
+reads with empty authorizations — public rows only — so a SEC-2-labelled
+source contributes only its unlabelled rows to a public target, the safe
+direction, and a documented v1 limit.
+
+`timelake_rollup_materializations_total` and `timelake_rollup_rows_written
+_total` on `/metrics`. Pinned by `crates/server/tests/rollup_materialize.rs`:
+exact seven-aggregate downsampling, exactly-once (a second pass at the same
+clock writes zero and the target stays one row), and the grace both ways —
+a late row before the seal is counted, one after it is not. The clock is
+injected (`materialize_rollups_at`) so "aged past lookback" is deterministic
+rather than a race against `SystemTime::now`.
+
 ### Added — downsampling, part 1: the rollup definition surface (R-2, #59) (2026-08-23)
 
 The first half of single-node downsampling (ARCHITECTURE §18, design in
