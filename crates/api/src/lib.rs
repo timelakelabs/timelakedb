@@ -67,7 +67,7 @@ impl RetentionPolicy {
 /// bucket's raw rows, which is what makes re-materialisation idempotent
 /// (ARCHITECTURE §18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum RollupFn {
     Avg,
     Min,
@@ -76,13 +76,37 @@ pub enum RollupFn {
     Count,
     First,
     Last,
+    /// Distinct count of the source column in the bucket. Recomputable from
+    /// source (one pass over the bucket's rows) but not algebraically
+    /// combinable — which is fine here, because materialisation never
+    /// combines partials, it computes each bucket once from raw rows (§18.6).
+    CountDistinct,
+    /// Approximate continuous percentile (`approx_percentile_cont`), quantile
+    /// in `RollupAgg::quantile`. Approximate on purpose: an exact percentile
+    /// over a wide `lookback` is expensive, and the recompute-from-source
+    /// idempotency argument holds either way (§18.6).
+    Percentile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+impl RollupFn {
+    /// Whether this function takes a `quantile` argument. Only `Percentile`
+    /// does; the check lives here so `validate` and the SQL builder agree.
+    pub fn takes_quantile(self) -> bool {
+        matches!(self, RollupFn::Percentile)
+    }
+}
+
+// No `Eq`: `quantile` is an `f64`, which has no total equality. `PartialEq`
+// is all the tests and upserts need.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RollupAgg {
     pub function: RollupFn,
     pub source_column: String,
     pub target_column: String,
+    /// The quantile for `Percentile` (0.0–1.0); `None` for every other
+    /// function. Enforced both ways in [`RollupDef::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantile: Option<f64>,
 }
 
 /// One R-2 rollup definition: continuously downsample `db`.`source` into
@@ -92,7 +116,8 @@ pub struct RollupAgg {
 /// SQL guard (P0-2) refuses `CREATE MATERIALIZED VIEW`, and a standing
 /// aggregate-and-delete control belongs behind the same admin auth as
 /// retention.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// No `Eq`: a `RollupAgg` may carry an `f64` quantile. `PartialEq` suffices.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RollupDef {
     pub db: String,
     /// Unique per database; identifies the definition for update and remove.
@@ -110,6 +135,14 @@ pub struct RollupDef {
     /// source, resolved from its schema at materialisation.
     pub group_by: Vec<String>,
     pub aggregations: Vec<RollupAgg>,
+    /// Optional SQL boolean expression on the source rows, ANDed into the
+    /// bucket scan before aggregation (`region = 'eu'`, `status_code >= 500`).
+    /// It is recomputable like everything else here — the same predicate runs
+    /// every pass — so it does not disturb idempotency (§18.6). Admin-authored
+    /// and run under the read-only guard; a malformed expression fails the
+    /// pass loudly rather than corrupting the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 impl RollupDef {
@@ -156,6 +189,36 @@ impl RollupDef {
                     a.target_column
                 ));
             }
+            // `quantile` belongs to `percentile` and nowhere else — enforced
+            // both directions so a typo (quantile on `avg`, or a percentile
+            // with no quantile) is a 400 at definition, not a rollup that
+            // silently fails every pass.
+            match (a.function.takes_quantile(), a.quantile) {
+                (true, None) => {
+                    return Err(format!(
+                        "aggregation {:?} is a percentile and needs a quantile (0.0–1.0)",
+                        a.target_column
+                    ));
+                }
+                (true, Some(q)) if !(0.0..=1.0).contains(&q) => {
+                    return Err(format!(
+                        "percentile quantile for {:?} must be within 0.0–1.0, got {q}",
+                        a.target_column
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(format!(
+                        "aggregation {:?} takes no quantile — only percentile does",
+                        a.target_column
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(f) = &self.filter
+            && f.trim().is_empty()
+        {
+            return Err("filter, if given, must not be blank".into());
         }
         for g in &self.group_by {
             if seen.contains(g) {
@@ -1001,6 +1064,9 @@ struct RollupSet {
     /// Tag columns to keep; omitted or empty means every source tag.
     group_by: Option<Vec<String>>,
     aggregations: Vec<RollupAggSet>,
+    /// SQL boolean expression ANDed into the source scan (`region = 'eu'`).
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1008,6 +1074,9 @@ struct RollupAggSet {
     function: RollupFn,
     source_column: String,
     target_column: String,
+    /// Quantile 0.0–1.0 for `percentile`; omitted for every other function.
+    #[serde(default)]
+    quantile: Option<f64>,
 }
 
 async fn rollups_list<E: Engine>(
@@ -1033,10 +1102,12 @@ async fn rollups_list<E: Engine>(
                 "lookback": humanize_secs(r.lookback_secs),
                 "lookback_secs": r.lookback_secs,
                 "group_by": r.group_by,
+                "filter": r.filter,
                 "aggregations": r.aggregations.iter().map(|a| json!({
                     "function": a.function,
                     "source_column": a.source_column,
                     "target_column": a.target_column,
+                    "quantile": a.quantile,
                 })).collect::<Vec<_>>(),
             })
         })
@@ -1119,8 +1190,13 @@ async fn rollups_set<E: Engine>(
                 function: a.function,
                 source_column: a.source_column.trim().to_string(),
                 target_column: a.target_column.trim().to_string(),
+                quantile: a.quantile,
             })
             .collect(),
+        filter: set
+            .filter
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty()),
     };
 
     let target_name = format!("{}.{}", def.db, def.name);

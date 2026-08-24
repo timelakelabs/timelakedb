@@ -901,15 +901,21 @@ RollupDef {
   target:       String,          // default "{source}_{interval}"
   interval:     Duration,        // the time bucket (parse_duration_secs, crates/api:160)
   group_by:     Vec<String>,     // tag columns to keep; default = all source tags
-  aggregations: Vec<Agg>,        // (function, source_column, target_column)
+  aggregations: Vec<Agg>,        // (function, source_column, target_column, quantile?)
+  filter:       Option<String>,  // optional SQL predicate on the source (§18.6)
 }
-Agg.function ∈ { avg, min, max, sum, count, first, last }   // v1 set (see 18.6)
+Agg.function ∈ { avg, min, max, sum, count, first, last, count_distinct, percentile }  // (see 18.6)
+Agg.quantile:  Option<f64>       // 0.0–1.0, required for percentile, forbidden otherwise
 ```
 
 The set is deliberately the **recomputable-from-source** aggregates —
-each is a single SQL aggregate over the rows in one time bucket, and each
-can be recomputed exactly from those rows. That property is the whole
-correctness argument (§18.3); it is why the v1 set stops where it does.
+each is a single SQL aggregate over the rows in one time bucket, computed
+from those rows alone. That property is the whole correctness argument
+(§18.3). `count_distinct` and `percentile` (the phase-2 grammar, §18.6)
+keep it: neither is algebraically *combinable* from partials, but the
+mechanism never combines partials — it recomputes each sealed bucket once
+from its raw rows — so both are exact here in a way they would not be under
+an accumulating scheme.
 
 ### 18.2 Persistence and surface — the retention pattern, reused
 
@@ -929,56 +935,67 @@ correctness argument (§18.3); it is why the v1 set stops where it does.
   are independent:** source retention short (days), target retention long
   (years).
 
-### 18.3 Materialisation — recompute a trailing window, overwrite (the trap)
+### 18.3 Materialisation — seal each bucket once, past a lookback grace
 
 Materialisation is a stage on the maintenance tick
-(`crates/server/src/main.rs:285`, on the compaction cadence — never on a
-query's critical path). For each definition, each pass:
+(`Engine::materialize_rollups_once`, on the compaction cadence — never on
+a query's critical path). For each definition, each pass:
 
-1. Runs the aggregation through the **existing query engine**
-   (`timelake_query::run_sql_env`), so it inherits the RR-1 memory pool
+1. Finds the **watermark**: `max(time)` already in the target (a bucket
+   start) plus one interval — the next bucket to seal. No side table; the
+   target is its own cursor, correct across a restart for free.
+
+2. Runs the aggregation through the **existing query engine**
+   (`sql_batches` → `run_sql_env`), so it inherits the RR-1 memory pool
    and the server-side deadline for free:
 
    ```sql
    SELECT date_bin('{interval}', time) AS time, {group_by...},
           {fn(src_col) AS target_col ...}
    FROM {source}
-   WHERE time >= {now - lookback} AND time < {now}
+   WHERE time >= {watermark} AND time < {high}   -- [AND ({filter})]
    GROUP BY 1, {group_by...}
    ```
 
-   `date_bin` is a DataFusion builtin already relied on (reference page).
+   `{high}` is `now - lookback` floored to a bucket boundary: only buckets
+   whose whole span has aged past the grace are sealed. Both bounds are
+   pinned as `arrow_cast(<ns>, 'Timestamp(Nanosecond, None)')` literals,
+   not SQL `now()` — `now()` is timezone-aware and `time` is not, and the
+   coercion error would be swallowed as a non-fatal rollup failure,
+   silently emptying the target. `date_bin` is a DataFusion builtin
+   already relied on (reference page).
 
-2. Writes the result rows to `{target}` through the **normal write path**
+3. Writes the result rows to `{target}` through the **normal write path**
    — WAL, buffer, flush, manifest — so the target is a real table with
-   durability, replication and dedup, not a special case.
+   durability, replication and retention, not a special case.
 
-**Why a trailing window and not "each closed window once".** The obvious
-design materialises each window exactly once when it closes. It is correct
-until a late write lands in a window already sealed, and then that
-window's rollup is silently wrong forever — the exact failure the
-timelakedb#55 trap warns about. Instead, each tick re-aggregates a
-**bounded trailing window** (`now - lookback` … `now`) and *upserts* it.
+**Exactly-once by construction.** A bucket is written a single time, only
+after it ages past `lookback`, and never rewritten — so the target never
+carries a duplicate primary key and no compaction is in the correctness
+path. This is a **correction** to the model this section first described
+(recompute the trailing window every pass and let last-write-wins collapse
+the re-emitted rows). That is unsound here: LWW dedup lands only at
+compaction, and the overlap trigger is *strict on a shared boundary*
+(`compaction::has_overlap`). A rollup row sits exactly on its bucket start,
+so a rollup whose data occupies one bucket writes single-instant files
+(`min_ts == max_ts`) that never register as overlapping — the re-emitted
+duplicate would stand forever and a `sum`/`count` over the target would
+read double. Sealing once sidesteps it. (Shipped in timelakedb#62; the
+first cut of the test caught the double-count — `COUNT(*)` came back 2.)
 
-**Why re-materialising does not double-count.** A rollup row's primary key
-is `(time = window_start, group_by tags)`. Because a rollup row is a normal
-row, the write path deduplicates last-write-wins on the primary key at
-flush and again at compaction (FR-5, §7) — so **re-materialising a window
-overwrites its previous row rather than appending a second one.** The
-mechanism is idempotent *by construction*, using the same LWW the retry
-path on the write side already depends on.
+**Lookback is the grace, and the whole tuning surface.** A source row that
+lands within `lookback` of its bucket is counted, because the bucket is
+held open until it ages out; one that lands after the bucket has sealed is
+not re-picked-up. A stated, bounded limitation (like Tributary's measured
+RPO), not a silent one — it is exactly what the retention invariant
+(§18.4) protects, and the same shape as a TimescaleDB continuous aggregate
+with a refresh lag.
 
-**Why recompute and not accumulate.** The tempting optimisation is to add
-each new source row into an existing rollup value incrementally. That
-breaks on both late data and re-materialisation, and turns `avg` into a
-running-sum bookkeeping problem. Recomputing the whole bucket from source
-each pass is exact for every aggregate in the v1 set and needs no state
-beyond the source rows — at the bounded cost of re-reading `lookback` of
-source each tick. **The lookback is the entire tuning surface:** it must
-cover the expected out-of-order lag; a write older than `lookback` is not
-re-picked-up. That is a stated, bounded limitation (like Tributary's
-measured RPO), not a silent one — it is surfaced in a metric (§18.5) and
-documented.
+**Why recompute and not accumulate.** Each sealed bucket is computed whole
+from its source rows, never folded incrementally into a running value —
+which is what keeps every aggregate in the set (avg, percentiles,
+`count_distinct` included) exact, and needs no state beyond the source
+rows, at the bounded cost of the bucket scan.
 
 ### 18.4 Retention interaction — the invariant
 
@@ -994,36 +1011,45 @@ rollup misses them. So a standing invariant, checked and named the way
 
 ### 18.5 Metrics and observability
 
-- `timelake_rollups` (gauge): definitions loaded.
-- `timelake_rollup_materializations_total` / `_rows_written_total`.
-- `timelake_rollup_lag_seconds{db,name}`: seconds since the last
-  successful materialisation — before either has run it tracks uptime,
-  like the flush/compaction lag gauges (§13), so a stalled rollup is
-  visible.
-- `timelake_rollup_late_dropped_total`: source rows seen older than
-  `lookback` at materialisation time — the number that says the lookback
-  is too short for the workload's real out-of-order lag.
+- `timelake_rollups` (gauge): definitions loaded. **Shipped.**
+- `timelake_rollup_materializations_total` / `_rows_written_total`: passes
+  run, and target rows written. **Shipped.** `_rows_written_total` rises in
+  steps as buckets age past their lookback and seal; flat between passes
+  means nothing has aged out, not that a pass failed.
+- `timelake_rollup_lag_seconds{db,name}` (planned): seconds since the last
+  successful materialisation, like the flush/compaction lag gauges (§13),
+  so a stalled rollup is visible. Not yet wired.
+- `timelake_rollup_late_dropped_total` (planned, and re-scoped by the
+  watermark model): under seal-once there is no per-row "dropped late"
+  count — a post-seal row is simply not reflected. If a signal is wanted
+  it is "source rows seen with `time < watermark` at seal time". Not yet
+  wired.
 
 ### 18.6 Phasing (one phase at a time, each ending in a drill)
 
-- **Phase 1 — single node.** The `RollupDef` model, persistence, the
-  admin API, the recompute-trailing-window materialisation on an
-  `all`-role node's tick, the v1 aggregate set, the metrics, and a
-  Catchment/Gauge drill that pins: **exactness** (the target equals the
-  same aggregation run by hand, fixed-bound), **idempotency** (a second
-  tick changes nothing), **late data** (an out-of-order write into a
-  window within the lookback corrects it; one older does not), the
-  **retention invariant** (§18.4), and **the storage win** — source-short
-  + target-long is smaller than all-source, measured with Gauge, because
-  the number is the whole reason the feature exists.
-- **Phase 2 — cluster.** Materialisation is maintenance work, so it moves
-  to the **compactor role** (§12.4) once that is startable — it already
-  owns compaction, retention and tombstone rewrites, reads the union the
-  way a querier does, and writes the target the way any node does. Until
-  then a cluster runs rollups on its `all`-role node, the same way it runs
-  compaction today. Richer aggregation grammar (a `WHERE` filter,
-  percentiles, `count(distinct)`) is phase 2+, added against the same
-  recompute-from-source property that makes the v1 set correct.
+- **Phase 1 — single node. Shipped (timelakedb#59).** The `RollupDef`
+  model, persistence, the admin API, the **watermark-finalization**
+  materialisation (§18.3) on an `all`-role node's tick, the v1 aggregate
+  set, and the metrics. Pinned by unit + integration tests: **exactness**
+  (the target equals the same aggregation run by hand, fixed-bound),
+  **idempotency** (a second pass at the same clock writes nothing and the
+  target stays one row), **late data** (a write within the lookback is
+  counted; one past the seal is not), and the **retention invariant**
+  (§18.4). **Outstanding:** the Gauge *storage win* measurement —
+  source-short + target-long smaller than all-source — the number that is
+  the whole reason the feature exists; deferred to a live run.
+- **Phase 2 — cluster + grammar.** Two independent halves.
+  **Grammar — shipped (timelakedb#60):** a `WHERE` `filter`,
+  `count_distinct`, and `percentile` (`approx_percentile_cont` plus a
+  `quantile`), each still recomputable-from-source (§18.1), so exactness
+  and exactly-once are untouched; pinned by a combined
+  filter + `count_distinct` + `percentile` materialisation test.
+  **Cluster — blocked on C2 phase 5b.** Materialisation is maintenance
+  work, so it moves to the **compactor role** (§12.4) — which reads the
+  shard union the way a querier does and writes the target the way any
+  node does — once the compactor is startable. Until then a role-split
+  cluster has no `all` node to run rollups on, so a cluster downsamples
+  only after 5b lands.
 
 ### 18.7 Decisions and alternatives considered
 

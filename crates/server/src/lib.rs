@@ -396,6 +396,19 @@ fn build_rollup_sql(def: &RollupDef, tags: &[String], lower: Option<i64>, high: 
             RollupFn::Count => format!("count(\"{col}\")"),
             RollupFn::First => format!("first_value(\"{col}\" ORDER BY time)"),
             RollupFn::Last => format!("last_value(\"{col}\" ORDER BY time)"),
+            RollupFn::CountDistinct => format!("count(DISTINCT \"{col}\")"),
+            // `quantile` is guaranteed present for a percentile by
+            // RollupDef::validate; unwrap to the median defensively rather
+            // than panic if a stored config ever slipped the check. `{:?}`
+            // formats the f64 with a decimal point — `{}` would render 1.0 as
+            // the integer literal `1`, and approx_percentile_cont wants a
+            // float percentile, so p0.0 and p1.0 would fail to plan.
+            RollupFn::Percentile => {
+                format!(
+                    "approx_percentile_cont(\"{col}\", {:?})",
+                    a.quantile.unwrap_or(0.5)
+                )
+            }
         };
         select.push_str(&format!(
             ", {expr} AS \"{}\"",
@@ -409,6 +422,12 @@ fn build_rollup_sql(def: &RollupDef, tags: &[String], lower: Option<i64>, high: 
     let mut where_ = format!("time < arrow_cast({high}, 'Timestamp(Nanosecond, None)')");
     if let Some(lo) = lower {
         where_ = format!("time >= arrow_cast({lo}, 'Timestamp(Nanosecond, None)') AND {where_}");
+    }
+    // The optional row filter (§18.6). Parenthesised so its own OR/AND cannot
+    // rebind against the time bounds. Runs under the read-only guard like the
+    // rest of the pass, so it can select but not write.
+    if let Some(f) = &def.filter {
+        where_ = format!("{where_} AND ({f})");
     }
     format!(
         "{select} FROM \"{}\" WHERE {where_} {group}",
