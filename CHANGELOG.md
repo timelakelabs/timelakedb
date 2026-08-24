@@ -13,6 +13,49 @@ here.
 
 ## [Unreleased]
 
+### Added — downsampling, part 1: the rollup definition surface (R-2, #59) (2026-08-23)
+
+The first half of single-node downsampling (ARCHITECTURE §18, design in
+timelakedb#58): a rollup can be **defined, validated, persisted and
+removed**, and the retention invariant is enforced at definition time.
+Materialisation — the stage that actually writes the target table on the
+maintenance tick — is the second half of #59 and is **not** in this
+change, so a defined rollup persists but does not yet run. That is why it
+is not on the public reference page: the site documents what works, and a
+rollup that materialises nothing would be a footgun there. The
+`/admin/rollups` routes exist so the surface can be reviewed and driven,
+and the CHANGELOG says plainly that they are inert until part 2.
+
+A `RollupDef` is configuration, not SQL DDL — the read-only guard refuses
+`CREATE MATERIALIZED VIEW` (P0-2), and a standing aggregate-and-delete
+control belongs behind the same admin auth as retention. So the whole
+thing is the retention pattern reused: the type lives in `crates/api`
+beside `RetentionPolicy`; it persists to `catalog/config/rollups.json`
+through the `Store` (encrypted, SEC-1), seeded from `TIMELAKE_ROLLUPS`
+(a JSON array), the stored copy winning at boot; `GET/PUT /admin/rollups`
+and `DELETE /admin/rollups/{db}/{name}` mirror `/admin/retention`,
+`admin`-role and audited (`rollup.set` / `rollup.remove`); and
+`timelake_rollups` counts the definitions on `/metrics`.
+
+The v1 aggregate set is the recomputable-from-source ones only — `avg`,
+`min`, `max`, `sum`, `count`, `first`, `last` — because recompute-from-
+source is what makes re-materialisation idempotent (§18.3), and an
+aggregate that cannot be recomputed exactly from a bucket's rows would
+break that before it is even written.
+
+The retention invariant (§18.4) is checked in `set_rollup`, not
+discovered wrong later: a rollup whose lookback reaches past its source's
+retention is refused, because the oldest buckets would under-count as
+retention drops the source out from under a materialisation pass. Most-
+specific source policy wins, matching enforcement; a wildcard (`"*"`)
+policy binds it too; a source kept forever passes any lookback.
+
+Pinned by `crates/server/tests/rollups.rs`: the define/list/remove +
+restart round-trip through the store, upsert-by-`(db,name)`, the eight
+structural rejections, and the retention invariant (specific and wildcard
+source policies). No materialisation is exercised — that test lands with
+part 2.
+
 ### Fixed — SEC-5 had a hole: a schema-union conflict leaked a column and its types (2026-08-23)
 
 SEC-5 sanitizes query failures at `run_sql_env`, the one execution point,

@@ -61,6 +61,113 @@ impl RetentionPolicy {
     }
 }
 
+/// A downsampling aggregate: `function(source_column) AS target_column`, over
+/// the rows in one time bucket. The set is deliberately the aggregates that
+/// are **recomputable from source** — each can be recomputed exactly from a
+/// bucket's raw rows, which is what makes re-materialisation idempotent
+/// (ARCHITECTURE §18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RollupFn {
+    Avg,
+    Min,
+    Max,
+    Sum,
+    Count,
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RollupAgg {
+    pub function: RollupFn,
+    pub source_column: String,
+    pub target_column: String,
+}
+
+/// One R-2 rollup definition: continuously downsample `db`.`source` into
+/// `db`.`target` at `interval_secs` resolution, materialised on the
+/// maintenance tick into an ordinary table that carries its own retention.
+/// See ARCHITECTURE §18. This is configuration, not SQL DDL — the read-only
+/// SQL guard (P0-2) refuses `CREATE MATERIALIZED VIEW`, and a standing
+/// aggregate-and-delete control belongs behind the same admin auth as
+/// retention.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RollupDef {
+    pub db: String,
+    /// Unique per database; identifies the definition for update and remove.
+    pub name: String,
+    pub source: String,
+    pub target: String,
+    /// The time bucket, in seconds.
+    pub interval_secs: u64,
+    /// How far back each materialisation pass re-aggregates and overwrites,
+    /// in seconds — the bound on how late a write can arrive and still be
+    /// picked up. Must be ≥ `interval_secs`, and (checked against engine
+    /// state) shorter than the source's retention (§18.4).
+    pub lookback_secs: u64,
+    /// Tag columns to keep in the target. Empty means every tag of the
+    /// source, resolved from its schema at materialisation.
+    pub group_by: Vec<String>,
+    pub aggregations: Vec<RollupAgg>,
+}
+
+impl RollupDef {
+    /// Structural validation only. The retention invariant (§18.4) needs the
+    /// engine's policies and is checked in `set_rollup`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.db.trim().is_empty() {
+            return Err("db must not be empty: name the database this rollup runs in".into());
+        }
+        if self.name.trim().is_empty() {
+            return Err("rollup name must not be empty".into());
+        }
+        if self.source.trim().is_empty() {
+            return Err("source table must not be empty".into());
+        }
+        if self.target.trim().is_empty() {
+            return Err("target table must not be empty".into());
+        }
+        if self.source == self.target {
+            return Err("source and target must differ — a rollup cannot feed itself".into());
+        }
+        if self.interval_secs == 0 {
+            return Err("interval must be > 0".into());
+        }
+        if self.lookback_secs < self.interval_secs {
+            return Err(
+                "lookback must be ≥ interval: a pass has to cover at least one whole bucket".into(),
+            );
+        }
+        if self.aggregations.is_empty() {
+            return Err("a rollup needs at least one aggregation".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in &self.aggregations {
+            if a.source_column.trim().is_empty() || a.target_column.trim().is_empty() {
+                return Err("each aggregation needs a source_column and a target_column".into());
+            }
+            if a.target_column == "time" {
+                return Err("a target_column may not be named 'time' (the bucket column)".into());
+            }
+            if !seen.insert(a.target_column.clone()) {
+                return Err(format!(
+                    "two aggregations write the same target_column {:?}",
+                    a.target_column
+                ));
+            }
+        }
+        for g in &self.group_by {
+            if seen.contains(g) {
+                return Err(format!(
+                    "group_by tag {g:?} collides with an aggregation's target_column"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Errors the write path can surface over the wire.
 pub enum WriteError {
     /// 400 — the request is at fault (parse error, type conflict, bad
@@ -140,6 +247,14 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Remove one policy (that table keeps everything again).
     fn remove_retention(&self, db: &str, table: &str) -> Result<(), String>;
+
+    /// R-2 rollups (ARCHITECTURE §18): the runtime downsampling surface,
+    /// backing `/admin/rollups`. `set_rollup` upserts by `(db, name)` and
+    /// enforces the retention invariant (§18.4); materialisation runs on the
+    /// maintenance tick, not on this surface.
+    fn rollups(&self) -> Vec<RollupDef>;
+    fn set_rollup(&self, def: RollupDef) -> Result<(), String>;
+    fn remove_rollup(&self, db: &str, name: &str) -> Result<(), String>;
 
     /// R-1 targeted delete: record a durable tombstone that hides every row
     /// matching (all `tag_equals` AND the `[min_ts_ns, max_ts_ns]` window)
@@ -282,6 +397,14 @@ pub fn app<E: Engine>(
         .route(
             "/admin/retention/{db}/{table}",
             axum::routing::delete(retention_delete::<E>),
+        )
+        .route(
+            "/admin/rollups",
+            get(rollups_list::<E>).put(rollups_set::<E>),
+        )
+        .route(
+            "/admin/rollups/{db}/{name}",
+            axum::routing::delete(rollups_delete::<E>),
         )
         .route("/admin/delete", post(admin_delete::<E>))
         .route("/admin/audit", get(audit_list::<E>))
@@ -850,6 +973,251 @@ async fn retention_delete<E: Engine>(
                 source,
                 "retention.remove",
                 Some(target),
+                before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
+    }
+}
+
+/// A rollup definition as it arrives on the wire: durations are strings
+/// (`"1m"`, `"7d"`), the stored form is seconds.
+#[derive(Deserialize)]
+struct RollupSet {
+    db: String,
+    name: String,
+    source: String,
+    /// Defaults to `{source}_{interval}`.
+    target: Option<String>,
+    /// "1m", "1h", "7d", or seconds — the time bucket.
+    interval: String,
+    /// How far back each pass re-aggregates. Defaults to `interval` (one
+    /// bucket), which tolerates no out-of-order lag — set it to cover the
+    /// real lateness of the source.
+    lookback: Option<String>,
+    /// Tag columns to keep; omitted or empty means every source tag.
+    group_by: Option<Vec<String>>,
+    aggregations: Vec<RollupAggSet>,
+}
+
+#[derive(Deserialize)]
+struct RollupAggSet {
+    function: RollupFn,
+    source_column: String,
+    target_column: String,
+}
+
+async fn rollups_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Viewer) {
+        return deny;
+    }
+    let mut rollups: Vec<Value> = state
+        .engine
+        .rollups()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "db": r.db,
+                "name": r.name,
+                "source": r.source,
+                "target": r.target,
+                "interval": humanize_secs(r.interval_secs),
+                "interval_secs": r.interval_secs,
+                "lookback": humanize_secs(r.lookback_secs),
+                "lookback_secs": r.lookback_secs,
+                "group_by": r.group_by,
+                "aggregations": r.aggregations.iter().map(|a| json!({
+                    "function": a.function,
+                    "source_column": a.source_column,
+                    "target_column": a.target_column,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    rollups.sort_by_key(|r| {
+        (
+            r["db"].as_str().unwrap_or("").to_string(),
+            r["name"].as_str().unwrap_or("").to_string(),
+        )
+    });
+    Json(json!({ "rollups": rollups, "role": session.role.as_str() })).into_response()
+}
+
+async fn rollups_set<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source_ip = source_of(req.extensions());
+    // Introducing or replacing a rollup creates or abandons a table — a
+    // storage-governing action, so `admin`, like the destructive half of
+    // retention.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 256 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let set: RollupSet = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    let Some(interval_secs) = parse_duration_secs(&set.interval) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "interval {:?} is not <n>d/<n>h/<n>m/seconds (> 0)",
+                set.interval
+            ),
+        );
+    };
+    let lookback_secs = match set.lookback.as_deref() {
+        None => interval_secs,
+        Some(s) => match parse_duration_secs(s) {
+            Some(v) => v,
+            None => {
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("lookback {s:?} is not <n>d/<n>h/<n>m/seconds (> 0)"),
+                );
+            }
+        },
+    };
+    let source = set.source.trim().to_string();
+    let target = set
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{source}_{}", set.interval.trim()));
+
+    let def = RollupDef {
+        db: set.db.trim().to_string(),
+        name: set.name.trim().to_string(),
+        source,
+        target,
+        interval_secs,
+        lookback_secs,
+        group_by: set.group_by.unwrap_or_default(),
+        aggregations: set
+            .aggregations
+            .into_iter()
+            .map(|a| RollupAgg {
+                function: a.function,
+                source_column: a.source_column.trim().to_string(),
+                target_column: a.target_column.trim().to_string(),
+            })
+            .collect(),
+    };
+
+    let target_name = format!("{}.{}", def.db, def.name);
+    let after = json!({
+        "db": def.db, "name": def.name, "source": def.source, "target": def.target,
+        "interval_secs": def.interval_secs, "lookback_secs": def.lookback_secs,
+    });
+    let before = state
+        .engine
+        .rollups()
+        .into_iter()
+        .find(|r| r.db == def.db && r.name == def.name)
+        .map(|r| json!({"source": r.source, "target": r.target, "interval_secs": r.interval_secs}));
+
+    match state.engine.set_rollup(def) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source_ip,
+                "rollup.set",
+                Some(target_name),
+                before,
+                Some(after.clone()),
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "status": "set", "rollup": after })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source_ip,
+                "rollup.set",
+                Some(target_name),
+                before,
+                None,
+                "denied",
+            );
+            let _ = state.audit.record(ev);
+            // A rejected definition is the caller's — bad structure or the
+            // retention invariant (§18.4). Store failures are rare and their
+            // message says so.
+            err_response(StatusCode::BAD_REQUEST, &e)
+        }
+    }
+}
+
+async fn rollups_delete<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path((db, name)): axum::extract::Path<(String, String)>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source_ip = source_of(req.extensions());
+    // Removing the definition stops the target being fed; the target table
+    // and its data stay until its own retention expires them. Admin.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let target_name = format!("{db}.{name}");
+    let before = state
+        .engine
+        .rollups()
+        .into_iter()
+        .find(|r| r.db == db && r.name == name)
+        .map(|r| json!({"source": r.source, "target": r.target}));
+    match state.engine.remove_rollup(&db, &name) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source_ip,
+                "rollup.remove",
+                Some(target_name),
+                before,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "db": db, "name": name, "status": "removed" })).into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source_ip,
+                "rollup.remove",
+                Some(target_name),
                 before,
                 None,
                 "error",
