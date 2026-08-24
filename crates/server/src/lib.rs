@@ -776,6 +776,12 @@ pub struct Engine {
     /// must not pretend to — a write accepted here would be durable
     /// nowhere the cluster reads from.
     read_only: std::sync::atomic::AtomicBool,
+    /// C2 phase 5b: this compactor's `(ordinal, count)` among the compactor
+    /// peers, set once at boot from discovery. `compact_once` only merges
+    /// partitions this node owns (`compaction::owns_partition`), so N
+    /// compactors divide the work instead of racing it. Unset on every other
+    /// role and on a lone `all` node → owns everything, unchanged behaviour.
+    compactor_shard: std::sync::OnceLock<(usize, usize)>,
     /// CL-3: the ingesters whose live buffers this node unions into every
     /// query. `None` on `all`/`ingester`/`router`, which is why those
     /// paths are unchanged.
@@ -979,6 +985,7 @@ impl Engine {
             cl3_reads_refused: AtomicU64::new(0),
             cl2_recovered: AtomicU64::new(0),
             read_only: std::sync::atomic::AtomicBool::new(false),
+            compactor_shard: std::sync::OnceLock::new(),
             remote: RwLock::new(None),
         };
         let n = frames.len();
@@ -1243,6 +1250,18 @@ impl Engine {
                 .entry((f.db.clone(), f.table.clone(), f.partition.clone()))
                 .or_default()
                 .push(f);
+        }
+        // C2 phase 5b: a compactor merges only the partitions it owns, so N
+        // compactors split the work instead of racing every partition for
+        // double the IO. The commit fence stays the correctness floor if
+        // ownership ever overlaps (a membership change mid-flight); this
+        // retain only removes the waste. Unsharded — the `all` node or a lone
+        // compactor, `count <= 1` — owns everything, so it is a no-op there.
+        let (ordinal, count) = self.compactor_shard();
+        if count > 1 {
+            groups.retain(|(db, table, partition), _| {
+                compaction::owns_partition(db, table, partition, ordinal, count)
+            });
         }
         // Two triggers now, not one. Count is read amplification, as it
         // always was; overlap is CORRECTNESS -- duplicate primary keys
@@ -2414,6 +2433,23 @@ impl Engine {
         self.read_only.store(true, Ordering::Relaxed);
     }
 
+    /// Record this compactor's place among its peers (C2 phase 5b), set once
+    /// at boot from discovery. `ordinal` is this node's index in the sorted
+    /// compactor id list, `count` the number of compactors. `compact_once`
+    /// then merges only the partitions this node owns. Idempotent: a second
+    /// call is ignored, because the topology is fixed for a process's life
+    /// (static discovery — a membership change is a restart).
+    pub fn set_compactor_shard(&self, ordinal: usize, count: usize) {
+        let _ = self.compactor_shard.set((ordinal, count));
+    }
+
+    /// This node's `(ordinal, count)` among compactors, or `(0, 1)` when it
+    /// is unsharded — a lone compactor or an `all` node, which owns every
+    /// partition. Read by `compact_once` and surfaced on `/metrics`.
+    fn compactor_shard(&self) -> (usize, usize) {
+        self.compactor_shard.get().copied().unwrap_or((0, 1))
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Relaxed)
     }
@@ -2932,6 +2968,8 @@ impl Engine {
              # TYPE timelake_wal_bytes gauge\ntimelake_wal_bytes {}\n\
              # TYPE timelake_compactions_total counter\ntimelake_compactions_total {}\n\
              # TYPE timelake_stale_merges_total counter\ntimelake_stale_merges_total {}\n\
+             # TYPE timelake_compactor_shard_ordinal gauge\ntimelake_compactor_shard_ordinal {}\n\
+             # TYPE timelake_compactor_shard_count gauge\ntimelake_compactor_shard_count {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
              # TYPE timelake_rollups gauge\ntimelake_rollups {}\n\
              # TYPE timelake_rollup_materializations_total counter\n\
@@ -2967,6 +3005,8 @@ impl Engine {
             wal_bytes,
             self.compactions_total.load(Ordering::Relaxed),
             self.stale_merges.load(Ordering::Relaxed),
+            self.compactor_shard().0,
+            self.compactor_shard().1,
             self.retention_drops_total.load(Ordering::Relaxed),
             self.rollups.read().expect("rollups lock").len(),
             self.rollup_materializations_total.load(Ordering::Relaxed),

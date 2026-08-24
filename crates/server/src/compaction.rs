@@ -129,6 +129,48 @@ pub fn has_overlap(files: &[FileMeta]) -> bool {
     false
 }
 
+/// Which of `count` compactors owns a partition (C2 phase 5b). FNV-1a over
+/// `db\0table\0partition`, mod `count` — the same hash the router shards
+/// writes with (`router::shard_of`), keyed on the partition instead of the
+/// measurement, so the assignment is deterministic and needs no coordination.
+///
+/// This is the **work-avoidance layer above the commit fence**: with each
+/// partition owned by exactly one compactor, N compactors never race the
+/// same merge, so they do not burn double the IO to land half the merges.
+/// The fence (`Catalog::commit_replace`) stays the correctness floor — if two
+/// compactors ever do overlap (a membership change mid-flight, mismatched
+/// `count`), the loser's merge is refused, not mis-committed. Ownership only
+/// has to be good, not perfect.
+///
+/// `count == 0` is treated as "unsharded" (a lone compactor / the `all`
+/// node): everything is owned. A down compactor's partitions simply wait for
+/// it to return — compaction is not on any critical path, so a paused shard
+/// grows read amplification, it does not lose or corrupt data.
+pub fn owns_partition(
+    db: &str,
+    table: &str,
+    partition: &str,
+    ordinal: usize,
+    count: usize,
+) -> bool {
+    if count <= 1 {
+        return true;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+    };
+    mix(db.as_bytes());
+    mix(&[0]);
+    mix(table.as_bytes());
+    mix(&[0]);
+    mix(partition.as_bytes());
+    (h % count as u64) as usize == ordinal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +278,47 @@ mod tests {
             "if this now passes, the point-file gap has been closed -- \
              update the module docs and this test together"
         );
+    }
+
+    #[test]
+    fn partition_ownership_is_a_total_deterministic_partition() {
+        // count 0 and 1 mean "unsharded": one compactor owns everything.
+        assert!(owns_partition("poc", "t", "2026-08-24-00", 0, 0));
+        assert!(owns_partition("poc", "t", "2026-08-24-00", 0, 1));
+
+        // Across many partitions and 3 compactors: each partition is owned by
+        // exactly one ordinal (a total partition), the choice is stable, and
+        // all three ordinals get a share (no compactor sits idle).
+        const N: usize = 3;
+        let mut per_ordinal = [0usize; N];
+        for hour in 0..300 {
+            let part = format!("2026-08-24-{hour:02}");
+            let owners: Vec<usize> = (0..N)
+                .filter(|&o| owns_partition("poc", "sensor", &part, o, N))
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "partition {part} owned by {owners:?}, want exactly one"
+            );
+            // Stable: the same query a second time agrees.
+            assert!(owns_partition("poc", "sensor", &part, owners[0], N));
+            per_ordinal[owners[0]] += 1;
+        }
+        assert!(
+            per_ordinal.iter().all(|&c| c > 0),
+            "every compactor should own some partitions, got {per_ordinal:?}"
+        );
+
+        // The table name is part of the key: two same-named partitions in
+        // different tables can land on different compactors.
+        let a: Vec<usize> = (0..N)
+            .filter(|&o| owns_partition("poc", "a", "p", o, N))
+            .collect();
+        let b: Vec<usize> = (0..N)
+            .filter(|&o| owns_partition("poc", "b", "p", o, N))
+            .collect();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
     }
 }
