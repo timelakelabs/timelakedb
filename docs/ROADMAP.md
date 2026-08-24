@@ -195,7 +195,7 @@ The competitive analysis adds and re-ranks the rest:
 
 | Item | Why | Effort |
 |---|---|---|
-| **R-2 Downsampling / rollups** (continuous aggregates into ordinary tables, compaction-driven) | The storage-cost story v1 CQs, v2 tasks and QuestDB materialized views all tell; ours can be simpler because rollups are just another table behind the same store | L |
+| **R-2 Downsampling / rollups** (continuous aggregates into ordinary tables, compaction-driven) — **design in `ARCHITECTURE.md` §18**, ticket timelakedb#55; the loudest OSS gap in the field per `../COMPETITOR_FEATURE_REQUESTS.md` | The storage-cost story v1 CQs, v2 tasks and QuestDB materialized views all tell; ours can be simpler because rollups are just another table behind the same store | L |
 | **R-3 Prometheus `remote_write` ingest** | One config line to capture a Prometheus fleet — VM's entire growth engine. OTLP metrics second, same seam | M |
 | **R-4 Last-value cache** | InfluxDB 3's answer to the exact workload behind the Shape A p95 carve-out (608 ms vs 250 target); attack both with one design | M |
 | C2 phase 5b + C3 cluster phases, real-AWS sizing, console U0/U1/U3 (U2 metrics + self-monitoring shipped 2026-08-18) | as designed | L |

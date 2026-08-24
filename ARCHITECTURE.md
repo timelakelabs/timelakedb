@@ -851,3 +851,181 @@ nothing else installed. Grafana is not replaced (FR-8): the console
 explains the node, Grafana explores the data. U3 aggregates nodes through
 the `Discovery` trait, under CL-5's standing guard — the membership view
 is advisory and may never carry correctness.
+
+## 18. Downsampling — continuous rollups (R-2) — design
+
+The third promise is "you decide what data lives, and for how long."
+Per-table retention (FR-7) answers *how long*; downsampling answers *at
+what resolution*. Without it, the "keep 1s data for a week, 1m data
+forever" cost story every mature TSDB tells has a hole, and it is the
+loudest gap in the field that this database does not yet fill —
+Enterprise-gated in VictoriaMetrics and absent from InfluxDB 3 Core, free
+only in QuestDB (timelakedb#55; `../COMPETITOR_FEATURE_REQUESTS.md`).
+
+**A rollup is a stored definition that the node re-materialises on its own
+maintenance tick into an ordinary target table, which then carries its own
+retention.** The whole design rests on one sentence from the roadmap —
+*rollups are just another table behind the same store* — so there is no
+new storage engine, no new query path, and no new retention mechanism.
+There is a definition, and one materialisation stage on rails that exist.
+That is why this is `L` and not `XL`: the weight is entirely in the
+window-and-idempotency semantics below, not in storage or execution.
+
+### 18.1 The definition
+
+A rollup is **configuration, not SQL DDL.** The data-plane SQL surface is
+read-only, enforced on the logical plan (P0-2), so `CREATE MATERIALIZED
+VIEW` on `/api/sql` is refused by construction — and it should be, because
+a rollup is a *standing* deletion-and-aggregation control with the same
+blast radius as retention, and it belongs behind the same admin auth.
+So it mirrors retention exactly:
+
+```
+RollupDef {
+  db:           String,          // the database
+  name:         String,          // unique per db; identifies the definition
+  source:       String,          // source table
+  target:       String,          // default "{source}_{interval}"
+  interval:     Duration,        // the time bucket (parse_duration_secs, crates/api:160)
+  group_by:     Vec<String>,     // tag columns to keep; default = all source tags
+  aggregations: Vec<Agg>,        // (function, source_column, target_column)
+}
+Agg.function ∈ { avg, min, max, sum, count, first, last }   // v1 set (see 18.6)
+```
+
+The set is deliberately the **recomputable-from-source** aggregates —
+each is a single SQL aggregate over the rows in one time bucket, and each
+can be recomputed exactly from those rows. That property is the whole
+correctness argument (§18.3); it is why the v1 set stops where it does.
+
+### 18.2 Persistence and surface — the retention pattern, reused
+
+- Held in `RwLock<Vec<RollupDef>>` on the engine, seeded at boot from
+  `TIMELAKE_ROLLUPS`, and persisted to `catalog/config/rollups.json`
+  through the `Store` — encrypted with everything else (SEC-1), travels
+  with a cluster's bucket. This is the exact shape of
+  `RETENTION_CONFIG_PATH` / `retention: RwLock<Vec<RetentionPolicy>>`
+  (`crates/server/src/lib.rs:335,612,744`); the stored copy outranks the
+  env seed at boot, same as retention.
+- Admin routes, `admin`-role, audited (P1-2): `GET/PUT /admin/rollups`,
+  `DELETE /admin/rollups/{db}/{name}` — mirroring `/admin/retention`.
+  Introducing or removing a rollup is an admin action (it creates or
+  abandons a table); the audit target names `db.name`.
+- The target table's retention is an ordinary `(db, target)` policy set
+  the ordinary way. **The point of the feature is that the two lifecycles
+  are independent:** source retention short (days), target retention long
+  (years).
+
+### 18.3 Materialisation — recompute a trailing window, overwrite (the trap)
+
+Materialisation is a stage on the maintenance tick
+(`crates/server/src/main.rs:285`, on the compaction cadence — never on a
+query's critical path). For each definition, each pass:
+
+1. Runs the aggregation through the **existing query engine**
+   (`timelake_query::run_sql_env`), so it inherits the RR-1 memory pool
+   and the server-side deadline for free:
+
+   ```sql
+   SELECT date_bin('{interval}', time) AS time, {group_by...},
+          {fn(src_col) AS target_col ...}
+   FROM {source}
+   WHERE time >= {now - lookback} AND time < {now}
+   GROUP BY 1, {group_by...}
+   ```
+
+   `date_bin` is a DataFusion builtin already relied on (reference page).
+
+2. Writes the result rows to `{target}` through the **normal write path**
+   — WAL, buffer, flush, manifest — so the target is a real table with
+   durability, replication and dedup, not a special case.
+
+**Why a trailing window and not "each closed window once".** The obvious
+design materialises each window exactly once when it closes. It is correct
+until a late write lands in a window already sealed, and then that
+window's rollup is silently wrong forever — the exact failure the
+timelakedb#55 trap warns about. Instead, each tick re-aggregates a
+**bounded trailing window** (`now - lookback` … `now`) and *upserts* it.
+
+**Why re-materialising does not double-count.** A rollup row's primary key
+is `(time = window_start, group_by tags)`. Because a rollup row is a normal
+row, the write path deduplicates last-write-wins on the primary key at
+flush and again at compaction (FR-5, §7) — so **re-materialising a window
+overwrites its previous row rather than appending a second one.** The
+mechanism is idempotent *by construction*, using the same LWW the retry
+path on the write side already depends on.
+
+**Why recompute and not accumulate.** The tempting optimisation is to add
+each new source row into an existing rollup value incrementally. That
+breaks on both late data and re-materialisation, and turns `avg` into a
+running-sum bookkeeping problem. Recomputing the whole bucket from source
+each pass is exact for every aggregate in the v1 set and needs no state
+beyond the source rows — at the bounded cost of re-reading `lookback` of
+source each tick. **The lookback is the entire tuning surface:** it must
+cover the expected out-of-order lag; a write older than `lookback` is not
+re-picked-up. That is a stated, bounded limitation (like Tributary's
+measured RPO), not a silent one — it is surfaced in a metric (§18.5) and
+documented.
+
+### 18.4 Retention interaction — the invariant
+
+The source's retention drops whole `(table, hour)` partitions on its own
+tick. If a bucket's source rows expire *before* it is materialised, the
+rollup misses them. So a standing invariant, checked and named the way
+`gc_grace_secs ≥ query_timeout_secs` is:
+
+> **`source_retention` must exceed `rollup_lookback`.** A rollup whose
+> lookback reaches past its source's retention window is rejected at
+> definition time, because it would silently under-count the oldest
+> buckets it claims to cover.
+
+### 18.5 Metrics and observability
+
+- `timelake_rollups` (gauge): definitions loaded.
+- `timelake_rollup_materializations_total` / `_rows_written_total`.
+- `timelake_rollup_lag_seconds{db,name}`: seconds since the last
+  successful materialisation — before either has run it tracks uptime,
+  like the flush/compaction lag gauges (§13), so a stalled rollup is
+  visible.
+- `timelake_rollup_late_dropped_total`: source rows seen older than
+  `lookback` at materialisation time — the number that says the lookback
+  is too short for the workload's real out-of-order lag.
+
+### 18.6 Phasing (one phase at a time, each ending in a drill)
+
+- **Phase 1 — single node.** The `RollupDef` model, persistence, the
+  admin API, the recompute-trailing-window materialisation on an
+  `all`-role node's tick, the v1 aggregate set, the metrics, and a
+  Catchment/Gauge drill that pins: **exactness** (the target equals the
+  same aggregation run by hand, fixed-bound), **idempotency** (a second
+  tick changes nothing), **late data** (an out-of-order write into a
+  window within the lookback corrects it; one older does not), the
+  **retention invariant** (§18.4), and **the storage win** — source-short
+  + target-long is smaller than all-source, measured with Gauge, because
+  the number is the whole reason the feature exists.
+- **Phase 2 — cluster.** Materialisation is maintenance work, so it moves
+  to the **compactor role** (§12.4) once that is startable — it already
+  owns compaction, retention and tombstone rewrites, reads the union the
+  way a querier does, and writes the target the way any node does. Until
+  then a cluster runs rollups on its `all`-role node, the same way it runs
+  compaction today. Richer aggregation grammar (a `WHERE` filter,
+  percentiles, `count(distinct)`) is phase 2+, added against the same
+  recompute-from-source property that makes the v1 set correct.
+
+### 18.7 Decisions and alternatives considered
+
+- **Config object, not SQL DDL.** Forced by P0-2 (the read-only guard
+  refuses `CREATE MATERIALIZED VIEW`) and right on its own terms — a
+  rollup is a standing control that belongs behind admin auth and the
+  audit trail, exactly where retention is.
+- **Recompute-and-overwrite, not incremental accumulation.** Accumulation
+  breaks on late data and re-materialisation and needs per-rollup state;
+  recompute is idempotent by construction and stateless, at a bounded
+  re-read cost. The trailing window is the price and the only knob.
+- **Trailing window, not watermark-of-closed-windows.** Closed-window
+  materialisation is wrong under out-of-order arrival — the failure mode
+  a high-cardinality event store must assume, not treat as an edge.
+- **Target is an ordinary table.** The alternative — a dedicated rollup
+  store — would duplicate the buffer, flush, manifest, replication and
+  retention paths for no gain. Reusing the table machinery is what keeps
+  this `L`; a rollup that needed its own storage would be a second engine.
