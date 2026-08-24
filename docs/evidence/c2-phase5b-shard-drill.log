@@ -1,0 +1,59 @@
+C2 phase 5b — the compactor gate opens: partition ownership above the fence
+2026-08-24 · one all-node (ingest, own compaction off) + two compactors
+             sharing one object store (deploy/compose/timelakedb-compactor-cluster.yml)
+             driven by deploy/compose/compactor-drill/shard_drill.sh
+================================================================================
+
+THE CLAIM UNDER TEST: with the gate open, N compactors DIVIDE the partitions
+instead of racing every one of them. Each owns a disjoint slice by FNV-1a over
+db\0table\0partition mod N (compaction::owns_partition), computing its ordinal
+by sorting its id with the discovered peers. The commit fence stays the
+correctness floor; ownership is the efficiency layer that let the gate open.
+
+What a green run shows, in order:
+  - both compactors START (the gate is open — neither exits 2) and read their
+    ordinal from discovery: ca=0, cb=1, count=2;
+  - they DIVIDE: 8 tables split 4/4, both compactors busy;
+  - no merge is WASTED: stale_merges stays 0 — no partition touched twice;
+  - the store SETTLES: 8 tables -> 8 files, every partition compacted once;
+  - nothing is LOST: 48 rows in, 48 rows out.
+
+Transcript:
+--------------------------------------------------------------------------------
+
+=== bring the rig up (node + two compactors, shared store) ===
+
+=== wait for all three to answer /health ===
+  PASS  node and both compactors are up (the gate is open — neither compactor exited 2)
+
+=== each compactor learned its ordinal from discovery ===
+  ca: ordinal=0 count=2    cb: ordinal=1 count=2
+  PASS  ca and cb hold distinct ordinals over count=2
+
+=== seed 8 tables, 2 ascending non-overlapping files each (min_files=2 → compact) ===
+  PASS  wrote 48 rows across 8 tables in two flushes each
+
+=== wait for the compactors to divide and merge, then settle (30s tick) ===
+  t+8s: files=0 ca=0 cb=0
+  t+16s: files=12 ca=4 cb=4
+  t+24s: files=12 ca=4 cb=4
+  t+32s: files=12 ca=4 cb=4
+  t+40s: files=12 ca=4 cb=4
+  t+48s: files=8 ca=4 cb=4
+
+=== results ===
+  compactions:  ca=4  cb=4
+  stale merges: ca=0  cb=0
+  files in catalog: 8 (want 8 — one per table, fully compacted)
+  PASS  every partition settled to a single file (8 == 8) — all compacted
+  PASS  both compactors did work — the partitions were divided, not hogged
+  PASS  zero stale merges — they never raced the same partition (ownership is disjoint)
+
+=== no rows lost across the compaction ===
+  rows across all 8 tables: 48 (want 48)
+  PASS  every row survived the merges — nothing lost, nothing doubled
+
+=== verdict ===
+  ALL CHECKS PASSED
+
+=== tear down ===

@@ -470,10 +470,11 @@ in one process, bench and fixtures untouched. The specialised roles are
 built one phase at a time; **a role whose phase has not landed is refused
 at startup** (`exit 2` with a named message) rather than started
 half-built, so no one deploys an ingester that does not replicate. The
-node logs its role, id, and resolved peers at boot. The compactor role is
-built (phase 5a, 2026-08-21) and still refused by `Role::implemented` —
-see its bullet below for why, and why the lease this sentence used to
-promise was replaced by a commit fence.
+node logs its role, id, and resolved peers at boot. Every role is now
+built and startable, the compactor last (phase 5a role, 5b partition
+ownership) — see its bullet below for how N compactors divide the work
+above the commit fence, and why the lease this sentence used to promise
+was replaced by that fence.
 
 - **Router — shipped (C2 phase 3, reads added in phase 4).** Stateless, holds no data,
   opens no engine. It hashes each line's `(db, measurement)` → one
@@ -575,7 +576,8 @@ promise was replaced by a commit fence.
   Known cost, a C3 refinement: providers are registered for every table
   in the database before planning, so a query fans out snapshot requests
   for tables it will not read.
-- **Compactor — built (C2 phase 5a, 2026-08-21), gate shut.**
+- **Compactor — shipped (C2 phase 5a role 2026-08-21, 5b ownership
+  2026-08-24, gate open).**
   `TIMELAKE_ROLE=compactor` runs the §7 loops (compact, tombstone
   rewrites, retention, GC) and nothing else: no WAL, no buffer, writes
   refused, an HTTP surface of `/health` + `/ping` + `/metrics` built
@@ -595,10 +597,21 @@ promise was replaced by a commit fence.
   and the commit is refused without burning a sequence number. The
   refused merge goes to deferred GC and counts in
   `timelake_stale_merges_total` (not as a compaction). So concurrent
-  compactors are *correct* today. `Role::implemented` still refuses the
-  role because they are not yet *efficient* — two compactors racing every
-  partition do double the IO to land half the merges. Phase 5b is the
-  work-avoidance layer above the fence; flipping the gate is its gate.
+  compactors are *correct*. **Phase 5b** is the efficiency layer that let
+  the gate open: each compactor owns a disjoint slice of partitions —
+  FNV-1a over `db\0table\0partition` mod N, the same hash the router shards
+  writes with, keyed on the partition (`compaction::owns_partition`) — so
+  `compact_once` skips what it does not own and N compactors never race the
+  same merge. Every compactor computes the same ordinal by sorting its own
+  id with the discovered compactor peers; no coordination. The fence stays
+  the floor if ownership ever overlaps (a membership change mid-flight, a
+  mismatched N): the loser's merge is still refused, so ownership only has
+  to be good, not perfect. `timelake_compactor_shard_{ordinal,count}` on
+  `/metrics` shows the split. Scoped to compaction merges (the IO-heavy
+  stage); retention and tombstone GC still run on every compactor and stay
+  fence-safe — sharding them is a later refinement, not correctness. Drill:
+  `deploy/compose/compactor-drill/` — two compactors divide the partitions,
+  duplicates collapse, `stale_merges` stays ~0.
 
 ### 12.5 Discovery & intra-cluster TLS
 

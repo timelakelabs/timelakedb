@@ -1,0 +1,114 @@
+# Two compactors dividing one store's partitions (C2 phase 5b).
+#
+#   deploy/compose/compactor-drill/shard_drill.sh
+#
+# The work-division rig, as opposed to `timelakedb-compactor.yml` (one
+# compactor). An `all` node ingests with its OWN compaction turned off, and
+# two compactors — `ca` and `cb` — split the partitions between them by
+# ownership (§12.4, `compaction::owns_partition`): FNV-1a over
+# `db\0table\0partition` mod 2, each computing its ordinal by sorting its id
+# with the peer's.
+#
+# ## Why the node does not compact, without a "never compact" switch
+#
+# It has `TIMELAKE_COMPACT_MIN_FILES=1000000`, so the file-count trigger never
+# fires — and the drill seeds ASCENDING, non-overlapping files, so the overlap
+# trigger (which ignores the file count) never fires either. Both triggers
+# quiet ⇒ the node leaves every partition for the compactors, which run
+# `min_files=2`. That is the honest way to say "node ingests, compactors
+# compact" when the engine has no switch for it.
+#
+# ## Why they share a volume
+#
+# The compactor reaches the same object store, tails the catalog, and rewrites
+# files. Discovery carries no correctness (CL-5): a compactor consults it only
+# to learn the peer set and compute its own ordinal, never for a commit. If
+# ownership ever overlapped (a membership change mid-flight) the commit fence
+# still refuses the loser's merge — ownership is the efficiency layer, the
+# fence is the floor.
+name: bench-timelakedb-compactor-cluster
+services:
+  node:
+    image: timelakedb-5b:latest
+    build: ../..
+    container_name: tl5b-node
+    hostname: tl5b-node
+    ports:
+      - "7975:1963"
+    environment:
+      TIMELAKE_ROLE: all
+      TIMELAKE_NODE_ID: tl5b-node
+      TIMELAKE_SELFMON: "off"
+      # Node ingests; its own compaction is off (see header). Flush fast so
+      # the drill can build several files per table without long waits.
+      TIMELAKE_COMPACT_MIN_FILES: "1000000"
+      TIMELAKE_FLUSH_ROWS: "1"
+      TIMELAKE_FLUSH_AGE_SECS: "1"
+    volumes:
+      - shared-store:/var/lib/timelake/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  compactor-a:
+    image: timelakedb-5b:latest
+    build: ../..
+    container_name: tl5b-ca
+    hostname: ca
+    # Wait for the node to initialise the shared store. A compactor is happy
+    # to sit on an empty store, but three processes racing to CREATE the same
+    # cold local directory tree trip over each other's half-made subdirs. In a
+    # real deployment the store already exists (S3, made by the ingesters), so
+    # this ordering is a local-cold-start nicety, not a runtime dependency.
+    depends_on:
+      node:
+        condition: service_healthy
+    ports:
+      - "7976:1963"   # /health + /metrics only; no data plane
+    environment:
+      TIMELAKE_ROLE: compactor
+      TIMELAKE_NODE_ID: ca
+      TIMELAKE_SELFMON: "off"
+      TIMELAKE_CLUSTER_ADDR: "ca:1965"
+      TIMELAKE_PEERS: "cb=compactor@cb:1965"
+      TIMELAKE_COMPACT_MIN_FILES: "2"
+    volumes:
+      - shared-store:/var/lib/timelake/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  compactor-b:
+    image: timelakedb-5b:latest
+    build: ../..
+    container_name: tl5b-cb
+    hostname: cb
+    depends_on:
+      node:
+        condition: service_healthy
+    ports:
+      - "7977:1963"
+    environment:
+      TIMELAKE_ROLE: compactor
+      TIMELAKE_NODE_ID: cb
+      TIMELAKE_SELFMON: "off"
+      TIMELAKE_CLUSTER_ADDR: "cb:1965"
+      TIMELAKE_PEERS: "ca=compactor@ca:1965"
+      TIMELAKE_COMPACT_MIN_FILES: "2"
+    volumes:
+      - shared-store:/var/lib/timelake/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:1963/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  shared-store:

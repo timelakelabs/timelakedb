@@ -2,34 +2,30 @@
 #
 #   docker compose -f deploy/compose/timelakedb-compactor.yml up -d --build
 #
-# THIS DOES NOT START YET, ON PURPOSE. `Role::implemented` refuses
-# `compactor`, so that container exits 2 with a message naming the reason.
-# The topology is committed anyway, because a role nobody has ever tried to
-# launch is a role nobody knows is wired correctly — the env vars, the
-# shared volume, the health check and the port mapping are all things that
-# are wrong until someone runs them once.
-#
-# Bring it up and you should see:
+# The compactor starts as of C2 phase 5b (the gate opened 2026-08-24). Bring
+# it up and you should see:
 #
 #   node       | healthy, serving writes and queries on 7965
-#   compactor  | exited 2: "TIMELAKE_ROLE=compactor is not yet implemented"
+#   compactor  | "compactor up (maintenance only: no writes, no queries)"
 #
-# That second line is the expected result today. When the gate opens, this
-# file is what proves the role works without anyone assembling a topology
-# under time pressure.
+# This rig is the ONE-compactor case: the node ingests with its own
+# compaction turned off, and the single compactor does the rewrite work. For
+# the multi-compactor work-division drill (two compactors dividing the
+# partitions, `stale_merges` staying ~0), see `compactor-drill/`.
 #
 # ## Why they share a volume and not a network path
 #
 # The compactor is not a peer in the CL-2 sense. It replicates nothing and
 # talks to nobody: it reaches the same object store, tails the catalog, and
-# rewrites files. Discovery does not carry correctness here (CL-5) and the
-# compactor consults it for nothing at all.
+# rewrites files. Discovery carries no correctness here (CL-5) — a lone
+# compactor consults it for nothing; a fleet consults it only to compute its
+# own ordinal for partition ownership (§12.4, 5b), never for a commit.
 #
-# That is also why this is safe to run before the lease exists. Two nodes
-# compacting the same partition is *correct* — the loser's merge is refused
-# at commit because its inputs are gone (`Catalog::commit_replace`) — it is
-# merely wasteful. `timelake_stale_merges_total` on either node counts how
-# wasteful.
+# Two compactors compacting the same partition is *correct* — the loser's
+# merge is refused at commit because its inputs are gone
+# (`Catalog::commit_replace`) — it is merely wasteful, and 5b's partition
+# ownership is what stops the waste. `timelake_stale_merges_total` on either
+# node counts any that slips through (a membership change mid-flight).
 name: bench-timelakedb-compactor
 services:
   node:
