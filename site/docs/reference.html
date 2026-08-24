@@ -304,6 +304,9 @@
             <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink, introduce, or widen scope; body <code>db</code>, <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
             <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
+            <tr><td><code>GET /admin/rollups</code></td><td>viewer</td><td>—</td><td>200 + <code>{"rollups":[{db, name, source, target, interval, lookback, group_by, aggregations[]}]}</code></td></tr>
+            <tr><td><code>PUT /admin/rollups</code></td><td><strong>admin</strong>; body <code>db</code>, <code>name</code>, <code>source</code>, <code>interval</code>, <code>aggregations[]</code>, optional <code>target</code>, <code>lookback</code>, <code>group_by[]</code></td><td>—</td><td>200; upserts by <code>(db, name)</code>, persists durably, first pass on the next maintenance tick. 400 on a structural error or a lookback that outlives the source's retention</td></tr>
+            <tr><td><code>DELETE /admin/rollups/{db}/{name}</code></td><td><strong>admin</strong></td><td>—</td><td>200; stops materialising. The target table is left exactly as it stands — its rows are ordinary data, so remove them with retention or a targeted delete if you want them gone. 404 if unknown</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
             <tr><td><code>GET /admin/tokens</code></td><td>operator</td><td>—</td><td>200 + token records (id, description, scope, databases, grants, issuer, timestamps, revoked, last used); the secret is never re-shown</td></tr>
             <tr><td><code>POST /admin/tokens</code></td><td>admin; body <code>description</code>, <code>scope</code>, optional <code>databases</code>, <code>authorizations</code>, <code>expires_in_secs</code></td><td>—</td><td>200 + <code>{secret, token}</code> — the secret appears exactly once</td></tr>
@@ -372,6 +375,53 @@
         shrinking, introducing, or removing a window — plus TLS reload.
       </p>
 
+      <h3>Rollups (downsampling, R-2)</h3>
+      <p>
+        A <em>rollup</em> continuously downsamples one table into another: it
+        buckets the source by a fixed interval, aggregates each bucket, and
+        writes the result to a target table you then query like any other.
+        Define one with <code>PUT /admin/rollups</code> — a <code>source</code>
+        and <code>target</code> table, an <code>interval</code> (the bucket
+        width, e.g. <code>"1m"</code>), a <code>group_by</code> (the tag columns
+        to keep; omit it for every source tag), and the
+        <code>aggregations</code>: each names a <code>function</code>, a
+        <code>source_column</code> and the <code>target_column</code> to write.
+        <code>target</code> defaults to <code>{source}_{interval}</code>. The
+        function set is the seven that a bucket's own rows determine exactly —
+        <code>avg</code>, <code>min</code>, <code>max</code>, <code>sum</code>,
+        <code>count</code>, <code>first</code>, <code>last</code> — where
+        <code>first</code>/<code>last</code> mean earliest/latest by time in the
+        bucket.
+      </p>
+      <p>
+        Materialisation runs on the maintenance tick and is
+        <strong>exactly-once</strong>: a bucket is written a single time, only
+        after its whole span has aged past <code>lookback</code>, and never
+        rewritten. That makes <code>lookback</code> the grace period an open
+        bucket is held for out-of-order data — a point arriving within
+        <code>lookback</code> of its bucket is counted; one arriving after the
+        bucket has sealed is <em>not</em> reflected. Set <code>lookback</code> to
+        cover the real lateness of your source (it defaults to one
+        <code>interval</code>, i.e. effectively no grace). A rollup is refused if
+        its <code>lookback</code> reaches past the source's retention window,
+        because a bucket would seal after its source rows had already been
+        dropped — a silent under-count, caught at definition time instead.
+      </p>
+      <div class="note">
+        <p>
+          Two v1 limits, stated plainly. A materialisation pass reads with no
+          authorizations, so a source carrying <a href="#labels">visibility
+          labels (SEC-2)</a> rolls up only its <em>unlabelled</em> rows into the
+          target — the safe direction, never surfacing a hidden row's
+          contribution in a public table. And deleting a rollup stops it
+          materialising but leaves the target table in place; its rows are
+          ordinary data, removed with retention or a targeted delete.
+          <code>timelake_rollups</code> counts the definitions and
+          <code>timelake_rollup_rows_written_total</code> the rows materialised,
+          both on <code>/metrics</code>.
+        </p>
+      </div>
+
       <h3>Admin console (<code>/admin/ui</code>)</h3>
       <p>
         <code>GET /admin/ui</code> serves the management page: one
@@ -416,7 +466,7 @@
         </p>
       </div>
 
-      <h3>Row visibility labels (SEC-2)</h3>
+      <h3 id="labels">Row visibility labels (SEC-2)</h3>
       <p>
         A tag named <code>_visibility</code> holds an Accumulo-style label
         expression per row — <code>admin</code>, <code>ops&amp;audit</code>,
@@ -756,6 +806,9 @@
             <tr><td><code>timelake_stale_merges_total</code></td><td>counter</td><td>Merges refused by the compaction commit fence because another writer had already replaced their input files. 0 on a single node; on a cluster it is the number that says whether a second compactor would earn its keep</td></tr>
             <tr><td><code>timelake_cl3_reads_refused_total</code></td><td>counter</td><td>Live-buffer reads the intra-cluster listener refused with 503 because <code>TIMELAKE_INTERNAL_MAX_CONCURRENT</code> was saturated (ingester role only). Query load lands on the ingest tier as this work; a rising count means queriers are outrunning what an ingester will serve</td></tr>
             <tr><td><code>timelake_retention_drops_total</code></td><td>counter</td><td>Files dropped by per-table retention</td></tr>
+            <tr><td><code>timelake_rollups</code></td><td>gauge</td><td>Rollup definitions currently loaded (R-2)</td></tr>
+            <tr><td><code>timelake_rollup_materializations_total</code></td><td>counter</td><td>Materialisation passes run — one per maintenance cycle that has any rollup defined, whether or not a bucket sealed on it</td></tr>
+            <tr><td><code>timelake_rollup_rows_written_total</code></td><td>counter</td><td>Rows written into rollup targets. Rises in steps as buckets age past their <code>lookback</code> and seal; flat between means nothing has aged out since the last pass, not that a pass failed</td></tr>
             <tr><td><code>timelake_parquet_files</code></td><td>gauge</td><td>Files currently in the catalog</td></tr>
             <tr><td><code>timelake_catalog_commit_conflicts_total</code></td><td>counter</td><td>Catalog commits that lost a CAS race and retried. 0 on a single writer; climbing means real multi-writer contention on one bucket</td></tr>
             <tr><td><code>timelake_cl2_replicated_total</code></td><td>counter</td><td>Frames an ingester replicated to its peer before ack (ingester role only)</td></tr>

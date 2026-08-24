@@ -287,13 +287,22 @@ async fn main() {
             loop {
                 tick.tick().await;
                 n += 1;
-                let e = Arc::clone(&maint);
                 let compact = n.is_multiple_of(3);
                 let retention = n.is_multiple_of(6);
                 // R-1b runs on the compaction cadence: physical delete is the
                 // same kind of rewrite work and never on a query's critical
                 // path, since R-1a already hides the rows at read time.
                 let tombstones = n.is_multiple_of(3);
+                // R-2 (§18.3): materialise BEFORE the flush+compact below, so
+                // this pass's rollup rows are flushed to a file and their
+                // cross-pass duplicates collapsed by the overlap-triggered
+                // compaction in THIS tick rather than a later one. It reads
+                // through SQL (async), so it can't live in the blocking
+                // closure; per-rollup failures are logged inside, never fatal.
+                if compact && let Err(err) = Arc::clone(&maint).materialize_rollups_once().await {
+                    tracing::error!(%err, stage = "rollup", "maintenance stage failed");
+                }
+                let e = Arc::clone(&maint);
                 // Each stage is independent. A failing flush used to abort
                 // the rest of the tick, so one unflushable table stopped
                 // compaction and retention for every table on the node.
