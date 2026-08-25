@@ -302,13 +302,15 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 Each release attaches a `.deb` and an `.rpm` built from that tag.
 
 ```bash
+VER=0.2.0
+
 # Debian / Ubuntu
-curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb_0.1.0~alpha_amd64.deb
-sudo apt install ./timelakedb_0.1.0~alpha_amd64.deb
+curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb_${VER}_amd64.deb
+sudo apt install ./timelakedb_${VER}_amd64.deb
 
 # RHEL / Rocky / Alma / Amazon Linux 2023
-curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb-0.1.0~alpha-1.x86_64.rpm
-sudo dnf install ./timelakedb-0.1.0~alpha-1.x86_64.rpm
+curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb-${VER}-1.x86_64.rpm
+sudo dnf install ./timelakedb-${VER}-1.x86_64.rpm
 ```
 
 The package installs the server, a hardened systemd unit, and
