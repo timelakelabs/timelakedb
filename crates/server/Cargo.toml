@@ -39,6 +39,9 @@ flate2.workspace = true
 # CL-3 tests wire two engines to ONE store in a single process — the
 # cluster's read shape without a container.
 timelake-store = { path = "../store" }
+timelake-prometheus = { path = "../prometheus" }
+prost = "0.14"
+snap = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true

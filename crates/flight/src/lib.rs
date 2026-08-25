@@ -20,21 +20,26 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
+use arrow_flight::sql::server::PeekableFlightDataStream;
 use arrow_flight::sql::{
     CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes,
-    CommandGetTables, CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+    CommandGetTables, CommandStatementIngest, CommandStatementQuery, ProstMessageExt, SqlInfo,
+    TicketStatementQuery,
 };
+use arrow_flight::utils::flight_data_to_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
     Ticket,
 };
-use futures::{Stream, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
 /// Future alias so implementors don't need a futures dependency.
 pub type SqlFuture<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, String>> + Send + 'a>>;
+
+mod doput;
 
 /// What the blanket `FlightService` impl expects back from every DoGet.
 type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
@@ -93,6 +98,40 @@ pub trait SqlBackend: Send + Sync + 'static {
 
     /// Merged schema for one table, when it has any data behind it.
     fn table_schema(&self, db: &str, table: &str) -> Option<SchemaRef>;
+
+    /// Authenticate one WRITE call (DoPut, #79). `Ok(())` — the caller may
+    /// write. This is the mirror of [`Self::authenticate_read`]: a token
+    /// scoped read-only is refused here, so DoPut is a separate write-scoped
+    /// door, NOT an exception carved into the read-only SQL guard (P0-2).
+    /// The default is open, matching the data plane's default-off posture.
+    fn authenticate_write(
+        &self,
+        _authorization: Option<&str>,
+        _db: &str,
+    ) -> Result<(), timelake_auth::TokenError> {
+        Ok(())
+    }
+
+    /// Write line protocol through the SAME durable path an HTTP write uses —
+    /// WAL fsync before ack, replication, LWW, SEC-2, and the #98 schema-union
+    /// conflict all below this seam. DoPut serializes its Arrow rows to line
+    /// protocol and calls in here rather than reaching under the engine. The
+    /// default refuses, so only the real engine ingests.
+    fn write_lp(&self, _db: &str, _body: &[u8]) -> Result<usize, PutError> {
+        Err(PutError::Internal(
+            "DoPut is not supported by this backend".into(),
+        ))
+    }
+}
+
+/// A write failure on the DoPut path, mapped to the gRPC status the client
+/// expects: a bad batch is `InvalidArgument`, the WAL cap is
+/// `ResourceExhausted` (the gRPC 429), anything else `Internal`.
+#[derive(Debug)]
+pub enum PutError {
+    BadRequest(String),
+    Backpressure(String),
+    Internal(String),
 }
 
 #[derive(Clone)]
@@ -164,6 +203,14 @@ fn deny(e: timelake_auth::TokenError) -> Status {
 /// authorizations. Every handler passes through here — including DoGet,
 /// because a ticket is an opaque handle a client can craft: planning-time
 /// authentication alone would let a forged ticket skip the door.
+fn put_error_to_status(e: PutError) -> Status {
+    match e {
+        PutError::BadRequest(m) => Status::invalid_argument(m),
+        PutError::Backpressure(m) => Status::resource_exhausted(m),
+        PutError::Internal(m) => Status::internal(m),
+    }
+}
+
 fn resolve_auths<B: SqlBackend + ?Sized>(
     backend: &B,
     md: &tonic::metadata::MetadataMap,
@@ -484,6 +531,70 @@ impl FlightSqlService for TimeLakeFlight {
         let builder = query.into_builder(sql_info());
         let schema = builder.schema();
         Ok(one_batch(schema, builder.build()))
+    }
+
+    /// DoPut / bulk ingest (#79): an Arrow stream lands on the same write path
+    /// line protocol uses. Write-scoped — a read-only token is refused, the
+    /// mirror of the read guard; DoPut is NOT an exception carved into P0-2's
+    /// read-only SQL guard. A column type that disagrees with the table
+    /// conflicts exactly as a bad line-protocol field does (#98), because the
+    /// rows go through the same write_lp seam.
+    async fn do_put_statement_ingest(
+        &self,
+        ticket: CommandStatementIngest,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        let table = ticket.table.clone();
+        if table.is_empty() {
+            return Err(Status::invalid_argument(
+                "CommandStatementIngest.table is required",
+            ));
+        }
+        // db: FlightSQL schema (db_schema), else catalog, else the `database`
+        // metadata, else the default — the resolution DoGet already uses.
+        let db = ticket
+            .schema
+            .clone()
+            .or_else(|| ticket.catalog.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| db_from_metadata(request.metadata()));
+        self.backend
+            .authenticate_write(
+                authorization_from_metadata(request.metadata()).as_deref(),
+                &db,
+            )
+            .map_err(deny)?;
+
+        // The framework PEEKED the first message (schema + descriptor) rather
+        // than consuming it, so iterating the peekable yields it first —
+        // exactly what flight_data_to_batches expects as the schema message.
+        let mut stream = request.into_inner();
+        let mut datas: Vec<FlightData> = Vec::new();
+        while let Some(fd) = stream.next().await {
+            datas.push(fd?);
+        }
+        let batches = flight_data_to_batches(&datas).map_err(|e| {
+            Status::invalid_argument(format!("DoPut stream is not decodable Arrow: {e}"))
+        })?;
+
+        // Every batch -> rows -> line protocol, accumulated into ONE write so
+        // the whole DoPut is atomic: a conflict in any batch rejects all of it,
+        // exactly as a poison line rejects a line-protocol request.
+        let mut lp = String::new();
+        let mut nrows = 0usize;
+        for batch in &batches {
+            let rows = doput::batch_to_rows(&table, batch).map_err(Status::invalid_argument)?;
+            nrows += rows.len();
+            lp.push_str(&timelake_ingest::to_line_protocol(&rows));
+        }
+        if nrows == 0 {
+            return Ok(0);
+        }
+        let written = self
+            .backend
+            .write_lp(&db, lp.as_bytes())
+            .map_err(put_error_to_status)?;
+        Ok(written as i64)
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
@@ -830,6 +941,157 @@ mod tests {
             batch.num_rows() >= 4,
             "an empty info list means all of them, got {}",
             batch.num_rows()
+        );
+    }
+
+    async fn client_with(
+        backend: Arc<dyn SqlBackend>,
+    ) -> FlightSqlServiceClient<tonic::transport::Channel> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(TimeLakeFlight::new(backend)))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .expect("connect to the test server");
+        FlightSqlServiceClient::new(channel)
+    }
+
+    /// Records the line protocol the DoPut path produces, so a test can assert
+    /// the Arrow-batch -> rows -> LP conversion end to end over the wire.
+    #[derive(Default)]
+    struct CapturingBackend {
+        writes: std::sync::Mutex<Vec<(String, String)>>,
+        deny_write: bool,
+    }
+
+    impl SqlBackend for CapturingBackend {
+        fn authenticate_read(
+            &self,
+            _a: Option<&str>,
+            _db: &str,
+        ) -> Result<Option<Vec<String>>, timelake_auth::TokenError> {
+            Ok(None)
+        }
+        fn query_batches<'a>(
+            &'a self,
+            _db: String,
+            _sql: String,
+            _au: Vec<String>,
+            _id: Option<String>,
+        ) -> SqlFuture<'a> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn databases(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn tables(&self, _db: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn table_schema(&self, _db: &str, _t: &str) -> Option<SchemaRef> {
+            None
+        }
+        fn authenticate_write(
+            &self,
+            _a: Option<&str>,
+            _db: &str,
+        ) -> Result<(), timelake_auth::TokenError> {
+            if self.deny_write {
+                Err(timelake_auth::TokenError::Forbidden)
+            } else {
+                Ok(())
+            }
+        }
+        fn write_lp(&self, db: &str, body: &[u8]) -> Result<usize, PutError> {
+            let lp = String::from_utf8(body.to_vec()).unwrap();
+            let n = timelake_ingest::parse_lines(&lp, 1, 0)
+                .map(|r| r.len())
+                .unwrap_or(0);
+            self.writes.lock().unwrap().push((db.to_string(), lp));
+            Ok(n)
+        }
+    }
+
+    fn ingest_batch() -> RecordBatch {
+        use arrow::array::{
+            ArrayRef, Float64Array, StringDictionaryBuilder, TimestampNanosecondArray,
+        };
+        use arrow::datatypes::Int32Type;
+        let time: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            1_000_000_i64,
+            2_000_000,
+        ]));
+        let mut hb = StringDictionaryBuilder::<Int32Type>::new();
+        hb.append_value("h1");
+        hb.append_value("h2");
+        let host: ArrayRef = Arc::new(hb.finish());
+        let temp: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 2.5]));
+        RecordBatch::try_from_iter(vec![("time", time), ("host", host), ("temp", temp)]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn do_put_ingests_an_arrow_batch_over_the_write_path() {
+        let backend = Arc::new(CapturingBackend::default());
+        let mut c = client_with(backend.clone()).await;
+        let command = CommandStatementIngest {
+            table: "weather".to_string(),
+            schema: Some("flt".to_string()),
+            ..Default::default()
+        };
+        let n = c
+            .execute_ingest(command, futures::stream::iter(vec![Ok(ingest_batch())]))
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "two rows ingested");
+
+        let writes = backend.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let (db, lp) = &writes[0];
+        assert_eq!(db, "flt", "the FlightSQL schema field selects the database");
+        // The batch survives as line protocol: dict column -> tag, f64 -> field,
+        // time -> ns timestamp, table from the command.
+        let rows = timelake_ingest::parse_lines(lp, 1, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].table, "weather");
+        assert_eq!(rows[0].tags, vec![("host".to_string(), "h1".to_string())]);
+        assert_eq!(
+            rows[0].fields,
+            vec![("temp".to_string(), timelake_ingest::FieldValue::Float(1.5))]
+        );
+        assert_eq!(rows[0].timestamp_ns, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn do_put_requires_write_scope() {
+        let backend = Arc::new(CapturingBackend {
+            deny_write: true,
+            ..Default::default()
+        });
+        let mut c = client_with(backend.clone()).await;
+        let command = CommandStatementIngest {
+            table: "weather".to_string(),
+            ..Default::default()
+        };
+        let err = c
+            .execute_ingest(command, futures::stream::iter(vec![Ok(ingest_batch())]))
+            .await
+            .expect_err("a read-only caller must be refused");
+        assert!(
+            backend.writes.lock().unwrap().is_empty(),
+            "a denied DoPut must not write anything"
+        );
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("permission") || msg.contains("denied") || msg.contains("forbidden"),
+            "expected a permission error, got: {msg}"
         );
     }
 }

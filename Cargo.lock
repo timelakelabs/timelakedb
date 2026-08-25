@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "flate2",
@@ -4487,13 +4487,15 @@ dependencies = [
  "serde_json",
  "timelake-audit",
  "timelake-auth",
+ "timelake-ingest",
+ "timelake-prometheus",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "timelake-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4503,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "serde",
@@ -4517,7 +4519,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-buffer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "datafusion",
@@ -4526,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-catalog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4536,11 +4538,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-cluster"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "timelake-compact"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "datafusion",
  "timelake-buffer",
@@ -4550,11 +4552,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-discovery"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "timelake-flight"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4573,11 +4575,20 @@ dependencies = [
 
 [[package]]
 name = "timelake-ingest"
-version = "0.1.0"
+version = "0.2.0"
+
+[[package]]
+name = "timelake-prometheus"
+version = "0.2.0"
+dependencies = [
+ "prost",
+ "snap",
+ "timelake-ingest",
+]
 
 [[package]]
 name = "timelake-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4593,19 +4604,21 @@ dependencies = [
 
 [[package]]
 name = "timelake-retention"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "timelake-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",
  "flate2",
  "http-body-util",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",
+ "snap",
  "tempfile",
  "timelake-api",
  "timelake-audit",
@@ -4616,6 +4629,7 @@ dependencies = [
  "timelake-compact",
  "timelake-flight",
  "timelake-ingest",
+ "timelake-prometheus",
  "timelake-query",
  "timelake-store",
  "timelake-store-s3",
@@ -4631,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "tempfile",
@@ -4639,7 +4653,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-store-s3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
@@ -4653,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "rcgen",
@@ -4667,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-wal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "tempfile",
