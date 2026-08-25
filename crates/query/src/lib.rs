@@ -22,6 +22,10 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use serde_json::{Map, Number, Value, json};
 
+/// The registry stores column types as Arrow `DataType`s; re-exported
+/// so the write path can compare an incoming field against the
+/// established type without a direct datafusion dependency.
+pub use datafusion::arrow::datatypes::DataType as QueryDataType;
 pub use datafusion::arrow::datatypes::SchemaRef as QuerySchema;
 /// Re-export so downstream crates name batches without a direct
 /// datafusion dependency (version unification lives here).
@@ -1104,7 +1108,7 @@ mod tests {
     fn buffer_with(lp: &str) -> RecordBatch {
         let mut buf = TableBuffer::default();
         for line in parse_lines(lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         buf.snapshot().unwrap()
     }

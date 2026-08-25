@@ -1102,7 +1102,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let parts = flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
         let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(256)).unwrap();
@@ -1216,7 +1216,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let parts = flush::prepare_ordered(&buf.snapshot().unwrap(), Some("pid")).unwrap();
         let bytes = flush::to_parquet_bytes_rg(&parts[0].1, Some(1024)).unwrap();
@@ -1283,7 +1283,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
         let bytes = flush::to_parquet_bytes(&parts[0].1).unwrap();
@@ -1360,7 +1360,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
         // small row groups (256) so pruning is at a fine grain and visible in
@@ -1473,7 +1473,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let snap = buf.snapshot().unwrap();
         let part = &flush::prepare(&snap).unwrap()[0].1;
@@ -1551,7 +1551,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let snapshot = buf.snapshot().unwrap();
         let parts = flush::prepare(&snapshot).unwrap();
@@ -1712,7 +1712,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let snapshot = buf.snapshot().unwrap();
         // the stored schema is still dictionary-encoded — FR-2 is a

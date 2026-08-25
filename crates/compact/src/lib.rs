@@ -82,7 +82,7 @@ mod tests {
     fn batch(lp: &str) -> RecordBatch {
         let mut buf = TableBuffer::default();
         for line in parse_lines(lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         buf.snapshot().unwrap()
     }

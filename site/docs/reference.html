@@ -129,9 +129,10 @@
 
       <h3>Schema rules</h3>
       <ul>
-        <li>The first write of a field name fixes its type. Integers and unsigned
-            integers are accepted into an existing float column (widening); nothing
-            else is coerced.</li>
+        <li>The first write of a field name fixes its type for the life of the
+            table — across flushes, compactions and restarts, not just within one
+            write buffer. Integers and unsigned integers are accepted into an
+            existing float column (widening); nothing else is coerced.</li>
         <li>A conflicting type is a 400 naming the field, and the whole request is
             rejected: <code>field 'v' type conflict: column was created with a
             different type than Str("oops")</code>.</li>

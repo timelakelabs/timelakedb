@@ -29,7 +29,7 @@ pub use timelake_api::{RETENTION_ANY_DB, RetentionPolicy, RollupAgg, RollupDef, 
 use timelake_buffer::{TableBuffer, flush};
 use timelake_catalog::{Catalog, FileMeta};
 use timelake_ingest::{parse_lines, precision_multiplier};
-use timelake_query::{QuerySession, batches_to_json};
+use timelake_query::{QueryDataType, QuerySession, batches_to_json};
 use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::{Wal, WalCipher};
@@ -1021,6 +1021,13 @@ impl Engine {
             remote: RwLock::new(None),
         };
         let n = frames.len();
+        // Establish column types from the on-disk catalog BEFORE replaying the
+        // WAL, so a replayed write re-creates a since-flushed column with the
+        // type the files carry, not the incoming value's. Without this, replay
+        // reintroduces the very cross-type corruption the live path now prevents
+        // (timelakedb#98); the post-replay refresh below then folds in any
+        // columns that live only in the WAL.
+        engine.refresh_schema_registry();
         for (db, mult, body) in frames {
             let body = String::from_utf8_lossy(&body);
             if let Err(e) = engine.apply(&db, &body, mult, 0) {
@@ -1039,11 +1046,39 @@ impl Engine {
     fn apply(&self, db: &str, body: &str, mult: i64, default_ts_ns: i64) -> Result<usize, String> {
         let rows = parse_lines(body, mult, default_ts_ns).map_err(|e| e.to_string())?;
         let n = rows.len();
+        // Established column types per table (timelakedb#98): a buffer column
+        // re-created after a flush drained it must adopt the type the table's
+        // files already carry, not the incoming value's — else a string into a
+        // since-flushed float column is accepted (204) and corrupts reads. Read
+        // the registry once here; the buffer applies it as it creates columns.
+        let established: HashMap<String, HashMap<String, QueryDataType>> = {
+            let reg = self.schemas.read().expect("schemas lock");
+            let mut m: HashMap<String, HashMap<String, QueryDataType>> = HashMap::new();
+            for row in &rows {
+                if m.contains_key(&row.table) {
+                    continue;
+                }
+                if let Some(schema) = reg.get(&(db.to_string(), row.table.clone())) {
+                    m.insert(
+                        row.table.clone(),
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| (f.name().clone(), f.data_type().clone()))
+                            .collect(),
+                    );
+                }
+            }
+            m
+        };
         let touched: Vec<(String, usize)> = {
             let mut dbs = self.dbs.write().expect("dbs lock");
             let tables = dbs.entry(db.to_string()).or_default();
             for row in &rows {
-                tables.entry(row.table.clone()).or_default().append(row)?;
+                tables
+                    .entry(row.table.clone())
+                    .or_default()
+                    .append(row, established.get(&row.table))?;
             }
             let mut touched: Vec<String> = rows.iter().map(|r| r.table.clone()).collect();
             touched.sort();

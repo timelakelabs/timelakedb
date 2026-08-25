@@ -106,6 +106,29 @@ impl FieldCol {
     }
 }
 
+/// An empty [`FieldCol`] of the type a column was ESTABLISHED with, drawn
+/// from the schema registry's Arrow type. Returns `None` for a type that is
+/// not a field-value column (a tag's dictionary, `time`'s timestamp), so the
+/// caller falls back to the incoming value. This is how a flush stops being
+/// able to change a column's type: the buffer it drained is gone, but the
+/// type the files carry is not, and a re-created column adopts it instead of
+/// whatever value happens to arrive first (timelakedb#98).
+fn col_for_datatype(dt: &DataType) -> Option<FieldCol> {
+    Some(match dt {
+        DataType::Float64 => FieldCol::F64(Vec::new()),
+        DataType::Int64 => FieldCol::I64(Vec::new()),
+        DataType::UInt64 => FieldCol::U64(Vec::new()),
+        DataType::Boolean => FieldCol::Bool(Vec::new()),
+        DataType::Utf8 | DataType::LargeUtf8 => FieldCol::Str(Vec::new()),
+        DataType::Dictionary(_, inner)
+            if matches!(inner.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            FieldCol::Str(Vec::new())
+        }
+        _ => return None,
+    })
+}
+
 fn type_conflict(col: &str, v: &FieldValue) -> String {
     format!(
         "field '{col}' type conflict: column was created with a \
@@ -150,7 +173,11 @@ impl TableBuffer {
     /// maintenance was one sequential task) compaction and retention for
     /// every other table on the node. One 400 poisoned the whole engine,
     /// and the WAL replayed it at boot, so a restart did not clear it.
-    pub fn append(&mut self, line: &ParsedLine) -> Result<(), String> {
+    pub fn append(
+        &mut self,
+        line: &ParsedLine,
+        established: Option<&HashMap<String, DataType>>,
+    ) -> Result<(), String> {
         // Validate every field — against the column it would land in, and
         // against any column this same line is about to create — BEFORE
         // touching anything.
@@ -165,7 +192,19 @@ impl TableBuffer {
                     return Err(type_conflict(k, v));
                 }
             } else {
-                pending.push((k, FieldCol::new(v)));
+                // A new column here — but a flush may have drained an OLDER
+                // one of a fixed type. Adopt that established type so a value
+                // it can't hold (a string into a float) is the conflict, and
+                // a value it can (an int into a float) coerces on push rather
+                // than creating a second, incompatible column.
+                let col = established
+                    .and_then(|m| m.get(k))
+                    .and_then(col_for_datatype)
+                    .unwrap_or_else(|| FieldCol::new(v));
+                if !col.accepts(v) {
+                    return Err(type_conflict(k, v));
+                }
+                pending.push((k, col));
             }
         }
 
@@ -187,7 +226,10 @@ impl TableBuffer {
         for (k, v) in &line.fields {
             let col = self.fields.entry(k.clone()).or_insert_with(|| {
                 self.field_names.push(k.clone());
-                let mut c = FieldCol::new(v);
+                let mut c = established
+                    .and_then(|m| m.get(k))
+                    .and_then(col_for_datatype)
+                    .unwrap_or_else(|| FieldCol::new(v));
                 c.pad_to(n);
                 c
             });
@@ -527,7 +569,7 @@ mod tests {
         let lp = "pipeline_events,product_id=p1,step=01-download,event=start value=1i 100\npipeline_events,product_id=p2,step=01-download,event=stop duration_s=9.5 200\npipeline_events,product_id=p1,step=02-extract,route=alpha,event=start value=1i 300";
         let mut buf = TableBuffer::default();
         for line in parse_lines(lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         assert_eq!(buf.row_count(), 3);
 
@@ -563,11 +605,11 @@ mod tests {
         // maintenance tick behind it.
         let mut buf = TableBuffer::default();
         for line in parse_lines("tt,h=a v=1 100", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
 
         let bad = parse_lines("tt,h=a v=\"oops\" 200", 1, 0).unwrap();
-        let err = buf.append(&bad[0]).unwrap_err();
+        let err = buf.append(&bad[0], None).unwrap_err();
         assert!(err.contains("type conflict"), "unexpected error: {err}");
 
         assert_eq!(buf.row_count(), 1, "rejected row must not be counted");
@@ -575,7 +617,7 @@ mod tests {
 
         // and the buffer still accepts good writes afterwards
         for line in parse_lines("tt,h=a v=2 300", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         assert_eq!(buf.snapshot().unwrap().num_rows(), 2);
     }
@@ -587,7 +629,7 @@ mod tests {
         // write.
         let mut buf = TableBuffer::default();
         for line in parse_lines("dt,h=a,h=b v=1,v=2 100", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let batch = buf.snapshot().expect("snapshot must survive repeated keys");
         assert_eq!(batch.num_rows(), 1);
@@ -614,11 +656,11 @@ mod tests {
     fn conflicting_repeat_within_one_line_is_rejected_cleanly() {
         let mut buf = TableBuffer::default();
         for line in parse_lines("ct,h=a v=1 100", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         // second `w` conflicts with the column the first `w` would create
         let bad = parse_lines("ct,h=a w=1,w=\"two\" 200", 1, 0).unwrap();
-        assert!(buf.append(&bad[0]).is_err());
+        assert!(buf.append(&bad[0], None).is_err());
         assert_eq!(buf.row_count(), 1);
         assert_eq!(buf.snapshot().unwrap().num_rows(), 1);
     }
@@ -633,7 +675,7 @@ mod tests {
         );
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let parts = flush::prepare(&buf.snapshot().unwrap()).unwrap();
         assert_eq!(parts.len(), 2, "two hour partitions");
@@ -678,7 +720,7 @@ mod tests {
             .collect();
         let mut buf = TableBuffer::default();
         for line in parse_lines(&lp, 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let snap = buf.snapshot().unwrap();
 
@@ -744,15 +786,15 @@ mod tests {
     fn type_conflicts_name_the_field() {
         let mut buf = TableBuffer::default();
         for line in parse_lines("m x=1i 1", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         let bad = parse_lines("m x=\"oops\" 2", 1, 0).unwrap();
-        let err = buf.append(&bad[0]).unwrap_err();
+        let err = buf.append(&bad[0], None).unwrap_err();
         assert!(err.contains("'x'"));
         // ints promote into float columns
         let mut buf = TableBuffer::default();
         for line in parse_lines("m y=1.5 1\nm y=2i 2", 1, 0).unwrap() {
-            buf.append(&line).unwrap();
+            buf.append(&line, None).unwrap();
         }
         assert_eq!(buf.row_count(), 2);
     }
