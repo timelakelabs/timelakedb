@@ -13,6 +13,25 @@ here.
 
 ## [Unreleased]
 
+### Added — Flight DoPut: an Arrow-native write path (#79) (2026-08-25)
+
+`DoPut(CommandStatementIngest)` over Flight SQL lands an Arrow stream on the
+same write path line protocol uses — WAL fsync before ack, replication, LWW,
+SEC-2, and the #98 schema-union conflict all inherited below `write_lp`. A
+producer that already holds Arrow (Tributary L6, a Spark job, a DataFusion
+pipeline) writes columnar batches without encoding to line-protocol text on the
+wire; this unblocks Tributary's L6 Flight-shipping path.
+
+Write-scoped and explicit: a read-only token is refused, the mirror of the read
+guard — DoPut is a separate ingestion door, not an exception carved into P0-2's
+read-only SQL guard. Column roles follow the engine's storage so a DoGet batch
+writes straight back: `time` is the timestamp, a string column is a tag, a
+numeric/boolean column is a field, with an Arrow field-metadata override
+(`timelake:role`) for a genuine string field (Flight hydrates dictionaries to
+Utf8 on the wire, so tag and string-field columns are otherwise
+indistinguishable). A conflicting column type is refused like a bad
+line-protocol field (#98), never silently forked.
+
 ### Added — Prometheus `remote_write` ingest (#56, R-3) (2026-08-25)
 
 `POST /api/v1/write` accepts a snappy-compressed protobuf `WriteRequest`, so a

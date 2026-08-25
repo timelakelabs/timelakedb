@@ -3298,6 +3298,33 @@ impl timelake_flight::SqlBackend for Engine {
     fn table_schema(&self, db: &str, table: &str) -> Option<timelake_query::QuerySchema> {
         Engine::table_schema(self, db, table)
     }
+
+    fn authenticate_write(
+        &self,
+        authorization: Option<&str>,
+        db: &str,
+    ) -> Result<(), timelake_auth::TokenError> {
+        // The mirror of authenticate_read: a token scoped read-only fails
+        // Action::Write here, so DoPut is a write-scoped door, not an
+        // exception in the read-only guard (#79).
+        self.authenticate_data_impl(authorization, timelake_auth::Action::Write, db)
+            .map(|_| ())
+    }
+
+    fn write_lp(&self, db: &str, body: &[u8]) -> Result<usize, timelake_flight::PutError> {
+        use timelake_api::WriteError as WE;
+        use timelake_flight::PutError as PE;
+        // The same durable path the HTTP write handlers use — DoPut is a
+        // client write, so it takes the guarded `write_lp_internal` (WAL,
+        // replication, LWW, #98 conflict), not a back door.
+        self.write_lp_internal(db, body, Some("ns"))
+            .map_err(|e| match e {
+                WE::BadRequest(m) => PE::BadRequest(m),
+                WE::Backpressure(m) => PE::Backpressure(m),
+                WE::NotHere(m) => PE::Internal(m),
+                WE::Internal(m) => PE::Internal(m),
+            })
+    }
 }
 
 /// The plaintext router. Admin routes authenticate (SEC-4); the data

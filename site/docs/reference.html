@@ -664,10 +664,24 @@
             <tr><td><code>CommandGetTables</code></td><td>Implemented, including <code>include_schema</code> (the Arrow schema, IPC-encoded)</td></tr>
             <tr><td><code>CommandGetTableTypes</code></td><td>Implemented — a single <code>BASE TABLE</code></td></tr>
             <tr><td><code>CommandGetSqlInfo</code></td><td>Implemented — server name, version, Arrow version, read-only, no DDL</td></tr>
-            <tr><td>Prepared statements, <code>DoPut</code>, <code>ListFlights</code>, keys and type info</td><td>Unimplemented</td></tr>
+            <tr><td><code>DoPut(CommandStatementIngest)</code></td><td>Implemented — bulk Arrow ingest onto the same write path as line protocol (#79). Write-scoped: a read-only token is refused</td></tr>
+            <tr><td>Prepared statements, <code>ListFlights</code>, keys and type info</td><td>Unimplemented</td></tr>
           </tbody>
         </table>
       </div>
+      <p>
+        <strong>DoPut column roles.</strong> A column named <code>time</code>
+        (Timestamp(ns) or Int64 ns) is the timestamp; a <em>string</em> column
+        (Utf8, or a dictionary of Utf8) is a tag; a numeric or boolean column
+        (Float64/Int64/UInt64/Boolean) is a field. Flight hydrates dictionaries
+        to Utf8 on the wire, so a batch fetched with <code>DoGet</code> writes
+        straight back with <code>DoPut</code>. To send a genuine <em>string
+        field</em> — a log line, indistinguishable from a tag by type — set the
+        Arrow field metadata <code>timelake:role</code> to <code>field</code>
+        (or <code>tag</code> to force the other way). A column whose type
+        conflicts with the table's is refused exactly as a bad line-protocol
+        field is; nothing forks a divergent column.
+      </p>
 
       <h3>How the namespace maps</h3>
       <div class="table-wrap">
