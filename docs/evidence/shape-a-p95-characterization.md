@@ -80,3 +80,13 @@ representative test:
 > group instead of a coarse one. Confirm with a full-scale Gauge run, watching
 > `timelake_scan_row_groups_scanned_total` per lookup fall and the p95 with it,
 > and measure the flush cost (finer groups = more metadata) against RR-1/PR-1.
+
+---
+
+**Phase 2 (#70, 2026-08-25).** Full-scale Gauge measured this — and the
+conclusion above ("make L0's groups fine") did NOT hold as a net win. Coarse
+L0 already clears the 250 ms target (baseline p95 65–212 ms vs M4's 608 ms;
+the blooms-on-dict fix documented here did the work). Finer L0 gives a faster
+median lookup but a riskier p95 tail and a tendency to slower ingest, so the
+`l0_row_group_rows` knob stays **off by default**, a documented opt-in. Full
+run data and the decision: `shape-a-p95-l0-rowgroups.md`.
