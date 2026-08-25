@@ -434,6 +434,7 @@ pub fn app<E: Engine>(
         .route("/write", post(write_v1::<E>))
         .route("/api/v2/write", post(write_v2::<E>))
         .route("/api/v3/write_lp", post(write_v3::<E>))
+        .route("/api/v1/write", post(write_prometheus::<E>))
         .route(
             "/api/sql",
             post(sql::<E>).layer(axum::middleware::from_fn_with_state(
@@ -1513,6 +1514,16 @@ async fn write_common<E: Engine>(
     let res =
         tokio::task::spawn_blocking(move || engine.write_lp(&db, &body, precision.as_deref()))
             .await;
+    write_result_response(res)
+}
+
+/// The write-path response contract, shared by every write endpoint: 204 on
+/// success, 400 for a bad body, 429 (with retry-after) at the WAL cap, 501 for
+/// a wrong-node forward, 500 otherwise. A remote_write write is a write like
+/// any other, so it answers on exactly these codes.
+fn write_result_response(
+    res: Result<Result<usize, WriteError>, tokio::task::JoinError>,
+) -> axum::response::Response {
     match res {
         Ok(Ok(_lines)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(WriteError::BadRequest(msg))) => err_response(StatusCode::BAD_REQUEST, &msg),
@@ -1526,6 +1537,48 @@ async fn write_common<E: Engine>(
         Ok(Err(WriteError::NotHere(msg))) => err_response(StatusCode::NOT_IMPLEMENTED, &msg),
         Err(join) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &join.to_string()),
     }
+}
+
+/// Prometheus `remote_write` (R-3, timelakedb#56): `POST /api/v1/write?db=…`.
+///
+/// The body is snappy-compressed protobuf, not gzip+text, so it does NOT go
+/// through `maybe_gunzip`/`parse_lines`. It is decoded to rows, serialized to
+/// line protocol, and handed to the SAME `write_lp` seam every other write
+/// uses — so WAL durability, CL-2 replication, LWW dedup and SEC-2 are
+/// inherited, not reimplemented. `__name__` becomes the measurement, every
+/// other label a tag, the sample value a `value` field (never a table per
+/// field — freshet#4).
+async fn write_prometheus<E: Engine>(
+    state: State<Arc<E>>,
+    Query(params): Params,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let Some(db) = params.get("db").cloned() else {
+        return err_response(StatusCode::BAD_REQUEST, "missing 'db' parameter");
+    };
+    if let Err(e) =
+        state
+            .0
+            .authenticate_data(authorization_of(&headers).as_deref(), Action::Write, &db)
+    {
+        return deny_response(e);
+    }
+    let rows = match timelake_prometheus::decode_remote_write(&body) {
+        Ok(r) => r,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    // A scrape with only stale/empty series decodes to nothing — that is a
+    // successful no-op, not a 400 (Prometheus keeps sending them).
+    if rows.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    // Rows already carry ns timestamps, so precision is ns (identity).
+    let lp = timelake_ingest::to_line_protocol(&rows);
+    let engine = state.0.clone();
+    let res =
+        tokio::task::spawn_blocking(move || engine.write_lp(&db, lp.as_bytes(), Some("ns"))).await;
+    write_result_response(res)
 }
 
 fn maybe_gunzip(headers: &HeaderMap, body: Bytes) -> std::io::Result<Vec<u8>> {

@@ -293,6 +293,7 @@
             <tr><td><code>POST /write</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
             <tr><td><code>POST /api/v2/write</code></td><td><code>bucket</code></td><td><code>precision</code>, <code>org</code> (ignored)</td><td>204</td></tr>
             <tr><td><code>POST /api/v3/write_lp</code></td><td><code>db</code></td><td><code>precision</code></td><td>204</td></tr>
+            <tr><td><code>POST /api/v1/write</code></td><td><code>db</code></td><td>Prometheus <code>remote_write</code>: snappy-compressed protobuf body, not line protocol</td><td>204</td></tr>
             <tr><td><code>POST /api/sql</code></td><td>body <code>sql</code></td><td>body <code>db</code> (default <code>poc</code>), body <code>authorizations</code> / header <code>X-TimeLake-Authorizations</code> (SEC-2, comma-separated)</td><td>200 + JSON rows</td></tr>
             <tr><td><code>GET /health</code></td><td>—</td><td>—</td><td>200 + <code>{"status":"pass","name":"timelakedb","version":…}</code></td></tr>
             <tr><td><code>GET|HEAD /ping</code></td><td>—</td><td>—</td><td>204 + <code>x-timelakedb-version</code></td></tr>

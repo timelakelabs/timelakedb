@@ -266,9 +266,115 @@ fn take_field_value(bytes: &[u8], pos: &mut usize) -> Result<FieldValue, String>
         .map_err(|_| format!("bad float {tok:?}"))
 }
 
+/// Serialize rows back to line protocol — the inverse of [`parse_lines`], for
+/// internal producers that build [`ParsedLine`]s directly (Prometheus
+/// remote_write, timelakedb#56) and then hand them to the engine's
+/// line-protocol write path. Escaping matches the parser's set exactly; the
+/// round-trip is pinned by test.
+///
+/// Float fields print in Rust's shortest round-tripping decimal form, so a
+/// whole number reads back as a float (`2`, not `2i`). A non-finite float
+/// (NaN/Inf) has no line-protocol form — the caller must drop those before
+/// they get here (the remote_write decoder does).
+pub fn to_line_protocol(rows: &[ParsedLine]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        escape_into(&mut out, &row.table, false);
+        for (k, v) in &row.tags {
+            out.push(',');
+            escape_into(&mut out, k, true);
+            out.push('=');
+            escape_into(&mut out, v, true);
+        }
+        out.push(' ');
+        for (i, (k, v)) in row.fields.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            escape_into(&mut out, k, true);
+            out.push('=');
+            match v {
+                FieldValue::Float(x) => out.push_str(&x.to_string()),
+                FieldValue::Int(x) => {
+                    out.push_str(&x.to_string());
+                    out.push('i');
+                }
+                FieldValue::UInt(x) => {
+                    out.push_str(&x.to_string());
+                    out.push('u');
+                }
+                FieldValue::Bool(b) => out.push(if *b { 't' } else { 'f' }),
+                FieldValue::Str(s) => {
+                    out.push('"');
+                    for c in s.chars() {
+                        if c == '"' || c == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                    }
+                    out.push('"');
+                }
+            }
+        }
+        out.push(' ');
+        out.push_str(&row.timestamp_ns.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Escape a measurement, tag key/value, or field key: a comma or space always
+/// gets a backslash; an equals only in the places that use `=` as a delimiter
+/// (tag/field keys and tag values), never in a measurement.
+fn escape_into(out: &mut String, s: &str, escape_equals: bool) {
+    for c in s.chars() {
+        if c == ',' || c == ' ' || (escape_equals && c == '=') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_line_protocol_round_trips_through_parse_lines() {
+        // The values that would break naive escaping: comma/space/equals in a
+        // tag value, comma/space in a measurement, quote/backslash in a string
+        // field, every field type, and a whole-number float that must not gain
+        // an `i` suffix.
+        let rows = vec![
+            ParsedLine {
+                table: "http_requests".into(),
+                tags: vec![
+                    ("job".into(), "api".into()),
+                    ("path".into(), "/a b,c=d".into()),
+                ],
+                fields: vec![("value".into(), FieldValue::Float(1.0))],
+                timestamp_ns: 1_700_000_000_000_000_000,
+            },
+            ParsedLine {
+                table: "weird name,x y".into(),
+                tags: vec![],
+                fields: vec![
+                    ("i".into(), FieldValue::Int(-3)),
+                    ("u".into(), FieldValue::UInt(7)),
+                    ("b".into(), FieldValue::Bool(true)),
+                    ("s".into(), FieldValue::Str("he said \"hi\"\\bye".into())),
+                    ("f".into(), FieldValue::Float(2.5)),
+                ],
+                timestamp_ns: 9,
+            },
+        ];
+        let lp = to_line_protocol(&rows);
+        let back = parse_lines(&lp, 1, 0).expect("serialized LP must re-parse");
+        assert_eq!(
+            back, rows,
+            "rows must survive a to_line_protocol -> parse round trip"
+        );
+    }
 
     #[test]
     fn workload_shapes_parse_exactly() {

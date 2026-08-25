@@ -1,0 +1,10 @@
+[package]
+name = "timelake-prometheus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+timelake-ingest = { path = "../ingest" }
+prost = "0.14"
+snap = "1"

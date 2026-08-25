@@ -13,6 +13,25 @@ here.
 
 ## [Unreleased]
 
+### Added — Prometheus `remote_write` ingest (#56, R-3) (2026-08-25)
+
+`POST /api/v1/write` accepts a snappy-compressed protobuf `WriteRequest`, so a
+Prometheus server or Grafana Agent points at TimeLakeDB with one config line —
+no Telegraf or Tributary in between. The decode is separate from line protocol
+(new `timelake-prometheus` crate — the four `prompb` messages are hand-written,
+so no `protoc` build step), but the rows land on the **same** engine write path:
+WAL fsync before the 204, CL-2 replication, LWW dedup and SEC-2 all inherited,
+not reimplemented.
+
+The mapping is deliberately not VictoriaMetrics': one Prometheus series
+`(__name__, labels)` becomes one row — `__name__` the measurement, every other
+label a tag, the sample value a `value` field — never a table per field, so a
+tag stays a compressed dictionary column (FR-2). Millisecond timestamps become
+nanoseconds; stale/±Inf samples are dropped, so a stale-only scrape is a 204
+no-op rather than a 400. A remote_write arm reads back row-for-row identical to
+the same data sent as line protocol
+(`crates/server/tests/prometheus_remote_write.rs`).
+
 ## [0.2.0] - 2026-08-25
 
 ### Added — a finer-L0-row-group knob for the Shape A path (#70, mechanism) (2026-08-24)
