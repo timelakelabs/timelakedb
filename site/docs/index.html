@@ -51,6 +51,9 @@
       <li><a href="#security">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 5 6.5v5c0 4.3 2.9 7.6 7 9 4.1-1.4 7-4.7 7-9v-5Z"/><path d="m9 12 2 2 4-4"/></svg>
         Security</a></li>
+      <li><a href="#storage">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7.5" ry="3"/><path d="M4.5 5.5v13c0 1.6 3.4 3 7.5 3s7.5-1.4 7.5-3v-13"/><path d="M4.5 12c0 1.6 3.4 3 7.5 3s7.5-1.4 7.5-3"/></svg>
+        Object Store</a></li>
       <li><a href="#operations">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7" ry="2.5"/><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13"/><path d="m9.5 13.5 2 2 4-4"/></svg>
         Backup &amp; Restore</a></li>
@@ -597,6 +600,106 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       </p>
     </section>
 
+    <section id="storage">
+      <h2>Object Store</h2>
+      <p>
+        The durable database lives in an <em>object store</em>: the immutable
+        Parquet files and the append-only manifest-log catalog that names them.
+        One setting chooses the backend — <code>TIMELAKE_OBJECT_STORE</code> —
+        and everything above it (ingest, query, compaction, retention,
+        encryption) is written against one narrow store interface, so the
+        backend is a deployment choice, not a code path.
+      </p>
+
+      <h3>Local directory — the default</h3>
+      <p>
+        Left unset, the store is an <code>objects/</code> directory under
+        <code>TIMELAKE_DATA_DIR</code>, beside the write-ahead log. This is the
+        single-node default and what the quick start runs; back it up by copying
+        the data directory (<a href="#operations">Backup &amp; Restore</a>).
+      </p>
+
+      <h3>Amazon S3</h3>
+      <p>
+        Set <code>TIMELAKE_OBJECT_STORE=s3://bucket/prefix</code> and the Parquet
+        objects and the catalog move to the bucket; the node keeps only its
+        write-ahead log on local disk, holding the writes not yet flushed to
+        Parquet. Credentials come from the standard AWS chain — an instance or
+        IRSA role, <code>AWS_ACCESS_KEY_ID</code> /
+        <code>AWS_SECRET_ACCESS_KEY</code>, or a shared profile — and
+        <code>AWS_REGION</code> selects the region. Nothing above the store
+        changes: the SQL, the write endpoints and the metrics are identical.
+      </p>
+
+      <div class="code">
+        <header>S3 backend <button class="copy" type="button">Copy</button></header>
+<pre>TIMELAKE_OBJECT_STORE=s3://my-timelake-bucket/prod   <span class="c"># bucket + optional prefix</span>
+AWS_REGION=us-east-1
+<span class="c"># credentials: an instance / IRSA role is preferred; or set:</span>
+AWS_ACCESS_KEY_ID=…
+AWS_SECRET_ACCESS_KEY=…
+
+<span class="c"># encryption at rest (optional; the two layers are independent):</span>
+TIMELAKE_KMS_KEY_ID=alias/timelake       <span class="c"># client-side envelope keys (SEC-1)</span>
+TIMELAKE_S3_SSE_KEY_ID=alias/timelake    <span class="c"># server-side SSE-KMS (defaults to the above)</span></pre>
+      </div>
+
+      <h3>S3-compatible stores</h3>
+      <p>
+        Point <code>AWS_ENDPOINT_URL</code> at any S3-compatible endpoint —
+        MinIO in your own datacentre, or LocalStack for a test rig — and
+        path-style addressing switches on automatically, so a bucket name that
+        is not a valid DNS label still resolves. The reference rig
+        <code>deploy/compose/timelakedb-s3.yml</code> runs exactly this against
+        LocalStack; the C0 drill records it
+        (<code>docs/evidence/c0-s3-drill.log</code>).
+      </p>
+
+      <h3>Encryption, two independent layers</h3>
+      <ul>
+        <li><strong>Client-side envelope (SEC-1).</strong> Every object is
+            AES-256-GCM encrypted before it leaves the node, under a data key
+            wrapped by KMS (<code>TIMELAKE_KMS_KEY_ID</code>) — so the bucket
+            never sees plaintext, and this covers the catalog, not just the
+            data. A bounded key cache keeps KMS off the flush path; keys live
+            only in memory.</li>
+        <li><strong>Server-side SSE-KMS.</strong> Every PUT also carries SSE-KMS
+            headers with <strong>S3 Bucket Keys enabled</strong>
+            (<code>TIMELAKE_S3_SSE_KEY_ID</code>, defaulting to the client key —
+            separate only if you want the blast-radius isolation). Enable
+            either layer, both, or neither.</li>
+      </ul>
+      <p>
+        With client-side encryption on, the key is part of your
+        <em>configuration</em>, not the bucket: a restore needs the same key,
+        and losing every copy of it loses every object at once. Keep it where
+        you keep secrets, apart from the data.
+      </p>
+
+      <h3>One bucket, many nodes</h3>
+      <p>
+        Catalog commits are compare-and-swap on the next manifest sequence
+        (S3 <code>If-None-Match</code>), so two nodes writing one bucket never
+        lose a commit — the property a cluster is built on. A role-split cluster
+        shares a single bucket across a router, its ingesters and its queriers
+        (<a href="#scaling">Scaling</a>). Drilled on both the local and S3
+        mechanisms (<code>catalog-cas-drill.log</code>).
+      </p>
+
+      <h3>Backing up an S3 store</h3>
+      <p>
+        When the objects live in a bucket, the bucket <em>is</em> the durable
+        copy: turn on S3 versioning and, for geographic redundancy,
+        cross-region replication, and the store carries its own point-in-time
+        recovery. The node's local data directory then holds only the
+        write-ahead log — the last flush interval of writes — so
+        <code>ops/tldb-backup.sh</code> is the tool for the local-directory
+        backend, not the S3 one. Either way, back up your configuration and the
+        encryption key separately (<a href="#operations">Backup &amp;
+        Restore</a>).
+      </p>
+    </section>
+
     <section id="operations">
       <h2>Backup &amp; Restore</h2>
       <p>
@@ -632,6 +735,34 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
       <p>
         Quiescing writes (<code>--stop &lt;container&gt;</code>) removes even that
         window. It is not required.
+      </p>
+
+      <h3>What the archive holds — and what it does not</h3>
+      <p>
+        The archive is the data directory, and nothing else lives there. Three
+        things you back up <em>separately</em>, or a restore comes up wrong:
+      </p>
+      <ul>
+        <li><strong>Configuration</strong> — the <code>TIMELAKE_*</code>
+            environment and your compose or unit file. A restore applies the new
+            node's configuration to the old data, so a changed retention
+            specification, in particular, takes effect immediately.</li>
+        <li><strong>The TLS certificate and key</strong>, mounted from outside
+            the data directory.</li>
+        <li><strong>The encryption key</strong>, if encryption at rest is on.
+            The objects in the archive are ciphertext, and a restore only serves
+            under the same <code>TIMELAKE_ENCRYPTION_KEY</code> — the wrong key
+            is a named refusal at startup, not garbage data. Keep it apart from
+            the archives (losing every copy loses every backup at once), and note
+            the WAL in the archive is plaintext regardless, so it holds a few
+            minutes of readable recent writes.</li>
+      </ul>
+      <p>
+        <strong>If your objects are in S3</strong>
+        (<code>TIMELAKE_OBJECT_STORE=s3://…</code>) the Parquet and the catalog
+        are in the bucket, not the data directory — so the bucket is what you
+        protect, with versioning and replication, and this tool captures only
+        the local WAL. See <a href="#storage">Object Store</a>.
       </p>
 
       <h3>Measured</h3>
@@ -712,6 +843,42 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         revoked on any node's console takes effect everywhere within about
         ten seconds — drilled on the S3 cluster rig,
         <code>docs/evidence/token-reload-drill.log</code>.
+      </p>
+
+      <h3>Read-only nodes</h3>
+      <p>
+        A <strong>querier</strong> is the read-only node: it owns no data,
+        refuses writes with <code>501</code>, and runs no maintenance. It
+        replays the catalog from the shared object store, tails the manifest
+        log, and unions the ingesters' live buffers under a freshness watermark
+        — so it answers SQL and Flight SQL across the whole cluster, durable
+        Parquet plus the seconds of data still in memory, without holding any of
+        it. Add queriers to scale reads out: the router forwards
+        <code>/api/sql</code> across them round-robin, and Grafana points at a
+        querier's Flight SQL port.
+      </p>
+      <p>
+        Three things wire one up — the <strong>same object store</strong> as the
+        rest of the cluster (a read-only node only makes sense over shared
+        storage), the role, and the ingesters listed by their <em>internal</em>
+        address so it can read their live buffers. It needs no data volume of
+        its own.
+      </p>
+      <div class="code">
+        <header>A read-only querier <button class="copy" type="button">Copy</button></header>
+<pre>TIMELAKE_ROLE=querier
+TIMELAKE_NODE_ID=querier-a
+TIMELAKE_OBJECT_STORE=s3://my-timelake-bucket/prod   <span class="c"># the cluster's bucket</span>
+<span class="c"># ingesters by internal address — id=role@cluster_addr|data_addr:</span>
+TIMELAKE_PEERS=ingester-a=ingester@ingester-a:1965|ingester-a:1963,ingester-b=ingester@ingester-b:1965|ingester-b:1963
+<span class="c"># serves SQL on :1963 and Flight SQL on :1964 — point Grafana at :1964</span></pre>
+      </div>
+      <p>
+        A querier refuses rather than under-counts: if an ingester it needs is
+        unreachable it fails the query with a named error
+        (<code>timelake_querier_refusals_total</code>) instead of returning a
+        quietly short result. Shipped and drilled —
+        <code>docs/evidence/cl3-querier-drill.log</code> (19/19).
       </p>
 
       <h3>What the cluster is built on, and what is still open</h3>
