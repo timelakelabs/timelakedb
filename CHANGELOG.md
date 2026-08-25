@@ -13,6 +13,8 @@ here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
 ### Added — a finer-L0-row-group knob for the Shape A path (#70, mechanism) (2026-08-24)
 
 The lever #69 pointed at. `EngineConfig.l0_row_group_rows` /
