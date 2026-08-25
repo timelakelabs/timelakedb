@@ -765,6 +765,10 @@ pub struct Engine {
     /// the query path pushes to.
     selfmon: Option<std::sync::Arc<selfmon::SelfMonitor>>,
     retention_drops_total: AtomicU64,
+    // #99: tables skipped this run because their files/buffer disagree on a
+    // column type and can't present one schema. A rising count means legacy
+    // (pre-#98) corrupted tables are being read around, not that reads fail.
+    unbuildable_tables_total: AtomicU64,
     /// R-2: rollup materialisation passes run, and target rows written by
     /// them (ARCHITECTURE §18).
     rollup_materializations_total: AtomicU64,
@@ -997,6 +1001,7 @@ impl Engine {
             write_rejects: WriteRejects::default(),
             selfmon,
             retention_drops_total: AtomicU64::new(0),
+            unbuildable_tables_total: AtomicU64::new(0),
             rollup_materializations_total: AtomicU64::new(0),
             rollup_rows_written_total: AtomicU64::new(0),
             tombstone_rewrites_total: AtomicU64::new(0),
@@ -2295,18 +2300,40 @@ impl Engine {
             // from several nodes, and two of them can legitimately disagree
             // about which columns exist.
             let mut schema = self.table_schema(db, &name);
+            let mut conflict: Option<String> = None;
             for b in &buffer {
-                // SEC-5 (exposure 5): a schema_union conflict names a column
-                // and two Arrow types. This is the read path — the error
-                // returns straight to /api/sql and Flight — and it happens
-                // before run_sql_env, so it must be sanitized at the source
-                // or it leaks (#47). The write-path union sites keep their
-                // verbatim message on purpose; only this one is caller-facing
-                // read output.
-                schema = Some(
-                    timelake_query::schema_union(schema, b.schema())
-                        .map_err(|e| timelake_query::opaque_read_error("schema-union", e))?,
+                match timelake_query::schema_union(schema.clone(), b.schema()) {
+                    Ok(s) => schema = Some(s),
+                    Err(e) => {
+                        conflict = Some(e);
+                        break;
+                    }
+                }
+            }
+            // #99: a table whose files and buffer disagree on a column's type
+            // cannot present one schema. It used to fail the WHOLE request here,
+            // taking down reads of every OTHER table in the database too — the
+            // query registers a provider for each table up front, so one bad
+            // union aborted them all. Isolate it instead: register a provider
+            // that errors only when THIS table is scanned, so a query that never
+            // names it runs untouched. The conflict message names columns and
+            // Arrow types, so it stays in the server log; SEC-5 (exposure 5)
+            // keeps it off the wire — the scan error is sanitized like any
+            // other read failure (#47).
+            if let Some(e) = conflict {
+                self.unbuildable_tables_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    db,
+                    table = %name,
+                    conflict = %e,
+                    "table has an unresolvable schema conflict; isolating it from reads of other tables (timelakedb#99)"
                 );
+                tables.push((
+                    name.clone(),
+                    Arc::new(timelake_query::provider::ErrorTable::new(name)),
+                ));
+                continue;
             }
             let Some(schema) = schema else { continue };
 
@@ -3089,6 +3116,7 @@ impl Engine {
              # TYPE timelake_compactor_shard_ordinal gauge\ntimelake_compactor_shard_ordinal {}\n\
              # TYPE timelake_compactor_shard_count gauge\ntimelake_compactor_shard_count {}\n\
              # TYPE timelake_retention_drops_total counter\ntimelake_retention_drops_total {}\n\
+             # TYPE timelake_query_unbuildable_tables_total counter\ntimelake_query_unbuildable_tables_total {}\n\
              # TYPE timelake_rollups gauge\ntimelake_rollups {}\n\
              # TYPE timelake_rollup_materializations_total counter\n\
              timelake_rollup_materializations_total {}\n\
@@ -3134,6 +3162,7 @@ impl Engine {
             self.compactor_shard().0,
             self.compactor_shard().1,
             self.retention_drops_total.load(Ordering::Relaxed),
+            self.unbuildable_tables_total.load(Ordering::Relaxed),
             self.rollups.read().expect("rollups lock").len(),
             self.rollup_materializations_total.load(Ordering::Relaxed),
             self.rollup_rows_written_total.load(Ordering::Relaxed),

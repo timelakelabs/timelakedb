@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -30,6 +30,56 @@ use timelake_catalog::FileMeta;
 use timelake_store::Store;
 
 use datafusion::arrow::record_batch::RecordBatch;
+
+/// A table that cannot present a coherent schema — its files and buffer
+/// disagree on a column's type (the state timelakedb#98 could leave behind,
+/// or a legacy pre-#98 file set). Registering one of these in place of a real
+/// provider is how [`crate::run_sql_env`]'s caller isolates the conflict: a
+/// query that never names this table plans and runs untouched, and only a
+/// query that actually scans it fails. Without it, one table's `schema_union`
+/// error took down reads of every table in the database (timelakedb#99).
+///
+/// The schema is empty and `scan` always errors, so the failure surfaces at
+/// execution and is routed through the run-time sanitizer like any other —
+/// the client gets an opaque ref, the real reason stays in the server log.
+#[derive(Debug)]
+pub struct ErrorTable {
+    name: String,
+    schema: SchemaRef,
+}
+
+impl ErrorTable {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            schema: Arc::new(Schema::empty()),
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for ErrorTable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan(format!(
+            "table '{}' has an unresolvable schema conflict across its files and              buffer and cannot be read; other tables in the database are unaffected",
+            self.name
+        )))
+    }
+}
 
 /// A Parquet file read through the [`Store`] in ranges rather than whole.
 ///
@@ -1800,6 +1850,70 @@ mod tests {
         assert_eq!(
             p.tag_equals,
             vec![("product_id".to_string(), "p1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_table_isolates_its_failure_from_other_tables() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        // A healthy table and a poison one registered side by side — exactly
+        // what `Engine::sql_batches` does when one table's files and buffer
+        // cannot be unioned into a single schema (timelakedb#99).
+        let good_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let good = RecordBatch::try_new(
+            good_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+            ],
+        )
+        .unwrap();
+        let good = MemTable::try_new(good_schema, vec![vec![good]]).unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("good", Arc::new(good)).unwrap();
+        ctx.register_table("bad", Arc::new(ErrorTable::new("bad")))
+            .unwrap();
+
+        // A query that never names `bad` plans and runs untouched — the whole
+        // point: one unreadable table must not take down reads of the others.
+        let rows = ctx
+            .sql("SELECT COUNT(*) AS n FROM good")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2, "the healthy table must answer normally");
+
+        // Only a query that actually scans `bad` fails — and it names why.
+        let scanned = ctx
+            .sql("SELECT COUNT(*) FROM bad")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let err = format!(
+            "{:?}",
+            scanned.expect_err("scanning the poison table must fail")
+        );
+        assert!(
+            err.contains("schema conflict"),
+            "the scan error must name the reason, got: {err}"
         );
     }
 }
