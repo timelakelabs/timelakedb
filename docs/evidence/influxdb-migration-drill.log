@@ -1,0 +1,16 @@
+=== InfluxDB v1 -> TimeLakeDB migration drill (2026-08-25 20:29:39) ===
+url=http://localhost:1963  workdir=C:\Users\rlcow\AppData\Local\Temp\migrate-drill-eu69wqea
+
+-- clean corpus: 5000 points (10 hosts x 500) into db 'migr_clean_1787704179' --
+  [PASS] importer exits 0 (nothing rejected)  exit=0 ['done: 5,000 lines in 0.0s (103,445/s), 0 rejected']
+  [PASS] COUNT(*) matches the source exactly  got 5000, want 5000
+  [PASS] per-entity COUNT (host=h5) matches  got 500, want 500
+  [PASS] Shape-A lookup returns the row, correctly typed  [{'usage': 35.0, 'cores': 5}]
+
+-- type-drift trap: establish int, then a float point, into db 'migr_trap_1787704179' --
+  [PASS] integer point imports (establishes the column type)  exit=0
+  [PASS] importer exits non-zero when a line is rejected  exit=1
+  [PASS] the drifted line is in the rejects file, not lost  'mem,host=a used=100.5 1700000000000000001\n#   rejected: {"error":"field \'used\' type conflict: column was created with a '
+  [PASS] the table still holds only the good (integer) point  got 1, want 1
+
+=== PASS: migration is exact and the type-drift trap is honoured ===

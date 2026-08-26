@@ -13,6 +13,18 @@ here.
 
 ## [Unreleased]
 
+### Added — InfluxDB migration, proven end to end (#78) (2026-08-25)
+
+`ops/influxdb1-import.py` (the InfluxDB v1/v2 line-protocol importer, #97) now
+has the drill that closes #78's acceptance:
+`deploy/compose/migration-drill/migrate_drill.py` migrates a known corpus over
+the ordinary write path and shows `COUNT(*)` plus a per-entity Shape-A lookup
+agree with the source **exactly**, then that the int->float type-drift trap
+quarantines the offending line to the rejects file rather than dropping it or
+silently retyping the column. Evidence:
+`docs/evidence/influxdb-migration-drill.log`. InfluxDB v2 is the same path (its
+export is line protocol too), noted in the tool.
+
 ### Added — Flight DoPut: an Arrow-native write path (#79) (2026-08-25)
 
 `DoPut(CommandStatementIngest)` over Flight SQL lands an Arrow stream on the
