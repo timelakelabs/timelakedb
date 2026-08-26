@@ -18,6 +18,11 @@ stopped):
   (or, against a running v1, per measurement:
     influx -database mydb -execute 'SELECT * FROM ...' -format csv  ... )
 
+STEP 1b — InfluxDB v2 is the SAME shape: `influx export` (or the v2 read
+API) emits line protocol, so point this tool at that file exactly as for
+v1. The only difference is naming — a v2 bucket becomes the `--db` here;
+match `--precision` to what the export wrote (`influx_inspect` emits ns).
+
 STEP 2 — import, from a file:
 
     ops/influxdb1-import.py --url http://localhost:1963 --db mydb --file export.lp
@@ -47,6 +52,11 @@ and keeps going. Read that file — it is the list of points to decide a coercio
 for (usually: rewrite the old integers as floats, e.g. `Ni` -> `N`, and
 re-import) before you call the migration complete. Silence there would be points
 quietly dropped.
+
+Drilled end to end — a known corpus migrated, COUNT(*) and a Shape-A
+lookup matching the source exactly, and the int->float drift trap landing
+in the rejects file rather than being dropped: `deploy/compose/migration-drill/migrate_drill.py`
+(evidence `docs/evidence/influxdb-migration-drill.log`).
 
 Stdlib only — no pip install, runs anywhere with python3.
 """
