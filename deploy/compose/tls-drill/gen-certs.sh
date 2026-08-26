@@ -57,3 +57,12 @@ else
   echo "usage: $0 initial|renewal|client [CN]" >&2
   exit 2
 fi
+
+# The server container runs as a non-root user (uid 1000, Dockerfile USER
+# timelake) and reads this pair off a read-only bind mount. openssl writes
+# private keys 0600 owner-only regardless of umask, which that user cannot
+# read, so without this the TLS listener panics at startup with EACCES
+# (crates/server/src/main.rs, "initial TLS cert load must succeed"). These
+# are throwaway 1-day drill certs, so world-readable is fine and intended;
+# do NOT copy this to how the product handles real operator keys.
+chmod a+r certs/*.crt certs/*.key
