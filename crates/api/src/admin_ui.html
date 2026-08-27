@@ -181,6 +181,33 @@
       token can only narrow what its holder sees, never widen it. Issuing and
       revoking need <b>admin</b>.</div>
     </div>
+
+    <div class="card">
+      <h2>Audit trail</h2>
+      <form id="auditfilter">
+        <label>Actor <input id="au-actor" placeholder="any" style="min-width:7rem"></label>
+        <label>Action
+          <input id="au-action" list="au-actions" placeholder="any" style="min-width:9rem">
+          <datalist id="au-actions"></datalist>
+        </label>
+        <label>Target <input id="au-target" placeholder="any" style="min-width:9rem"></label>
+        <label>Show
+          <select id="au-limit"><option>50</option><option selected>100</option><option>500</option></select>
+        </label>
+        <button type="submit">Filter</button>
+      </form>
+      <div class="stat" id="au-chain"></div>
+      <table id="audit"><thead>
+        <tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th></tr>
+      </thead><tbody></tbody></table>
+      <div class="warn">The chain is <b>tamper-evident</b>, verified on every
+      load (<code>?verify=1</code>): a hand-edited record breaks it at its
+      sequence number, shown above. A <b>denied</b> or <b>rejected</b> action
+      is recorded too — that is the point of the trail. While the audit sink is
+      unavailable every mutation is refused (503, fail-closed), so a change can
+      never land unrecorded; <code>TIMELAKE_AUDIT_FAIL_OPEN</code> is the loud
+      opt-out.</div>
+    </div>
   </section>
 </div>
 <script>
@@ -219,7 +246,7 @@ async function refresh() {
   $('#me-user').textContent = body.username;
   $('#me-role').textContent = body.role;
   $('#defaultbanner').hidden = !body.default_credential_active;
-  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops();
+  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops(); loadAudit();
 }
 
 $('#loginform').onsubmit = async (e) => {
@@ -402,6 +429,51 @@ $('#tokenform').onsubmit = async (e) => {
   $('#tokenform').reset();
   loadTokens();
 };
+
+async function loadAudit() {
+  const q = new URLSearchParams({ verify: '1', limit: $('#au-limit').value });
+  const actor = $('#au-actor').value.trim(); if (actor) q.set('principal', actor);
+  const action = $('#au-action').value.trim(); if (action) q.set('action', action);
+  const target = $('#au-target').value.trim(); if (target) q.set('target', target);
+  const { ok, body } = await api('GET', '/admin/audit?' + q.toString());
+  if (!ok) return;
+  // Chain status first — a broken chain is the headline, not a footnote.
+  const chain = $('#au-chain');
+  if (body.verify && body.verify.ok) {
+    chain.innerHTML = `Chain <span style="color:var(--green)">verified</span> — ${body.total} record${body.total === 1 ? '' : 's'}.`;
+  } else if (body.verify) {
+    chain.innerHTML = `Chain <span style="color:var(--red)">broken at seq ${body.verify.break.seq}</span>: ${body.verify.break.reason}. A record was altered.`;
+  }
+  const tb = $('#audit tbody');
+  tb.innerHTML = '';
+  if (!body.records.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">No matching records.</td></tr>';
+    return;
+  }
+  const actions = new Set();
+  // Newest first — the log is stored oldest-first for the chain.
+  for (const r of body.records.slice().reverse()) {
+    actions.add(r.action);
+    const tr = document.createElement('tr');
+    // A denial or rejection is a real event, shown as one, not hidden.
+    const outcome = r.outcome === 'ok'
+      ? r.outcome
+      : `<span style="color:var(--amber)">${r.outcome}</span>`;
+    tr.innerHTML =
+      `<td class="mono" style="white-space:nowrap">${r.ts}</td>` +
+      `<td>${r.principal}</td>` +
+      `<td class="mono">${r.action}</td>` +
+      `<td class="mono">${r.target || '—'}</td>` +
+      `<td>${outcome}</td>`;
+    tb.appendChild(tr);
+  }
+  const dl = $('#au-actions');
+  dl.innerHTML = '';
+  for (const a of [...actions].sort()) {
+    const o = document.createElement('option'); o.value = a; dl.appendChild(o);
+  }
+}
+$('#auditfilter').onsubmit = (e) => { e.preventDefault(); loadAudit(); };
 
 async function loadTables() {
   try {
