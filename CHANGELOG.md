@@ -13,6 +13,8 @@ here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
 ### Added — InfluxDB migration, proven end to end (#78) (2026-08-25)
 
 `ops/influxdb1-import.py` (the InfluxDB v1/v2 line-protocol importer, #97) now
@@ -62,6 +64,50 @@ nanoseconds; stale/±Inf samples are dropped, so a stale-only scrape is a 204
 no-op rather than a 400. A remote_write arm reads back row-for-row identical to
 the same data sent as line protocol
 (`crates/server/tests/prometheus_remote_write.rs`).
+
+### Fixed — a flush could let a later write change a column's type (#98) (2026-08-25)
+
+A field's established type has to outlive the buffer a flush drains, and it
+didn't. The write path only checked the *live* buffer, so once a flush had
+reset it, a value conflicting with the column's real type was accepted with a
+204 and corrupted the table at read: a string retyped the whole column (the
+float `1.5` came back as `"1.5"`), an int truncated it (`1.5` came back as
+`1`). The identical write with no flush in between was correctly refused — the
+bug only surfaced across a flush, which is exactly when nobody is watching for
+it.
+
+Fixed to consult the column's committed type, not just whatever the buffer
+currently holds. All three faces are pinned in
+`crates/server/tests/type_conflict.rs`: the string is refused, the int coerces
+without truncating, and neither can be resurrected by WAL replay after a
+restart.
+
+### Fixed — one schema-conflicting table no longer fails reads of every other table (#99) (2026-08-25)
+
+The query path registers a DataFusion provider for every table up front, so a
+single table whose files and buffer disagree on a column's type — it cannot
+present one schema — used to abort the *whole* request, taking reads of every
+other table in the database down with it. A table corrupted before the #98 fix
+could make the entire database look dead.
+
+Isolate it instead: the conflicting table gets an `ErrorTable` provider that
+errors only when that table is actually scanned, so a query that never names it
+runs untouched. A new `unbuildable_tables_total` counter makes the condition
+visible — a rising count means pre-#98 corrupt tables are being read around, not
+that reads are failing. The conflict message names the columns and Arrow types
+in the server log; SEC-5 keeps it off the wire, sanitized like any other read
+error (#47).
+
+### Changed — the L0 row-group knob, measured at full scale: leave it off (#70) (2026-08-25)
+
+`TIMELAKE_L0_ROW_GROUP_ROWS` (shipped default-off in 0.2.0, #76) flushes L0 with
+fine row groups so a present-entity Shape A lookup on fresh data need not decode
+a ~1M-row group for a handful of rows. Phase 1 (#69) traced #68's 608 ms cold
+p95 to that gap; this is the full-scale acceptance that decides the default. Run
+interleaved (baseline, 64K, baseline, …) on a fresh container each time so cache
+warming can't favour one config, over the 36.6M-line workload — not unit scale.
+The knob doesn't earn its ingest cost, so the default stays off. Evidence:
+`docs/evidence/shape-a-p95-l0-rowgroups.md`.
 
 ## [0.2.0] - 2026-08-25
 
