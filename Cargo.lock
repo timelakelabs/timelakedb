@@ -4487,6 +4487,7 @@ dependencies = [
  "serde_json",
  "timelake-audit",
  "timelake-auth",
+ "timelake-config",
  "timelake-ingest",
  "timelake-prometheus",
  "tokio",

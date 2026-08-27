@@ -302,6 +302,34 @@ pub trait Engine: Send + Sync + 'static {
     /// Prometheus exposition text (SR-4).
     fn metrics_text(&self) -> String;
 
+    /// U0b (§3): the layered configuration surface backing `/admin/config`.
+    /// The applied revision (§3.8), and the whole `default < property <
+    /// override` stack with provenance per key.
+    fn config_revision(&self) -> u64;
+    fn config_provenance(&self, key: &str) -> Option<Value>;
+    fn config_provenance_all(&self) -> Vec<Value>;
+    /// Set an override (a value, or `None` for explicit-none) and apply it;
+    /// returns the new revision. Validates the proposed whole config (§3.6).
+    fn set_config(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<u64, timelake_config::ConfigSetError>;
+    /// Remove an override, reverting to the property/default. `true` if one was
+    /// present.
+    fn revert_config(&self, key: &str) -> Result<bool, timelake_config::ConfigSetError>;
+    /// Validate a proposed override and return the provenance it WOULD have,
+    /// without applying it (`?dry_run=1`).
+    fn config_dry_run(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<Value, timelake_config::ConfigSetError>;
+
     /// Current retention policies (FR-7).
     fn retention_policies(&self) -> Vec<RetentionPolicy>;
 
@@ -470,6 +498,13 @@ pub fn admin_app<E: Engine>(
         .route(
             "/admin/retention/{db}/{table}",
             axum::routing::delete(retention_delete::<E>),
+        )
+        .route("/admin/config", get(config_list::<E>))
+        .route(
+            "/admin/config/{key}",
+            get(config_get::<E>)
+                .put(config_set::<E>)
+                .delete(config_delete::<E>),
         )
         .route(
             "/admin/rollups",
@@ -852,6 +887,207 @@ async fn change_password<E: Engine>(
             )
                 .into_response()
         }
+    }
+}
+
+/// Map a config-crate role requirement to the auth role that gates it.
+fn config_role(r: timelake_config::Role) -> Role {
+    match r {
+        timelake_config::Role::Viewer => Role::Viewer,
+        timelake_config::Role::Operator => Role::Operator,
+        timelake_config::Role::Admin => Role::Admin,
+    }
+}
+
+/// `PUT /admin/config/{key}` body: `{"value": <string|number|bool|null>}`.
+/// `null` is explicit-none (§3.3); a scalar is stringified for the resolver.
+#[derive(serde::Deserialize)]
+struct ConfigSetBody {
+    value: Value,
+}
+
+fn config_value_text(v: &Value) -> Result<Option<String>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        Value::Bool(b) => Ok(Some(b.to_string())),
+        _ => Err("value must be a string, number, boolean, or null".to_string()),
+    }
+}
+
+/// A config write error mapped to a status: a resolver rejection is `409` (the
+/// request is well-formed but violates a constraint), a store failure `500`.
+fn config_err_response(e: timelake_config::ConfigSetError) -> axum::response::Response {
+    let code = match e {
+        timelake_config::ConfigSetError::Rejected(_) => StatusCode::CONFLICT,
+        timelake_config::ConfigSetError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err_response(code, &e.to_string())
+}
+
+/// The override `at` timestamp, from the same source as the audit trail.
+fn config_at() -> String {
+    timelake_audit::rfc3339_utc(std::time::SystemTime::now())
+}
+
+/// `GET /admin/config` — every setting with full provenance, plus the revision.
+async fn config_list<E: Engine>(State(state): State<AdminState<E>>) -> axum::response::Response {
+    Json(json!({
+        "revision": state.engine.config_revision(),
+        "settings": state.engine.config_provenance_all(),
+    }))
+    .into_response()
+}
+
+/// `GET /admin/config/{key}` — one setting's provenance.
+async fn config_get<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match state.engine.config_provenance(&key) {
+        Some(p) => Json(p).into_response(),
+        None => err_response(StatusCode::NOT_FOUND, &format!("unknown setting `{key}`")),
+    }
+}
+
+/// `PUT /admin/config/{key}` — set an override (value or `null`). `?dry_run=1`
+/// validates and previews without applying.
+async fn config_set<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+
+    let Some(spec) = timelake_config::spec(&key) else {
+        return err_response(StatusCode::NOT_FOUND, &format!("unknown setting `{key}`"));
+    };
+    if let Some(deny) = require(&session, config_role(spec.min_role)) {
+        return deny;
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let set: ConfigSetBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                &format!("body must be {{\"value\": <string|number|bool|null>}}: {e}"),
+            );
+        }
+    };
+    let value = match config_value_text(&set.value) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let dry_run = matches!(
+        params.get("dry_run").map(String::as_str),
+        Some("1") | Some("true")
+    );
+    let at = config_at();
+    if dry_run {
+        return match state
+            .engine
+            .config_dry_run(&key, value, &session.username, &at)
+        {
+            Ok(preview) => Json(json!({ "dry_run": true, "would_apply": preview })).into_response(),
+            Err(e) => config_err_response(e),
+        };
+    }
+
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let before = state
+        .engine
+        .config_provenance(&key)
+        .map(|p| p["effective"].clone());
+    match state.engine.set_config(&key, value, &session.username, &at) {
+        Ok(revision) => {
+            let after = state
+                .engine
+                .config_provenance(&key)
+                .map(|p| p["effective"].clone());
+            let ev = audit_event(
+                &session,
+                source,
+                "config.set",
+                Some(key.clone()),
+                before,
+                after,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "key": key, "revision": revision, "status": "applied" })).into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "config.set",
+                Some(key.clone()),
+                before,
+                None,
+                "rejected",
+            );
+            let _ = audit_record(&state.audit, ev);
+            config_err_response(e)
+        }
+    }
+}
+
+/// `DELETE /admin/config/{key}` — revert an override to the property/default.
+async fn config_delete<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    let Some(spec) = timelake_config::spec(&key) else {
+        return err_response(StatusCode::NOT_FOUND, &format!("unknown setting `{key}`"));
+    };
+    if let Some(deny) = require(&session, config_role(spec.min_role)) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let before = state
+        .engine
+        .config_provenance(&key)
+        .map(|p| p["effective"].clone());
+    match state.engine.revert_config(&key) {
+        Ok(removed) => {
+            let after = state
+                .engine
+                .config_provenance(&key)
+                .map(|p| p["effective"].clone());
+            let ev = audit_event(
+                &session,
+                source,
+                "config.revert",
+                Some(key.clone()),
+                before,
+                after,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            let status = if removed { "reverted" } else { "no override" };
+            Json(json!({ "key": key, "status": status })).into_response()
+        }
+        Err(e) => config_err_response(e),
     }
 }
 
