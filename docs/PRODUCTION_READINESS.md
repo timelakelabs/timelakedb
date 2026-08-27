@@ -473,7 +473,7 @@ peak and 50× better by bound.
   608 ms against a 250 ms target, and intra-run ingest decline under
   maintenance contention. Streaming execution, range reads, and
   maintenance/query isolation.
-- **Console U0, U1 (part) and U3** — the admin listener on 1965 bound to
+- **Console U0, U1 (part) and U3** — the admin listener on 1966 bound to
   loopback (moving `/admin/*` off the data port), layered configuration
   with provenance, cluster view. **U2 is done** (metrics + performance
   views, 2026-08-18): see `docs/CONSOLE.md` §7.4/§7.6 and the drill

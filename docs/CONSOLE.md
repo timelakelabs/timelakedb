@@ -718,12 +718,18 @@ may consult the console.
 |---|---|---|---|
 | 1963 | HTTP data | `0.0.0.0` | writes, `/api/sql`, `/health`, `/ping`, `/metrics` |
 | 1964 | Flight SQL | `0.0.0.0` | FR-8 |
-| **1965** | **Admin** | **`127.0.0.1`** | console UI + `/admin/*` API |
+| 1965 | Intra-cluster | private, opt-in | replication + live-buffer reads (`/internal/v1/*`), ingester role, `TIMELAKE_CLUSTER_ADDR` |
+| **1966** | **Admin** | **`127.0.0.1`** | console UI + `/admin/*` API |
 
 The admin listener is private by default and must be opened deliberately
-(`TIMELAKE_ADMIN_ADDR=0.0.0.0:1965`), which is the opposite of the
+(`TIMELAKE_ADMIN_ADDR=0.0.0.0:1966`), which is the opposite of the
 current situation where the most destructive endpoint in the system rides
 on the most exposed port.
+
+Admin is **1966, not 1965**: this section originally assigned 1965, but the
+intra-cluster replication listener already holds it (`TIMELAKE_CLUSTER_ADDR`;
+the rigs bind `:1965`), so on a `role=all` node the two would collide. 1965
+stays with replication; admin takes the next port in the family.
 
 **Breaking change**: `/admin/retention` and `/admin/ui` move off 1963,
 and `/admin/tls/reload` moves with them. Since nothing has been released
@@ -920,7 +926,7 @@ Each phase is gated by something the harness or a drill can check, per
 CLAUDE.md's rule that no milestone is done on unit tests alone.
 
 **U0 — Admin plane: layered config, auth, retention rebuilt.**
-The admin listener on 1965 with TLS and SEC-4 (bootstrap, roles,
+The admin listener on 1966 with TLS and SEC-4 (bootstrap, roles,
 sessions, tokens); `timelake-config` with the three layers, provenance,
 pinning, validation and hot-swap; the settings inventory of §3.5;
 retention migrated onto it (three-state override, impact preview);

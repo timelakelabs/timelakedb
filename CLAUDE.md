@@ -53,8 +53,8 @@ This project is inspired by the following projects.
   (off regardless of the property) — because "revert to the property" and
   "keep everything anyway" are different intents. `TIMELAKE_CONFIG_PINNED`
   locks named keys to the property layer. The console gets its own
-  listener (1965, private by default) with SEC-4 auth; the admin
-  endpoints move off 1963.
+  listener (1966, private by default — 1965 is the intra-cluster
+  replication port) with SEC-4 auth; the admin endpoints move off 1963.
 - TLS 1.3 (rustls) on every listener in v1, mTLS intra-cluster in v2
   (SEC-3 — "TLS 3.0" in conversation means TLS 1.3). Certs are short-TTL
   (~24 h) and hot-rotated: file-watch + ArcSwap resolver, validate-before-
