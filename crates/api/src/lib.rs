@@ -330,6 +330,17 @@ pub trait Engine: Send + Sync + 'static {
         at: &str,
     ) -> Result<Value, timelake_config::ConfigSetError>;
 
+    /// U1 (§6): a filtered page of the node's application log for
+    /// `/admin/logs`. Newest first; `min_level` keeps entries at or above that
+    /// severity.
+    fn app_logs(
+        &self,
+        min_level: &str,
+        target: Option<&str>,
+        contains: Option<&str>,
+        limit: usize,
+    ) -> Value;
+
     /// Current retention policies (FR-7).
     fn retention_policies(&self) -> Vec<RetentionPolicy>;
 
@@ -506,6 +517,7 @@ pub fn admin_app<E: Engine>(
                 .put(config_set::<E>)
                 .delete(config_delete::<E>),
         )
+        .route("/admin/logs", get(logs_list::<E>))
         .route(
             "/admin/rollups",
             get(rollups_list::<E>).put(rollups_set::<E>),
@@ -888,6 +900,37 @@ async fn change_password<E: Engine>(
                 .into_response()
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct LogsQuery {
+    level: Option<String>,
+    target: Option<String>,
+    contains: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /admin/logs` — a filtered snapshot of the node's application-log ring
+/// (§6). Not the audit trail, and not the stored data: the recent operational
+/// log, in memory and bounded, so a console can triage without shipping logs
+/// into the database.
+async fn logs_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    Query(q): Query<LogsQuery>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Viewer) {
+        return deny;
+    }
+    let level = q.level.as_deref().unwrap_or("info");
+    let limit = q.limit.unwrap_or(500).min(5000);
+    Json(
+        state
+            .engine
+            .app_logs(level, q.target.as_deref(), q.contains.as_deref(), limit),
+    )
+    .into_response()
 }
 
 /// Map a config-crate role requirement to the auth role that gates it.
