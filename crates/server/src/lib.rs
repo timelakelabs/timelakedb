@@ -37,6 +37,7 @@ use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, Local
 use timelake_store_s3::{AwsContext, AwsKms, S3Stats, S3Store};
 use timelake_wal::{Wal, WalCipher};
 
+pub mod applog;
 pub mod compaction;
 pub mod logfile;
 pub mod querier;
@@ -2184,6 +2185,16 @@ impl timelake_api::Engine for Engine {
         Engine::config_revision(self)
     }
 
+    fn app_logs(
+        &self,
+        min_level: &str,
+        target: Option<&str>,
+        contains: Option<&str>,
+        limit: usize,
+    ) -> serde_json::Value {
+        Engine::app_logs(self, min_level, target, contains, limit)
+    }
+
     fn config_provenance(&self, key: &str) -> Option<serde_json::Value> {
         Engine::config_provenance(self, key)
     }
@@ -3853,6 +3864,30 @@ impl Engine {
     /// `timelake_config_revision`.
     pub fn config_revision(&self) -> u64 {
         self.config.read().expect("config lock").revision()
+    }
+
+    /// U1: a filtered page of the node's application-log ring for
+    /// `/admin/logs`. Newest first; `min_level` keeps entries at or above that
+    /// severity (`warn` shows warn + error). The ring is process-global, fed by
+    /// the tracing layer in `main`.
+    pub fn app_logs(
+        &self,
+        min_level: &str,
+        target: Option<&str>,
+        contains: Option<&str>,
+        limit: usize,
+    ) -> serde_json::Value {
+        let (entries, dropped) = applog::global().snapshot();
+        let rank = applog::level_rank(min_level);
+        let page: Vec<&applog::LogEntry> = entries
+            .iter()
+            .rev()
+            .filter(|e| applog::level_rank(&e.level) <= rank)
+            .filter(|e| target.is_none_or(|t| e.target.contains(t)))
+            .filter(|e| contains.is_none_or(|c| e.message.contains(c)))
+            .take(limit)
+            .collect();
+        serde_json::json!({ "entries": page, "dropped": dropped })
     }
 
     /// Full provenance for one setting (§3.2), or `None` if the key is unknown.

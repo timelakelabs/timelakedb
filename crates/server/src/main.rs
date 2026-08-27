@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, fmt, registry};
 
 #[tokio::main]
 async fn main() {
@@ -11,14 +12,26 @@ async fn main() {
     // node writes to a file it rotates itself, by size and/or by time.
     // This is NOT the audit trail — that is hash-chained evidence with its
     // own rotation and its own retention floor.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mkfilter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // U1 (§6): an in-memory ring of recent logs feeds the console
+    // (`GET /admin/logs`), added as a layer BESIDE the fmt layer, so stdout /
+    // the rotating file are unchanged and the ring respects the same filter.
+    // It is not the audit trail, and is never ingested into the database.
     match timelake_server::logfile::from_env() {
-        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
-        Some(log) => tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        None => registry()
+            .with(mkfilter())
+            .with(fmt::layer())
+            .with(timelake_server::applog::layer())
+            .init(),
+        Some(log) => registry()
+            .with(mkfilter())
             // No ANSI escapes in a file — they make a log grep-hostile.
-            .with_ansi(false)
-            .with_writer(timelake_server::logfile::LogSink(log))
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(timelake_server::logfile::LogSink(log)),
+            )
+            .with(timelake_server::applog::layer())
             .init(),
     }
 

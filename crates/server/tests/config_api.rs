@@ -237,4 +237,8 @@ async fn the_console_includes_the_configuration_screen() {
     assert!(html.contains("<h2>Audit trail</h2>"), "audit card present");
     assert!(html.contains("/admin/audit?"), "audit API wired");
     assert!(html.contains("loadAudit("), "audit loader present");
+    // U1 (#110) phase B: the Logs screen ships and wires to the logs API.
+    assert!(html.contains("<h2>Logs</h2>"), "logs card present");
+    assert!(html.contains("/admin/logs?"), "logs API wired");
+    assert!(html.contains("loadLogs("), "logs loader present");
 }

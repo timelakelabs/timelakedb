@@ -183,6 +183,31 @@
     </div>
 
     <div class="card">
+      <h2>Logs</h2>
+      <form id="logfilter">
+        <label>Level ≥
+          <select id="lg-level">
+            <option value="trace">trace</option><option value="debug">debug</option>
+            <option value="info" selected>info</option><option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label>Target has <input id="lg-target" placeholder="e.g. flush" style="min-width:8rem"></label>
+        <label>Message has <input id="lg-contains" placeholder="any" style="min-width:8rem"></label>
+        <label style="flex-direction:row;align-items:center;gap:.4rem">
+          <input type="checkbox" id="lg-live" checked style="min-width:auto"> live</label>
+        <button type="submit">Filter</button>
+      </form>
+      <div class="stat" id="lg-stat"></div>
+      <pre id="logout" style="max-height:22rem;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:.8rem;line-height:1.45;white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.2);border-radius:6px;padding:.6rem;margin-top:.6rem;color:var(--mist)"></pre>
+      <div class="warn">The node's recent log, kept in a bounded in-memory ring
+      and refreshed while <b>live</b>. It is <b>not</b> ingested into the
+      database — that would amplify writes exactly when the node is least
+      healthy — and it is <b>not</b> the audit trail. Older lines are dropped
+      once the ring is full; the count is shown.</div>
+    </div>
+
+    <div class="card">
       <h2>Audit trail</h2>
       <form id="auditfilter">
         <label>Actor <input id="au-actor" placeholder="any" style="min-width:7rem"></label>
@@ -246,7 +271,7 @@ async function refresh() {
   $('#me-user').textContent = body.username;
   $('#me-role').textContent = body.role;
   $('#defaultbanner').hidden = !body.default_credential_active;
-  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops(); loadAudit();
+  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops(); loadLogs(); loadAudit();
 }
 
 $('#loginform').onsubmit = async (e) => {
@@ -430,6 +455,21 @@ $('#tokenform').onsubmit = async (e) => {
   loadTokens();
 };
 
+async function loadLogs() {
+  const q = new URLSearchParams({ level: $('#lg-level').value, limit: '500' });
+  const t = $('#lg-target').value.trim(); if (t) q.set('target', t);
+  const c = $('#lg-contains').value.trim(); if (c) q.set('contains', c);
+  const { ok, body } = await api('GET', '/admin/logs?' + q.toString());
+  if (!ok) return;
+  $('#logout').textContent = body.entries
+    .map(e => `${e.ts} ${e.level.padEnd(5)} ${e.target}  ${e.message}`)
+    .join('\n');
+  $('#lg-stat').innerHTML = body.dropped > 0
+    ? `Newest first. <b>${body.dropped}</b> older lines dropped to overflow since start.`
+    : 'Newest first — the bounded ring of recent log lines.';
+}
+$('#logfilter').onsubmit = (e) => { e.preventDefault(); loadLogs(); };
+
 async function loadAudit() {
   const q = new URLSearchParams({ verify: '1', limit: $('#au-limit').value });
   const actor = $('#au-actor').value.trim(); if (actor) q.set('principal', actor);
@@ -537,6 +577,10 @@ $('#setform').onsubmit = async (e) => {
 
 refresh();
 setInterval(() => { if (ME && !ME.must_change_password) loadDrops(); }, 10000);
+// Live log tail: poll while signed in and the "live" box is checked.
+setInterval(() => {
+  if (ME && !ME.must_change_password && $('#lg-live') && $('#lg-live').checked) loadLogs();
+}, 3000);
 </script>
 </body>
 </html>
