@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
+use arc_swap::ArcSwap;
+
 use serde_json::Value;
 use timelake_api::WriteError;
 // Re-exported so callers and tests name the retention types through the
@@ -689,7 +691,19 @@ pub struct Engine {
     /// SEC-1: true when the store is the encrypting decorator (drives the
     /// timelake_encryption_enabled gauge; the engine itself cannot tell).
     store_encrypted: bool,
-    cfg: EngineConfig,
+    /// The effective engine config, behind an `ArcSwap` so the hot tunables
+    /// (flush/compact/gc/wal/l0/query-timeout/data-auth) take a live update
+    /// when `/admin/config` writes an override — the same pattern
+    /// `timelake-tls` uses for certificates. Materialised at boot from
+    /// [`Self::config`]; the boot-captured consumers (query pool, client
+    /// limiter) still take their values at `open`, so a change to those
+    /// settings applies on restart (U0b, timelakedb#109).
+    cfg: ArcSwap<EngineConfig>,
+    /// U0b: the layered configuration (`default < property < override`) with
+    /// provenance, the source of truth for `/admin/config`. The override layer
+    /// persists to [`SETTINGS_CONFIG_PATH`] through the store, the retention
+    /// pattern exactly; `cfg` above is its materialised form.
+    config: RwLock<timelake_config::Layered>,
     /// Shared pool + admission + timeout (RR-1/RR-2) — ONE for all queries.
     query_env: timelake_query::QueryEnv,
     /// SEC-6: per-client concurrency cap in front of the admission
@@ -907,6 +921,39 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
+        // U0b (timelakedb#109 §3): the layered config. The property layer is
+        // the config this node was given (env in production, or the caller's
+        // literal in a test); the override layer is settings.json, loaded from
+        // the store like retention so an operator's durable change survives a
+        // restart with a stale env. The overrides are materialised into `cfg`
+        // now so the boot-captured consumers below — the query pool, the
+        // client limiter — take the effective values too.
+        let settings_doc: timelake_config::SettingsDoc = match store.get(SETTINGS_CONFIG_PATH) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("settings.json: {e}"),
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                timelake_config::SettingsDoc::empty()
+            }
+            Err(e) => return Err(e),
+        };
+        let layered = timelake_config::Layered::load(
+            config_property(&cfg),
+            config_pinned_from_env(),
+            settings_doc,
+        );
+        for key in layered.divergent() {
+            tracing::warn!(
+                setting = %key,
+                "config override shadows a system property that has since changed \
+                 (timelakedb#109 §3.2)"
+            );
+        }
+        let cfg = materialize(&layered, retention.clone());
+
         // Node identity, read once: it stamps the audit chain (§5.2) and
         // tags every self-monitoring row, so a cluster's samples aggregate.
         // Through the cluster crate's reader, so the name here and the name
@@ -990,7 +1037,8 @@ impl Engine {
             retention: RwLock::new(retention),
             rollups: RwLock::new(rollups),
             flushing: RwLock::new(HashMap::new()),
-            cfg,
+            cfg: ArcSwap::from_pointee(cfg),
+            config: RwLock::new(layered),
             lines_total: AtomicU64::new(0),
             flushes_total: AtomicU64::new(0),
             compactions_total: AtomicU64::new(0),
@@ -1139,8 +1187,8 @@ impl Engine {
         let need = {
             let dbs = self.dbs.read().expect("dbs lock");
             dbs.values().flat_map(|t| t.values()).any(|b| {
-                b.row_count() >= self.cfg.flush_rows
-                    || (b.row_count() > 0 && b.age_secs() >= self.cfg.flush_age_secs)
+                b.row_count() >= self.cfg.load().flush_rows
+                    || (b.row_count() > 0 && b.age_secs() >= self.cfg.load().flush_age_secs)
             })
         };
         if need { self.flush_all() } else { Ok(0) }
@@ -1169,10 +1217,10 @@ impl Engine {
         // validate before durability: a 400 must not land in the WAL
         parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
         // RR-5: the WAL cap is a named, visible limit
-        if self.wal.lock().expect("wal lock").size() > self.cfg.wal_max_bytes {
+        if self.wal.lock().expect("wal lock").size() > self.cfg.load().wal_max_bytes {
             return Err(WriteError::Backpressure(format!(
                 "wal exceeds {} bytes; flush in progress — retry",
-                self.cfg.wal_max_bytes
+                self.cfg.load().wal_max_bytes
             )));
         }
         let _gate = self.ingest_gate.read().expect("ingest gate");
@@ -1331,7 +1379,7 @@ impl Engine {
             let (min_ts, max_ts) = flush::time_bounds(&part);
             // L0 row-group size (#70): None = coarse default; a small value
             // makes fresh data prune at a fine grain like settled files do.
-            let bytes = flush::to_parquet_bytes_rg(&part, self.cfg.l0_row_group_rows)?;
+            let bytes = flush::to_parquet_bytes_rg(&part, self.cfg.load().l0_row_group_rows)?;
             let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
             let path = format!(
                 "{db}/{table}/data/{partition}/{:020}-{seq:06}.parquet",
@@ -1388,7 +1436,9 @@ impl Engine {
         // `compaction` for why the overlap test is strict.
         let mut todo: Vec<(compaction::Trigger, Vec<FileMeta>)> = groups
             .into_values()
-            .filter_map(|v| compaction::trigger_for(&v, self.cfg.compact_min_files).map(|t| (t, v)))
+            .filter_map(|v| {
+                compaction::trigger_for(&v, self.cfg.load().compact_min_files).map(|t| (t, v))
+            })
             .collect();
         // Overlap first, then most files. A partition with duplicates is
         // serving wrong answers right now; one with four files is merely
@@ -1681,12 +1731,12 @@ impl Engine {
     /// The largest HTTP body this node accepts, on either listener.
     /// Read by both routers so they cannot disagree (FR-1).
     pub fn max_body_bytes(&self) -> usize {
-        self.cfg.max_body_bytes
+        self.cfg.load().max_body_bytes
     }
 
     /// Concurrency ceiling for intra-cluster live/snapshot reads (CL-3).
     pub fn internal_max_concurrent(&self) -> usize {
-        self.cfg.internal_max_concurrent
+        self.cfg.load().internal_max_concurrent
     }
 
     /// True where the intra-cluster listener runs: the replica WAL is
@@ -2032,7 +2082,7 @@ impl Engine {
 
     /// Physically delete superseded files older than the grace window.
     pub fn run_gc(&self) -> usize {
-        let grace = std::time::Duration::from_secs(self.cfg.gc_grace_secs);
+        let grace = std::time::Duration::from_secs(self.cfg.load().gc_grace_secs);
         let due: Vec<String> = {
             let mut q = self.pending_gc.lock().expect("gc lock");
             let (ready, keep): (Vec<_>, Vec<_>) =
@@ -2347,7 +2397,7 @@ impl Engine {
                 buffer,
                 files,
                 self.store.clone(),
-                std::time::Duration::from_secs(self.cfg.query_timeout_secs),
+                std::time::Duration::from_secs(self.cfg.load().query_timeout_secs),
                 self.query_env.runtime.memory_pool.clone(),
                 self.meta_cache.clone(),
                 session
@@ -2996,7 +3046,7 @@ impl Engine {
              timelake_data_requests_anonymous_total {}\n\
              # TYPE timelake_data_requests_rejected_total counter\n\
              timelake_data_requests_rejected_total {}\n",
-            match self.cfg.data_auth {
+            match self.cfg.load().data_auth {
                 timelake_auth::DataAuthMode::Off => 0,
                 timelake_auth::DataAuthMode::Optional => 1,
                 timelake_auth::DataAuthMode::Required => 2,
@@ -3100,6 +3150,13 @@ impl Engine {
             ),
             None => String::new(),
         };
+        // U0b (§3.8): the applied config revision, so the cluster view can
+        // flag a node that is behind. Unconditional — every node has a config.
+        let config_line = format!(
+            "# TYPE timelake_config_revision gauge\n\
+             timelake_config_revision {}\n",
+            self.config_revision()
+        );
         format!(
             "# TYPE timelake_lines_written_total counter\n\
              timelake_lines_written_total {}\n\
@@ -3148,7 +3205,7 @@ impl Engine {
              # TYPE timelake_audit_records_total counter\n\
              timelake_audit_records_total {}\n\
              # TYPE timelake_audit_sink_healthy gauge\n\
-             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}",
+             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -3209,13 +3266,14 @@ impl Engine {
             // answerable without running the harness.
             self.query_env.metrics.render(),
             self.lifecycle_lines(),
+            config_line,
         )
     }
 }
 
 impl Engine {
     pub fn config(&self) -> EngineConfig {
-        self.cfg.clone()
+        self.cfg.load_full().as_ref().clone()
     }
 
     /// The one data-plane authentication path. Both the HTTP router and
@@ -3230,7 +3288,7 @@ impl Engine {
     ) -> Result<timelake_auth::Decision, timelake_auth::TokenError> {
         let result = self
             .auth
-            .decide_data(self.cfg.data_auth, authorization, action, db);
+            .decide_data(self.cfg.load().data_auth, authorization, action, db);
         match &result {
             Ok(d) if d.is_authenticated() => {
                 self.data_auth_counts
@@ -3629,6 +3687,220 @@ pub fn admin_app_with_tls(
         .layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
+/// The layered-config override document (§3.7), one path through the store.
+const SETTINGS_CONFIG_PATH: &str = "catalog/config/settings.json";
+
+/// Render an `EngineConfig`'s inventory settings to their text form — the
+/// property layer for the resolver (§3.1). These are exactly what
+/// `config_from_env` produced (the compiled default folded with any
+/// `TIMELAKE_*`), so the property layer reflects the deployment's environment.
+fn config_property(cfg: &EngineConfig) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    m.insert("flush_rows".into(), cfg.flush_rows.to_string());
+    m.insert("flush_age_secs".into(), cfg.flush_age_secs.to_string());
+    m.insert("wal_max_bytes".into(), cfg.wal_max_bytes.to_string());
+    m.insert(
+        "compact_min_files".into(),
+        cfg.compact_min_files.to_string(),
+    );
+    m.insert(
+        "l0_row_group_rows".into(),
+        cfg.l0_row_group_rows
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+    );
+    m.insert(
+        "max_concurrent_queries".into(),
+        cfg.max_concurrent_queries.to_string(),
+    );
+    m.insert(
+        "max_concurrent_queries_per_client".into(),
+        cfg.max_concurrent_queries_per_client.to_string(),
+    );
+    m.insert(
+        "query_timeout_secs".into(),
+        cfg.query_timeout_secs.to_string(),
+    );
+    m.insert("gc_grace_secs".into(), cfg.gc_grace_secs.to_string());
+    m.insert("query_mem_bytes".into(), cfg.query_mem_bytes.to_string());
+    m.insert("repl_timeout_ms".into(), cfg.repl_timeout_ms.to_string());
+    m.insert("max_body_bytes".into(), cfg.max_body_bytes.to_string());
+    m.insert(
+        "internal_max_concurrent".into(),
+        cfg.internal_max_concurrent.to_string(),
+    );
+    m.insert("data_auth".into(), data_auth_str(cfg.data_auth).to_string());
+    m
+}
+
+/// The keys pinned to the property layer by system policy (§3.4).
+fn config_pinned_from_env() -> std::collections::BTreeSet<String> {
+    std::env::var("TIMELAKE_CONFIG_PINNED")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn data_auth_str(m: timelake_auth::DataAuthMode) -> &'static str {
+    match m {
+        timelake_auth::DataAuthMode::Off => "off",
+        timelake_auth::DataAuthMode::Optional => "optional",
+        timelake_auth::DataAuthMode::Required => "required",
+    }
+}
+
+fn parse_data_auth(s: &str) -> timelake_auth::DataAuthMode {
+    match s {
+        "optional" => timelake_auth::DataAuthMode::Optional,
+        "required" => timelake_auth::DataAuthMode::Required,
+        _ => timelake_auth::DataAuthMode::Off,
+    }
+}
+
+/// Build the effective `EngineConfig` from the resolved layered values plus the
+/// separately-managed retention list — the inverse of [`config_property`].
+/// Every inventory field is parsed back from its effective text; a value that
+/// passed the resolver's validation cannot fail to parse, so a parse error
+/// falls back to the compiled default rather than panicking.
+fn materialize(
+    layered: &timelake_config::Layered,
+    retention: Vec<RetentionPolicy>,
+) -> EngineConfig {
+    let d = EngineConfig::default();
+    let g = |k: &str| layered.effective(k).map(|e| e.value).unwrap_or_default();
+    let l0 = {
+        let v = g("l0_row_group_rows");
+        if v.is_empty() || v == "off" {
+            None
+        } else {
+            v.parse().ok()
+        }
+    };
+    EngineConfig {
+        flush_rows: g("flush_rows").parse().unwrap_or(d.flush_rows),
+        flush_age_secs: g("flush_age_secs").parse().unwrap_or(d.flush_age_secs),
+        wal_max_bytes: g("wal_max_bytes").parse().unwrap_or(d.wal_max_bytes),
+        compact_min_files: g("compact_min_files")
+            .parse()
+            .unwrap_or(d.compact_min_files),
+        l0_row_group_rows: l0,
+        retention,
+        max_concurrent_queries: g("max_concurrent_queries")
+            .parse()
+            .unwrap_or(d.max_concurrent_queries),
+        max_concurrent_queries_per_client: g("max_concurrent_queries_per_client")
+            .parse()
+            .unwrap_or(d.max_concurrent_queries_per_client),
+        query_timeout_secs: g("query_timeout_secs")
+            .parse()
+            .unwrap_or(d.query_timeout_secs),
+        gc_grace_secs: g("gc_grace_secs").parse().unwrap_or(d.gc_grace_secs),
+        query_mem_bytes: g("query_mem_bytes").parse().unwrap_or(d.query_mem_bytes),
+        data_auth: parse_data_auth(&g("data_auth")),
+        repl_timeout_ms: g("repl_timeout_ms").parse().unwrap_or(d.repl_timeout_ms),
+        max_body_bytes: g("max_body_bytes").parse().unwrap_or(d.max_body_bytes),
+        internal_max_concurrent: g("internal_max_concurrent")
+            .parse()
+            .unwrap_or(d.internal_max_concurrent),
+    }
+}
+
+/// A rejected `/admin/config` write: the resolver refused it (§3.6), or the
+/// override store could not be written.
+#[derive(Debug)]
+pub enum ConfigSetError {
+    Rejected(timelake_config::ConfigError),
+    Store(String),
+}
+
+impl std::fmt::Display for ConfigSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSetError::Rejected(e) => write!(f, "{e}"),
+            ConfigSetError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigSetError {}
+
+impl Engine {
+    /// The current applied config revision (§3.8), also on
+    /// `timelake_config_revision`.
+    pub fn config_revision(&self) -> u64 {
+        self.config.read().expect("config lock").revision()
+    }
+
+    /// Full provenance for one setting (§3.2), or `None` if the key is unknown.
+    pub fn config_provenance(&self, key: &str) -> Option<serde_json::Value> {
+        self.config.read().expect("config lock").provenance(key)
+    }
+
+    /// Provenance for every setting.
+    pub fn config_provenance_all(&self) -> Vec<serde_json::Value> {
+        self.config.read().expect("config lock").provenance_all()
+    }
+
+    /// Set a config override (a value, or `None` for explicit-none) and apply
+    /// it. Validates the proposed whole config; on rejection nothing changes
+    /// (§3.6). The hot tunables take effect at once through the `ArcSwap`; the
+    /// boot-captured ones apply on the next restart. Returns the new revision.
+    pub fn set_config(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<u64, ConfigSetError> {
+        let mut layered = self.config.write().expect("config lock");
+        let revision = layered
+            .set(key, value, actor, at)
+            .map_err(ConfigSetError::Rejected)?;
+        // Persist under the write lock so concurrent admin edits cannot land in
+        // the store out of order (the retention discipline).
+        self.persist_config(&layered.to_doc())
+            .map_err(ConfigSetError::Store)?;
+        let effective = materialize(
+            &layered,
+            self.retention.read().expect("retention lock").clone(),
+        );
+        self.cfg.store(Arc::new(effective));
+        Ok(revision)
+    }
+
+    /// Revert an override to the property (or default). Returns whether one was
+    /// present, and re-materialises like [`Self::set_config`].
+    pub fn revert_config(&self, key: &str) -> Result<bool, ConfigSetError> {
+        let mut layered = self.config.write().expect("config lock");
+        let removed = layered.revert(key).map_err(ConfigSetError::Rejected)?;
+        if removed {
+            self.persist_config(&layered.to_doc())
+                .map_err(ConfigSetError::Store)?;
+            let effective = materialize(
+                &layered,
+                self.retention.read().expect("retention lock").clone(),
+            );
+            self.cfg.store(Arc::new(effective));
+        }
+        Ok(removed)
+    }
+
+    fn persist_config(&self, doc: &timelake_config::SettingsDoc) -> Result<(), String> {
+        self.store
+            .put(
+                SETTINGS_CONFIG_PATH,
+                &serde_json::to_vec_pretty(doc).expect("settings json"),
+            )
+            .map_err(|e| format!("persist settings config: {e}"))
+    }
+}
+
 /// Parse engine config from environment (main + integration use).
 pub fn config_from_env() -> EngineConfig {
     fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
@@ -3677,4 +3949,27 @@ pub fn config_from_env() -> EngineConfig {
 /// Convenience used by main and tests.
 pub fn data_dir_from_env() -> PathBuf {
     PathBuf::from(std::env::var("TIMELAKE_DATA_DIR").unwrap_or_else(|_| "./data".to_string()))
+}
+
+#[cfg(test)]
+mod config_pin_tests {
+    use super::*;
+
+    /// With no property and no overrides, every effective value is the config
+    /// inventory's compiled-in default string. Materialising them must
+    /// reproduce `EngineConfig::default()` exactly — the pin that keeps
+    /// `timelake_config`'s default strings and the engine's `Default` impl from
+    /// drifting apart, the one coupling the config crate cannot check on its
+    /// own. If this fails, an inventory `default` and an `EngineConfig::default`
+    /// field disagree.
+    #[test]
+    fn inventory_defaults_match_engineconfig_default() {
+        let layered = timelake_config::Layered::new(
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+        );
+        let got = materialize(&layered, Vec::new());
+        let want = EngineConfig::default();
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
 }

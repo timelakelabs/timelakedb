@@ -4619,6 +4619,7 @@ version = "0.3.0"
 name = "timelake-server"
 version = "0.3.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "axum-server",
  "flate2",
@@ -4636,6 +4637,7 @@ dependencies = [
  "timelake-catalog",
  "timelake-cluster",
  "timelake-compact",
+ "timelake-config",
  "timelake-flight",
  "timelake-ingest",
  "timelake-prometheus",

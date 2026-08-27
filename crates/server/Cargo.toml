@@ -25,6 +25,8 @@ timelake-catalog = { path = "../catalog" }
 timelake-compact = { path = "../compact" }
 timelake-flight = { path = "../flight" }
 timelake-tls = { path = "../tls" }
+timelake-config = { path = "../config" }
+arc-swap.workspace = true
 axum-server.workspace = true
 # HTTP peer identity: the acceptor reads the rustls ServerConnection off the
 # stream, and layers the identity onto the service. Both crates are already
