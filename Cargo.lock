@@ -4551,6 +4551,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "timelake-config"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "timelake-discovery"
 version = "0.3.0"
 
