@@ -96,6 +96,22 @@
     </div>
 
     <div class="card">
+      <h2>Configuration</h2>
+      <table id="settings"><thead>
+        <tr><th>Setting</th><th>Effective</th><th>Layers</th><th>Scope · Apply · Role</th><th></th></tr>
+      </thead><tbody></tbody></table>
+      <div class="stat" id="config-stat"></div>
+      <div class="warn">Provenance is the layout: each setting shows its
+      effective value and the layer it resolved from
+      (<b>default &lt; property &lt; override</b>). <b>Reverting an override
+      falls back to the property, not the default.</b> A change is validated as
+      a whole — <code>gc_grace_secs</code> must exceed
+      <code>query_timeout_secs</code> — and refused with the reason if it would
+      break. A <b>hot</b> setting applies at once; <b>staged</b>/<b>boot</b>
+      apply on the next restart. 🔒 marks a setting pinned by a system property.</div>
+    </div>
+
+    <div class="card">
       <h2>Retention policies</h2>
       <table id="policies"><thead>
         <tr><th>Database</th><th>Table</th><th>Window</th><th>Seconds</th><th></th></tr>
@@ -199,11 +215,11 @@ async function refresh() {
     return;
   }
   show('main');
-  $('#subtitle').textContent = 'Per-table retention windows (FR-7).';
+  $('#subtitle').textContent = 'Configuration, retention and data-plane tokens for this node.';
   $('#me-user').textContent = body.username;
   $('#me-role').textContent = body.role;
   $('#defaultbanner').hidden = !body.default_credential_active;
-  loadPolicies(); loadTokens(); loadTables(); loadDrops();
+  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops();
 }
 
 $('#loginform').onsubmit = async (e) => {
@@ -270,6 +286,69 @@ async function loadPolicies() {
     tr.lastElementChild.appendChild(del);
     tb.appendChild(tr);
   }
+}
+
+async function loadSettings() {
+  const { ok, body } = await api('GET', '/admin/config');
+  if (!ok) return;
+  $('#config-stat').innerHTML = `Applied revision <b>${body.revision}</b> — ` +
+    `<code>timelake_config_revision</code> exposes it for the cluster view.`;
+  const tb = $('#settings tbody');
+  tb.innerHTML = '';
+  for (const s of body.settings) {
+    const eff = s.effective, L = s.layers;
+    const tr = document.createElement('tr');
+    // The layer stack, muted, so provenance is visible at a glance rather
+    // than a tooltip: default < property < override, whichever are set.
+    const layers = [];
+    if (L.default === '') layers.push('default off');
+    else if (L.default != null) layers.push(`default ${L.default}`);
+    if (L.property) layers.push(`property ${L.property.value}`);
+    if (L.override) layers.push(`override ${L.override.value === null ? 'off' : L.override.value}`);
+    // property_at_write differing from the live property means the operator
+    // changed the deployment while an override shadows it (§3.2).
+    const diverged = s.diverged
+      ? ` <span style="color:var(--amber)" title="the system property changed since this override was set: was ${s.diverged.property_at_write}, now ${s.diverged.property_now}">⚠ diverged</span>`
+      : '';
+    tr.innerHTML =
+      `<td class="mono">${s.key}${s.pinned ? ' 🔒' : ''}</td>` +
+      `<td><span class="mono">${eff.value === '' ? 'off' : eff.value}</span> ` +
+        `<span class="pill" style="text-transform:none">${eff.source}</span>${diverged}</td>` +
+      `<td class="stat" style="margin:0">${layers.join(' · ')}</td>` +
+      `<td class="stat" style="margin:0">${s.scope} · ${s.apply} · ${s.min_role}</td>` +
+      `<td style="text-align:right"></td>`;
+    const cell = tr.lastElementChild;
+    if (!s.pinned) {
+      const edit = document.createElement('button');
+      edit.className = 'ghost'; edit.textContent = 'edit';
+      edit.onclick = () => editSetting(s);
+      cell.appendChild(edit);
+      if (eff.source === 'override') {
+        const rev = document.createElement('button');
+        rev.className = 'ghost'; rev.textContent = 'revert'; rev.style.marginLeft = '.4rem';
+        rev.onclick = async () => {
+          const res = await api('DELETE', '/admin/config/' + encodeURIComponent(s.key));
+          if (!res.ok) alert(res.body?.error || 'failed');
+          loadSettings();
+        };
+        cell.appendChild(rev);
+      }
+    }
+    tb.appendChild(tr);
+  }
+}
+
+async function editSetting(s) {
+  const v = prompt(
+    `New value for ${s.key}\n(${s.scope} · applies ${s.apply} · needs ${s.min_role})\n` +
+    'Blank = revert to the property/default.', s.effective.value);
+  if (v === null) return;
+  const path = '/admin/config/' + encodeURIComponent(s.key);
+  const res = v === '' ? await api('DELETE', path) : await api('PUT', path, { value: v });
+  // The resolver's rejection (a bad value, or a cross-field invariant) comes
+  // back as the reason, not a silent no-op.
+  if (!res.ok) { alert(res.body?.error || 'failed'); return; }
+  loadSettings();
 }
 
 async function loadTokens() {
