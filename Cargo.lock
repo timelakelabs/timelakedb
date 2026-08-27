@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "flate2",
@@ -4495,7 +4495,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-audit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-auth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "serde",
@@ -4519,7 +4519,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-buffer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "datafusion",
@@ -4528,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-catalog"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4538,11 +4538,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-cluster"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "timelake-compact"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "datafusion",
  "timelake-buffer",
@@ -4552,11 +4552,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-discovery"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "timelake-flight"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4565,6 +4565,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "timelake-auth",
+ "timelake-ingest",
  "timelake-tls",
  "tokio",
  "tokio-rustls",
@@ -4575,11 +4576,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-ingest"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "timelake-prometheus"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "snap",
@@ -4588,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4604,11 +4605,11 @@ dependencies = [
 
 [[package]]
 name = "timelake-retention"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "timelake-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -4645,7 +4646,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "tempfile",
@@ -4653,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-store-s3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aws-config",
  "aws-sdk-kms",
@@ -4667,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-tls"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "rcgen",
@@ -4681,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "timelake-wal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "tempfile",
