@@ -13,5 +13,6 @@ tracing.workspace = true
 flate2.workspace = true
 timelake-auth = { path = "../auth" }
 timelake-audit = { path = "../audit" }
+timelake-config = { path = "../config" }
 timelake-ingest = { path = "../ingest" }
 timelake-prometheus = { path = "../prometheus" }

@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use arc_swap::ArcSwap;
+use timelake_config::ConfigSetError;
 
 use serde_json::Value;
 use timelake_api::WriteError;
@@ -2179,6 +2180,42 @@ impl timelake_api::Engine for Engine {
         self.metrics_text_impl()
     }
 
+    fn config_revision(&self) -> u64 {
+        Engine::config_revision(self)
+    }
+
+    fn config_provenance(&self, key: &str) -> Option<serde_json::Value> {
+        Engine::config_provenance(self, key)
+    }
+
+    fn config_provenance_all(&self) -> Vec<serde_json::Value> {
+        Engine::config_provenance_all(self)
+    }
+
+    fn set_config(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<u64, ConfigSetError> {
+        Engine::set_config(self, key, value, actor, at)
+    }
+
+    fn revert_config(&self, key: &str) -> Result<bool, ConfigSetError> {
+        Engine::revert_config(self, key)
+    }
+
+    fn config_dry_run(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<serde_json::Value, ConfigSetError> {
+        Engine::config_dry_run(self, key, value, actor, at)
+    }
+
     fn retention_policies(&self) -> Vec<RetentionPolicy> {
         Engine::retention_policies(self)
     }
@@ -3811,25 +3848,6 @@ fn materialize(
     }
 }
 
-/// A rejected `/admin/config` write: the resolver refused it (§3.6), or the
-/// override store could not be written.
-#[derive(Debug)]
-pub enum ConfigSetError {
-    Rejected(timelake_config::ConfigError),
-    Store(String),
-}
-
-impl std::fmt::Display for ConfigSetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigSetError::Rejected(e) => write!(f, "{e}"),
-            ConfigSetError::Store(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigSetError {}
-
 impl Engine {
     /// The current applied config revision (§3.8), also on
     /// `timelake_config_revision`.
@@ -3889,6 +3907,23 @@ impl Engine {
             self.cfg.store(Arc::new(effective));
         }
         Ok(removed)
+    }
+
+    /// Validate a proposed override without applying or persisting it, and
+    /// return the provenance the setting WOULD have (the `?dry_run=1` preview,
+    /// §3.6). The rejection is the same the resolver gives `set_config`.
+    pub fn config_dry_run(
+        &self,
+        key: &str,
+        value: Option<String>,
+        actor: &str,
+        at: &str,
+    ) -> Result<serde_json::Value, ConfigSetError> {
+        let mut trial = self.config.read().expect("config lock").clone();
+        trial
+            .set(key, value, actor, at)
+            .map_err(ConfigSetError::Rejected)?;
+        Ok(trial.provenance(key).unwrap_or(serde_json::Value::Null))
     }
 
     fn persist_config(&self, doc: &timelake_config::SettingsDoc) -> Result<(), String> {

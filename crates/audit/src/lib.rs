@@ -607,8 +607,10 @@ fn read_segment(path: &Path) -> io::Result<Vec<AuditRecord>> {
 }
 
 /// RFC 3339 UTC with microsecond precision, no chrono — the same civil-date
-/// algorithm the buffer crate uses for hour partitions.
-fn rfc3339_utc(sys: SystemTime) -> String {
+/// algorithm the buffer crate uses for hour partitions. Public so the config
+/// surface stamps override `at` timestamps from the same source as the audit
+/// trail, rather than growing a second date formatter.
+pub fn rfc3339_utc(sys: SystemTime) -> String {
     let dur = sys.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs() as i64;
     let micros = dur.subsec_micros();

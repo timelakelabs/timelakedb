@@ -364,6 +364,26 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// A rejected write on the config surface: either the resolver refused the
+/// change (§3.6 — maps to `409`), or the override store could not be written
+/// (maps to `500`). Shared by the engine and the `/admin/config` handlers.
+#[derive(Debug)]
+pub enum ConfigSetError {
+    Rejected(ConfigError),
+    Store(String),
+}
+
+impl std::fmt::Display for ConfigSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSetError::Rejected(e) => write!(f, "{e}"),
+            ConfigSetError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigSetError {}
+
 /// The layered configuration at runtime: the property layer (from env), the
 /// override layer (persisted), and the pinned set. The default layer is the
 /// inventory's compiled-in values.
