@@ -115,8 +115,10 @@ This project is inspired by the following projects.
   `CODE_OF_CONDUCT.md`, `CHANGELOG.md`. `ops/tldb-backup.sh` +
   `docs/BACKUP_RESTORE.md` make AT-5 runnable (helper-container tar, no
   host bind mount; `--recreate` for the destroyed-volume case; drops
-  `*.tmp-write` on restore). **Auth: `/admin/*` sessions (SEC-4) + data
-  plane by token (SEC-4 phased, default off) — see the status entry
+  `*.tmp-write` on restore). **Auth: `/admin/*` sessions (SEC-4), now on the
+  private admin listener (`TIMELAKE_ADMIN_ADDR`, default `127.0.0.1:1966`;
+  U0a split it off the 1963 data port, which now returns `410` for `/admin/*`)
+  + data plane by token (SEC-4 phased, default off) — see the status entry
   below.** SECURITY.md states the full posture. **P0-2 CLOSED**:
   `/api/sql` + Flight are read-only (plan-level guard
   `crates/query/src/sql_guard.rs`, drill

@@ -3336,6 +3336,24 @@ pub fn app(engine: Arc<Engine>) -> axum::Router {
     timelake_api::app(engine, auth, audit, false).layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
+/// The public data plane, served on the data port (1963): the data routes plus
+/// a `410 Gone` stub over `/admin/*`, which U0 moved to the admin listener.
+pub fn data_app(engine: Arc<Engine>) -> axum::Router {
+    let limit = engine.max_body_bytes();
+    timelake_api::data_app(engine).layer(axum::extract::DefaultBodyLimit::max(limit))
+}
+
+/// The private admin plane, served on the admin listener (1966): the console
+/// and every guarded `/admin/*` route. Plaintext variant — session cookies are
+/// not `Secure` (that is the TLS variant, `admin_app_with_tls`).
+pub fn admin_app(engine: Arc<Engine>) -> axum::Router {
+    let auth = engine.auth();
+    let audit = engine.audit_log();
+    let limit = engine.max_body_bytes();
+    timelake_api::admin_app(engine, auth, audit, false)
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
+}
+
 /// The compactor's HTTP surface: health, ping and metrics, nothing else.
 ///
 /// A compactor takes no writes and answers no queries, so it gets no data
@@ -3537,15 +3555,11 @@ async fn internal_recover(
     }
 }
 
-/// The TLS-enabled router: the api surface plus the explicit rotation
-/// trigger (SEC-3 mandates BOTH a file watcher and an admin endpoint;
-/// reload-by-restart is forbidden). Session cookies are `Secure` here,
-/// and the reload endpoint sits behind the same SEC-4 guard as the rest
-/// of /admin.
-pub fn app_with_tls_admin(
-    engine: Arc<Engine>,
-    rot: Arc<timelake_tls::RotatingCert>,
-) -> axum::Router {
+/// The SEC-3 explicit rotation trigger as its own guarded router — SEC-3
+/// mandates BOTH a file watcher and an admin endpoint; reload-by-restart is
+/// forbidden. It rides the admin listener now (U0), behind the same SEC-4 guard
+/// as the rest of `/admin`.
+fn tls_reload_route(engine: &Arc<Engine>, rot: Arc<timelake_tls::RotatingCert>) -> axum::Router {
     use axum::response::IntoResponse;
     let reload = move || {
         let rot = Arc::clone(&rot);
@@ -3579,16 +3593,40 @@ pub fn app_with_tls_admin(
             }
         }
     };
+    axum::Router::new()
+        .route("/admin/tls/reload", axum::routing::post(reload))
+        .layer(axum::middleware::from_fn_with_state(
+            engine.auth(),
+            timelake_api::require_admin_session,
+        ))
+}
+
+/// The combined TLS router (data + admin on one `Router`) — the test-harness
+/// analogue of `app`, with `Secure` cookies and the `/admin/tls/reload`
+/// trigger. Production serves `data_app` and `admin_app_with_tls` separately.
+pub fn app_with_tls_admin(
+    engine: Arc<Engine>,
+    rot: Arc<timelake_tls::RotatingCert>,
+) -> axum::Router {
+    let reload = tls_reload_route(&engine, rot);
     let auth = engine.auth();
     let audit = engine.audit_log();
-    timelake_api::app(engine, auth.clone(), audit, true).merge(
-        axum::Router::new()
-            .route("/admin/tls/reload", axum::routing::post(reload))
-            .layer(axum::middleware::from_fn_with_state(
-                auth,
-                timelake_api::require_admin_session,
-            )),
-    )
+    timelake_api::app(engine, auth, audit, true).merge(reload)
+}
+
+/// The private admin plane over TLS (admin listener, 1966): `admin_app` with
+/// `Secure` cookies and the SEC-3 `/admin/tls/reload` trigger.
+pub fn admin_app_with_tls(
+    engine: Arc<Engine>,
+    rot: Arc<timelake_tls::RotatingCert>,
+) -> axum::Router {
+    let reload = tls_reload_route(&engine, rot);
+    let auth = engine.auth();
+    let audit = engine.audit_log();
+    let limit = engine.max_body_bytes();
+    timelake_api::admin_app(engine, auth, audit, true)
+        .merge(reload)
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
 /// Parse engine config from environment (main + integration use).

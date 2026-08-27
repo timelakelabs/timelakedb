@@ -433,6 +433,12 @@ async fn main() {
         .expect("TIMELAKE_FLIGHT_ADDR must be host:port");
     let flight_backend: Arc<dyn timelake_flight::SqlBackend> = engine.clone();
 
+    // U0: the admin plane (console + /admin/*) binds its OWN listener, private
+    // by default (loopback), off the exposed data port. 1965 is the
+    // intra-cluster replication port, so admin takes 1966.
+    let admin_addr =
+        std::env::var("TIMELAKE_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:1966".to_string());
+
     // SEC-3: TLS on BOTH listeners when cert+key are configured; the
     // fixtures and bench stay plaintext by simply not setting these.
     let tls_cert = std::env::var("TIMELAKE_TLS_CERT").ok();
@@ -524,7 +530,42 @@ async fn main() {
             let sock_addr: std::net::SocketAddr = addr
                 .parse()
                 .expect("TIMELAKE_ADDR must be host:port under TLS");
-            let app = timelake_server::app_with_tls_admin(engine, rot);
+
+            // The private admin listener over TLS (console + /admin/* +
+            // /admin/tls/reload). Same want-mode identity acceptor as the data
+            // port; a bind failure is loud but not fatal to the data plane.
+            {
+                let admin_sock: std::net::SocketAddr = admin_addr
+                    .parse()
+                    .expect("TIMELAKE_ADMIN_ADDR must be host:port under TLS");
+                let admin_tls = rot.server_config_with_client_ca(
+                    allow_tls12,
+                    &[b"h2".as_slice(), b"http/1.1"],
+                    client_ca.clone(),
+                );
+                let admin_acceptor = timelake_server::tls_identity::IdentityAcceptor::new(
+                    axum_server::tls_rustls::RustlsAcceptor::new(
+                        axum_server::tls_rustls::RustlsConfig::from_config(admin_tls),
+                    ),
+                );
+                let admin_app =
+                    timelake_server::admin_app_with_tls(Arc::clone(&engine), Arc::clone(&rot));
+                tokio::spawn(async move {
+                    tracing::info!(addr = %admin_sock, "admin listener up (private, TLS; console + /admin/*)");
+                    if let Err(e) = axum_server::bind(admin_sock)
+                        .acceptor(admin_acceptor)
+                        .serve(
+                            admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        )
+                        .await
+                    {
+                        tracing::error!(error = %e, "admin listener (TLS) exited");
+                    }
+                });
+            }
+
+            // The data port serves the data plane only; /admin/* returns 410.
+            let app = timelake_server::data_app(engine);
             // SEC-3 v2 on HTTP: wrap the rustls acceptor so a verified
             // client certificate's CN reaches the handlers as a request
             // extension. Without this the connection is mutually
@@ -549,12 +590,38 @@ async fn main() {
                     tracing::error!(error = %e, "flight sql server exited");
                 }
             });
+            // The private admin listener (plaintext). A bind failure is loud
+            // but NOT fatal: the data plane keeps serving and /admin/* is simply
+            // unavailable until the address is free.
+            {
+                let admin = timelake_server::admin_app(Arc::clone(&engine));
+                let a = admin_addr.clone();
+                tokio::spawn(async move {
+                    match TcpListener::bind(&a).await {
+                        Ok(l) => {
+                            tracing::info!(addr = %a, "admin listener up (private; console + /admin/*)");
+                            if let Err(e) = axum::serve(
+                                l,
+                                admin.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "admin listener exited");
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            addr = %a, error = %e,
+                            "admin listener bind failed — /admin/* unavailable (data plane unaffected)"
+                        ),
+                    }
+                });
+            }
             let listener = TcpListener::bind(&addr).await.expect("bind listen address");
             axum::serve(
                 listener,
                 // with_connect_info: the SEC-6 limiter keys on the peer
                 // address for callers without a data-plane token.
-                timelake_server::app(engine)
+                timelake_server::data_app(engine)
                     .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
