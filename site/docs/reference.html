@@ -467,16 +467,17 @@
       </p>
       <div class="note warn">
         <p>
-          <strong>The console is on the data port.</strong> It answers on 1963
-          alongside writes and <code>/api/sql</code>, so publishing the write API
-          publishes the console's front door — the session is what protects it,
-          not the network boundary. Binding privately
-          (<code>TIMELAKE_ADDR=127.0.0.1:1963</code>) is still the primary
-          control, and a reverse proxy must forward cookies and the
-          <code>X-TimeLake-CSRF</code> header. A dedicated admin listener on
-          <strong>1966</strong>, bound to loopback by default and carrying
-          <code>/admin/*</code> away from 1963, is designed as phase U0 in
-          <code>docs/CONSOLE.md</code> — not shipped.
+          <strong>The console has its own listener.</strong>
+          <code>/admin/*</code> and the console answer on a dedicated admin
+          listener, <strong>1966</strong>, bound to <code>127.0.0.1</code> by
+          default (<code>TIMELAKE_ADMIN_ADDR</code> opens it deliberately) —
+          off the data port, so publishing the write API no longer publishes
+          the console's front door. The data port returns
+          <code>410 Gone</code> for <code>/admin/*</code>, naming the new
+          listener; <code>/metrics</code> stays on 1963, unauthenticated by
+          design. A reverse proxy fronting the console must forward cookies and
+          the <code>X-TimeLake-CSRF</code> header. (U0 phase, timelakedb#108;
+          the rest of U0 — layered config — is in <code>docs/CONSOLE.md</code>.)
         </p>
       </div>
 

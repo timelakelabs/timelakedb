@@ -418,32 +418,41 @@ pub fn maintenance_app<E: Engine>(engine: Arc<E>) -> Router {
         .with_state(engine)
 }
 
-/// The data plane (unauthenticated — FR-1/FR-8/FR-9 clients) plus the
-/// admin surface (authenticated — SEC-4). Two routers, two states,
-/// merged: no admin route can accidentally inherit the open state.
+/// The combined router (data plane + admin plane on one `Router`). Used by the
+/// in-process test harness and by callers that want a single service.
+///
+/// Production does NOT serve this: U0 split the admin plane onto its own
+/// private listener, so the two are served separately — `data_app` on the
+/// public data port (1963) and `admin_app` on the private admin port (1966).
+/// Keeping the merged form is a test convenience; the split behaviour (410 on
+/// the data port, auth on the admin port) is exercised against `data_app` /
+/// `admin_app` directly.
 pub fn app<E: Engine>(
     engine: Arc<E>,
     auth: Arc<Auth>,
     audit: Arc<timelake_audit::AuditLog>,
     secure_cookies: bool,
 ) -> Router {
-    let data = Router::new()
-        .route("/health", get(health))
-        .route("/ping", get(ping::<E>).head(ping::<E>))
-        .route("/metrics", get(metrics::<E>))
-        .route("/write", post(write_v1::<E>))
-        .route("/api/v2/write", post(write_v2::<E>))
-        .route("/api/v3/write_lp", post(write_v3::<E>))
-        .route("/api/v1/write", post(write_prometheus::<E>))
-        .route(
-            "/api/sql",
-            post(sql::<E>).layer(axum::middleware::from_fn_with_state(
-                engine.clone(),
-                rate_limit_sql::<E>,
-            )),
-        )
-        .with_state(engine.clone());
+    data_routes(engine.clone()).merge(admin_app(engine, auth, audit, secure_cookies))
+}
 
+/// The public data plane (port 1963): writes, `/api/sql`, `/health`, `/ping`,
+/// `/metrics` — plus a `410 Gone` stub over the whole `/admin/*` space, which
+/// moved to the private admin listener at U0. `/metrics` stays here on purpose:
+/// it is unauthenticated by design and Prometheus scrapes it.
+pub fn data_app<E: Engine>(engine: Arc<E>) -> Router {
+    data_routes(engine).route("/admin/{*rest}", axum::routing::any(admin_moved))
+}
+
+/// The private admin plane (port 1966, loopback by default): the console shell,
+/// the login endpoint, and every guarded `/admin/*` route. The most destructive
+/// surface in the system, kept off the exposed data port.
+pub fn admin_app<E: Engine>(
+    engine: Arc<E>,
+    auth: Arc<Auth>,
+    audit: Arc<timelake_audit::AuditLog>,
+    secure_cookies: bool,
+) -> Router {
     let state = AdminState {
         engine,
         auth,
@@ -503,7 +512,41 @@ pub fn app<E: Engine>(
         .route("/admin/session", post(session_login::<E>))
         .with_state(state);
 
-    data.merge(guarded).merge(public)
+    guarded.merge(public)
+}
+
+/// The data-plane routes, shared by `app` (merged with the live admin plane)
+/// and `data_app` (merged with the `/admin/*` gone-stub). No `/admin/*` here.
+fn data_routes<E: Engine>(engine: Arc<E>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ping", get(ping::<E>).head(ping::<E>))
+        .route("/metrics", get(metrics::<E>))
+        .route("/write", post(write_v1::<E>))
+        .route("/api/v2/write", post(write_v2::<E>))
+        .route("/api/v3/write_lp", post(write_v3::<E>))
+        .route("/api/v1/write", post(write_prometheus::<E>))
+        .route(
+            "/api/sql",
+            post(sql::<E>).layer(axum::middleware::from_fn_with_state(
+                engine.clone(),
+                rate_limit_sql::<E>,
+            )),
+        )
+        .with_state(engine)
+}
+
+/// `410 Gone` for the admin API on the data port: it moved to the private
+/// admin listener (U0). Not a redirect — the target is loopback by default, so
+/// a browser cannot follow it; the body names where it went.
+async fn admin_moved() -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::GONE,
+        axum::Json(serde_json::json!({
+            "error": "the admin API moved off the data port to the private admin listener",
+            "listener": "TIMELAKE_ADMIN_ADDR (default 127.0.0.1:1966)",
+        })),
+    )
 }
 
 /// The management page (FR-7 GUI + SEC-4 login): a single self-contained

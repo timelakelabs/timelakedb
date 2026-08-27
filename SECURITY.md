@@ -117,11 +117,16 @@ follow from "no authentication" and are listed so you can design around them.
    failure.
 
 3a. **~~`/admin/retention` is an unauthenticated deletion control.~~
-   CLOSED (SEC-4).** `/admin/*` now authenticates every request. What
-   replaces it is smaller but real: **a fresh node seeds `admin`/`admin`**
-   (see below), so the window between first start and the first password
-   change is a window in which a reachable attacker can take the console.
-   The seeded credential can do nothing but change its own password, and
+   CLOSED (SEC-4), and narrowed again (U0a).** `/admin/*` now authenticates
+   every request, and since U0a it no longer answers on the public data
+   port: the console binds a **private admin listener**
+   (`TIMELAKE_ADMIN_ADDR`, default `127.0.0.1:1966`) and 1963 returns `410`
+   for `/admin/*`. What remains is smaller but real: **a fresh node seeds
+   `admin`/`admin`** (see below), so the window between first start and the
+   first password change is a window in which an attacker *who can reach the
+   admin listener* can take the console — by default the loopback interface,
+   not anyone who can reach the write port. The seeded credential can do
+   nothing but change its own password, and
    `timelake_admin_default_credential_active` is 1 until it does — but the
    mitigation is procedural, not structural. Set
    `TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD` to skip the well-known default
