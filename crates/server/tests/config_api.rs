@@ -212,3 +212,25 @@ async fn config_requires_a_session() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// The console (phase D) ships the Configuration screen and wires it to the
+/// API. This is a static-content smoke test — it cannot drive the JS in a
+/// browser, but it catches the screen being dropped or the endpoint renamed.
+#[tokio::test]
+async fn the_console_includes_the_configuration_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelake_server::app(engine(dir.path()));
+    let res = app
+        .oneshot(Request::get("/admin/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("<h2>Configuration</h2>"),
+        "config card present"
+    );
+    assert!(html.contains("/admin/config"), "config API wired");
+    assert!(html.contains("loadSettings("), "config loader present");
+}
