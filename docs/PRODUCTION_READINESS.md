@@ -487,7 +487,7 @@ peak and 50× better by bound.
   so it still draws when a node's query path is down and the `_system`
   console cannot answer. `deploy/grafana/cluster/`, overlay
   `deploy/compose/timelakedb-cluster-s3.monitoring.yml`, drill
-  `docs/evidence/cluster-dashboard-drill.log` (15/15). Follow-up: the
+  `docs/evidence/cluster-dashboard-drill.log` (15/15). Follow-up (#123): the
   ingesters do not expose `catalog_head`, so the convergence panel's head
   spread is over the log followers (queriers + compactor) only.
 - **Tributary L5** — Consul/Kubernetes discovery, DaemonSet deployment,
