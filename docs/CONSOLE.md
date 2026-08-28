@@ -960,7 +960,13 @@ degraded-mode banners.
 *Gate*: killing a node shows it within 10 s with the right role and
 health; a node held at an old revision is flagged; a wrong or stale
 membership view changes nothing about write or catalog correctness
-(CL-5 guard, drilled).
+(CL-5 guard). Drilled 2026-08-27 on the ingester pair —
+`docs/evidence/u3-cluster-drill.log` (14/14): membership with roles, the
+divergence flag once one node advances its config, a *wedged* peer read
+unreachable in 3 s (the per-peer timeout, not a clean refusal, which is
+the path the 10 s bound governs), and an exact-count write on the
+survivor with the peer down. Not covered yet: drill-in proxying and
+topologies past two nodes.
 
 U0–U2 are independent of the C track and can proceed in parallel with
 C1; U3 depends on the C2 role split.
