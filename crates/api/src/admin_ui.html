@@ -233,6 +233,18 @@
       never land unrecorded; <code>TIMELAKE_AUDIT_FAIL_OPEN</code> is the loud
       opt-out.</div>
     </div>
+    <div class="card">
+      <h2>Cluster</h2>
+      <div class="stat" id="cl-conv"></div>
+      <table id="cluster"><thead>
+        <tr><th>Node</th><th>Role</th><th>Health</th><th>Version</th><th>Uptime</th><th>Cfg rev</th><th>Catalog head</th></tr>
+      </thead><tbody></tbody></table>
+      <div class="warn">Derived from discovery and <b>advisory</b> (CL-5): this
+      view never gates a write or a query. A node shown <b>unreachable</b> is
+      discovery's to explain; a node whose <b>config revision</b> lags the rest
+      is flagged ⚠ — it has not yet applied a change the others have. A
+      single-node deployment shows just this node.</div>
+    </div>
   </section>
 </div>
 <script>
@@ -271,7 +283,7 @@ async function refresh() {
   $('#me-user').textContent = body.username;
   $('#me-role').textContent = body.role;
   $('#defaultbanner').hidden = !body.default_credential_active;
-  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops(); loadLogs(); loadAudit();
+  loadSettings(); loadPolicies(); loadTokens(); loadTables(); loadDrops(); loadLogs(); loadAudit(); loadCluster();
 }
 
 $('#loginform').onsubmit = async (e) => {
@@ -455,6 +467,42 @@ $('#tokenform').onsubmit = async (e) => {
   loadTokens();
 };
 
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function loadCluster() {
+  const { ok, body } = await api('GET', '/admin/cluster');
+  if (!ok) return;
+  $('#cl-conv').innerHTML = body.config_converged
+    ? 'Config revision <span style="color:var(--green)">converged</span> across the cluster.'
+    : 'Config revision <span style="color:var(--amber)">diverged</span> — a node has not applied a change the others have.';
+  // The cluster's highest applied revision; a reachable node below it is behind.
+  const maxRev = Math.max(0, ...body.nodes.filter(n => n.reachable).map(n => n.config_revision || 0));
+  const tb = $('#cluster tbody');
+  tb.innerHTML = '';
+  for (const n of body.nodes) {
+    const tr = document.createElement('tr');
+    const health = n.reachable
+      ? '<span style="color:var(--green)">up</span>'
+      : '<span style="color:var(--red)">unreachable</span>';
+    const rev = (n.reachable && n.config_revision != null) ? n.config_revision : '—';
+    const behind = (n.reachable && (n.config_revision ?? maxRev) < maxRev)
+      ? ' <span style="color:var(--amber)" title="behind the cluster">⚠</span>' : '';
+    const self = n.self ? ' <span class="pill" style="text-transform:none">this</span>' : '';
+    tr.innerHTML =
+      `<td class="mono">${n.id || '—'}${self}</td>` +
+      `<td class="mono">${n.role || '—'}</td>` +
+      `<td>${health}</td>` +
+      `<td class="mono">${n.reachable ? (n.version || '—') : '—'}</td>` +
+      `<td class="mono">${(n.reachable && n.uptime_secs != null) ? fmtUptime(n.uptime_secs) : '—'}</td>` +
+      `<td class="mono">${rev}${behind}</td>` +
+      `<td class="mono">${(n.reachable && n.catalog_head != null) ? n.catalog_head : '—'}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
 async function loadLogs() {
   const q = new URLSearchParams({ level: $('#lg-level').value, limit: '500' });
   const t = $('#lg-target').value.trim(); if (t) q.set('target', t);
@@ -581,6 +629,9 @@ setInterval(() => { if (ME && !ME.must_change_password) loadDrops(); }, 10000);
 setInterval(() => {
   if (ME && !ME.must_change_password && $('#lg-live') && $('#lg-live').checked) loadLogs();
 }, 3000);
+// Cluster health: refresh on the maintenance cadence so a node dropping shows
+// within ~10s (the U3 gate).
+setInterval(() => { if (ME && !ME.must_change_password) loadCluster(); }, 10000);
 </script>
 </body>
 </html>

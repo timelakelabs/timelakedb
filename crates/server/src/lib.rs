@@ -3471,11 +3471,13 @@ pub fn data_app(engine: Arc<Engine>) -> axum::Router {
 /// The private admin plane, served on the admin listener (1966): the console
 /// and every guarded `/admin/*` route. Plaintext variant — session cookies are
 /// not `Secure` (that is the TLS variant, `admin_app_with_tls`).
-pub fn admin_app(engine: Arc<Engine>) -> axum::Router {
+pub fn admin_app(engine: Arc<Engine>, peers: Vec<ClusterPeer>) -> axum::Router {
     let auth = engine.auth();
     let audit = engine.audit_log();
     let limit = engine.max_body_bytes();
+    let cluster = cluster_route(Arc::clone(&engine), peers);
     timelake_api::admin_app(engine, auth, audit, false)
+        .merge(cluster)
         .layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 
@@ -3684,6 +3686,106 @@ async fn internal_recover(
 /// mandates BOTH a file watcher and an admin endpoint; reload-by-restart is
 /// forbidden. It rides the admin listener now (U0), behind the same SEC-4 guard
 /// as the rest of `/admin`.
+/// One peer for the cluster view (U3): its id, role, and the public data
+/// address its `/health` answers on. Built from `Discovery` in `main`.
+#[derive(Clone)]
+pub struct ClusterPeer {
+    pub id: String,
+    pub role: String,
+    pub data_address: String,
+}
+
+/// A guarded `GET /admin/cluster` route (U3, §8), in the server crate so the
+/// api crate stays free of the cluster dependency; the peer list is captured
+/// from `main` (from `Discovery`). Advisory only — CL-5's guard: the view is
+/// derived from discovery, and nothing on the write or catalog path consults
+/// it.
+fn cluster_route(engine: Arc<Engine>, peers: Vec<ClusterPeer>) -> axum::Router {
+    let auth = engine.auth();
+    let view = move || {
+        let engine = Arc::clone(&engine);
+        let peers = peers.clone();
+        async move { cluster_view(engine, peers).await }
+    };
+    axum::Router::new()
+        .route("/admin/cluster", axum::routing::get(view))
+        // route_layer, not layer: the guard must run only when /admin/cluster
+        // matches. A plain layer wraps the fallback too, so after merging, an
+        // unmatched path (e.g. /metrics) would hit the guarded fallback and
+        // return 401 instead of 404.
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            timelake_api::require_admin_session,
+        ))
+}
+
+/// Fan out to every peer's public `/health` in parallel, add this node, and
+/// report config-revision convergence. A peer that does not answer within the
+/// timeout is shown **unreachable** rather than omitted — a missing node is
+/// exactly what the operator needs to see.
+async fn cluster_view(engine: Arc<Engine>, peers: Vec<ClusterPeer>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut nodes = vec![{
+        let mut h = engine.node_health();
+        h["reachable"] = serde_json::json!(true);
+        h["self"] = serde_json::json!(true);
+        h
+    }];
+    let client = reqwest::Client::new();
+    let mut set = tokio::task::JoinSet::new();
+    for p in peers {
+        let client = client.clone();
+        set.spawn(async move {
+            let url = format!("http://{}/health", p.data_address);
+            let res = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .await;
+            match res {
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
+                        Ok(mut v) => {
+                            v["id"] = serde_json::json!(p.id);
+                            v["reachable"] = serde_json::json!(true);
+                            v
+                        }
+                        Err(_) => unreachable_node(&p),
+                    },
+                    Err(_) => unreachable_node(&p),
+                },
+                _ => unreachable_node(&p),
+            }
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok(v) = res {
+            nodes.push(v);
+        }
+    }
+    // Convergence over the reachable nodes' applied revisions.
+    let revs: Vec<u64> = nodes
+        .iter()
+        .filter(|n| n["reachable"].as_bool().unwrap_or(false))
+        .filter_map(|n| n["config_revision"].as_u64())
+        .collect();
+    let converged = revs.windows(2).all(|w| w[0] == w[1]);
+    axum::Json(serde_json::json!({
+        "nodes": nodes,
+        "config_converged": converged,
+    }))
+    .into_response()
+}
+
+fn unreachable_node(p: &ClusterPeer) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "role": p.role,
+        "reachable": false,
+        "status": "unreachable",
+    })
+}
+
 fn tls_reload_route(engine: &Arc<Engine>, rot: Arc<timelake_tls::RotatingCert>) -> axum::Router {
     use axum::response::IntoResponse;
     let reload = move || {
@@ -3720,7 +3822,9 @@ fn tls_reload_route(engine: &Arc<Engine>, rot: Arc<timelake_tls::RotatingCert>) 
     };
     axum::Router::new()
         .route("/admin/tls/reload", axum::routing::post(reload))
-        .layer(axum::middleware::from_fn_with_state(
+        // route_layer so the guard only runs for /admin/tls/reload; a plain
+        // layer would wrap the fallback and turn an unmatched path into 401.
+        .route_layer(axum::middleware::from_fn_with_state(
             engine.auth(),
             timelake_api::require_admin_session,
         ))
@@ -3744,13 +3848,16 @@ pub fn app_with_tls_admin(
 pub fn admin_app_with_tls(
     engine: Arc<Engine>,
     rot: Arc<timelake_tls::RotatingCert>,
+    peers: Vec<ClusterPeer>,
 ) -> axum::Router {
     let reload = tls_reload_route(&engine, rot);
+    let cluster = cluster_route(Arc::clone(&engine), peers);
     let auth = engine.auth();
     let audit = engine.audit_log();
     let limit = engine.max_body_bytes();
     timelake_api::admin_app(engine, auth, audit, true)
         .merge(reload)
+        .merge(cluster)
         .layer(axum::extract::DefaultBodyLimit::max(limit))
 }
 

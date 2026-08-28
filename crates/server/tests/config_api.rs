@@ -241,4 +241,8 @@ async fn the_console_includes_the_configuration_screen() {
     assert!(html.contains("<h2>Logs</h2>"), "logs card present");
     assert!(html.contains("/admin/logs?"), "logs API wired");
     assert!(html.contains("loadLogs("), "logs loader present");
+    // U3 (#111) phase 2: the Cluster screen ships and wires to the cluster API.
+    assert!(html.contains("<h2>Cluster</h2>"), "cluster card present");
+    assert!(html.contains("/admin/cluster"), "cluster API wired");
+    assert!(html.contains("loadCluster("), "cluster loader present");
 }
