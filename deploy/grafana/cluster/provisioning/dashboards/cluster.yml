@@ -1,0 +1,16 @@
+# Loads the cluster dashboard from disk on startup. Own provider, own path
+# (deploy/grafana/cluster/dashboards) so it never overlaps the single-node
+# console provider (deploy/grafana/provisioning/dashboards).
+apiVersion: 1
+
+providers:
+  - name: timelakedb-cluster
+    orgId: 1
+    folder: TimeLakeDB
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

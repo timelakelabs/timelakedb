@@ -481,6 +481,15 @@ peak and 50× better by bound.
   per-query pruning counters, a real `level` field on `FileMeta` instead
   of the filename-prefix convention, and shipping a querier's samples to
   an ingester so a CL-3 node can be charted at all.
+- **Cluster-wide Grafana dashboard** shipped 2026-08-28 (#117): the deep,
+  per-tier time-series companion to the U3 console cluster view —
+  **Prometheus** scraping every node's `/metrics` relabelled by node+role,
+  so it still draws when a node's query path is down and the `_system`
+  console cannot answer. `deploy/grafana/cluster/`, overlay
+  `deploy/compose/timelakedb-cluster-s3.monitoring.yml`, drill
+  `docs/evidence/cluster-dashboard-drill.log` (15/15). Follow-up (#123): the
+  ingesters do not expose `catalog_head`, so the convergence panel's head
+  spread is over the log followers (queriers + compactor) only.
 - **Tributary L5** — Consul/Kubernetes discovery, DaemonSet deployment,
   container-log metadata with the tag allowlist earning its keep, and
   workload identity (SPIFFE / projected tokens) as a third credential

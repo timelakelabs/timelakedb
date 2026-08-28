@@ -1,0 +1,19 @@
+# The cluster dashboard's datasource — Prometheus, NOT the Flight SQL
+# `_system` source the single-node console uses (deploy/grafana/provisioning).
+# Kept in its own tree so the console rig, which mounts the whole
+# deploy/grafana/dashboards dir, never picks up a Prometheus dashboard it has
+# no datasource for.
+apiVersion: 1
+
+datasources:
+  - name: TimeLakeDB-Cluster
+    uid: timelakedb-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # Match the scrape interval so rate() windows and the graph step agree.
+      timeInterval: 5s
+    editable: true

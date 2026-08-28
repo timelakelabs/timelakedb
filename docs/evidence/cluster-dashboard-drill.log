@@ -1,0 +1,63 @@
+Cluster-monitoring Grafana dashboard (timelakedb#117)
+2026-08-28 · router + ingester×2 + querier×2 + compactor + localstack, with the
+             Prometheus + Grafana monitoring overlay
+             (timelakedb-cluster-s3.yml + timelakedb-cluster-s3.monitoring.yml)
+   dashboard: deploy/grafana/cluster/dashboards/timelakedb-cluster.json
+   drill:     deploy/compose/cluster-drill/cluster_dashboard_drill.sh
+================================================================================
+
+THE CLAIM UNDER TEST is that the cluster dashboard has real, per-node data to
+draw. It is asserted against PROMETHEUS, not Grafana pixels: the panels are
+PromQL, so if the query a panel is built on returns the series, the panel draws
+it — and this is the honest check, because a panel reads "green" just as easily
+when its query is wrong and returns nothing successfully.
+
+Prometheus scrapes every node's /metrics (NOT the _system Flight SQL path,
+which is down exactly when the cluster view is needed) and relabels each target
+by node + role. Four legs:
+
+  - Tiers populate. up=6; ingester lines/s on BOTH ingesters (the shard hash
+    spread the writes); router forwarding; querier serving; CL-2 replication;
+    an object-store put, i.e. a flush actually landed.
+  - Provisioning. Grafana loaded the dashboard and the Prometheus datasource,
+    both resolved by uid.
+  - Convergence. Spread is 0 with every node level, then flips to 1 the instant
+    one node's applied config is advanced (#109 config_revision) — the panel
+    that flags a node held behind, the same fact the U3 console view shows.
+  - CL-2 degraded. Kill an ingester and its peer's timelake_cl2_degraded lights
+    up (PR-7); up{role="ingester"} drops to 1.
+
+WHAT THE METRICS ACTUALLY EXPOSE, confirmed here and reflected in the panels
+(the exposition is per-role — a panel must tolerate a role missing a series,
+never read it as zero):
+  - config_revision is on all five engine nodes; the router holds no engine
+    and has none, so the convergence math is over five, not six.
+  - catalog_head is on the log FOLLOWERS (queriers + compactor); ingesters, the
+    writers, do not expose it yet — filed as a follow-up, not faked in a query.
+  - compactions_total ticks on the ingesters (they compact their own files);
+    the by-node panels attribute it honestly rather than assuming a tier.
+
+================================================================================
+== cluster-dashboard drill ==
+-- phase 1: drive traffic through the router + a querier --
+   driven; waiting for a flush (flush_age 15s) + scrapes
+-- phase 2: Grafana provisioned the dashboard + datasource --
+  PASS  cluster dashboard provisioned
+  PASS  Prometheus datasource provisioned
+-- phase 3: every tier has per-node data --
+  PASS  overview: 6 targets up
+  PASS  overview: cluster ingest > 0
+  PASS  ingesters: both writing
+  PASS  ingesters: CL-2 replication flowing
+  PASS  router: forwarding writes
+  PASS  queriers: serving reads
+  PASS  object store: puts (a flush landed)
+-- phase 4: convergence panel flags a node held behind --
+  PASS  config_revision on all 5 engine nodes (router has none)
+  PASS  baseline: converged (spread 0)
+  PASS  after advancing ingester-a: spread flips to 1 (flagged)
+  PASS  ingester-a is the node ahead (rev 1)
+-- phase 5: CL-2 degraded lights up when an ingester dies --
+  PASS  ingester-a raises CL-2 degraded with its peer down
+  PASS  up{role=ingester} drops to 1
+== cluster-dashboard drill: 15 passed, 0 failed ==
