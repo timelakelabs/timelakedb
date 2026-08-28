@@ -1,0 +1,35 @@
+# Prometheus scrape for the role-split cluster (timelakedb#117).
+#
+# WHY /metrics and not the _system Flight SQL path the console dashboard
+# uses: /metrics answers from atomics with no query engine behind it, so it
+# still reports when a node's read path is unhealthy — which is exactly when
+# an operator opens the cluster view — and a CL-3 querier stores nothing in
+# _system at all. Prometheus scraping /metrics is the robust, VM-native
+# source. (See CONSOLE.md §7.5 and the ticket's "trap".)
+#
+# The exposition carries NO node/role label — those are attached HERE, one
+# static target per node, so every series the dashboard draws can be grouped
+# by node and filtered by role. Service names are the compose DNS names from
+# timelakedb-cluster-s3.yml; the data port is 1963 on every role (the router
+# holds no engine and the compactor serves health/ping/metrics only, but both
+# expose /metrics there).
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: timelakedb
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ingester-a:1963"]
+        labels: { node: ingester-a, role: ingester }
+      - targets: ["ingester-b:1963"]
+        labels: { node: ingester-b, role: ingester }
+      - targets: ["querier-a:1963"]
+        labels: { node: querier-a, role: querier }
+      - targets: ["querier-b:1963"]
+        labels: { node: querier-b, role: querier }
+      - targets: ["compactor:1963"]
+        labels: { node: compactor, role: compactor }
+      - targets: ["router:1963"]
+        labels: { node: router, role: router }

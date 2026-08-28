@@ -1,0 +1,51 @@
+# Monitoring overlay for the CL-3 cluster rig (timelakedb#117).
+#
+# Adds Prometheus (scraping every node's /metrics, relabeled by node+role —
+# see ../grafana/cluster/prometheus.yml) and Grafana (the cluster dashboard)
+# ON TOP OF timelakedb-cluster-s3.yml. Merge, do not fork:
+#
+#   docker compose -f timelakedb-cluster-s3.yml \
+#                  -f timelakedb-cluster-s3.monitoring.yml up -d --build
+#   # Grafana → http://localhost:3006  (admin/admin), Prometheus → :9490
+#   docker compose -f timelakedb-cluster-s3.yml \
+#                  -f timelakedb-cluster-s3.monitoring.yml down -v
+#
+# The `name:` MUST equal the base rig's so both -f files land in one project
+# and one network — that is what lets Prometheus reach `ingester-a:1963` etc.
+# by service name. Images track the repo's grafana:latest convention; pin
+# both for a long-lived deployment.
+name: bench-timelakedb-cluster-s3
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cl3-prometheus
+    hostname: prometheus
+    volumes:
+      - ../grafana/cluster/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1h   # a drill rig, not a history store
+    ports:
+      - "9490:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cl3-grafana
+    ports:
+      - "3006:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # A drill rig: no sign-up, no phone-home.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ../grafana/cluster/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../grafana/cluster/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../grafana/cluster/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    depends_on:
+      - prometheus
