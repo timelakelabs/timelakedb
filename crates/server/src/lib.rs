@@ -693,6 +693,13 @@ pub struct Engine {
     /// SEC-1: true when the store is the encrypting decorator (drives the
     /// timelake_encryption_enabled gauge; the engine itself cannot tell).
     store_encrypted: bool,
+    /// This node's id (`TIMELAKE_NODE_ID`), stamped on the audit chain and
+    /// reported on `/health` so the cluster view can name it (U3).
+    node_id: String,
+    /// This node's cluster role (`TIMELAKE_ROLE`, default `all`), reported on
+    /// `/health` so `/admin/cluster` shows who holds which role (U3). The
+    /// engine does not otherwise consult it — role behaviour is wired in main.
+    role: String,
     /// The effective engine config, behind an `ArcSwap` so the hot tunables
     /// (flush/compact/gc/wal/l0/query-timeout/data-auth) take a live update
     /// when `/admin/config` writes an override — the same pattern
@@ -962,6 +969,12 @@ impl Engine {
         // discovery advertises to peers cannot differ — they did, when this
         // line carried its own fallback (#40).
         let node_id = timelake_cluster::node_id_from_env();
+        // U3: the node's role, reported on /health. main validates TIMELAKE_ROLE
+        // (and exits on a bad value) before open, so reading it raw is safe.
+        let role = std::env::var("TIMELAKE_ROLE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "all".to_string());
         // U2 self-monitoring. Built before the query environment because
         // the observer has to be attached at construction — the sampler is
         // a plain buffer with no engine reference, so there is no cycle.
@@ -1017,7 +1030,7 @@ impl Engine {
         };
         let audit = Arc::new(timelake_audit::AuditLog::open_with(
             data_dir.join("audit"),
-            node_id,
+            node_id.clone(),
             audit_fail_open,
             audit_policy,
         )?);
@@ -1039,6 +1052,8 @@ impl Engine {
             retention: RwLock::new(retention),
             rollups: RwLock::new(rollups),
             flushing: RwLock::new(HashMap::new()),
+            node_id,
+            role,
             cfg: ArcSwap::from_pointee(cfg),
             config: RwLock::new(layered),
             lines_total: AtomicU64::new(0),
@@ -2193,6 +2208,10 @@ impl timelake_api::Engine for Engine {
         limit: usize,
     ) -> serde_json::Value {
         Engine::app_logs(self, min_level, target, contains, limit)
+    }
+
+    fn node_health(&self) -> serde_json::Value {
+        Engine::node_health(self)
     }
 
     fn config_provenance(&self, key: &str) -> Option<serde_json::Value> {
@@ -3864,6 +3883,33 @@ impl Engine {
     /// `timelake_config_revision`.
     pub fn config_revision(&self) -> u64 {
         self.config.read().expect("config lock").revision()
+    }
+
+    /// This node's id (`TIMELAKE_NODE_ID`).
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// This node's cluster role (`TIMELAKE_ROLE`, default `all`).
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// The node's self-reported health for `/health` and the U3 cluster view:
+    /// id, role, applied config revision, catalog head, and uptime. Answered
+    /// from atomics/accessors, never the query path, so it holds when the
+    /// engine is unhealthy — which is when the cluster view matters most.
+    pub fn node_health(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": "pass",
+            "name": "timelakedb",
+            "version": env!("CARGO_PKG_VERSION"),
+            "id": self.node_id,
+            "role": self.role,
+            "config_revision": self.config_revision(),
+            "catalog_head": self.catalog_head(),
+            "uptime_secs": self.uptime_secs(),
+        })
     }
 
     /// U1: a filtered page of the node's application-log ring for

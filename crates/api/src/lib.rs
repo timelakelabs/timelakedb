@@ -341,6 +341,11 @@ pub trait Engine: Send + Sync + 'static {
         limit: usize,
     ) -> Value;
 
+    /// U3 (§8): the node's self-reported health — status/name/version plus id,
+    /// role, applied config revision, catalog head and uptime — the row the
+    /// cluster view aggregates. Answered from atomics, not the query path.
+    fn node_health(&self) -> Value;
+
     /// Current retention policies (FR-7).
     fn retention_policies(&self) -> Vec<RetentionPolicy>;
 
@@ -451,7 +456,7 @@ impl<E: Engine> Clone for AdminState<E> {
 /// direction that stays correct by default.
 pub fn maintenance_app<E: Engine>(engine: Arc<E>) -> Router {
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health::<E>))
         .route("/ping", get(ping::<E>).head(ping::<E>))
         .route("/metrics", get(metrics::<E>))
         .with_state(engine)
@@ -566,7 +571,7 @@ pub fn admin_app<E: Engine>(
 /// and `data_app` (merged with the `/admin/*` gone-stub). No `/admin/*` here.
 fn data_routes<E: Engine>(engine: Arc<E>) -> Router {
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health::<E>))
         .route("/ping", get(ping::<E>).head(ping::<E>))
         .route("/metrics", get(metrics::<E>))
         .route("/write", post(write_v1::<E>))
@@ -1750,12 +1755,8 @@ async fn admin_delete<E: Engine>(
 /// something false. Nothing parsed it (grep of every sibling repo), and
 /// there is no milestone concept that survives the cluster phases, so it
 /// is gone rather than bumped to a value that would rot the same way (#39).
-async fn health() -> Json<Value> {
-    Json(json!({
-        "status": "pass",
-        "name": "timelakedb",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+async fn health<E: Engine>(State(engine): State<Arc<E>>) -> Json<Value> {
+    Json(engine.node_health())
 }
 
 async fn ping<E: Engine>(
