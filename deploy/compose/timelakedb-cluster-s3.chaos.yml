@@ -1,0 +1,46 @@
+# Chaos overlay for the CL-3 rig — a half-open partition on the ingester
+# pair's replication link (timelakedb, chaos step 1).
+#
+# Puts a toxiproxy between ingester-a and its replication peer so a drill can
+# black-hole the A->B replication link (:1965) at RUNTIME — a connection that
+# hangs, not one that refuses, which is the path a clean `docker stop` skips.
+# Only ingester-a's peer cluster_addr is rerouted; the public data port
+# (:1963), the querier and the router all reach the ingesters directly, so the
+# data plane is untouched.
+#
+#   docker compose -f deploy/compose/timelakedb-cluster-s3.yml \
+#                  -f deploy/compose/timelakedb-cluster-s3.chaos.yml \
+#                  up -d --build localstack ingester-a ingester-b toxiproxy
+#   # wait for both ingesters healthy, then:
+#   sh deploy/compose/cluster-drill/cl2_partition_chaos.sh \
+#       | tee docs/evidence/cl2-partition-chaos-drill.log
+#   docker compose -f deploy/compose/timelakedb-cluster-s3.yml \
+#                  -f deploy/compose/timelakedb-cluster-s3.chaos.yml down -v
+#
+# The `name:` MUST equal the base rig's so both -f files land in one project
+# and one network — that is what lets ingester-a reach `toxiproxy:21001`.
+name: bench-timelakedb-cluster-s3
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.11.0
+    container_name: cl3-toxiproxy
+    hostname: toxiproxy
+    command: ["-host=0.0.0.0", "-config=/toxiproxy.json"]
+    volumes:
+      - ./cluster-drill/toxiproxy.json:/toxiproxy.json:ro
+    # 8474 is the control API (driven via `docker exec`, not published);
+    # 21001 is the proxied replication port ingester-a dials.
+    restart: unless-stopped
+
+  ingester-a:
+    depends_on:
+      localstack:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    environment:
+      # Reroute ONLY ingester-a's replication link — the peer cluster_addr,
+      # :1965 — through toxiproxy. The data_address (:1963) stays direct; it
+      # is the public write port, not the replication path.
+      TIMELAKE_PEERS: ingester-b=ingester@toxiproxy:21001|ingester-b:1963
