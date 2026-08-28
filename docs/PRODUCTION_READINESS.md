@@ -473,14 +473,16 @@ peak and 50× better by bound.
   608 ms against a 250 ms target, and intra-run ingest decline under
   maintenance contention. Streaming execution, range reads, and
   maintenance/query isolation.
-- **Console U0, U1 (part) and U3** — the admin listener on 1966 bound to
-  loopback (moving `/admin/*` off the data port), layered configuration
-  with provenance, cluster view. **U2 is done** (metrics + performance
-  views, 2026-08-18): see `docs/CONSOLE.md` §7.4/§7.6 and the drill
-  `docs/evidence/u2-console-drill.log`. Its own follow-ups are the
-  per-query pruning counters, a real `level` field on `FileMeta` instead
-  of the filename-prefix convention, and shipping a querier's samples to
-  an ingester so a CL-3 node can be charted at all.
+- **Console U0–U3 — done.** The admin listener on 1966 bound to loopback
+  (`/admin/*` off the data port, U0a), layered configuration with provenance
+  (U0b), logs and the hash-chained audit view (U1), metrics + performance
+  views (U2), and the cluster view over `Discovery` (U3) all shipped, each
+  phase gate drilled — see `docs/CONSOLE.md` §14 and the
+  `docs/evidence/*-drill.log` transcripts. Remaining follow-ups are small: the
+  U2 per-query pruning counters, a real `level` field on `FileMeta` instead of
+  the filename-prefix convention, shipping a querier's samples to an ingester
+  so a CL-3 node can be charted at all, and the deferred console items
+  (drill-in proxying, cross-node config propagation).
 - **Cluster-wide Grafana dashboard** shipped 2026-08-28 (#117): the deep,
   per-tier time-series companion to the U3 console cluster view —
   **Prometheus** scraping every node's `/metrics` relabelled by node+role,

@@ -275,13 +275,16 @@
     <section id="http">
       <h2>HTTP API</h2>
       <p>
-        Port 1963, shared by the data plane and the admin plane.
-        <code>/health</code>, <code>/ping</code> and <code>/metrics</code>
-        take no authentication; writes and <code>/api/sql</code>
-        authenticate by token when <code>TIMELAKE_DATA_AUTH</code> is
-        <code>optional</code> or <code>required</code> (default
-        <code>off</code>, see Data-plane tokens below); every
-        <code>/admin/*</code> route requires a session (SEC-4). See
+        Port 1963 is the data plane. <code>/health</code>, <code>/ping</code>
+        and <code>/metrics</code> take no authentication; writes and
+        <code>/api/sql</code> authenticate by token when
+        <code>TIMELAKE_DATA_AUTH</code> is <code>optional</code> or
+        <code>required</code> (default <code>off</code>, see Data-plane tokens
+        below). The admin plane — every <code>/admin/*</code> route — answers on
+        a dedicated private listener, <strong>1966</strong>
+        (<code>TIMELAKE_ADMIN_ADDR</code>, <code>127.0.0.1</code> by default),
+        each route requiring a session (SEC-4); on 1963 those paths now return
+        <code>410 Gone</code> and name the new listener. See
         <a href="index.html#security">Security</a> and
         <a href="index.html#console">Admin Console</a>.
       </p>
@@ -305,11 +308,17 @@
             <tr><td><code>GET /admin/retention</code></td><td>viewer</td><td>—</td><td>200 + <code>{"policies":[{db, table, seconds, duration, all_databases}]}</code></td></tr>
             <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink, introduce, or widen scope; body <code>db</code>, <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
             <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
+            <tr><td><code>GET /admin/config</code></td><td>session (viewer)</td><td>—</td><td>200 + <code>{revision, settings[]}</code> — every setting with its effective value and where it came from (default &lt; property &lt; override), plus the applied config revision</td></tr>
+            <tr><td><code>GET /admin/config/{key}</code></td><td>session (viewer)</td><td>—</td><td>200 + that one setting's layered provenance. 404 if unknown</td></tr>
+            <tr><td><code>PUT /admin/config/{key}</code></td><td>the setting's own role (viewer/operator/<strong>admin</strong>); body <code>value</code> (a value, or <code>null</code> for explicit-off)</td><td><code>dry_run=1</code> previews without applying</td><td>200; persists durably and applies live. 409 if it breaks a cross-field invariant (the error names it), 404 if unknown</td></tr>
+            <tr><td><code>DELETE /admin/config/{key}</code></td><td>the setting's own role</td><td>—</td><td>200; drops the override back to the property/default beneath it</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
             <tr><td><code>GET /admin/rollups</code></td><td>viewer</td><td>—</td><td>200 + <code>{"rollups":[{db, name, source, target, interval, lookback, group_by, aggregations[]}]}</code></td></tr>
             <tr><td><code>PUT /admin/rollups</code></td><td><strong>admin</strong>; body <code>db</code>, <code>name</code>, <code>source</code>, <code>interval</code>, <code>aggregations[]</code> (each <code>function</code>, <code>source_column</code>, <code>target_column</code>, and <code>quantile</code> for <code>percentile</code>), optional <code>target</code>, <code>lookback</code>, <code>group_by[]</code>, <code>filter</code></td><td>—</td><td>200; upserts by <code>(db, name)</code>, persists durably, first pass on the next maintenance tick. 400 on a structural error, a percentile missing its quantile, or a lookback that outlives the source's retention</td></tr>
             <tr><td><code>DELETE /admin/rollups/{db}/{name}</code></td><td><strong>admin</strong></td><td>—</td><td>200; stops materialising. The target table is left exactly as it stands — its rows are ordinary data, so remove them with retention or a targeted delete if you want them gone. 404 if unknown</td></tr>
             <tr><td><code>GET /admin/audit</code></td><td>viewer</td><td><code>action</code>, <code>principal</code>, <code>target</code>, <code>since</code>, <code>limit</code>, <code>verify</code></td><td>200 + <code>{records[], total, returned}</code>. <code>?verify=1</code> adds <code>{"verify":{"ok":true}}</code>, or the first chain break and its seq. Reading the log is itself audited</td></tr>
+            <tr><td><code>GET /admin/logs</code></td><td>viewer</td><td><code>level</code> (default <code>info</code>), <code>target</code>, <code>contains</code>, <code>limit</code> (≤ 5000)</td><td>200 + <code>{entries[], dropped}</code> — the in-process log ring; <code>dropped</code> is how many entries it overwrote before you read</td></tr>
+            <tr><td><code>GET /admin/cluster</code></td><td>viewer</td><td>—</td><td>200 + <code>{nodes[], config_converged}</code> — this node and each discovery peer, with role, health, applied <code>config_revision</code> and <code>catalog_head</code>; a wedged peer reads <code>reachable:false</code> within a 3 s per-peer timeout. Advisory only (CL-5)</td></tr>
             <tr><td><code>GET /admin/tokens</code></td><td>operator</td><td>—</td><td>200 + token records (id, description, scope, databases, grants, issuer, timestamps, revoked, last used); the secret is never re-shown</td></tr>
             <tr><td><code>POST /admin/tokens</code></td><td>admin; body <code>description</code>, <code>scope</code>, optional <code>databases</code>, <code>authorizations</code>, <code>expires_in_secs</code></td><td>—</td><td>200 + <code>{secret, token}</code> — the secret appears exactly once</td></tr>
             <tr><td><code>DELETE /admin/tokens/{id}</code></td><td>admin</td><td>—</td><td>200; effective immediately. 404 if unknown or already revoked</td></tr>
@@ -449,21 +458,31 @@
         seeded <code>admin</code>/<code>admin</code> credential is quarantined,
         so the console goes straight to a forced password change and returns to
         sign-in afterwards (rotation ends every session for that principal,
-        including the current one). After that it manages two things.
-        Retention, scoped per database and table: the active policies with
-        all-databases wildcards called out in red, a set/remove form with
-        table-name completion from <code>SHOW TABLES</code>, the live
+        including the current one). After that it carries a screen per surface.
+        <strong>Configuration</strong> (U0b): every setting with its layered
+        provenance — default &lt; property &lt; override — a set/revert form
+        with a dry-run preview, and a 409 that names the invariant when a change
+        would break one. <strong>Retention</strong>, scoped per database and
+        table: the active policies with all-databases wildcards called out in
+        red, a set/remove form with table-name completion from
+        <code>SHOW TABLES</code>, the live
         <code>timelake_retention_drops_total</code> counter, and a standing
         warning that shrinking a window deletes data on the next enforcement
         pass — permanently once <code>TIMELAKE_GC_GRACE_SECS</code> elapses.
-        And data-plane tokens: issue one with a scope, database allowlist and
-        visibility grants, see the secret exactly once, list and revoke. The
-        header shows who you are and your role, and the page states which role
-        each action needs; the server is what enforces it, so an action above
-        your role fails with <code>403</code> rather than being hidden. A banner
+        <strong>Data-plane tokens</strong>: issue one with a scope, database
+        allowlist and visibility grants, see the secret exactly once, list and
+        revoke. <strong>Logs</strong> and the hash-chained
+        <strong>audit trail</strong> (U1), filterable, the audit view with an
+        in-page verify that walks the chain. And a <strong>cluster</strong> view
+        (U3, after the role split): each node's role, health and applied config
+        revision, a node held behind flagged — derived from discovery and
+        advisory only (CL-5), so no console action depends on it. The header
+        shows who you are and your role, and the page states which role each
+        action needs; the server is what enforces it, so an action above your
+        role fails with <code>403</code> rather than being hidden. A banner
         appears while the seeded credential is still active. Targeted delete,
-        the audit trail, certificate grants and TLS reload have no page yet —
-        they are the <code>/admin/*</code> routes above, with a session.
+        certificate grants and TLS reload have no page yet — they are the
+        <code>/admin/*</code> routes above, with a session.
       </p>
       <div class="note warn">
         <p>
@@ -476,8 +495,9 @@
           <code>410 Gone</code> for <code>/admin/*</code>, naming the new
           listener; <code>/metrics</code> stays on 1963, unauthenticated by
           design. A reverse proxy fronting the console must forward cookies and
-          the <code>X-TimeLake-CSRF</code> header. (U0 phase, timelakedb#108;
-          the rest of U0 — layered config — is in <code>docs/CONSOLE.md</code>.)
+          the <code>X-TimeLake-CSRF</code> header. (U0–U3,
+          timelakedb#108/#109/#110/#111; the design is in
+          <code>docs/CONSOLE.md</code>.)
         </p>
       </div>
 
@@ -862,7 +882,8 @@
             <tr><td><code>timelake_querier_snapshot_errors_total</code></td><td>counter</td><td>Failed snapshot or live-view fetches</td></tr>
             <tr><td><code>timelake_querier_refusals_total</code></td><td>counter</td><td>Queries refused rather than answered from an incomplete cluster. <strong>Alert on this</strong></td></tr>
             <tr><td><code>timelake_querier_catchups_total</code></td><td>counter</td><td>Times a query had to fold the manifest log forward to reach an ingester's head</td></tr>
-            <tr><td><code>timelake_catalog_head</code></td><td>gauge</td><td>Highest manifest sequence this node has applied — the freshness watermark (querier role only)</td></tr>
+            <tr><td><code>timelake_catalog_head</code></td><td>gauge</td><td>Highest manifest sequence this node has applied — the freshness watermark. Every engine node (ingesters, queriers, compactor); the router has no catalog</td></tr>
+            <tr><td><code>timelake_config_revision</code></td><td>gauge</td><td>The applied configuration revision. Compared across nodes in the cluster view to flag one held behind (convergence)</td></tr>
             <tr><td><code>timelake_buffer_rows</code></td><td>gauge</td><td>Rows in memory, not yet flushed</td></tr>
             <tr><td><code>timelake_wal_bytes</code></td><td>gauge</td><td>WAL size; 429 backpressure begins at <code>TIMELAKE_WAL_MAX_BYTES</code></td></tr>
             <tr><td><code>timelake_databases</code></td><td>gauge</td><td>Databases with a live buffer</td></tr>

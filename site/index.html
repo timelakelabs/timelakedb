@@ -239,7 +239,7 @@
   <div class="shell">
     <div class="section-head">
       <h2>Quick start</h2>
-      <p>Install a package or run the container — neither needs a Rust toolchain. The server accepts line protocol on 1963, answers Flight SQL on 1964, and serves its management console on 1963 at <code>/admin/ui</code>.</p>
+      <p>Install a package or run the container — neither needs a Rust toolchain. The server accepts line protocol on 1963 and answers Flight SQL on 1964; the management console lives on a private admin listener (1966, loopback by default — you publish it deliberately) at <code>/admin/ui</code>.</p>
     </div>
 
     <div class="code">
@@ -279,10 +279,11 @@ curl http://localhost:<span class="n">1963</span>/health</pre>
     <p>
       Point a stock Telegraf <code>influxdb_v2</code> output at the same URL, or add
       Grafana's InfluxDB datasource in SQL mode against port 1964 —
-      both work unmodified. To manage retention on the running server, open
-      <a href="http://localhost:1963/admin/ui"><code>http://localhost:1963/admin/ui</code></a>
-      and sign in — the first run seeds <code>admin</code>/<code>admin</code> and
-      makes you replace it before anything else works. The
+      both work unmodified. To manage the running server, open the admin console
+      on its private listener at <code>/admin/ui</code> (1966, loopback by
+      default — publish it deliberately) and sign in — the first run seeds
+      <code>admin</code>/<code>admin</code> and makes you replace it before
+      anything else works. The
       <a href="docs/index.html">documentation</a> covers ingestion, querying,
       retention, the <a href="docs/index.html#console">console</a> and operations
       in detail.
