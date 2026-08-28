@@ -48,10 +48,10 @@ rather than drawing a zero:
 
 - **`config_revision`** — all five engine nodes; the router holds no engine
   and has none, so the convergence spread is over five, not six.
-- **`catalog_head`** — the log **followers** (queriers + compactor). The
-  ingesters, which write the log, do not expose it yet (a follow-up, tracked
-  separately — not faked in a query). The "catalog head" panels are labelled
-  as follower freshness for that reason.
+- **`catalog_head`** — every engine node's applied manifest head; the router
+  holds no catalog and has none. The ingesters — the write front — expose it
+  as of #123, so the convergence panels compare the read tier against the
+  writers, not just followers against each other.
 - **`compactions_total`** — ticks on the ingesters, which compact their own
   files; the compactor can read 0. The by-node panels attribute it honestly
   instead of assuming a tier.

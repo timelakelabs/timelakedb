@@ -3204,25 +3204,31 @@ impl Engine {
                  # TYPE timelake_querier_refusals_total counter\n\
                  timelake_querier_refusals_total {}\n\
                  # TYPE timelake_querier_catchups_total counter\n\
-                 timelake_querier_catchups_total {}\n\
-                 # TYPE timelake_catalog_head gauge\n\
-                 timelake_catalog_head {}\n",
+                 timelake_querier_catchups_total {}\n",
                 r.peer_count(),
                 r.stats.snapshot_fetches.load(Ordering::Relaxed),
                 r.stats.snapshot_rows.load(Ordering::Relaxed),
                 r.stats.snapshot_errors.load(Ordering::Relaxed),
                 r.stats.refusals.load(Ordering::Relaxed),
                 r.stats.catchups.load(Ordering::Relaxed),
-                self.catalog.head(),
             ),
             None => String::new(),
         };
-        // U0b (§3.8): the applied config revision, so the cluster view can
-        // flag a node that is behind. Unconditional — every node has a config.
+        // U0b (§3.8): the applied config revision and the applied catalog
+        // head — the two convergence signals every ENGINE node carries (the
+        // router has no engine and emits neither). catalog_head is the
+        // highest manifest seq this node has applied; Catalog::head advances
+        // only after a successful CAS, never mid-commit (crates/catalog),
+        // so it is safe to compare across nodes to flag a follower behind
+        // the write front. #123 moved catalog_head here from the querier-only
+        // block above, where the ingesters — the writers — never emitted it.
         let config_line = format!(
             "# TYPE timelake_config_revision gauge\n\
-             timelake_config_revision {}\n",
-            self.config_revision()
+             timelake_config_revision {}\n\
+             # TYPE timelake_catalog_head gauge\n\
+             timelake_catalog_head {}\n",
+            self.config_revision(),
+            self.catalog.head(),
         );
         format!(
             "# TYPE timelake_lines_written_total counter\n\

@@ -309,6 +309,48 @@ async fn a_lone_node_emits_no_querier_metrics_and_is_otherwise_unchanged() {
         !body.contains("timelake_querier_"),
         "a lone node must not emit CL-3 metrics"
     );
+    // #123: it still reports its catalog head — that metric is not a
+    // querier-only line. Present before any commit, at 0.
+    assert!(
+        body.contains("timelake_catalog_head 0"),
+        "a writer's catalog head is in /metrics, not just node_health: {body}"
+    );
+}
+
+/// #123: a writer (ingester / role=all) exposes its *committed* catalog head
+/// in /metrics, so the cluster convergence panel can compare the read tier
+/// against the write front. Before this, `timelake_catalog_head` lived only
+/// in the querier block (`remote_buffers` set), so the nodes that define the
+/// head never emitted it.
+#[tokio::test]
+async fn a_writer_emits_its_committed_catalog_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(LocalStore::new(dir.path()).unwrap());
+    let eng = node(dir.path(), store);
+    assert!(
+        eng.remote_buffers().is_none(),
+        "no remote buffers: this is a writer, not a querier"
+    );
+    let app = timelake_server::app(eng.clone());
+
+    write(&eng, &format!("cpu,host=a v=1i {}\n", now_ns())).await;
+    eng.flush_all().unwrap(); // one manifest commit — the head advances to 1
+
+    let m = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body =
+        String::from_utf8(m.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        body.contains("timelake_catalog_head 1"),
+        "the writer reports its committed head, not just the followers: {body}"
+    );
+    assert!(
+        !body.contains("timelake_querier_"),
+        "still a writer, not a querier"
+    );
 }
 
 #[tokio::test]
