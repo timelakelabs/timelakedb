@@ -102,11 +102,11 @@ timelake/
     tls/         validate-before-swap cert loading, rotation  ← SEC-3
     store-s3/    S3Store + AwsKms behind the Store/Kms traits  ← CL-1, C0
     auth/        principals, sessions, roles                  ← SEC-4
-  (planned, not yet built)
     config/      layered resolver (default < property < override),
-                 provenance, validation, hot-swap holder      ← §17, U0
-    audit/       chained append-only sink, system.audit       ← SR-6, U1
-    admin/       admin listener: console REST API + embedded UI ← SR-5, U0
+                 provenance, validation, hot-swap holder      ← §17, U0b
+    audit/       chained append-only sink, _system.audit      ← SR-6, U1
+    (the admin listener, /admin/* REST API and embedded console UI
+     shipped in api/ + server/ — U0–U3 — not a separate crate)
   tests/
     at/          AT-1..AT-6 harness glue (tsdb-bench adapter lives in
                  ../Gauge/bench/backends/timelakedb.py, not here)
@@ -815,9 +815,10 @@ is "done" on unit tests alone.
 
 ## 17. Console — the operator plane (SR-5/SR-6/SEC-4) — design
 
-**Status: designed 2026-08-09; build phased U0–U3 (§14). Full design:
-`docs/CONSOLE.md`.** One authenticated surface for changing what the
-server does, seeing what it did, and watching what it is doing. It adds
+**Status: designed 2026-08-09; U0–U3 built (§14; phase gates drilled,
+`docs/evidence/`). Full design: `docs/CONSOLE.md`.** One authenticated
+surface for changing what the server does, seeing what it did, and watching
+what it is doing. It adds
 four crates (§3) and one listener; it adds no new place to keep state.
 
 The retention slice shipped on 2026-08-09 (`/admin/retention` +

@@ -354,21 +354,25 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
     <section id="console">
       <h2>Admin Console</h2>
       <p>
-        A management page ships with the server at
-        <code>http://&lt;host&gt;:1963/admin/ui</code> — self-contained HTML from
-        the binary itself, no build step, no external assets, and no separate
-        deployment. It signs you in, makes you replace the first-run password,
-        and then manages what the server does at runtime.
+        A management page ships with the server on its private admin listener
+        at <code>/admin/ui</code> (see
+        <a href="#console-port">Ports and exposure</a>) — self-contained HTML
+        from the binary itself, no build step, no external assets, and no
+        separate deployment. It signs you in, makes you replace the first-run
+        password, and then manages what the server does at runtime.
       </p>
 
       <div class="note warn">
         <p>
-          <strong>The console shares port 1963 with the data plane today.</strong>
-          Every <code>/admin/*</code> route requires a session, but the port is
-          the same one your writers use — so keep 1963 private and treat console
-          reachability as an access-control decision. A dedicated, privately
-          bound admin listener is designed and phased as U0; see
-          <a href="#console-port">Ports and exposure</a>.
+          <strong>The console has its own private listener.</strong>
+          <code>/admin/*</code> and the console answer on a dedicated admin
+          listener, <strong>1966</strong>, bound to <code>127.0.0.1</code> by
+          default (<code>TIMELAKE_ADMIN_ADDR</code> opens it deliberately) — off
+          the data port, so publishing the write API no longer publishes the
+          console's front door; on 1963 those paths return <code>410 Gone</code>.
+          Every <code>/admin/*</code> route still requires a session (SEC-4).
+          See <a href="#console-port">Ports and exposure</a>. (U0a,
+          timelakedb#108.)
         </p>
       </div>
 
@@ -411,6 +415,12 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
 
       <h3>What it manages today</h3>
       <p>
+        <strong>Configuration</strong> (U0b, RR-5): every setting with its
+        layered provenance — <code>EngineConfig</code> default &lt;
+        <code>TIMELAKE_*</code> property &lt; stored override — a set/revert form
+        with a dry-run preview, and a 409 that names the invariant when a change
+        would break one (a GC grace shorter than the query timeout, say). It
+        applies live and persists through the object store.
         <strong>Retention</strong> (FR-7), scoped per database and table: the
         active policies with all-databases wildcards called out, a set/remove
         form with table-name completion, the live
@@ -425,16 +435,23 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         with the secret shown exactly once.
       </p>
       <p>
-        Everything else the admin plane does is API-first for now — targeted
-        delete, the audit trail, certificate grants and TLS reload are
-        <code>curl</code> against <code>/admin/*</code> with a session, listed
-        under <a href="#api">API Reference</a>. Metrics and performance views
-        exist as a <em>Grafana</em> console rather than a page in this one: the
-        node stores its own telemetry in <code>_system</code> and
+        <strong>Logs</strong> and the hash-chained <strong>audit trail</strong>
+        (U1): the recent in-process log ring, filterable by level and substring;
+        and the audit viewer, filterable by action, principal and target, with an
+        in-page verify that walks the chain and reports the first break. A
+        <strong>cluster</strong> view (U3, after the role split): every node from
+        discovery with its role, health, applied config revision and catalog
+        head, a node held behind flagged — advisory only (CL-5), so nothing on
+        the write or catalog path depends on it. Metrics and performance views
+        stay a <em>Grafana</em> console rather than a page in this one: the node
+        stores its own telemetry in <code>_system</code> and
         <code>deploy/compose/timelakedb-console.yml</code> provisions the
-        dashboard that reads it (port 3004). Layered configuration with visible
-        provenance and a cluster view are designed but not built — the phases
-        are U0–U3 in <code>ARCHITECTURE.md</code> §14, specified in
+        single-node dashboard (port 3004), while
+        <code>deploy/grafana/cluster/</code> adds a cluster-wide dashboard over
+        Prometheus. Targeted delete, certificate grants and TLS reload remain
+        API-first — <code>curl</code> against <code>/admin/*</code> with a
+        session, listed under <a href="#api">API Reference</a>. The phased
+        design is <code>ARCHITECTURE.md</code> §14 and
         <code>docs/CONSOLE.md</code>.
       </p>
 
@@ -444,28 +461,23 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
           <thead><tr><th>Port</th><th>Serves</th><th>Authentication</th></tr></thead>
           <tbody>
             <tr><td><code>1963</code></td><td>Writes, <code>/api/sql</code>, <code>/health</code>, <code>/ping</code>, <code>/metrics</code></td><td><strong>Token, when enabled</strong> — <code>TIMELAKE_DATA_AUTH=optional|required</code>. Default <code>off</code>, which leaves it open</td></tr>
-            <tr><td><code>1963</code></td><td><code>/admin/*</code> and the console at <code>/admin/ui</code></td><td><strong>Session required</strong> (SEC-4)</td></tr>
+            <tr><td><code>1966</code> (<code>TIMELAKE_ADMIN_ADDR</code>)</td><td><code>/admin/*</code> and the console at <code>/admin/ui</code></td><td><strong>Session required</strong> (SEC-4). Bound to <code>127.0.0.1</code> by default; on 1963 these paths now return <code>410 Gone</code></td></tr>
             <tr><td><code>1964</code></td><td>Arrow Flight SQL</td><td><strong>Token, when enabled</strong> — same setting, same default</td></tr>
             <tr><td><code>TIMELAKE_CLUSTER_ADDR</code> (the rigs use <code>1965</code>)</td><td>Intra-cluster replication and live-buffer reads — ingester role only, <code>/internal/v1/*</code></td><td><strong>None</strong>, by design, and no visibility filter — keep it on a private network and never publish it</td></tr>
           </tbody>
         </table>
       </div>
       <p>
-        Both listeners move together: <code>TIMELAKE_ADDR</code> and
-        <code>TIMELAKE_FLIGHT_ADDR</code> set the bind addresses, and TLS
-        (<code>TIMELAKE_TLS_CERT</code>&nbsp;/&nbsp;<code>_KEY</code>) covers both
-        at once. There is no way to bind the console somewhere different from the
-        write API yet, so <code>TIMELAKE_ADDR=127.0.0.1:1963</code> plus an
-        authenticating proxy is the way to reach it remotely — and a proxy in
-        front of the console must forward cookies and the
-        <code>X-TimeLake-CSRF</code> header.
-      </p>
-      <p>
-        <strong>Planned (U0):</strong> the admin plane gets its own listener on
-        <code>1966</code>, bound to <code>127.0.0.1</code> by default, and
-        <code>/admin/*</code> leaves 1963. The most destructive endpoints should
-        not inherit the data plane's exposure. Until then, the port you publish
-        for writes is the port that reaches the console.
+        <code>TIMELAKE_ADDR</code> and <code>TIMELAKE_FLIGHT_ADDR</code> set the
+        data and Flight bind addresses; <code>TIMELAKE_ADMIN_ADDR</code>
+        (default <code>127.0.0.1:1966</code>) sets the admin listener's, kept on
+        loopback so publishing the write API never publishes the console's front
+        door. TLS (<code>TIMELAKE_TLS_CERT</code>&nbsp;/&nbsp;<code>_KEY</code>)
+        covers every listener at once. To reach the console remotely, put an
+        authenticating proxy in front of 1966 — it must forward cookies and the
+        <code>X-TimeLake-CSRF</code> header. (U0a, timelakedb#108: the admin
+        plane split off 1963, which now answers <code>410 Gone</code> for
+        <code>/admin/*</code> and names the new listener.)
       </p>
     </section>
 
@@ -1110,9 +1122,10 @@ TIMELAKE_PEERS=ingester-a=ingester@ingester-a:1965|ingester-a:1963,ingester-b=in
       <p>
         Administration is always authenticated; the data plane is only when
         <code>TIMELAKE_DATA_AUTH</code> says so, and it ships <code>off</code>.
-        Until you set it, whoever can reach 1963 or 1964 owns the data — and
-        because the console answers on 1963 too, that port also decides who can
-        reach the management surface. Bind to a private interface, keep
+        Until you set it, whoever can reach 1963 or 1964 owns the data. The
+        console answers on its own private listener (1966, loopback by default),
+        so it is not on those ports — but its exposure is still yours to decide
+        the moment you bind it wider. Bind to a private interface, keep
         TimeLakeDB off any network you do not control, rotate the seeded
         credential, stage <code>optional</code> → <code>required</code> while
         watching <code>timelake_data_requests_anonymous_total</code>, and read

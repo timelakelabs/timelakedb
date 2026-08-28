@@ -340,7 +340,12 @@ docker compose -f deploy/compose/timelakedb.yml up -d --build
 curl http://localhost:1963/health
 ```
 
-The admin console is at <http://localhost:1963/admin/ui>. A fresh node
+The admin console lives on a **private** admin listener
+(`TIMELAKE_ADMIN_ADDR`, default `127.0.0.1:1966`), deliberately off the data
+port so publishing writes never publishes the console — on 1963 the `/admin/*`
+paths now return `410 Gone`. The stock compose does not expose it; to open it,
+set `TIMELAKE_ADMIN_ADDR=0.0.0.0:1966`, publish `1966:1966`, and browse
+<http://localhost:1966/admin/ui> behind your own network controls. A fresh node
 seeds `admin`/`admin`, which can do nothing until you change it — see
 [`SECURITY.md`](SECURITY.md).
 
