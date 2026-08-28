@@ -1,0 +1,63 @@
+U3 operator console — the cluster view (timelakedb#111 §13)
+2026-08-27 · ingester pair, each the other's only peer
+             (deploy/compose/timelakedb-cluster-s3.yml, localstack + ingester×2)
+             drill: deploy/compose/cluster-drill/u3_cluster_drill.sh
+================================================================================
+
+THE CLAIM UNDER TEST is that GET /admin/cluster tells an operator the truth
+about the cluster fast enough to act on, and that the view is advisory only —
+it never sits on the write or catalog path (CL-5). Four properties, one gate
+each:
+
+  1. Membership. A node lists itself and every peer it was told about, each
+     with its role, and reports config_converged while the revisions agree.
+  2. Divergence is flagged. Advance one node's applied config; the other does
+     not follow (config is per-node — a node reloads its own layers, not its
+     peers'), so the view shows the revisions apart and config_converged=false.
+     Without this the revision column is decoration.
+  3. A gone node shows, and fast. The peer is WEDGED (docker pause — it
+     black-holes the SYN, so detection has to ride the 3 s per-peer timeout,
+     which is the path the 10 s bound actually governs; a cleanly stopped node
+     refuses instantly and would pass no matter how long the timeout were set).
+     Measured 3 s, wall-clock, from wedge to the view reading it unreachable —
+     still carrying its role, not dropped from the list.
+  4. CL-5 guard. With the peer down and the view degraded, a write to the
+     survivor still acks and reads back exact. The stale view changed nothing
+     about write or catalog correctness — the invariant the cluster rests on.
+
+The admin listener is loopback by default (SECURITY.md — never public), so
+every /admin/* call goes in through `docker exec` on the node, exactly as an
+operator on the box would reach it; the wedge/kill is from the host.
+
+ONE DETOUR worth recording, because it is the general operational caveat for
+this view: the first run had ingester-b on a STALE image whose /health still
+returned the old M3 stub `{"status":"pass","version":"0.1.0","milestone":"M3"}`
+instead of node_health. cluster_view fans out to each peer's /health, so a peer
+that answers with anything older than the node_health shape (role +
+config_revision, shipped with #120) shows up reachable but ROLELESS and with no
+revision — which silently defeats gate 2, since a peer that contributes no
+revision can never make config_converged go false. Not a bug in the view; a
+mixed-version cluster is. `docker compose up` reuses a per-service image, so
+`--build` both nodes or the drill lies to you. Rebuilt both, re-ran clean.
+
+================================================================================
+== U3 cluster-view drill ==
+-- gate 1: membership, both nodes at rev 0 --
+  PASS  view lists both nodes
+  PASS  ingester-a (self) reachable
+  PASS  ingester-a role is ingester
+  PASS  ingester-b (peer) reachable
+  PASS  ingester-b role is ingester
+  PASS  config_converged while both at rev 0
+-- gate 2: advance A's config; B does not follow --
+  PASS  ingester-a advanced to rev 1
+  PASS  ingester-b held at rev 0
+  PASS  divergence flagged (config_converged=false)
+-- gate 3: wedge B, it must read unreachable within 10 s --
+  PASS  wedged ingester-b reads unreachable in 3s (<=10)
+  PASS  ingester-b status=unreachable
+  PASS  unreachable node keeps its role
+-- gate 4: CL-5 — degraded view, writes still exact on the survivor --
+  PASS  write to the survivor acks (204) with its peer down
+  PASS  the 100 acked rows read back exact — the stale view changed nothing
+== U3 drill: 14 passed, 0 failed ==
