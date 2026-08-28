@@ -34,6 +34,10 @@ never read it as zero):
     and has none, so the convergence math is over five, not six.
   - catalog_head is on the log FOLLOWERS (queriers + compactor); ingesters, the
     writers, do not expose it yet — filed as a follow-up, not faked in a query.
+    (#123, same day: catalog_head now ships on every engine node, the writers
+    included; the drill gained a count==5 check for it. This transcript
+    predates that change — the metric is pinned by the unit test
+    `a_writer_emits_its_committed_catalog_head`.)
   - compactions_total ticks on the ingesters (they compact their own files);
     the by-node panels attribute it honestly rather than assuming a tier.
 

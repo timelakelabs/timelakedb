@@ -114,6 +114,7 @@ ck "$(pv 'sum(rate(timelake_s3_put_total[1m])) > bool 0')" 1 "object store: puts
 
 echo "-- phase 4: convergence panel flags a node held behind --"
 ck "$(pv 'count(timelake_config_revision)')" 5 "config_revision on all 5 engine nodes (router has none)"
+ck "$(pv 'count(timelake_catalog_head)')" 5 "catalog_head on all 5 engine nodes (#123: was followers-only)"
 ck "$(pv 'max(timelake_config_revision) - min(timelake_config_revision)')" 0 "baseline: converged (spread 0)"
 login admin
 adm -b /tmp/cj -X POST http://localhost:1966/admin/password \

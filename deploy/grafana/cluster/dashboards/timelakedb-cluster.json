@@ -1677,7 +1677,7 @@
         "type": "prometheus",
         "uid": "timelakedb-prometheus"
       },
-      "description": "Spread across the LOG FOLLOWERS (queriers + compactor) that expose catalog_head; ingesters, the writers, do not expose it yet. A follower sits a little behind by design; a large, growing spread is a node that stopped catching up.",
+      "description": "Spread across every engine node's applied catalog head \u2014 the ingesters (the write front) included since #123, so a follower lagging the writers shows here, not just followers lagging each other. A follower sits a little behind by design; a large, growing spread is a node that stopped catching up.",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -1829,12 +1829,12 @@
     {
       "id": 38,
       "type": "timeseries",
-      "title": "catalog_head by node (log followers)",
+      "title": "catalog_head by node",
       "datasource": {
         "type": "prometheus",
         "uid": "timelakedb-prometheus"
       },
-      "description": "Queriers + compactor; ingesters do not expose catalog_head yet.",
+      "description": "Every engine node's applied manifest head (the router has no catalog). Ingesters lead \u2014 the write front \u2014 and followers track; since #123 the writers expose it too.",
       "gridPos": {
         "h": 7,
         "w": 12,
