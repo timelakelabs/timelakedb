@@ -1,0 +1,49 @@
+CL-2 half-open partition — chaos step (timelakedb)
+2026-08-28 · ingester pair + localstack + toxiproxy on the replication link
+             (timelakedb-cluster-s3.yml + timelakedb-cluster-s3.chaos.yml)
+   overlay: deploy/compose/timelakedb-cluster-s3.chaos.yml
+   drill:   deploy/compose/cluster-drill/cl2_partition_chaos.sh
+================================================================================
+
+THE FAULT is the one the clean-stop CL-2 drill never reaches: a HALF-OPEN link.
+A docker-stop/SIGKILL peer refuses connections instantly — the ingester learns
+it is gone the fast way. Here a toxiproxy sits on ingester-a's replication link
+(the peer cluster_addr, :1965) and an upstream `timeout` toxic black-holes the
+frames, so they HANG instead of refusing. That is the path that decides whether
+a slow or partitioned peer can stall the write path.
+
+THE CLAIM UNDER TEST is the survivor-side PR-7 contract:
+  - the survivor stays UP (RR-1) and keeps acking, on local durability;
+  - it rides its per-write replication timeout (repl_timeout_ms = 250 ms) into
+    degraded mode — it does NOT hang on the dead peer;
+  - it loses nothing it acked (exact count on the survivor);
+  - the alarm clears on the next successful replication once the link heals,
+    one episode, no flapping.
+
+WHAT THIS DELIBERATELY DOES NOT CLAIM: two-copy durability under a partition.
+The toxic is upstream, so ingester-b never receives the degraded-era frames —
+they are single-copy on the survivor until an explicit /recover. That is the
+stated PR-7 cost (availability over the second replica while the pair is half
+up), and this drill exists to make that cost visible, not to pretend it away.
+
+Reproduced twice: on a fresh rig, then again without `down -v` — the drill
+suffixes its table per run and asserts the degraded-episode count relative to a
+baseline, so it is safe to re-run.
+
+================================================================================
+== CL-2 half-open partition chaos drill ==
+-- baseline: replication flows through toxiproxy --
+  PASS  pre-partition write of 200 acks
+  PASS  cl2_degraded=0 (peer reachable through the proxy)
+  PASS  ingester-a healthy
+-- inject: black-hole the A->B replication link (upstream, half-open) --
+  PASS  write under partition still acks (survivor local durability, PR-7)
+  PASS  ingester-a stays UP under partition (RR-1: the dead peer does not stall it)
+  PASS  cl2_degraded raised — peer unreachable via the dead link
+-- heal: remove the toxic; the next write clears the alarm --
+  PASS  post-heal write acks
+  PASS  cl2_degraded cleared on the next successful replication
+-- survivor-side zero loss --
+  PASS  exact count on the survivor: 200 + 50 + 200, nothing acked was lost
+  PASS  exactly one degraded episode — no flapping
+== CL-2 partition chaos: 10 passed, 0 failed ==
