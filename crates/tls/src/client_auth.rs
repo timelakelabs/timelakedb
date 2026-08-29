@@ -118,27 +118,42 @@ impl RotatingClientCa {
     }
 }
 
-/// Consults the rotating bundle at every handshake, and never refuses a
-/// peer for merely being anonymous.
+/// Consults the rotating bundle at every handshake. In want mode
+/// (`mandatory = false`) it never refuses a peer for merely being
+/// anonymous; in require mode (`mandatory = true`, C3 / #72) an anonymous
+/// peer is refused at the handshake. The trust decision is identical
+/// either way — only whether "no certificate" is allowed differs.
 #[derive(Debug)]
-pub(crate) struct WantClientAuth {
+pub(crate) struct ClientAuth {
     pub(crate) ca: Arc<RotatingClientCa>,
+    /// `false` = SEC-3 want mode (verify if offered, serve anyway).
+    /// `true` = C3 require mode (no cert, or a cert outside the bundle,
+    /// is refused). The intra-cluster listener sets this; the data plane
+    /// never does.
+    pub(crate) mandatory: bool,
 }
 
-impl WantClientAuth {
+impl ClientAuth {
     fn inner(&self) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, rustls::Error> {
-        rustls::server::WebPkiClientVerifier::builder_with_provider(
+        let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
             self.ca.current(),
             Arc::new(provider().clone()),
-        )
-        // The single call that makes this "want" rather than "require".
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| rustls::Error::General(e.to_string()))
+        );
+        // The one call that separates want from require: want serves an
+        // anonymous peer, require refuses it. Everything downstream — the
+        // chain check against the bundle — is the same.
+        let builder = if self.mandatory {
+            builder
+        } else {
+            builder.allow_unauthenticated()
+        };
+        builder
+            .build()
+            .map_err(|e| rustls::Error::General(e.to_string()))
     }
 }
 
-impl rustls::server::danger::ClientCertVerifier for WantClientAuth {
+impl rustls::server::danger::ClientCertVerifier for ClientAuth {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         // Hints would have to be pinned at construction, and the bundle
         // rotates underneath us; offer none and let clients present what
@@ -147,7 +162,7 @@ impl rustls::server::danger::ClientCertVerifier for WantClientAuth {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        false
+        self.mandatory
     }
 
     fn offer_client_auth(&self) -> bool {
@@ -291,5 +306,176 @@ mod tests {
     fn anonymous_peers_have_no_identity() {
         assert_eq!(identity_of(None), None);
         assert_eq!(identity_of(Some(&[])), None);
+    }
+}
+
+/// Real in-memory TLS 1.3 handshakes through a require-mode server config,
+/// because the one-line want/require difference (#72) is exactly the kind of
+/// thing that reads correct and behaves backwards. These drive an actual
+/// `ServerConnection`/`ClientConnection` pair rather than asserting a flag.
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use crate::RotatingCert;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+
+    fn ca(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let cert = params.self_signed(&key).unwrap();
+        (cert, key)
+    }
+
+    /// A leaf `cn` signed by `(issuer_cert, issuer_key)`, returned as the
+    /// (chain, private key) an rustls identity wants.
+    fn leaf(
+        cn: &str,
+        issuer_cert: &rcgen::Certificate,
+        issuer_key: &rcgen::KeyPair,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let cert = params.signed_by(&key, issuer_cert, issuer_key).unwrap();
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        (cert_der, key_der)
+    }
+
+    /// Build a `RotatingClientCa` bundle file from a CA cert, and a
+    /// `RotatingCert` server identity (`server_cn`) signed by that CA. The
+    /// tempdir is returned so its files outlive the loaders.
+    fn server_side(
+        ca_cert: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        server_cn: &str,
+    ) -> (Arc<RotatingCert>, Arc<RotatingClientCa>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = rcgen::KeyPair::generate().unwrap();
+        let mut sp = rcgen::CertificateParams::new(vec![server_cn.to_string()]).unwrap();
+        sp.distinguished_name
+            .push(rcgen::DnType::CommonName, server_cn);
+        let scert = sp.signed_by(&sk, ca_cert, ca_key).unwrap();
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, scert.pem()).unwrap();
+        std::fs::write(&key_path, sk.serialize_pem()).unwrap();
+        let rot = RotatingCert::load(&cert_path, &key_path).unwrap();
+
+        let bundle = dir.path().join("client-ca.pem");
+        std::fs::write(&bundle, ca_cert.pem()).unwrap();
+        let client_ca = RotatingClientCa::load(&bundle).unwrap();
+        (rot, client_ca, dir)
+    }
+
+    fn client_config(
+        server_root: &rcgen::Certificate,
+        identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+    ) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        roots.add(server_root.der().clone()).unwrap();
+        let b = ClientConfig::builder_with_provider(Arc::new(provider().clone()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots);
+        let cfg = match identity {
+            Some((chain, key)) => b.with_client_auth_cert(vec![chain], key).unwrap(),
+            None => b.with_no_client_auth(),
+        };
+        Arc::new(cfg)
+    }
+
+    /// Drive a full handshake in memory. Returns the first error either side
+    /// raises — for a require-mode refusal that is the server rejecting the
+    /// empty/untrusted client certificate.
+    fn handshake(
+        server_cfg: Arc<ServerConfig>,
+        client_cfg: Arc<ClientConfig>,
+        server_name: &'static str,
+    ) -> Result<(), rustls::Error> {
+        let mut server = ServerConnection::new(server_cfg).unwrap();
+        let name = rustls::pki_types::ServerName::try_from(server_name).unwrap();
+        let mut client = ClientConnection::new(client_cfg, name).unwrap();
+        for _ in 0..40 {
+            let mut c2s = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut c2s).unwrap();
+            }
+            let mut rd = &c2s[..];
+            while !rd.is_empty() {
+                if server.read_tls(&mut rd).unwrap() == 0 {
+                    break;
+                }
+            }
+            server.process_new_packets()?;
+
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            let mut rd = &s2c[..];
+            while !rd.is_empty() {
+                if client.read_tls(&mut rd).unwrap() == 0 {
+                    break;
+                }
+            }
+            client.process_new_packets()?;
+
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn require_mode_accepts_a_carded_peer_and_refuses_the_rest() {
+        let (ca_cert, ca_key) = ca("cluster-ca");
+        let (rot, client_ca, _dir) = server_side(&ca_cert, &ca_key, "node-a");
+        let server_cfg = rot.server_config_requiring_client_ca(false, &[], client_ca);
+
+        // A peer carrying a cert signed by the cluster CA gets in.
+        let carded = client_config(&ca_cert, Some(leaf("node-b", &ca_cert, &ca_key)));
+        assert!(
+            handshake(server_cfg.clone(), carded, "node-a").is_ok(),
+            "require mode must accept a peer whose cert the bundle trusts"
+        );
+
+        // A peer with no certificate is refused — the whole point of require.
+        let anon = client_config(&ca_cert, None);
+        assert!(
+            handshake(server_cfg.clone(), anon, "node-a").is_err(),
+            "require mode must refuse an anonymous peer"
+        );
+
+        // A peer whose cert is signed by some other CA is refused too.
+        let (other_cert, other_key) = ca("outsider-ca");
+        let intruder = client_config(&ca_cert, Some(leaf("intruder", &other_cert, &other_key)));
+        assert!(
+            handshake(server_cfg, intruder, "node-a").is_err(),
+            "a cert outside the bundle must be refused, not merely unidentified"
+        );
+    }
+
+    #[test]
+    fn want_mode_still_serves_the_anonymous_peer() {
+        // The regression guard for the shared verifier: flipping require on
+        // must not have turned the data plane's want mode into a wall.
+        let (ca_cert, ca_key) = ca("cluster-ca");
+        let (rot, client_ca, _dir) = server_side(&ca_cert, &ca_key, "node-a");
+        let want_cfg = rot.server_config_with_client_ca(false, &[], Some(client_ca));
+
+        let anon = client_config(&ca_cert, None);
+        assert!(
+            handshake(want_cfg, anon, "node-a").is_ok(),
+            "want mode must keep serving a peer that presents no certificate"
+        );
     }
 }
