@@ -9,12 +9,33 @@ services:
     ports:
       - "1963:1963"   # HTTP: line-protocol writes + /api/sql
       - "1964:1964"   # Flight SQL (Grafana, FR-8)
+      # DELIBERATE EXPOSURE — this reverses the U0a loopback default. The admin
+      # console and every /admin/* route are the MOST destructive surface
+      # (retention, targeted delete, config, token issuance), and a fresh node
+      # seeds a *quarantined* admin/admin — but "quarantined" only forces a
+      # password change, and an attacker on the network knows the default, so
+      # they can rotate it and take over before you do. Mitigate: seed a real
+      # bootstrap password (see the environment block) and/or front this with
+      # TLS + an auth proxy. To keep it to THIS machine only, publish
+      # "127.0.0.1:1966:1966" instead of the all-interfaces form below.
+      - "1966:1966"   # admin console (/admin/ui) — NETWORK-EXPOSED, see above
     environment:
       # RR-1: one shared 3.5 GB pool; with 2 admitted queries worst-case
       # tracked residency is 7 GB, inside the 8 GB cap below. (The
       # influxdb3 baseline peaked at 9.2 GB unconstrained on this VM.)
       TIMELAKE_QUERY_MEM_BYTES: "3758096384"
       TIMELAKE_MAX_CONCURRENT_QUERIES: "2"
+      # Bind the admin listener to all interfaces so the published 1966 port
+      # can reach it — Docker forwards from the container gateway, not
+      # loopback, so 127.0.0.1:1966 (the default) would never receive the
+      # forwarded connection. This is what opens the exposure the port note
+      # above warns about.
+      TIMELAKE_ADMIN_ADDR: "0.0.0.0:1966"
+      # STRONGLY RECOMMENDED while 1966 is on the network: seed a real
+      # bootstrap password so the console is never takeable with the
+      # well-known admin/admin. Provide it from your own environment or secret
+      # store — NEVER commit it here. Uncomment to REQUIRE it at `up` time:
+      # TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD: "${TIMELAKE_ADMIN_BOOTSTRAP_PASSWORD:?set a strong admin bootstrap password before exposing 1966}"
     # A runaway engine must never take the host VM down with it (learned
     # the hard way: an unkillable scan wedged Docker Desktop entirely)
     mem_limit: 8g
