@@ -219,6 +219,31 @@ impl RotatingCert {
         alpn: &[&[u8]],
         client_ca: Option<Arc<RotatingClientCa>>,
     ) -> Arc<ServerConfig> {
+        self.server_config_inner(allow_tls12, alpn, client_ca.map(|ca| (ca, false)))
+    }
+
+    /// As [`Self::server_config_with_client_ca`], but *requiring* a valid
+    /// client certificate: a peer that presents none, or one signed
+    /// outside `client_ca`, is refused at the handshake (C3 / #72). For
+    /// the intra-cluster listener only — the data-plane listeners stay
+    /// want mode, so the two keep independent client-auth modes.
+    pub fn server_config_requiring_client_ca(
+        self: &Arc<Self>,
+        allow_tls12: bool,
+        alpn: &[&[u8]],
+        client_ca: Arc<RotatingClientCa>,
+    ) -> Arc<ServerConfig> {
+        self.server_config_inner(allow_tls12, alpn, Some((client_ca, true)))
+    }
+
+    /// Shared body: want (`mandatory = false`) and require
+    /// (`mandatory = true`) differ only in the verifier they install.
+    fn server_config_inner(
+        self: &Arc<Self>,
+        allow_tls12: bool,
+        alpn: &[&[u8]],
+        client_ca: Option<(Arc<RotatingClientCa>, bool)>,
+    ) -> Arc<ServerConfig> {
         let versions: &[&rustls::SupportedProtocolVersion] = if allow_tls12 {
             &[&rustls::version::TLS13, &rustls::version::TLS12]
         } else {
@@ -228,9 +253,8 @@ impl RotatingCert {
             .with_protocol_versions(versions)
             .expect("ring provider supports TLS 1.2/1.3");
         let builder = match client_ca {
-            Some(ca) => {
-                builder.with_client_cert_verifier(Arc::new(client_auth::WantClientAuth { ca }))
-            }
+            Some((ca, mandatory)) => builder
+                .with_client_cert_verifier(Arc::new(client_auth::ClientAuth { ca, mandatory })),
             None => builder.with_no_client_auth(),
         };
         let mut cfg = builder.with_cert_resolver(Arc::new(Resolver(Arc::clone(self))));
