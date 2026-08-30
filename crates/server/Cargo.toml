@@ -26,6 +26,7 @@ timelake-compact = { path = "../compact" }
 timelake-flight = { path = "../flight" }
 timelake-tls = { path = "../tls" }
 timelake-config = { path = "../config" }
+timelake-discovery = { path = "../discovery" }
 arc-swap.workspace = true
 axum-server.workspace = true
 # HTTP peer identity: the acceptor reads the rustls ServerConnection off the

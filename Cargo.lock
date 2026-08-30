@@ -4648,6 +4648,7 @@ dependencies = [
  "timelake-cluster",
  "timelake-compact",
  "timelake-config",
+ "timelake-discovery",
  "timelake-flight",
  "timelake-ingest",
  "timelake-prometheus",

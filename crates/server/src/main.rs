@@ -54,12 +54,16 @@ async fn main() {
         );
         std::process::exit(2);
     }
-    let discovery = timelake_cluster::StaticDiscovery::from_env(role).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(2);
-    });
+    // #71 phase 2: the backend behind Arc<dyn Discovery> is chosen by
+    // TIMELAKE_DISCOVERY (static default | consul://host:port). Everything below
+    // reads membership the same way regardless.
+    let discovery = timelake_server::discovery::from_env(role)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
     {
-        use timelake_cluster::Discovery;
         let peers: Vec<String> = discovery
             .peers()
             .iter()
@@ -80,7 +84,6 @@ async fn main() {
     // forwarder. It never opens an engine; it shards line protocol across the
     // ingesters from discovery and forwards. Runs here and returns.
     if role == timelake_cluster::Role::Router {
-        use timelake_cluster::Discovery;
         let ingesters: Vec<(String, String)> = discovery
             .peers_with_role(timelake_cluster::Role::Ingester)
             .into_iter()
@@ -153,7 +156,6 @@ async fn main() {
     // pairing comes from discovery (the other `ingester` node). `all` never
     // reaches here, so its write path stays unchanged.
     if role == timelake_cluster::Role::Ingester {
-        use timelake_cluster::Discovery;
         engine
             .enable_replica_wal(&data_dir.join("replica-wal"))
             .expect("open replica WAL");
@@ -195,7 +197,6 @@ async fn main() {
     // second one would be a second writer), and unions the ingesters' live
     // buffers into every query so freshness survives the role split.
     if role == timelake_cluster::Role::Querier {
-        use timelake_cluster::Discovery;
         engine.set_read_only();
         let ingesters: Vec<(String, String)> = discovery
             .peers_with_role(timelake_cluster::Role::Ingester)
@@ -256,7 +257,6 @@ async fn main() {
         // list (itself plus the discovered compactor peers) and reads its own
         // index, so the assignment agrees across nodes with no coordination.
         let (ordinal, count) = {
-            use timelake_cluster::Discovery;
             let self_id = discovery.this_node().id.clone();
             let mut ids: Vec<String> = discovery
                 .peers_with_role(timelake_cluster::Role::Compactor)
@@ -286,7 +286,6 @@ async fn main() {
         // reads files only, which is complete for buckets old enough to have
         // flushed, and rollups only seal buckets that have aged past lookback.
         {
-            use timelake_cluster::Discovery;
             let ingesters: Vec<(String, String)> = discovery
                 .peers_with_role(timelake_cluster::Role::Ingester)
                 .into_iter()
@@ -463,7 +462,6 @@ async fn main() {
     // the peer list (id, role, data address) from discovery once, for whichever
     // admin listener runs below. Advisory only — CL-5.
     let cluster_peers: Vec<timelake_server::ClusterPeer> = {
-        use timelake_cluster::Discovery;
         discovery
             .peers()
             .iter()
