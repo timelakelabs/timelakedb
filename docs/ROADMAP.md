@@ -114,7 +114,7 @@ without an Enterprise contract.
 
 | | v1 | v2 | v3 Core | influxdb-cluster | QuestDB | VM | T |
 |---|---|---|---|---|---|---|---|
-| Replication / HA | Ent. | ✗ | Ent. | ✓ | Ent. | **✓ OSS cluster** | **◐ C2 phases 1–4 shipped** (ingester WAL replication with zero acked loss, router, stateless querier — `docs/evidence/cl2-replication-drill.log`, `router-sharding-drill.log`, `cl3-querier-drill.log`); compactor role built and gated; C3 **required intra-cluster mTLS shipped** (`docs/evidence/c3-mtls-rotation-drill.log`), Consul discovery (CL-5) still open |
+| Replication / HA | Ent. | ✗ | Ent. | ✓ | Ent. | **✓ OSS cluster** | **◐ C2 phases 1–4 shipped** (ingester WAL replication with zero acked loss, router, stateless querier — `docs/evidence/cl2-replication-drill.log`, `router-sharding-drill.log`, `cl3-querier-drill.log`); compactor role built and gated; **C3 shipped** — required intra-cluster mTLS (`docs/evidence/c3-mtls-rotation-drill.log`) and live Consul discovery (`docs/evidence/c3-consul-discovery-drill.log`) |
 | Multi-tenancy | ◐ | orgs | ◐ | ✗ | ✗ | ✓ tenants | ✗ (`org` ignored) |
 
 VictoriaMetrics' OSS clustering is why it eats Prometheus deployments.
@@ -185,7 +185,7 @@ The competitive analysis adds and re-ranks the rest:
 
 | Item | Why | Effort |
 |---|---|---|
-| P1-1 Replication/HA (C1→C2→WAL repl) — **C2 phases 1–4 shipped 2026-08-10** (roles, CL-2 WAL replication, router, CL-3 querier, each drilled); compactor role built 2026-08-21 behind a commit fence, gate shut until work-avoidance (5b); C3 required intra-cluster mTLS shipped, Consul open | Only OSS-cluster competitor is VM; was the longest pole | L → M remaining |
+| P1-1 Replication/HA (C1→C2→WAL repl) — **C2 phases 1–4 shipped 2026-08-10** (roles, CL-2 WAL replication, router, CL-3 querier, each drilled); compactor role built 2026-08-21 behind a commit fence, gate shut until work-avoidance (5b); C3 shipped (required intra-cluster mTLS + live Consul discovery) | Only OSS-cluster competitor is VM; was the longest pole | L → M remaining |
 | ~~P1-2 Audit trail~~ **DONE (SR-6, 2026-08-16)** — admin mutations hash-chained + fail-closed; `GET /admin/audit?verify=1` (data-plane + login/logout deferred) | Enterprise-gated everywhere else; needs P0-3's principal | M |
 | ~~**R-1 Targeted delete**~~ **DONE 2026-08-16** — `POST /admin/delete` records a manifest-log tombstone (tag equalities + time window) hidden in-scan everywhere at once, reclaimed physically by a maintenance pass; Riverkeeper R7 control | The GDPR answer every competitor has in some form | M |
 | ~~**T-1 Tributary self-telemetry** (`/metrics` + `/healthz`)~~ **DONE 2026-08-18** — 26 series, an outage-safe liveness probe, `Tributary/bench/results/t1-self-telemetry.log` | Unwatchable shippers don't survive ops review; every competitor has it; prerequisite for the L5 DaemonSet | S |

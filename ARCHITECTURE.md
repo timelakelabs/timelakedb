@@ -624,14 +624,19 @@ was replaced by that fence.
 ### 12.5 Discovery & intra-cluster TLS
 
 Topology from the `Discovery` trait: **static** backend (config/env —
-C0–C2, dev, the drill rig; **shipped**: `TIMELAKE_NODE_ID`,
-`TIMELAKE_CLUSTER_ADDR`, `TIMELAKE_PEERS` as `id=role@host:port`) then
-**Consul** (registration, health, sessions for the compactor lease) at
-C3. The trait is `Arc<dyn Discovery>` so the backend swaps by config, not
-code. The two standing rules hold:
-discovery informs routing and availability only — a stale membership
+dev, the drill rig; `TIMELAKE_NODE_ID`, `TIMELAKE_CLUSTER_ADDR`,
+`TIMELAKE_PEERS` as `id=role@host:port`) or **Consul** (registration +
+health, live membership), selected by `TIMELAKE_DISCOVERY`
+(`static` default | `consul://host:port`) — **both shipped** at C3. The
+trait is `Arc<dyn Discovery>` so the backend swaps by config, not code; a
+node registers itself and the router/querier/compactor re-read membership
+live, so a join or leave takes effect without a restart (drilled in
+`docs/evidence/c3-consul-discovery-drill.log`). The two standing rules
+hold: discovery informs routing and availability only — a stale membership
 view wastes work but cannot corrupt state, because every commit goes
-through catalog CAS; and leases are advisory, never correctness.
+through catalog CAS, and a Consul outage degrades to the last-known-good
+set rather than failing writes; and leases are advisory, never
+correctness.
 Intra-cluster links (WAL replication, buffer snapshots, router
 forwarding) run plaintext inside the drill network at C2 and are
 **required-mTLS at C3 (shipped)**. C3 flips the verifier (SEC-3 v2) from
