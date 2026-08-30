@@ -3505,11 +3505,14 @@ pub fn data_app(engine: Arc<Engine>) -> axum::Router {
 /// The private admin plane, served on the admin listener (1966): the console
 /// and every guarded `/admin/*` route. Plaintext variant — session cookies are
 /// not `Secure` (that is the TLS variant, `admin_app_with_tls`).
-pub fn admin_app(engine: Arc<Engine>, peers: Vec<ClusterPeer>) -> axum::Router {
+pub fn admin_app(
+    engine: Arc<Engine>,
+    discovery: Arc<dyn timelake_cluster::Discovery>,
+) -> axum::Router {
     let auth = engine.auth();
     let audit = engine.audit_log();
     let limit = engine.max_body_bytes();
-    let cluster = cluster_route(Arc::clone(&engine), peers);
+    let cluster = cluster_route(Arc::clone(&engine), discovery);
     timelake_api::admin_app(engine, auth, audit, false)
         .merge(cluster)
         .layer(axum::extract::DefaultBodyLimit::max(limit))
@@ -3729,16 +3732,34 @@ pub struct ClusterPeer {
     pub data_address: String,
 }
 
+/// Build the cluster-view peer list from discovery. Called per request so the
+/// U3 view reflects a live membership change (#71 phase 3): a joined node
+/// appears and a departed one goes, without a restart. Advisory only — CL-5.
+fn cluster_peers_from(d: &dyn timelake_cluster::Discovery) -> Vec<ClusterPeer> {
+    d.peers()
+        .into_iter()
+        .map(|n| ClusterPeer {
+            id: n.id,
+            role: n.role.as_str().to_string(),
+            data_address: n.data_address,
+        })
+        .collect()
+}
+
 /// A guarded `GET /admin/cluster` route (U3, §8), in the server crate so the
 /// api crate stays free of the cluster dependency; the peer list is captured
 /// from `main` (from `Discovery`). Advisory only — CL-5's guard: the view is
 /// derived from discovery, and nothing on the write or catalog path consults
 /// it.
-fn cluster_route(engine: Arc<Engine>, peers: Vec<ClusterPeer>) -> axum::Router {
+fn cluster_route(
+    engine: Arc<Engine>,
+    discovery: Arc<dyn timelake_cluster::Discovery>,
+) -> axum::Router {
     let auth = engine.auth();
     let view = move || {
         let engine = Arc::clone(&engine);
-        let peers = peers.clone();
+        // Live: the peer list is rebuilt from discovery on every request.
+        let peers = cluster_peers_from(discovery.as_ref());
         async move { cluster_view(engine, peers).await }
     };
     axum::Router::new()
@@ -3882,10 +3903,10 @@ pub fn app_with_tls_admin(
 pub fn admin_app_with_tls(
     engine: Arc<Engine>,
     rot: Arc<timelake_tls::RotatingCert>,
-    peers: Vec<ClusterPeer>,
+    discovery: Arc<dyn timelake_cluster::Discovery>,
 ) -> axum::Router {
     let reload = tls_reload_route(&engine, rot);
-    let cluster = cluster_route(Arc::clone(&engine), peers);
+    let cluster = cluster_route(Arc::clone(&engine), discovery);
     let auth = engine.auth();
     let audit = engine.audit_log();
     let limit = engine.max_body_bytes();

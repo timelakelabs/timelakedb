@@ -14,6 +14,22 @@ fn engine(dir: &std::path::Path) -> Arc<timelake_server::Engine> {
     timelake_server::Engine::open(dir, timelake_server::EngineConfig::default()).unwrap()
 }
 
+/// A static discovery reporting `peers`, as the admin cluster view now reads
+/// its peer list from `Discovery` live (#71) rather than a fixed `ClusterPeer`
+/// snapshot. `this` is a plain `all` node — the view's "self" comes from the
+/// engine, not from here.
+fn discovery(peers: Vec<timelake_cluster::NodeInfo>) -> Arc<dyn timelake_cluster::Discovery> {
+    Arc::new(timelake_cluster::StaticDiscovery::new(
+        timelake_cluster::NodeInfo {
+            id: "tldb".into(),
+            role: timelake_cluster::Role::All,
+            address: String::new(),
+            data_address: String::new(),
+        },
+        peers,
+    ))
+}
+
 #[derive(Clone, Default)]
 struct AdminSession {
     cookie: String,
@@ -98,12 +114,13 @@ async fn cluster_view_shows_self_and_an_unreachable_peer() {
     let dir = tempfile::tempdir().unwrap();
     // A peer nothing listens for: the connection is refused, so it must show
     // up as unreachable rather than vanish.
-    let peers = vec![timelake_server::ClusterPeer {
+    let ghost = timelake_cluster::NodeInfo {
         id: "ghost".into(),
-        role: "ingester".into(),
+        role: timelake_cluster::Role::Ingester,
+        address: String::new(),
         data_address: "127.0.0.1:1".into(),
-    }];
-    let app = timelake_server::admin_app(engine(dir.path()), peers);
+    };
+    let app = timelake_server::admin_app(engine(dir.path()), discovery(vec![ghost]));
     let session = admin_ready(&app).await;
 
     let (code, v) = admin_json(&app, "GET", "/admin/cluster", None, &session).await;
@@ -133,7 +150,7 @@ async fn cluster_view_shows_self_and_an_unreachable_peer() {
 #[tokio::test]
 async fn cluster_requires_a_session() {
     let dir = tempfile::tempdir().unwrap();
-    let app = timelake_server::admin_app(engine(dir.path()), Vec::new());
+    let app = timelake_server::admin_app(engine(dir.path()), discovery(vec![]));
     let res = app
         .oneshot(Request::get("/admin/cluster").body(Body::empty()).unwrap())
         .await

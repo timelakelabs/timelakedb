@@ -510,20 +510,9 @@ async fn main() {
     let admin_addr =
         std::env::var("TIMELAKE_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:1966".to_string());
 
-    // U3: the /admin/cluster view aggregates every peer's public /health. Build
-    // the peer list (id, role, data address) from discovery once, for whichever
-    // admin listener runs below. Advisory only — CL-5.
-    let cluster_peers: Vec<timelake_server::ClusterPeer> = {
-        discovery
-            .peers()
-            .iter()
-            .map(|n| timelake_server::ClusterPeer {
-                id: n.id.clone(),
-                role: n.role.as_str().to_string(),
-                data_address: n.data_address.clone(),
-            })
-            .collect()
-    };
+    // U3: the /admin/cluster view aggregates every peer's public /health. It is
+    // handed the discovery handle (not a snapshot), so the view reflects a live
+    // membership change (#71 phase 3). Advisory only — CL-5.
 
     // SEC-3: TLS on BOTH listeners when cert+key are configured; the
     // fixtures and bench stay plaintext by simply not setting these.
@@ -637,7 +626,7 @@ async fn main() {
                 let admin_app = timelake_server::admin_app_with_tls(
                     Arc::clone(&engine),
                     Arc::clone(&rot),
-                    cluster_peers.clone(),
+                    Arc::clone(&discovery),
                 );
                 tokio::spawn(async move {
                     tracing::info!(addr = %admin_sock, "admin listener up (private, TLS; console + /admin/*)");
@@ -683,7 +672,7 @@ async fn main() {
             // but NOT fatal: the data plane keeps serving and /admin/* is simply
             // unavailable until the address is free.
             {
-                let admin = timelake_server::admin_app(Arc::clone(&engine), cluster_peers.clone());
+                let admin = timelake_server::admin_app(Arc::clone(&engine), Arc::clone(&discovery));
                 let a = admin_addr.clone();
                 tokio::spawn(async move {
                     match TcpListener::bind(&a).await {

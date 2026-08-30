@@ -100,7 +100,18 @@ async fn metrics_and_health_stay_on_the_data_port() {
 #[tokio::test]
 async fn admin_plane_serves_admin_and_guards_it() {
     let dir = tempfile::tempdir().unwrap();
-    let admin = timelake_server::admin_app(engine(dir.path()), Vec::new());
+    let admin = timelake_server::admin_app(
+        engine(dir.path()),
+        Arc::new(timelake_cluster::StaticDiscovery::new(
+            timelake_cluster::NodeInfo {
+                id: "tldb".into(),
+                role: timelake_cluster::Role::All,
+                address: String::new(),
+                data_address: String::new(),
+            },
+            vec![],
+        )),
+    );
 
     // The console shell is public (it ships no data — it asks for it).
     assert_eq!(status(&admin, "GET", "/admin/ui").await, StatusCode::OK);
