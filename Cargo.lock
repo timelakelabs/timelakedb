@@ -4626,6 +4626,7 @@ dependencies = [
  "flate2",
  "http-body-util",
  "prost",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
