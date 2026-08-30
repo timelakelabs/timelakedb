@@ -1,0 +1,94 @@
+# TimeLakeDB Helm chart — values.
+#
+# Phase 1 (this file, #145) deploys a single `role=all` node: a StatefulSet with
+# a PVC for the durable data dir, ConfigMap/Secret plumbing, and safe defaults.
+# The `mode: cluster` topology (router / ingester / querier split) is phase 2.
+
+# "single" = one role=all node. "cluster" = the C2 split (phase 2, #146).
+mode: single
+
+image:
+  repository: ghcr.io/timelakelabs/timelakedb
+  # Empty = the chart's appVersion. Pin to a released tag in production.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Data-plane auth (SEC-4): "off" | "optional" | "required". The chart REFUSES to
+# render with "off" behind an externally-reachable Service (LoadBalancer /
+# NodePort) — an open write endpoint on the internet is never a silent default.
+dataAuth: "off"
+
+# SEC-4 admin bootstrap password. Empty = the server seeds admin/admin,
+# quarantined until rotated on first sign-in. Set this for anything real; it
+# lands in a chart-managed Secret, never a ConfigMap.
+adminBootstrapPassword: ""
+
+# Object store (C0/SEC-1). Disabled = the data lives on the local PVC, which is
+# fine for a single node. Enabled = an S3-compatible bucket (also what a cluster
+# needs so queriers can share one store).
+objectStore:
+  enabled: false
+  url: ""                 # s3://bucket/prefix
+  endpoint: ""            # AWS_ENDPOINT_URL for S3-compatible stores (MinIO); empty = real AWS
+  region: us-east-1
+  # Credentials: either inline (chart-managed Secret) OR name an existingSecret
+  # whose keys are AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+  accessKeyId: ""
+  secretAccessKey: ""
+  existingSecret: ""
+
+# Encryption at rest (SEC-1): a 64-hex key. Inline (chart Secret) or an
+# existingSecret with key TIMELAKE_ENCRYPTION_KEY. Empty = plaintext store.
+encryption:
+  key: ""
+  existingSecret: ""
+
+# TLS (SEC-3). Point at an existingSecret holding tls.crt / tls.key (and
+# optionally ca.crt to also verify client certificates). Empty = plaintext.
+tls:
+  enabled: false
+  existingSecret: ""
+  # Set true if the TLS secret also carries ca.crt (want-mode client auth).
+  clientCa: false
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  # ClusterIP is the safe default. LoadBalancer/NodePort require dataAuth != off.
+  type: ClusterIP
+  httpPort: 1963
+  flightPort: 1964
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 4Gi
+
+# Query engine knobs. Empty = the server's own defaults.
+query:
+  memBytes: ""            # TIMELAKE_QUERY_MEM_BYTES
+  maxConcurrent: ""       # TIMELAKE_MAX_CONCURRENT_QUERIES
+
+logLevel: info           # RUST_LOG
+
+# Extra environment variables, appended last (list of {name, value}).
+extraEnv: []
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,27 @@
+{{- include "timelakedb.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "timelakedb.fullname" . }}
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+data:
+  # Bind 0.0.0.0, not the packaging default 127.0.0.1 — a Service must reach it.
+  TIMELAKE_ADDR: "0.0.0.0:{{ .Values.service.httpPort }}"
+  TIMELAKE_FLIGHT_ADDR: "0.0.0.0:{{ .Values.service.flightPort }}"
+  TIMELAKE_DATA_DIR: "/var/lib/timelake/data"
+  TIMELAKE_DATA_AUTH: {{ .Values.dataAuth | quote }}
+  RUST_LOG: {{ .Values.logLevel | quote }}
+  {{- if .Values.objectStore.enabled }}
+  TIMELAKE_OBJECT_STORE: {{ .Values.objectStore.url | quote }}
+  AWS_REGION: {{ .Values.objectStore.region | quote }}
+  {{- with .Values.objectStore.endpoint }}
+  AWS_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.query.memBytes }}
+  TIMELAKE_QUERY_MEM_BYTES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.query.maxConcurrent }}
+  TIMELAKE_MAX_CONCURRENT_QUERIES: {{ . | quote }}
+  {{- end }}

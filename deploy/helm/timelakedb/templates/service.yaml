@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timelakedb.fullname" . }}
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # The client-facing Service: line-protocol writes + /api/sql on http, and
+  # Flight SQL. The intra-cluster listener (1965) is NEVER published here — it
+  # stays on the headless Service only (phase 2).
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "timelakedb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+    - name: flight
+      port: {{ .Values.service.flightPort }}
+      targetPort: flight
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-headless
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+spec:
+  # Governs the StatefulSet's stable pod DNS. Headless (no cluster IP);
+  # publishNotReadyAddresses so a peer resolves during startup, before its
+  # readiness probe passes — the cluster phase relies on this for TIMELAKE_PEERS.
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "timelakedb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+    - name: flight
+      port: {{ .Values.service.flightPort }}

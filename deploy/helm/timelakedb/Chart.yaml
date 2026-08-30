@@ -1,0 +1,17 @@
+apiVersion: v2
+name: timelakedb
+description: TimeLakeDB — a high-cardinality time-series database, deployed on Kubernetes
+type: application
+# Chart version. Bump on any chart change.
+version: 0.1.0
+# The TimeLakeDB image this chart is written against. There is no released
+# semver image yet, so this tracks the published `main` tag; pin `image.tag` to
+# a release tag once one ships.
+appVersion: "main"
+home: https://github.com/timelakelabs/timelakedb
+sources:
+  - https://github.com/timelakelabs/timelakedb
+keywords:
+  - time-series
+  - database
+  - observability

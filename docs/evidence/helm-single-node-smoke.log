@@ -1,0 +1,30 @@
+=== TimeLakeDB Helm single-node smoke (2026-08-30T22:51:20Z) ===
+pod=tldb-timelakedb-0  chart=deploy/helm/timelakedb  release=tldb  mode=single
+
+-- resources created by the chart --
+  NAME                               READY   AGE
+  statefulset.apps/tldb-timelakedb   1/1     72s
+  
+  NAME                               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)             AGE
+  service/tldb-timelakedb            ClusterIP   10.96.181.230   <none>        1963/TCP,1964/TCP   72s
+  service/tldb-timelakedb-headless   ClusterIP   None            <none>        1963/TCP,1964/TCP   72s
+  
+  NAME                        DATA   AGE
+  configmap/tldb-timelakedb   5      72s
+  
+  NAME                                           STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+  persistentvolumeclaim/data-tldb-timelakedb-0   Bound    pvc-737d7b60-f298-419a-905c-12e066ce6668   1Gi        RWO            standard       <unset>                 72s
+  
+  NAME                    READY   STATUS    RESTARTS   AGE
+  pod/tldb-timelakedb-0   1/1     Running   0          72s
+
+-- /health (role=all, single node) --
+  {"status":"pass","name":"timelakedb","version":"0.3.0","id":"tldb","role":"all","config_revision":0,"catalog_head":0,"uptime_secs":69}
+-- write 3 points, then read the count back (a fresh db) --
+  write: HTTP 204
+  read : [{"n":3}]
+-- durability posture: data on the PVC, rootfs read-only --
+  data dir: audit objects wal 
+  touch: cannot touch '/nope': Read-only file system
+
+=== SINGLE-NODE HELM SMOKE: PASS ===
