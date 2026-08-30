@@ -138,6 +138,16 @@ async fn main() {
     let repl_timeout_ms = cfg.repl_timeout_ms;
     let engine = timelake_server::Engine::open(&data_dir, cfg).expect("open engine (recovery)");
 
+    // #72 phase 2: client-side intra-cluster TLS, loaded once. The replicator
+    // (below) and the querier's remote buffers (per role) both present this
+    // node's identity to peers over https when it is configured. `None` keeps
+    // the links plaintext; a cluster CA set without a cert/key is a loud
+    // startup failure, not a silent downgrade to plaintext.
+    let peer_tls = timelake_server::peer_tls::PeerTls::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+
     // CL-2: an ingester replicates every write to its paired ingester before
     // the ack, and holds the peer's frames in a durable replica WAL. The
     // pairing comes from discovery (the other `ingester` node). `all` never
@@ -153,10 +163,11 @@ async fn main() {
         {
             Some(peer) => {
                 tracing::info!(peer = %peer.id, addr = %peer.address, "CL2 replication peer");
-                engine.set_replicator(timelake_server::replication::Replicator::new(
+                engine.set_replicator(timelake_server::replication::Replicator::new_with_tls(
                     &peer.id,
                     &peer.address,
                     repl_timeout_ms,
+                    peer_tls.as_ref(),
                 ));
             }
             None => tracing::warn!(
@@ -211,7 +222,10 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        let remote = Arc::new(timelake_server::querier::RemoteBuffers::new(ingesters));
+        let remote = Arc::new(timelake_server::querier::RemoteBuffers::new_with_tls(
+            ingesters,
+            peer_tls.as_ref(),
+        ));
         engine.set_remote_buffers(Arc::clone(&remote));
         tracing::info!(
             ingesters = ?remote.peer_ids(),
@@ -290,7 +304,10 @@ async fn main() {
                 .map(|n| (n.id, n.address))
                 .collect();
             if !ingesters.is_empty() {
-                let remote = Arc::new(timelake_server::querier::RemoteBuffers::new(ingesters));
+                let remote = Arc::new(timelake_server::querier::RemoteBuffers::new_with_tls(
+                    ingesters,
+                    peer_tls.as_ref(),
+                ));
                 engine.set_remote_buffers(Arc::clone(&remote));
                 tracing::info!(
                     ingesters = ?remote.peer_ids(),
