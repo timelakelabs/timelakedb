@@ -5,3 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The live Discovery trait lives in timelake-cluster (dependency-free by
+# design); this crate is where the backends that need I/O live, so the trait
+# crate stays lean. #71.
+timelake-cluster = { path = "../cluster" }
+reqwest.workspace = true
+tokio.workspace = true
+arc-swap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+

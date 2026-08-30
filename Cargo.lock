@@ -4562,6 +4562,14 @@ dependencies = [
 [[package]]
 name = "timelake-discovery"
 version = "0.3.0"
+dependencies = [
+ "arc-swap",
+ "reqwest",
+ "serde_json",
+ "timelake-cluster",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "timelake-flight"
