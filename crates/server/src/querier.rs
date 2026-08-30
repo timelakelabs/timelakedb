@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use timelake_query::QueryBatch;
 
 /// The header every internal read response carries: the serving node's
@@ -118,7 +119,14 @@ pub fn parse_live(body: &[u8]) -> Result<LiveReport, String> {
 /// The querier's view of the ingesters: who they are, what they are
 /// currently holding, and the client that fetches it.
 pub struct RemoteBuffers {
-    peers: Vec<IngesterPeer>,
+    /// The ingesters this querier reads. An `ArcSwap` so a live discovery
+    /// refresh (#71) swaps the set atomically — a query never sees a torn
+    /// list, and a joined ingester is unioned or a departed one dropped
+    /// without a restart.
+    peers: ArcSwap<Vec<IngesterPeer>>,
+    /// http|https for the internal links, fixed at construction so a refresh
+    /// rebuilds peer URLs with the same scheme.
+    scheme: &'static str,
     client: reqwest::Client,
     /// `(db, table)` pairs some ingester holds live rows for. Refreshed by
     /// the tail loop so that a table written but never yet flushed is
@@ -126,6 +134,22 @@ pub struct RemoteBuffers {
     /// "no such table" until the first flush.
     live: RwLock<BTreeSet<(String, String)>>,
     pub stats: QuerierStats,
+}
+
+/// Build the sorted peer list with its per-scheme internal URLs. One place, so
+/// construction and a live refresh produce byte-identical `IngesterPeer`s.
+fn build_peers(mut ingesters: Vec<(String, String)>, scheme: &str) -> Vec<IngesterPeer> {
+    // Sorted so the batch order a query sees is the same on every querier and
+    // every run — one less reason for two nodes to disagree about anything.
+    ingesters.sort_by(|a, b| a.0.cmp(&b.0));
+    ingesters
+        .into_iter()
+        .map(|(id, addr)| IngesterPeer {
+            id,
+            live_url: format!("{scheme}://{addr}/internal/v1/live"),
+            snapshot_url: format!("{scheme}://{addr}/internal/v1/snapshot"),
+        })
+        .collect()
 }
 
 impl RemoteBuffers {
@@ -140,22 +164,10 @@ impl RemoteBuffers {
     /// trusting only the cluster CA when the cluster has TLS (#72 phase 2).
     /// `tls = None` is the plaintext path, unchanged.
     pub fn new_with_tls(
-        mut ingesters: Vec<(String, String)>,
+        ingesters: Vec<(String, String)>,
         tls: Option<&crate::peer_tls::PeerTls>,
     ) -> RemoteBuffers {
         let scheme = crate::peer_tls::peer_scheme(tls);
-        // Sorted so the batch order a query sees is the same on every
-        // querier and every run — one less reason for two nodes to
-        // disagree about anything.
-        ingesters.sort_by(|a, b| a.0.cmp(&b.0));
-        let peers = ingesters
-            .into_iter()
-            .map(|(id, addr)| IngesterPeer {
-                id,
-                live_url: format!("{scheme}://{addr}/internal/v1/live"),
-                snapshot_url: format!("{scheme}://{addr}/internal/v1/snapshot"),
-            })
-            .collect();
         let mut builder = reqwest::Client::builder()
             // A hung ingester must not hang the query: the deadline
             // turns it into a refusal, which is the honest outcome.
@@ -164,19 +176,28 @@ impl RemoteBuffers {
             builder = t.apply_async(builder);
         }
         RemoteBuffers {
-            peers,
+            peers: ArcSwap::from_pointee(build_peers(ingesters, scheme)),
+            scheme,
             client: builder.build().expect("querier client"),
             live: RwLock::new(BTreeSet::new()),
             stats: QuerierStats::default(),
         }
     }
 
+    /// Replace the ingester set from a live discovery refresh (#71). Sorted and
+    /// URL-built exactly as construction does, so nothing downstream can tell a
+    /// refreshed set from a booted one.
+    pub fn update_peers(&self, ingesters: Vec<(String, String)>) {
+        self.peers
+            .store(Arc::new(build_peers(ingesters, self.scheme)));
+    }
+
     pub fn peer_ids(&self) -> Vec<String> {
-        self.peers.iter().map(|p| p.id.clone()).collect()
+        self.peers.load().iter().map(|p| p.id.clone()).collect()
     }
 
     pub fn peer_count(&self) -> usize {
-        self.peers.len()
+        self.peers.load().len()
     }
 
     /// Tables some ingester is currently holding live rows for.
@@ -206,7 +227,8 @@ impl RemoteBuffers {
     /// `SHOW TABLES` mid-outage.
     pub async fn refresh_live(&self) -> u64 {
         let mut set = tokio::task::JoinSet::new();
-        for p in &self.peers {
+        let peers = self.peers.load_full();
+        for p in peers.iter() {
             let client = self.client.clone();
             let url = p.live_url.clone();
             let id = p.id.clone();
@@ -265,7 +287,8 @@ impl RemoteBuffers {
     /// idea of who owns a table would silently drop rows.
     pub async fn snapshot(&self, db: &str, table: &str) -> Result<(Vec<QueryBatch>, u64), String> {
         let mut set = tokio::task::JoinSet::new();
-        for p in &self.peers {
+        let peers = self.peers.load_full();
+        for p in peers.iter() {
             let client = self.client.clone();
             let url = p.snapshot_url.clone();
             let id = p.id.clone();
@@ -319,7 +342,8 @@ impl RemoteBuffers {
         // Collected then sorted by ingester id: batch order must not depend
         // on which node happened to answer first, or two runs of the same
         // query could order rows differently.
-        let mut collected: Vec<(String, Vec<QueryBatch>)> = Vec::with_capacity(self.peers.len());
+        let mut collected: Vec<(String, Vec<QueryBatch>)> =
+            Vec::with_capacity(self.peers.load().len());
         let mut head = 0u64;
         let mut failure: Option<String> = None;
         while let Some(joined) = set.join_next().await {
@@ -434,6 +458,25 @@ mod tests {
         assert_eq!(a.peer_ids(), b.peer_ids());
         assert_eq!(a.peer_ids(), vec!["ing-a", "ing-b"]);
         assert_eq!(a.peer_count(), 2);
+    }
+
+    #[test]
+    fn update_peers_swaps_the_live_ingester_set() {
+        // #71 phase 3: a discovery refresh replaces the ingester set the
+        // querier fans out to, sorted the same way, without a restart.
+        let r = RemoteBuffers::new(vec![("ing-a".into(), "a:1965".into())]);
+        assert_eq!(r.peer_ids(), vec!["ing-a"]);
+        r.update_peers(vec![
+            ("ing-b".into(), "b:1965".into()),
+            ("ing-a".into(), "a:1965".into()),
+        ]);
+        assert_eq!(
+            r.peer_ids(),
+            vec!["ing-a", "ing-b"],
+            "a joined ingester is picked up, still sorted"
+        );
+        r.update_peers(vec![]);
+        assert!(r.peer_ids().is_empty(), "all ingesters departed");
     }
 
     #[tokio::test]

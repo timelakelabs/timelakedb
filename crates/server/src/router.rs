@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
+
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -56,8 +58,14 @@ pub struct RouterStats {
 }
 
 pub struct RouterState {
-    targets: Vec<Target>,
-    queriers: Vec<QueryTarget>,
+    /// Ingester shard targets and querier read targets, held live: an
+    /// `ArcSwap` each so a discovery refresh (#71) swaps the set atomically. A
+    /// write loads one consistent snapshot, so the shard count that sizes the
+    /// grouping and the index that selects a target cannot disagree across a
+    /// mid-request swap. The round-robin cursor and the stats stay put, which
+    /// is why only these two fields are swapped, not the whole state.
+    targets: ArcSwap<Vec<Target>>,
+    queriers: ArcSwap<Vec<QueryTarget>>,
     /// Round-robin cursor over the queriers. Reads are stateless, so any
     /// querier can answer any query; spreading them is the whole benefit of
     /// running more than one.
@@ -77,6 +85,31 @@ pub struct RouterState {
     pub stats: RouterStats,
 }
 
+/// Build the shard targets, sorted by id so the hash → target mapping is stable
+/// across restarts and across a live refresh. One place, so construction and a
+/// membership refresh produce identical `Target`s.
+fn build_targets(mut ingesters: Vec<(String, String)>) -> Vec<Target> {
+    ingesters.sort_by(|a, b| a.0.cmp(&b.0));
+    ingesters
+        .into_iter()
+        .map(|(id, addr)| Target {
+            id,
+            write_url: format!("http://{addr}/api/v3/write_lp"),
+        })
+        .collect()
+}
+
+fn build_queriers(mut queriers: Vec<(String, String)>) -> Vec<QueryTarget> {
+    queriers.sort_by(|a, b| a.0.cmp(&b.0));
+    queriers
+        .into_iter()
+        .map(|(id, addr)| QueryTarget {
+            id,
+            sql_url: format!("http://{addr}/api/sql"),
+        })
+        .collect()
+}
+
 impl RouterState {
     /// `ingesters` is `(id, data_address)` for each ingester the router can
     /// reach. Order is fixed (sorted by id) so the hash → target mapping is
@@ -87,28 +120,12 @@ impl RouterState {
 
     /// As [`RouterState::new`], plus the queriers `/api/sql` is forwarded to.
     pub fn with_queriers(
-        mut ingesters: Vec<(String, String)>,
-        mut queriers: Vec<(String, String)>,
+        ingesters: Vec<(String, String)>,
+        queriers: Vec<(String, String)>,
     ) -> RouterState {
-        ingesters.sort_by(|a, b| a.0.cmp(&b.0));
-        queriers.sort_by(|a, b| a.0.cmp(&b.0));
-        let targets = ingesters
-            .into_iter()
-            .map(|(id, addr)| Target {
-                id,
-                write_url: format!("http://{addr}/api/v3/write_lp"),
-            })
-            .collect();
-        let queriers = queriers
-            .into_iter()
-            .map(|(id, addr)| QueryTarget {
-                id,
-                sql_url: format!("http://{addr}/api/sql"),
-            })
-            .collect();
         RouterState {
-            targets,
-            queriers,
+            targets: ArcSwap::from_pointee(build_targets(ingesters)),
+            queriers: ArcSwap::from_pointee(build_queriers(queriers)),
             next_querier: AtomicU64::new(0),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -131,12 +148,20 @@ impl RouterState {
         self.max_body_bytes
     }
 
+    /// Replace the ingester and querier sets from a live discovery refresh
+    /// (#71). Atomic per set; a request loads a whole snapshot, so it never
+    /// sees half of a swap.
+    pub fn update(&self, ingesters: Vec<(String, String)>, queriers: Vec<(String, String)>) {
+        self.targets.store(Arc::new(build_targets(ingesters)));
+        self.queriers.store(Arc::new(build_queriers(queriers)));
+    }
+
     pub fn target_ids(&self) -> Vec<String> {
-        self.targets.iter().map(|t| t.id.clone()).collect()
+        self.targets.load().iter().map(|t| t.id.clone()).collect()
     }
 
     pub fn querier_ids(&self) -> Vec<String> {
-        self.queriers.iter().map(|q| q.id.clone()).collect()
+        self.queriers.load().iter().map(|q| q.id.clone()).collect()
     }
 
     /// Every querier, starting at the next one in the rotation.
@@ -146,13 +171,14 @@ impl RouterState {
     /// "is it up" is answered by asking. Queriers are stateless and
     /// interchangeable, which is exactly what makes falling through to the
     /// next one safe — it is the same answer from a different process.
-    fn querier_rotation(&self) -> Vec<&QueryTarget> {
-        if self.queriers.is_empty() {
+    fn querier_rotation(&self) -> Vec<QueryTarget> {
+        let queriers = self.queriers.load();
+        if queriers.is_empty() {
             return Vec::new();
         }
         let n = self.next_querier.fetch_add(1, Ordering::Relaxed) as usize;
-        (0..self.queriers.len())
-            .map(|i| &self.queriers[(n + i) % self.queriers.len()])
+        (0..queriers.len())
+            .map(|i| queriers[(n + i) % queriers.len()].clone())
             .collect()
     }
 }
@@ -198,10 +224,10 @@ async fn router_metrics(State(state): State<Arc<RouterState>>) -> String {
         state.stats.forwarded.load(Ordering::Relaxed),
         state.stats.forward_errors.load(Ordering::Relaxed),
         state.stats.rejected.load(Ordering::Relaxed),
-        state.targets.len(),
+        state.targets.load().len(),
         state.stats.queries_forwarded.load(Ordering::Relaxed),
         state.stats.query_errors.load(Ordering::Relaxed),
-        state.queriers.len(),
+        state.queriers.load().len(),
     )
 }
 
@@ -315,7 +341,13 @@ async fn write(
             "missing 'db' (or 'bucket') parameter",
         );
     }
-    if state.targets.is_empty() {
+    // One consistent snapshot of the shard targets for the whole request: the
+    // shard count that sizes the grouping and the index that selects a target
+    // must agree, even if a live membership refresh swaps the set mid-request
+    // (#71). load_full is an Arc clone, so the snapshot is owned across the
+    // forward loop's awaits.
+    let targets = state.targets.load_full();
+    if targets.is_empty() {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "router has no ingesters configured (TIMELAKE_PEERS)",
@@ -386,7 +418,7 @@ async fn write(
     // measurement now — the parse above refused any that did not — but the
     // check stays as the loop's own guard rather than an assumption about
     // the code twenty lines up.)
-    let mut shards: Vec<String> = vec![String::new(); state.targets.len()];
+    let mut shards: Vec<String> = vec![String::new(); targets.len()];
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -402,7 +434,7 @@ async fn write(
                 );
             }
         };
-        let idx = shard_of(&db, measurement, state.targets.len());
+        let idx = shard_of(&db, measurement, targets.len());
         // Forward original bytes verbatim so the ingester parses exactly
         // what the client sent.
         shards[idx].push_str(line);
@@ -417,7 +449,7 @@ async fn write(
         if sub.is_empty() {
             continue;
         }
-        let target = &state.targets[idx];
+        let target = &targets[idx];
         let mut req = state
             .client
             .post(&target.write_url)
@@ -585,7 +617,7 @@ mod tests {
                 ("qry-c".into(), "qc:1963".into()),
             ],
         );
-        let ids = |r: Vec<&QueryTarget>| r.into_iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        let ids = |r: Vec<QueryTarget>| r.into_iter().map(|q| q.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(s.querier_rotation()), vec!["qry-a", "qry-b", "qry-c"]);
         assert_eq!(
             ids(s.querier_rotation()),
@@ -601,6 +633,42 @@ mod tests {
         let s = RouterState::new(vec![("ing-a".into(), "a:1963".into())]);
         assert!(s.querier_rotation().is_empty());
         assert!(s.querier_ids().is_empty());
+    }
+
+    #[test]
+    fn a_live_update_swaps_the_targets_and_queriers() {
+        // #71 phase 3: a discovery refresh replaces the sets in place, so a
+        // joined node is routed to and a departed one is dropped without a
+        // restart. The round-robin cursor is untouched (it is not swapped).
+        let s = RouterState::new(vec![("ing-a".into(), "a:1963".into())]);
+        assert_eq!(s.target_ids(), vec!["ing-a"]);
+        s.update(
+            vec![
+                ("ing-a".into(), "a:1963".into()),
+                ("ing-b".into(), "b:1963".into()),
+            ],
+            vec![("qry-a".into(), "qa:1963".into())],
+        );
+        assert_eq!(
+            s.target_ids(),
+            vec!["ing-a", "ing-b"],
+            "a joined ingester is a shard target"
+        );
+        assert_eq!(
+            s.querier_ids(),
+            vec!["qry-a"],
+            "a joined querier is offered"
+        );
+        s.update(vec![("ing-b".into(), "b:1963".into())], vec![]);
+        assert_eq!(
+            s.target_ids(),
+            vec!["ing-b"],
+            "a departed ingester is dropped"
+        );
+        assert!(
+            s.querier_rotation().is_empty(),
+            "the departed querier is gone"
+        );
     }
 
     #[test]

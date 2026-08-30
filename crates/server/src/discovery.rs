@@ -15,6 +15,71 @@ use timelake_cluster::{Discovery, Role, StaticDiscovery};
 /// or leave is picked up promptly, long enough not to hammer the agent.
 const CONSUL_REFRESH: Duration = Duration::from_secs(5);
 
+/// How often a consumer (router/querier/compactor) re-reads membership from the
+/// backend and applies it. The backend refreshes its own cache on `CONSUL_REFRESH`;
+/// this reads that cache.
+pub const CONSUMER_REFRESH: Duration = Duration::from_secs(5);
+
+/// Peers of `role` as `(id, public data address)`, dropping any without one —
+/// what the router forwards writes/queries to. One place, so a boot read and a
+/// refresh read select the same set.
+pub fn role_data_addrs(d: &dyn Discovery, role: Role) -> Vec<(String, String)> {
+    d.peers_with_role(role)
+        .into_iter()
+        .filter(|n| !n.data_address.is_empty())
+        .map(|n| (n.id, n.data_address))
+        .collect()
+}
+
+/// Peers of `role` as `(id, intra-cluster address)`, dropping any without one —
+/// what the querier reads live buffers from over the internal listener.
+pub fn role_cluster_addrs(d: &dyn Discovery, role: Role) -> Vec<(String, String)> {
+    d.peers_with_role(role)
+        .into_iter()
+        .filter(|n| !n.address.is_empty())
+        .map(|n| (n.id, n.address))
+        .collect()
+}
+
+/// This compactor's `(ordinal, count)` among the compactor set: every compactor
+/// sorts the same id list (its peers plus itself) and reads its own index, so
+/// the partition-ownership split agrees across nodes with no coordination. A
+/// membership change reshuffles it; two compactors briefly owning a partition is
+/// caught by the commit fence (a merge whose inputs were replaced is refused),
+/// so a reshuffle is wasted work at worst, never corruption (CL-5).
+pub fn compactor_shard(d: &dyn Discovery) -> (usize, usize) {
+    let self_id = d.this_node().id.clone();
+    let mut ids: Vec<String> = d
+        .peers_with_role(Role::Compactor)
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+    ids.push(self_id.clone());
+    ids.sort();
+    ids.dedup();
+    let ordinal = ids.iter().position(|id| *id == self_id).unwrap_or(0);
+    (ordinal, ids.len())
+}
+
+/// Spawn a task that re-reads membership from `discovery` every `interval` and
+/// hands the backend to `apply`, which pushes it into a live consumer (#71,
+/// phase 3). The one place the consumer refresh cadence lives. For a static
+/// backend this is a harmless no-op re-read (membership never changes); only a
+/// dynamic backend (Consul) makes it do anything.
+pub fn spawn_refresh<F>(discovery: Arc<dyn Discovery>, interval: Duration, mut apply: F)
+where
+    F: FnMut(&dyn Discovery) + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            apply(discovery.as_ref());
+        }
+    });
+}
+
 /// The parsed `TIMELAKE_DISCOVERY` value — pure, so the selection is testable
 /// without touching the environment or the network.
 #[derive(Debug, PartialEq, Eq)]

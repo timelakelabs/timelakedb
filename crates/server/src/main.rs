@@ -84,12 +84,10 @@ async fn main() {
     // forwarder. It never opens an engine; it shards line protocol across the
     // ingesters from discovery and forwards. Runs here and returns.
     if role == timelake_cluster::Role::Router {
-        let ingesters: Vec<(String, String)> = discovery
-            .peers_with_role(timelake_cluster::Role::Ingester)
-            .into_iter()
-            .filter(|n| !n.data_address.is_empty())
-            .map(|n| (n.id, n.data_address))
-            .collect();
+        let ingesters = timelake_server::discovery::role_data_addrs(
+            discovery.as_ref(),
+            timelake_cluster::Role::Ingester,
+        );
         if ingesters.is_empty() {
             eprintln!(
                 "TIMELAKE_ROLE=router needs ingesters with public data addresses in \
@@ -99,12 +97,10 @@ async fn main() {
         }
         // Queriers are optional: a router with none still shards writes, and
         // says plainly that it cannot answer a query (CL-3).
-        let queriers: Vec<(String, String)> = discovery
-            .peers_with_role(timelake_cluster::Role::Querier)
-            .into_iter()
-            .filter(|n| !n.data_address.is_empty())
-            .map(|n| (n.id, n.data_address))
-            .collect();
+        let queriers = timelake_server::discovery::role_data_addrs(
+            discovery.as_ref(),
+            timelake_cluster::Role::Querier,
+        );
         if queriers.is_empty() {
             tracing::warn!(
                 "router has no queriers in TIMELAKE_PEERS — /api/sql will return 501 \
@@ -125,6 +121,29 @@ async fn main() {
             queriers = ?state.querier_ids(),
             %addr,
             "router up (write sharding + query forwarding)"
+        );
+        // #71 phase 3: keep the shard/querier targets live — a joined ingester
+        // starts receiving writes and a departed one stops, without a router
+        // restart. A misroute across a mid-refresh reshuffle is retried
+        // idempotently under LWW, so this changes availability, never
+        // correctness (CL-5). No-op under static discovery.
+        timelake_server::discovery::spawn_refresh(
+            Arc::clone(&discovery),
+            timelake_server::discovery::CONSUMER_REFRESH,
+            {
+                let state = Arc::clone(&state);
+                move |d| {
+                    let ing = timelake_server::discovery::role_data_addrs(
+                        d,
+                        timelake_cluster::Role::Ingester,
+                    );
+                    let qry = timelake_server::discovery::role_data_addrs(
+                        d,
+                        timelake_cluster::Role::Querier,
+                    );
+                    state.update(ing, qry);
+                }
+            },
         );
         let app = timelake_server::router::router_app(state);
         let listener = TcpListener::bind(&addr).await.expect("router bind");
@@ -198,12 +217,10 @@ async fn main() {
     // buffers into every query so freshness survives the role split.
     if role == timelake_cluster::Role::Querier {
         engine.set_read_only();
-        let ingesters: Vec<(String, String)> = discovery
-            .peers_with_role(timelake_cluster::Role::Ingester)
-            .into_iter()
-            .filter(|n| !n.address.is_empty())
-            .map(|n| (n.id, n.address))
-            .collect();
+        let ingesters = timelake_server::discovery::role_cluster_addrs(
+            discovery.as_ref(),
+            timelake_cluster::Role::Ingester,
+        );
         if ingesters.is_empty() {
             eprintln!(
                 "TIMELAKE_ROLE=querier needs the ingesters' internal addresses in \
@@ -222,6 +239,24 @@ async fn main() {
             ingesters = ?remote.peer_ids(),
             catalog_head = engine.catalog_head(),
             "querier up (stateless reads: shared store + live buffers)"
+        );
+        // #71 phase 3: keep the ingester set the querier reads live — a joined
+        // ingester's live buffer is unioned and a departed one dropped without a
+        // restart. The querier refuses rather than under-counts on an
+        // unreachable peer, so a stale set costs availability, never a short
+        // answer (CL-5). No-op under static discovery.
+        timelake_server::discovery::spawn_refresh(
+            Arc::clone(&discovery),
+            timelake_server::discovery::CONSUMER_REFRESH,
+            {
+                let remote = Arc::clone(&remote);
+                move |d| {
+                    remote.update_peers(timelake_server::discovery::role_cluster_addrs(
+                        d,
+                        timelake_cluster::Role::Ingester,
+                    ));
+                }
+            },
         );
         let e = Arc::clone(&engine);
         tokio::spawn(timelake_server::querier::tail(
@@ -256,19 +291,7 @@ async fn main() {
         // a disjoint slice of partitions. Every compactor sorts the same id
         // list (itself plus the discovered compactor peers) and reads its own
         // index, so the assignment agrees across nodes with no coordination.
-        let (ordinal, count) = {
-            let self_id = discovery.this_node().id.clone();
-            let mut ids: Vec<String> = discovery
-                .peers_with_role(timelake_cluster::Role::Compactor)
-                .into_iter()
-                .map(|n| n.id)
-                .collect();
-            ids.push(self_id.clone());
-            ids.sort();
-            ids.dedup();
-            let ordinal = ids.iter().position(|id| *id == self_id).unwrap_or(0);
-            (ordinal, ids.len())
-        };
+        let (ordinal, count) = timelake_server::discovery::compactor_shard(discovery.as_ref());
         engine.set_compactor_shard(ordinal, count);
         tracing::info!(
             %addr,
@@ -276,6 +299,21 @@ async fn main() {
             ordinal,
             compactors = count,
             "compactor up (maintenance only: no writes, no queries; owns 1/{count} of partitions)"
+        );
+        // #71 phase 3: recompute this compactor's ownership live when the
+        // compactor set changes, so a joined/departed compactor reshuffles the
+        // split without a restart. The commit fence makes a transient overlap
+        // safe (CL-5). No-op under static discovery.
+        timelake_server::discovery::spawn_refresh(
+            Arc::clone(&discovery),
+            timelake_server::discovery::CONSUMER_REFRESH,
+            {
+                let engine = Arc::clone(&engine);
+                move |d| {
+                    let (ordinal, count) = timelake_server::discovery::compactor_shard(d);
+                    engine.set_compactor_shard(ordinal, count);
+                }
+            },
         );
         // Rollup materialisation (§18.6, the cluster half) reads the SAME
         // shard union a querier does, so a rollup over a source sharded across
@@ -286,12 +324,10 @@ async fn main() {
         // reads files only, which is complete for buckets old enough to have
         // flushed, and rollups only seal buckets that have aged past lookback.
         {
-            let ingesters: Vec<(String, String)> = discovery
-                .peers_with_role(timelake_cluster::Role::Ingester)
-                .into_iter()
-                .filter(|n| !n.address.is_empty())
-                .map(|n| (n.id, n.address))
-                .collect();
+            let ingesters = timelake_server::discovery::role_cluster_addrs(
+                discovery.as_ref(),
+                timelake_cluster::Role::Ingester,
+            );
             if !ingesters.is_empty() {
                 let remote = Arc::new(timelake_server::querier::RemoteBuffers::new_with_tls(
                     ingesters,
@@ -301,6 +337,22 @@ async fn main() {
                 tracing::info!(
                     ingesters = ?remote.peer_ids(),
                     "compactor reads the shard union for rollup materialisation"
+                );
+                // #71 phase 3: keep the rollup union's ingester set live, the
+                // querier's way — a joined ingester's rows are aggregated and a
+                // departed one dropped without a restart.
+                timelake_server::discovery::spawn_refresh(
+                    Arc::clone(&discovery),
+                    timelake_server::discovery::CONSUMER_REFRESH,
+                    {
+                        let remote = Arc::clone(&remote);
+                        move |d| {
+                            remote.update_peers(timelake_server::discovery::role_cluster_addrs(
+                                d,
+                                timelake_cluster::Role::Ingester,
+                            ));
+                        }
+                    },
                 );
                 tokio::spawn(timelake_server::querier::tail(
                     Arc::clone(&engine),
