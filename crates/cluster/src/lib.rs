@@ -150,6 +150,19 @@ pub fn node_id_from_env() -> String {
     std::env::var("TIMELAKE_NODE_ID").unwrap_or_else(|_| DEFAULT_NODE_ID.to_string())
 }
 
+/// This process's own [`NodeInfo`] from the environment: `TIMELAKE_NODE_ID`,
+/// `TIMELAKE_CLUSTER_ADDR`, `TIMELAKE_DATA_ADDR`. The single place a node's own
+/// identity is assembled, so every discovery backend (static, Consul) reports
+/// the same node.
+pub fn this_node_from_env(role: Role) -> NodeInfo {
+    NodeInfo {
+        id: node_id_from_env(),
+        role,
+        address: std::env::var("TIMELAKE_CLUSTER_ADDR").unwrap_or_default(),
+        data_address: std::env::var("TIMELAKE_DATA_ADDR").unwrap_or_default(),
+    }
+}
+
 impl StaticDiscovery {
     /// Construct directly (used by tests and by `from_env`).
     pub fn new(this: NodeInfo, peers: Vec<NodeInfo>) -> StaticDiscovery {
@@ -165,22 +178,11 @@ impl StaticDiscovery {
     ///   (default empty; a lone node needs none).
     /// - `TIMELAKE_PEERS` — comma-separated `id=role@host:port`.
     pub fn from_env(role: Role) -> Result<StaticDiscovery, ClusterError> {
-        let id = node_id_from_env();
-        let address = std::env::var("TIMELAKE_CLUSTER_ADDR").unwrap_or_default();
         let peers = match std::env::var("TIMELAKE_PEERS") {
             Ok(v) => parse_peers(&v)?,
             Err(_) => Vec::new(),
         };
-        let data_address = std::env::var("TIMELAKE_DATA_ADDR").unwrap_or_default();
-        Ok(StaticDiscovery::new(
-            NodeInfo {
-                id,
-                role,
-                address,
-                data_address,
-            },
-            peers,
-        ))
+        Ok(StaticDiscovery::new(this_node_from_env(role), peers))
     }
 }
 

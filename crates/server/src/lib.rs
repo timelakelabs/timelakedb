@@ -39,6 +39,7 @@ use timelake_wal::{Wal, WalCipher};
 
 pub mod applog;
 pub mod compaction;
+pub mod discovery;
 pub mod internal_listener;
 pub mod logfile;
 pub mod peer_tls;
