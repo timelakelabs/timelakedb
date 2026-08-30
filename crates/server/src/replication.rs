@@ -47,6 +47,18 @@ pub struct Replicator {
 
 impl Replicator {
     pub fn new(peer_id: &str, peer_addr: &str, timeout_ms: u64) -> Replicator {
+        Self::new_with_tls(peer_id, peer_addr, timeout_ms, None)
+    }
+
+    /// As [`Self::new`], but presenting this node's certificate over https and
+    /// trusting only the cluster CA when the cluster has TLS (#72 phase 2).
+    /// `tls = None` is the plaintext path, unchanged.
+    pub fn new_with_tls(
+        peer_id: &str,
+        peer_addr: &str,
+        timeout_ms: u64,
+        tls: Option<&crate::peer_tls::PeerTls>,
+    ) -> Replicator {
         // A short timeout: a slow peer must not stall the write path
         // indefinitely — a timeout is treated exactly like a down peer
         // (degraded), which is the safe direction (availability holds).
@@ -57,13 +69,16 @@ impl Replicator {
         // to degraded immediately and availability holds, while a slow one
         // trips nothing and simply multiplies every write's latency.
         // See `docs/P1-1_DESIGN.md` D1.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
-            .expect("replication client");
+        let mut builder =
+            reqwest::blocking::Client::builder().timeout(Duration::from_millis(timeout_ms));
+        if let Some(t) = tls {
+            builder = t.apply_blocking(builder);
+        }
+        let client = builder.build().expect("replication client");
+        let scheme = crate::peer_tls::peer_scheme(tls);
         Replicator {
             peer_id: peer_id.to_string(),
-            endpoint: format!("http://{peer_addr}/internal/v1/replicate"),
+            endpoint: format!("{scheme}://{peer_addr}/internal/v1/replicate"),
             client,
             stats: Arc::new(ReplStats::default()),
         }

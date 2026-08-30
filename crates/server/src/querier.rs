@@ -132,7 +132,18 @@ impl RemoteBuffers {
     /// `ingesters` is `(id, cluster_address)` — the *internal* listener,
     /// not the public data port: live snapshots travel the same private
     /// link as CL-2 replication and move behind required mTLS at C3.
-    pub fn new(mut ingesters: Vec<(String, String)>) -> RemoteBuffers {
+    pub fn new(ingesters: Vec<(String, String)>) -> RemoteBuffers {
+        Self::new_with_tls(ingesters, None)
+    }
+
+    /// As [`Self::new`], but presenting this node's certificate over https and
+    /// trusting only the cluster CA when the cluster has TLS (#72 phase 2).
+    /// `tls = None` is the plaintext path, unchanged.
+    pub fn new_with_tls(
+        mut ingesters: Vec<(String, String)>,
+        tls: Option<&crate::peer_tls::PeerTls>,
+    ) -> RemoteBuffers {
+        let scheme = crate::peer_tls::peer_scheme(tls);
         // Sorted so the batch order a query sees is the same on every
         // querier and every run — one less reason for two nodes to
         // disagree about anything.
@@ -141,18 +152,20 @@ impl RemoteBuffers {
             .into_iter()
             .map(|(id, addr)| IngesterPeer {
                 id,
-                live_url: format!("http://{addr}/internal/v1/live"),
-                snapshot_url: format!("http://{addr}/internal/v1/snapshot"),
+                live_url: format!("{scheme}://{addr}/internal/v1/live"),
+                snapshot_url: format!("{scheme}://{addr}/internal/v1/snapshot"),
             })
             .collect();
+        let mut builder = reqwest::Client::builder()
+            // A hung ingester must not hang the query: the deadline
+            // turns it into a refusal, which is the honest outcome.
+            .timeout(Duration::from_secs(30));
+        if let Some(t) = tls {
+            builder = t.apply_async(builder);
+        }
         RemoteBuffers {
             peers,
-            client: reqwest::Client::builder()
-                // A hung ingester must not hang the query: the deadline
-                // turns it into a refusal, which is the honest outcome.
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("querier client"),
+            client: builder.build().expect("querier client"),
             live: RwLock::new(BTreeSet::new()),
             stats: QuerierStats::default(),
         }
