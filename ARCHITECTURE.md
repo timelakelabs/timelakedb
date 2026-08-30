@@ -341,8 +341,10 @@ Three rungs, cheapest first; the harness decides how far to climb:
   with its grants, so authenticating can only narrow what it sees. The
   anonymous path is unchanged, which is why this is additive.
   **Requiring** a certificate is a separate decision, and the sensible
-  place for it is the intra-cluster listener at C3, where there is no
-  Grafana to keep working.
+  place for it is the intra-cluster listener at C3 — **shipped**: that
+  listener requires a cluster-signed cert (`TIMELAKE_CLUSTER_CA`, §12.5),
+  where there is no Grafana to keep working, while the data plane stays
+  want mode.
 
 ## 12. Clustering v2 on S3 (CL-1..CL-5 + SEC-1 on AWS) — design
 
@@ -631,11 +633,16 @@ discovery informs routing and availability only — a stale membership
 view wastes work but cannot corrupt state, because every commit goes
 through catalog CAS; and leases are advisory, never correctness.
 Intra-cluster links (WAL replication, buffer snapshots, router
-forwarding) run plaintext inside the drill network at C2 and move to
-mTLS at C3. The verifier itself is already shipped (SEC-3 v2) — what C3
-adds is flipping it from want to **required** on the intra-cluster
-listener, which is safe there precisely because no stock client dials
-it: every peer is a node this deployment issued a certificate to.
+forwarding) run plaintext inside the drill network at C2 and are
+**required-mTLS at C3 (shipped)**. C3 flips the verifier (SEC-3 v2) from
+want to **required** on the intra-cluster listener — safe there precisely
+because no stock client dials it: every peer is a node this deployment
+issued a certificate to. It is gated on `TIMELAKE_CLUSTER_CA` (a plaintext
+drill cluster is unchanged), and the data-plane listeners keep their own
+want mode from a separate CA, so the two build independent client-auth
+configs. Drilled in `docs/evidence/c3-mtls-rotation-drill.log`:
+replication zero-loss over the authenticated link, hot cert rotation
+under load, and a certless or wrong-CA peer refused at the handshake.
 
 ### 12.6 LocalStack: the test-and-metrics rig
 

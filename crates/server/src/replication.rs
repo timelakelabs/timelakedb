@@ -69,13 +69,27 @@ impl Replicator {
         // to degraded immediately and availability holds, while a slow one
         // trips nothing and simply multiplies every write's latency.
         // See `docs/P1-1_DESIGN.md` D1.
-        let mut builder =
-            reqwest::blocking::Client::builder().timeout(Duration::from_millis(timeout_ms));
-        if let Some(t) = tls {
-            builder = t.apply_blocking(builder);
-        }
-        let client = builder.build().expect("replication client");
+        //
+        // Build on a plain OS thread. reqwest::blocking's builder blocks on an
+        // internal tokio runtime, and constructing it with a rustls identity
+        // from inside #[tokio::main] panics dropping that runtime in an async
+        // context ("Cannot drop a runtime ... from within an asynchronous
+        // context"). #132's mTLS drill caught it — the unit and integration
+        // tests never built the replicator inside a running runtime, so it only
+        // showed at real startup. A fresh thread has no runtime, so the
+        // constructor is safe to call from anywhere.
         let scheme = crate::peer_tls::peer_scheme(tls);
+        let tls = tls.cloned();
+        let client = std::thread::spawn(move || {
+            let mut builder =
+                reqwest::blocking::Client::builder().timeout(Duration::from_millis(timeout_ms));
+            if let Some(t) = &tls {
+                builder = t.apply_blocking(builder);
+            }
+            builder.build().expect("replication client")
+        })
+        .join()
+        .expect("replication client build thread panicked");
         Replicator {
             peer_id: peer_id.to_string(),
             endpoint: format!("{scheme}://{peer_addr}/internal/v1/replicate"),
@@ -138,5 +152,54 @@ impl Replicator {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ca(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, name);
+        (p.self_signed(&key).unwrap(), key)
+    }
+
+    fn leaf(cn: &str, ca_cert: &rcgen::Certificate, ca_key: &rcgen::KeyPair) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        p.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        let cert = p.signed_by(&key, ca_cert, ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    // Regression for #132: building the TLS replicator inside a tokio runtime
+    // must not panic. reqwest::blocking's builder blocks on an internal runtime,
+    // and constructing it with a rustls identity from within #[tokio::main]
+    // panicked ("Cannot drop a runtime ... from within an asynchronous
+    // context") — new_with_tls now isolates the build on a plain thread. Before
+    // that fix this test aborts with the panic; after it, it passes.
+    #[tokio::test]
+    async fn a_tls_replicator_builds_inside_a_runtime() {
+        let (ca_cert, ca_key) = ca("cluster-ca");
+        let (cert, key) = leaf("node-a", &ca_cert, &ca_key);
+        let tls = crate::peer_tls::PeerTls::from_pems(
+            cert.as_bytes(),
+            key.as_bytes(),
+            ca_cert.pem().as_bytes(),
+        )
+        .unwrap();
+        let r = Replicator::new_with_tls("peer", "127.0.0.1:1965", 100, Some(&tls));
+        assert_eq!(r.peer_id(), "peer");
+    }
+
+    // The plaintext path must stay safe inside a runtime too (it delegates to
+    // the same thread-isolated build).
+    #[tokio::test]
+    async fn a_plaintext_replicator_builds_inside_a_runtime() {
+        let r = Replicator::new("peer", "127.0.0.1:1965", 100);
+        assert_eq!(r.peer_id(), "peer");
     }
 }

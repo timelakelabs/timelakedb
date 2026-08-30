@@ -13,6 +13,37 @@ here.
 
 ## [Unreleased]
 
+### Added — Required intra-cluster mTLS (C3, #72) (2026-08-30)
+
+The intra-cluster listener (`/internal/v1/*` on `TIMELAKE_CLUSTER_ADDR` — CL-2
+replication, CL-3 live/snapshot reads) now **requires** a cluster-signed client
+certificate when the cluster has TLS: set `TIMELAKE_TLS_CERT`/`_KEY` plus a new
+`TIMELAKE_CLUSTER_CA`, and a peer with no certificate — or one signed outside
+the cluster CA — is refused at the handshake. Unset keeps the link plaintext, so
+the drills and single-node dev are untouched. The **data-plane listeners stay
+want mode** (stock Grafana/Telegraf hold no cert, AT-6): the two listeners build
+independent client-auth configs from independent CAs (`TIMELAKE_TLS_CLIENT_CA`
+vs `TIMELAKE_CLUSTER_CA`). This closes SECURITY.md exposure 10 — de-published was
+not authenticated.
+
+The node presents its serving cert as its cluster identity: the CL-2 replication
+client and the CL-3 querier's remote-buffer client dial peers over https,
+present that identity, and trust **only** the cluster CA (not the public web
+PKI). The serving cert and the cluster CA hot-rotate on file change
+(validate-before-swap, last-good on a bad renewal), so a short-TTL renewal never
+restarts the node. A new gauge `timelake_cluster_mtls_required` reports the
+listener's mode, separate from the data plane's `timelake_tls_client_auth_mode`.
+
+Landed over #129 (a require-mode verifier beside want, in `timelake-tls`), #130
+(peer clients present an identity over TLS), #131 (require it on the listener)
+and #132 (the drill + docs). Drilled end to end in
+`docs/evidence/c3-mtls-rotation-drill.log`
+(`deploy/compose/cluster-drill/c3_mtls_rotation_drill.sh`): a two-ingester pair
+behind required mTLS — replication with zero acked loss across a node death, a
+hot cert rotation under continuous writes that the established replication link
+rides out (zero write errors, zero loss), and a certless / wrong-CA peer refused
+at the handshake.
+
 ## [0.3.0] - 2026-08-26
 
 ### Added — InfluxDB migration, proven end to end (#78) (2026-08-25)
