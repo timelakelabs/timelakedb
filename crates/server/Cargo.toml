@@ -50,6 +50,9 @@ tempfile.workspace = true
 # peer_tls tests: mint a cluster CA + node cert so the reqwest identity/root
 # path is exercised for real, not against a checked-in PEM that expires.
 rcgen = "0.13"
+# internal_mtls test: drive real https clients (carded + certless) against the
+# require-mode intra-cluster listener.
+reqwest = { workspace = true }
 
 
 

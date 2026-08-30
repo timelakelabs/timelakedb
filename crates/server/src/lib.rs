@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use arc_swap::ArcSwap;
@@ -39,6 +39,7 @@ use timelake_wal::{Wal, WalCipher};
 
 pub mod applog;
 pub mod compaction;
+pub mod internal_listener;
 pub mod logfile;
 pub mod peer_tls;
 pub mod querier;
@@ -820,6 +821,11 @@ pub struct Engine {
     /// SEC-3 want mode: the rotating client-CA bundle, when configured.
     client_ca: RwLock<Option<Arc<timelake_tls::RotatingClientCa>>>,
     client_auth_counts: RwLock<Option<Arc<timelake_flight::ClientAuthCounts>>>,
+    /// C3 (#72): set on an ingester whose intra-cluster listener requires
+    /// mTLS. Surfaced as `timelake_cluster_mtls_required` so an operator — and
+    /// the phase-4 drill — can see the internal link is locked down, distinct
+    /// from the data plane's want mode.
+    cluster_mtls_required: AtomicBool,
     /// CL-2 replication (ingester role only; `None` on a lone `all` node,
     /// which is why that path is byte-for-byte unchanged). The client to
     /// this ingester's peer, set by main from discovery.
@@ -1081,6 +1087,7 @@ impl Engine {
             tls: RwLock::new(None),
             client_ca: RwLock::new(None),
             client_auth_counts: RwLock::new(None),
+            cluster_mtls_required: AtomicBool::new(false),
             replicator: RwLock::new(None),
             replica_wal: Mutex::new(None),
             replica_wal_dir: RwLock::new(None),
@@ -2570,6 +2577,13 @@ impl Engine {
         *self.client_ca.write().expect("client ca lock") = Some(ca);
     }
 
+    /// Mark that the intra-cluster listener requires mTLS (C3 / #72), so
+    /// `/metrics` reports `timelake_cluster_mtls_required 1`. Called once by
+    /// the internal listener when it comes up in require mode.
+    pub fn mark_cluster_mtls_required(&self) {
+        self.cluster_mtls_required.store(true, Ordering::Relaxed);
+    }
+
     /// Attach the connection counters the Flight accept loop increments,
     /// so /metrics can report how many peers actually authenticate.
     pub fn set_client_auth_counts(&self, c: Arc<timelake_flight::ClientAuthCounts>) {
@@ -3103,6 +3117,18 @@ impl Engine {
                 if ca.last_reload_ok() { 1 } else { 0 },
             ),
             None => String::new(),
+        };
+        // C3 (#72): the intra-cluster listener's mode is separate from the data
+        // plane's want mode above — an ingester's internal link can be require
+        // while the data port stays want, so it earns its own gauge rather than
+        // overloading timelake_tls_client_auth_mode.
+        let client_ca_lines = if self.cluster_mtls_required.load(Ordering::Relaxed) {
+            format!(
+                "{client_ca_lines}# TYPE timelake_cluster_mtls_required gauge\n\
+                 timelake_cluster_mtls_required 1\n"
+            )
+        } else {
+            client_ca_lines
         };
         let (da_auth, da_anon, da_rej) = self.data_auth_counts.snapshot();
         let data_auth_lines = format!(

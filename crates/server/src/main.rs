@@ -183,21 +183,11 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        let internal = timelake_server::internal_router(Arc::clone(&engine));
-        let listen = cluster_addr.clone();
-        tokio::spawn(async move {
-            let l = match TcpListener::bind(&listen).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(addr = %listen, error = %e, "internal listener bind failed");
-                    return;
-                }
-            };
-            tracing::info!(addr = %listen, "CL2 internal replication listener up");
-            if let Err(e) = axum::serve(l, internal).await {
-                tracing::error!(error = %e, "internal replication listener exited");
-            }
-        });
+        // #72 phase 3: the intra-cluster listener requires mTLS when the
+        // cluster has TLS (TIMELAKE_TLS_CERT/KEY + TIMELAKE_CLUSTER_CA), and
+        // stays plaintext otherwise so the drills and single-node dev are
+        // untouched. The data-plane listeners keep their own (want) mode.
+        timelake_server::internal_listener::spawn(Arc::clone(&engine), cluster_addr.clone());
     }
 
     // CL-3: the querier is a read replica. It takes no writes, runs no
