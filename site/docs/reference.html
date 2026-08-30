@@ -572,6 +572,33 @@
         </p>
       </div>
 
+      <h3>Required mTLS on the intra-cluster listener (SEC-3 v2, C3)</h3>
+      <p>
+        Want mode is the client-compatible half. The half with no stock client
+        to keep working is the <strong>intra-cluster</strong> listener
+        (<code>TIMELAKE_CLUSTER_ADDR</code>, carrying CL-2 replication and CL-3
+        live/snapshot reads), and there it is <strong>required</strong>. Set
+        <code>TIMELAKE_CLUSTER_CA</code> to a PEM bundle (alongside
+        <code>TIMELAKE_TLS_CERT</code>/<code>TIMELAKE_TLS_KEY</code>) and that
+        listener refuses any peer that presents no client certificate, or one
+        signed outside the bundle, at the handshake. The node presents its own
+        serving certificate as its cluster identity when it dials a peer, and
+        trusts only <code>TIMELAKE_CLUSTER_CA</code> — never the public web PKI.
+      </p>
+      <p>
+        This is <strong>separate from</strong> the data plane:
+        <code>TIMELAKE_TLS_CLIENT_CA</code> (want, above) and
+        <code>TIMELAKE_CLUSTER_CA</code> (required, here) are independent bundles
+        driving independent modes on the two listeners, so requiring peer certs
+        on the private link never touches the Grafana/Telegraf front door. Leave
+        <code>TIMELAKE_CLUSTER_CA</code> unset and the link stays plaintext (dev,
+        the drill rig). <code>timelake_cluster_mtls_required</code> reports the
+        mode. The serving cert and the cluster CA hot-rotate under load with the
+        same validate-before-swap rule as everything else — drilled in
+        <code>docs/evidence/c3-mtls-rotation-drill.log</code> (replication
+        zero-loss, rotation mid-write, certless/wrong-CA refused).
+      </p>
+
       <h3>Data-plane tokens (SEC-4 phased)</h3>
       <p>
         <code>TIMELAKE_DATA_AUTH</code> controls whether the data plane

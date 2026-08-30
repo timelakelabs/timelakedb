@@ -1,0 +1,35 @@
+=== C3 required intra-cluster mTLS drill (2026-08-30T02:07:33Z) ===
+workdir=/tmp/tmp.brQU39OV22  bin=target/debug/timelake-server
+started ing-a (pid 640) ing-b (pid 642)
+both nodes healthy behind TLS
+
+### LEG 1 — mTLS replication, zero acked loss ###
+  internal mTLS active: 1 / 1
+  [PASS] ing-a reports required mTLS on its internal link (1)
+  [PASS] ing-b reports required mTLS on its internal link (1)
+  wrote 20000 to A
+  [PASS] A has every acked line (20000)
+  [PASS] A replicated to B over mTLS (replicated_total=11) (yes)
+  [PASS] B holds the frames dormant (no double-flush) (0)
+  SIGKILL ing-a, recover on ing-b over the mTLS listener
+    recover response: {"recovered":11}
+  [PASS] ZERO ACKED LOSS: every line A acked is on B after recovery (20000)
+
+### LEG 2 — hot cert rotation under load ###
+  rotating BOTH nodes' serving cert/key to a fresh pair from the same CA, mid-write
+  [PASS] writes never failed across the rotation (none)
+  [PASS] zero acked loss across the rotation (30000 written, all present) (30000)
+  [PASS] replication kept landing on B across the swap (frames 12 -> 36) (yes)
+  [PASS] A's cert reload stayed healthy (last_reload_ok=1) (1)
+
+### LEG 3 — the wall: only a cluster-signed peer gets in ###
+  no-cert:      http='000' curl_exit='56'
+  [PASS] a peer with NO client cert is refused at the handshake (refused)
+  wrong-ca:     http='000' curl_exit='56'
+  [PASS] a cert signed by an outside CA is refused (refused)
+  cluster-cert: body='ok'
+  [PASS] a cluster-signed cert is served (ok)
+
+=== verdict: 13 passed, 0 failed ===
+=== PASS: required intra-cluster mTLS — replication zero-loss, hot rotation
+          under load, and a certless/wrong-CA peer refused. ===

@@ -248,18 +248,25 @@ follow from "no authentication" and are listed so you can design around them.
    `_system.queries`, so "which client is doing this to us" is an
    answerable question rather than an inference from logs.
 
-10. **The intra-cluster listener is unauthenticated and now serves
-    rows.** `TIMELAKE_CLUSTER_ADDR` carries CL-2 replication and, since
-    CL-3, `GET /internal/v1/snapshot` — a table's live buffer as Arrow
-    IPC — and `/internal/v1/live`. Two consequences, both deliberate and
-    both requiring that this port stay on a private network:
-    it applies **no data-plane token check** (trust is the network now,
-    the peer certificate at C3), and it applies **no SEC-2 visibility
-    filter**, because the querier re-applies the caller's restriction
-    when it scans those batches, exactly as it does for a file it reads
-    from the object store. That makes reaching this port equivalent to
-    read access to the bucket itself. A querier is only as private as its
-    ingesters' cluster addresses.
+10. **The intra-cluster listener serves rows; authenticate it with
+    required mTLS.** `TIMELAKE_CLUSTER_ADDR` carries CL-2 replication and,
+    since CL-3, `GET /internal/v1/snapshot` — a table's live buffer as
+    Arrow IPC — and `/internal/v1/live`. **C3 (shipped) requires mTLS on
+    this listener** when the cluster has TLS (`TIMELAKE_TLS_CERT`/`_KEY` +
+    `TIMELAKE_CLUSTER_CA`): a peer with no client certificate, or one
+    signed outside the cluster CA, is refused at the handshake, so the
+    port authenticates its peers by certificate rather than trusting the
+    network — drilled in `docs/evidence/c3-mtls-rotation-drill.log`
+    (replication zero-loss, hot rotation under load, certless/wrong-CA
+    refused). Two things still hold and are deliberate. It applies **no
+    data-plane token check** (the client certificate is the check now),
+    and it applies **no SEC-2 visibility filter**, because the querier
+    re-applies the caller's restriction when it scans those batches,
+    exactly as it does for a file it reads from the object store. So a
+    *carded* peer still reads un-filtered rows — reaching this port is
+    equivalent to read access to the bucket itself — which is why it stays
+    on a private network even with mTLS, and why a cluster left plaintext
+    (no `TIMELAKE_CLUSTER_CA`) has no authentication here at all.
 
 ## Targeted delete (R-1)
 
@@ -464,7 +471,7 @@ ever pointed at files it did not produce.
 | Admin authentication + roles | SEC-4 (v1 MUST) | **Shipped** — sessions, Argon2id, CSRF, forced first-run rotation |
 | Data-plane authentication | SEC-4 (phased) | **Shipped** — token auth on both listeners via `TIMELAKE_DATA_AUTH=off\|optional\|required`, scopes + database scoping + SEC-2 grants, one decision function for HTTP and Flight, drilled live (`docs/evidence/data-auth-drill.log`). Turns SEC-2 claims into authorization. Tributary presents the token (P0-5, done — Tributary repo `docs/evidence/p05-data-auth.log`). |
 | Client certificates, want mode | SEC-3 (v2) | **Shipped** — opt-in via `TIMELAKE_TLS_CLIENT_CA`, hot-rotating anchors with dual-CA overlap, identity plumbed into the query session on **both** Flight SQL and `/api/sql` (the latter via a custom `axum-server` `Accept`, 2026-08-18). AT-7 still 19/19 with it enabled. |
-| Mutual TLS *required*, intra-cluster | SEC-3 (v2) | Not started — want mode is the client-compatible half; requiring it is a C2/C3 decision for the intra-cluster listener, where there is no Grafana to keep working |
+| Mutual TLS *required*, intra-cluster | SEC-3 (v2) | **Shipped (C3)** — the intra-cluster listener requires a cluster-signed client cert when the cluster has TLS (`TIMELAKE_CLUSTER_CA`); the data-plane listeners stay want mode (no Grafana to break). Independent CAs, independent modes. Drilled: `docs/evidence/c3-mtls-rotation-drill.log` — replication zero-loss over mTLS, hot cert rotation under load, certless/wrong-CA peer refused. |
 | Encryption at rest | SEC-1 (design constraint v1, implement SHOULD v2) | **Shipped early** — envelope encryption at the store chokepoint, opt-in by key config; AWS KMS as a key source (`TIMELAKE_KMS_KEY_ID`, C0) and the WAL (SEC-8) are covered. Per-column keys (Parquet Modular Encryption) remain open at the same seam. |
 | Row visibility labels | SEC-2 (design constraint v1) | **Shipped** — `_visibility` labels enforced in-scan via the mandatory-predicate hook. |
 
