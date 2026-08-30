@@ -13,6 +13,36 @@ here.
 
 ## [Unreleased]
 
+### Added — Live Consul discovery (C3, #71) (2026-08-30)
+
+Discovery gained a second backend. Set `TIMELAKE_DISCOVERY=consul://host:port`
+and a node **registers itself** with Consul and discovers its peers from the
+live catalog, instead of a `TIMELAKE_PEERS` list hand-maintained on every node
+and frozen until a restart; `static` (the default, unchanged) still reads
+`TIMELAKE_PEERS`. The router, the CL-3 querier, the compactor and the U3 cluster
+view **re-read membership live**, so a node joining or leaving takes effect
+without a restart — a joined ingester receives writes / is unioned into queries /
+appears in the view, a departed one is dropped.
+
+CL-5 is preserved: discovery carries no correctness. A stale or lying membership
+view only misroutes or wastes work — a misrouted write is idempotent under LWW,
+an unreachable querier falls through, and two compactors briefly owning a
+partition are caught by the commit fence — and a Consul outage **degrades to the
+last-known-good set** (a `CONSUL_DISCOVERY_DEGRADED` alarm) rather than failing
+writes. `peers()` is a lock-free snapshot read, never a Consul round-trip on the
+hot path; membership refreshes out of band.
+
+Landed over #137 (the ConsulDiscovery backend, repurposing the dead
+`crates/discovery` placeholder so `timelake-cluster` stays dependency-free),
+#138 (`TIMELAKE_DISCOVERY` selection, `main` holds `Arc<dyn Discovery>`), #139
+(consumers re-read live) and #140 (the drill). Drilled end to end against a real
+Consul agent in `docs/evidence/c3-consul-discovery-drill.log`
+(`deploy/compose/cluster-drill/c3_consul_discovery_drill.sh`): a router + ingester
+pair discovered from Consul with no `TIMELAKE_PEERS`, a live join and leave with
+no restart, and a Consul flap that degrades rather than failing writes (zero
+acked loss). Consul-side leave detection uses a self-passed TTL check, so Consul
+never has to reach a node behind required mTLS.
+
 ### Added — Required intra-cluster mTLS (C3, #72) (2026-08-30)
 
 The intra-cluster listener (`/internal/v1/*` on `TIMELAKE_CLUSTER_ADDR` — CL-2

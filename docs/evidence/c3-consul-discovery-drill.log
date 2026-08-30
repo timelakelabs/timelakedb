@@ -1,0 +1,31 @@
+=== C3 Consul discovery drill (2026-08-30T09:36:49Z) ===
+workdir=/tmp/tmp.wRc642ni54  bin=target/debug/timelake-server  consul=1.20.1
+-- fetching consul 1.20.1 --
+-- waiting for consul --
+consul up
+
+### LEG 1 — discover the ingester pair from Consul (no TIMELAKE_PEERS) ###
+  [PASS] both ingesters registered themselves in Consul (2)
+  [PASS] the router discovered both ingesters from Consul (2)
+  wrote 6000 via the router
+  [PASS] every routed line landed on a discovered ingester (sum across the pair) (6000)
+
+### LEG 2 — a third ingester joins, seen live ###
+  ing-c up; waiting for the router to pick it up (refresh is 5s)…
+  [PASS] the router routes to the joined ingester with no restart (3)
+
+### LEG 3 — an ingester leaves, dropped live ###
+  killing ing-b; Consul drops it after its TTL check lapses…
+  [PASS] the router stops routing to the departed ingester with no restart (2)
+
+### LEG 4 — CL-5: a Consul flap degrades, never fails ###
+  stopping Consul under load…
+  restarting Consul…
+  [PASS] writes never failed while Consul was down (served on last-known-good) (none)
+  [PASS] the router raised the degraded alarm once (1)
+  [PASS] no acked row lost across the flap (20000 written, all present) (20000)
+
+=== verdict: 8 passed, 0 failed ===
+=== PASS: nodes register with Consul and discover peers live — boot
+          discovery, a live join and leave with no restart, and a
+          Consul flap that degrades rather than failing writes. ===
