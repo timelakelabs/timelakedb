@@ -13,6 +13,22 @@ here.
 
 ## [Unreleased]
 
+### Added — Last-value cache, the mechanism (#57 phase 1, #149) (2026-08-31)
+
+A new `timelake-lastvalue` crate holds an in-memory cache of the latest
+`(timestamp, fields)` per series, updated on the write path — the groundwork for
+"current value per entity" lookups that today plan and scan files. It is opt-in
+per `(db, table)` via `PUT /admin/last_cache` (persisted like retention/rollups),
+so the write-path cost lands only where asked; when nothing is enabled,
+`is_active()` is a lock-free `false` and the write path does no extra work. Two
+traps handled up front and covered by tests: an out-of-order write with an older
+timestamp never moves "current value" backwards, and the cache is capped with
+LRU eviction — one entry per series is exactly the per-series blowup FR-2 forbids,
+so it accelerates HOT series, not all series, with `timelake_last_value_entries`
+exposing the live count. Querying it (a `last_cache('table')` function, verified
+against the scan counters) is phase 2 (#150); this phase ships the cache and the
+write-path wiring only, with unit + write-path integration tests.
+
 ### Added — Helm chart, cluster mode (#81 phase 2, #146) (2026-08-30)
 
 `helm install --set mode=cluster` deploys the C2 split: ingesters as a
