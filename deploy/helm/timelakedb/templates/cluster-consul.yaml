@@ -1,0 +1,61 @@
+{{- if and (eq .Values.mode "cluster") .Values.cluster.discovery.embedded }}
+# A single-pod Consul dev server for membership discovery. Fine for standing a
+# cluster up; run an HA Consul (or point cluster.discovery.externalUrl at one)
+# for production. Discovery carries no correctness (CL-5), so a Consul blip
+# degrades to last-known-good rather than failing writes — but a single Consul
+# is still a coordination SPOF worth replacing for real workloads.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-consul
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consul
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "timelakedb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: consul
+  template:
+    metadata:
+      labels:
+        {{- include "timelakedb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: consul
+    spec:
+      containers:
+        - name: consul
+          image: hashicorp/consul:1.19
+          args: ["agent", "-dev", "-client=0.0.0.0", "-ui"]
+          ports:
+            - name: http
+              containerPort: 8500
+          readinessProbe:
+            httpGet:
+              path: /v1/status/leader
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-consul
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consul
+spec:
+  selector:
+    {{- include "timelakedb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: consul
+  ports:
+    - name: http
+      port: 8500
+      targetPort: http
+{{- end }}

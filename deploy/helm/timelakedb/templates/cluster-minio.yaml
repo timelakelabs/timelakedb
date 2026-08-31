@@ -1,0 +1,71 @@
+{{- if and (eq .Values.mode "cluster") .Values.cluster.minio.enabled }}
+# A single-pod MinIO for a self-contained cluster smoke. Ephemeral (emptyDir) —
+# it is NOT a durable object store. Point `objectStore` at real S3 for anything
+# you care about; this exists so `mode: cluster` can be brought up and smoked on
+# a throwaway cluster with no cloud account.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-minio
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "timelakedb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: minio
+  template:
+    metadata:
+      labels:
+        {{- include "timelakedb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: {{ .Values.cluster.minio.accessKey | quote }}
+            - name: MINIO_ROOT_PASSWORD
+              value: {{ .Values.cluster.minio.secretKey | quote }}
+          ports:
+            - name: s3
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-minio
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  selector:
+    {{- include "timelakedb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+{{- end }}

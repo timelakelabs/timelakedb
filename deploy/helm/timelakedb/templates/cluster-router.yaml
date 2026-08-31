@@ -1,0 +1,111 @@
+{{- if eq .Values.mode "cluster" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-router
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  # Stateless, opens no engine, owns no data — a Deployment. It shards writes to
+  # the ingesters and forwards queries to the queriers, both discovered from
+  # Consul. This is the single address clients keep.
+  replicas: {{ .Values.cluster.router.replicas }}
+  selector:
+    matchLabels:
+      {{- include "timelakedb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: router
+  template:
+    metadata:
+      labels:
+        {{- include "timelakedb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: router
+    spec:
+      serviceAccountName: {{ include "timelakedb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "timelakedb.podSecurityContext" . | nindent 8 }}
+      initContainers:
+        {{- include "timelakedb.waitConsulInit" . | nindent 8 }}
+      containers:
+        - name: timelakedb
+          image: {{ include "timelakedb.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            {{- include "timelakedb.clusterEnvFrom" . | nindent 12 }}
+          env:
+            {{- include "timelakedb.podIdentityEnv" . | nindent 12 }}
+            - name: TIMELAKE_ROLE
+              value: router
+            {{- include "timelakedb.tlsEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+            - name: flight
+              containerPort: {{ .Values.service.flightPort }}
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- include "timelakedb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/timelake/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "timelakedb.fullname" . }}
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # THE client endpoint: writes + /api/sql on http, Flight SQL. It selects the
+  # ROUTER only — never an ingester or querier directly, and never the internal
+  # listener (1965), which stays on the headless ingester Service.
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "timelakedb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+    - name: flight
+      port: {{ .Values.service.flightPort }}
+      targetPort: flight
+{{- end }}

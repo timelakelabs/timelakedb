@@ -1,0 +1,17 @@
+=== TimeLakeDB Helm CLUSTER smoke (2026-08-31T01:28:39Z) ===
+release=tldb  mode=cluster  discovery=Consul (self-registering)  object store=bundled MinIO
+
+-- topology (chart-rendered: StatefulSet for data, Deployments for the rest) --
+  statefulset.apps/tldb-timelakedb-ingester  ready=2/2
+  deployment.apps/tldb-timelakedb-compactor  ready=1/1
+  deployment.apps/tldb-timelakedb-querier  ready=2/2
+  deployment.apps/tldb-timelakedb-router  ready=1/1
+  router restarts: 0 (wait-consul init removed the startup race)
+
+-- Consul membership (each node self-registered its role) --
+  1 compactor, 2 ingester, 2 querier, 1 router
+
+-- write THROUGH THE ROUTER (shards to ingesters), read back (router -> querier -> ingester buffers) --
+  write: HTTP 204
+  read : [{"n":5}]
+=== CLUSTER HELM SMOKE: PASS ===

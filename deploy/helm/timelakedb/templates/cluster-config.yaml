@@ -1,0 +1,24 @@
+{{- if eq .Values.mode "cluster" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-cluster
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+data:
+  # Shared, non-per-pod env for every cluster node. The per-pod bits (node id,
+  # advertised addresses) come from the Downward API in each pod spec.
+  TIMELAKE_DATA_AUTH: {{ .Values.dataAuth | quote }}
+  RUST_LOG: {{ .Values.logLevel | quote }}
+  {{- if .Values.cluster.minio.enabled }}
+  TIMELAKE_OBJECT_STORE: "s3://{{ .Values.cluster.minio.bucket }}/objects"
+  AWS_ENDPOINT_URL: "http://{{ include "timelakedb.fullname" . }}-minio:9000"
+  AWS_REGION: "us-east-1"
+  {{- else }}
+  TIMELAKE_OBJECT_STORE: {{ .Values.objectStore.url | quote }}
+  AWS_REGION: {{ .Values.objectStore.region | quote }}
+  {{- with .Values.objectStore.endpoint }}
+  AWS_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

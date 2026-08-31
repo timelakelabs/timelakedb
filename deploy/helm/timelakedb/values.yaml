@@ -4,8 +4,57 @@
 # a PVC for the durable data dir, ConfigMap/Secret plumbing, and safe defaults.
 # The `mode: cluster` topology (router / ingester / querier split) is phase 2.
 
-# "single" = one role=all node. "cluster" = the C2 split (phase 2, #146).
+# "single" = one role=all node. "cluster" = the C2 split (router / ingester /
+# querier / compactor).
 mode: single
+
+# Cluster mode (#146). Only read when mode == "cluster".
+#
+# Discovery is Consul, NOT static TIMELAKE_PEERS. A static peers list cannot work
+# from a shared StatefulSet pod template: an ingester replicates to its first
+# ingester peer and does not filter itself out, so every ingester pod would need
+# a DIFFERENT peers list (one that excludes itself), which one template can't
+# express. Consul has each node self-register and returns peers with SELF
+# EXCLUDED, so replica counts are genuinely a value you can turn. It's also the
+# backend the live discovery drill (#140) exercises.
+cluster:
+  discovery:
+    # Bundle a single Consul (dev server) with the chart, or point at an
+    # existing one. A bundled dev Consul is a single pod — fine for getting a
+    # cluster up; run an HA Consul for production.
+    embedded: true
+    # Used only when embedded is false: consul://host:8500
+    externalUrl: ""
+
+  # Ingesters: the write path. A StatefulSet (durable WAL + data dir + PVC),
+  # paired for CL-2 replication. 2 is the tested pair.
+  ingester:
+    replicas: 2
+    persistence:
+      size: 10Gi
+      storageClass: ""
+
+  # Queriers: stateless read replicas. A Deployment; they own no durable data
+  # (catalog is replayed from the object store), so an ephemeral data dir.
+  querier:
+    replicas: 2
+
+  # Router: the single public endpoint. Stateless, opens no engine.
+  router:
+    replicas: 1
+
+  # Compactor: maintenance + rollups. One, unsharded. Owns no durable data.
+  compactor:
+    enabled: true
+
+  # A shared object store is REQUIRED in cluster mode — queriers replay one
+  # catalog and union the ingesters' buffers on top; there is no shared local
+  # disk. Set the top-level `objectStore`, or enable this dev MinIO for a smoke.
+  minio:
+    enabled: false
+    bucket: timelake-cluster
+    accessKey: minioadmin
+    secretKey: minioadmin
 
 image:
   repository: ghcr.io/timelakelabs/timelakedb

@@ -4,18 +4,58 @@ Deploy TimeLakeDB on Kubernetes. This encodes the topology the project actually
 tests, so you don't hand-roll StatefulSets, Services and the config/secret
 plumbing and get the cluster-role split subtly wrong.
 
-**Phase 1 (this chart) ships single-node.** `mode: cluster` — the router /
-ingester / querier split — is phase 2 (#146).
+Two modes: `mode: single` (one `role=all` node) and `mode: cluster` (the
+router / ingester / querier / compactor split).
 
-## Install
+## Install — single node
 
 ```sh
 helm install tldb deploy/helm/timelakedb -n timelakedb --create-namespace
 ```
 
-That brings up one `role=all` node: a StatefulSet with a PVC for the data dir, a
-client ClusterIP Service (HTTP `1963`, Flight SQL `1964`), and a headless Service
-for stable identity.
+One `role=all` node: a StatefulSet with a PVC for the data dir, a client
+ClusterIP Service (HTTP `1963`, Flight SQL `1964`), and a headless Service for
+stable identity.
+
+## Install — cluster
+
+```sh
+# A self-contained cluster with a bundled dev Consul + MinIO (for a smoke):
+helm install tldb deploy/helm/timelakedb -n timelakedb --create-namespace \
+  --set mode=cluster --set cluster.minio.enabled=true
+
+# Production: external S3, and pin the image tag:
+helm install tldb deploy/helm/timelakedb -n timelakedb --create-namespace \
+  --set mode=cluster \
+  --set objectStore.enabled=true --set objectStore.url=s3://my-bucket/timelake \
+  --set objectStore.existingSecret=my-s3-creds \
+  --set image.tag=v0.1.0
+```
+
+Cluster mode brings up **ingesters as a StatefulSet** (durable WAL + PVC, CL-2
+paired) and the **router, queriers and compactor as Deployments** (they own no
+durable data). Clients talk only to the router's ClusterIP Service (`tldb-timelakedb`).
+
+Discovery is **Consul, not static `TIMELAKE_PEERS`**. A static peers list cannot
+be expressed from a shared StatefulSet pod template: an ingester replicates to
+its first ingester peer without filtering itself out, so every pod would need a
+*different* list. Consul has each node self-register (node id = pod name, address
+= pod IP) and returns peers with self excluded, so `cluster.ingester.replicas` is
+a value you can actually turn. A shared object store (`objectStore` external S3,
+or the bundled dev MinIO) is required — queriers replay one catalog and there is
+no shared local disk.
+
+Verified on a real cluster in `docs/evidence/helm-cluster-smoke.log`: 2 ingesters +
+2 queriers + 1 compactor + 1 router self-register in Consul, a write through the
+router shards to the ingesters (204), and a read returns it through router →
+querier → ingester buffers.
+
+### The internal listener stays internal
+
+The intra-cluster listener (`1965`) is only on the **headless** ingester Service
+and is reached by pod IP over the cluster network. It is never on the router's
+client Service and never a LoadBalancer — exposing it would reopen the exposure
+the de-published port closed, and C3 makes intra-cluster mTLS required.
 
 ## Smoke it
 
