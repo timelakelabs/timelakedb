@@ -13,8 +13,11 @@ tracing.workspace = true
 bytes.workspace = true
 timelake-store = { path = "../store" }
 timelake-catalog = { path = "../catalog" }
+# #57: the last-value cache and its FieldValue type back the last_cache()
+# table function, which runs in production, not only tests.
+timelake-ingest = { path = "../ingest" }
+timelake-lastvalue = { path = "../lastvalue" }
 
 [dev-dependencies]
 timelake-buffer = { path = "../buffer" }
-timelake-ingest = { path = "../ingest" }
 

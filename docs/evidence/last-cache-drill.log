@@ -1,0 +1,26 @@
+=== last-value cache drill (2026-08-31T10:52:35Z) ===
+workdir=/tmp/tmp.8r50DlKzLF  bin=target/debug/timelake-server
+-- enable last_cache for poc.cpu via /admin/last_cache --
+  [PASS] PUT /admin/last_cache enabled poc.cpu (200)
+-- write series with distinct timestamps, plus an out-of-order older one --
+  [PASS] write t=10 (204)
+  [PASS] write t=20 (the latest) (204)
+  [PASS] write out-of-order t=15 (204)
+-- wait for the flush so a scan reads files (maintenance tick is ~10 s) --
+
+### 1. no file scan ###
+  [PASS] a real scan considered files (0 -> 1) (yes)
+  [PASS] last_cache('cpu') scanned NO files (stayed 1) (1)
+
+### 2. exact, and out-of-order-safe ###
+  scan   : [{"host":"a","usage":0.5},{"host":"b","usage":0.6}]
+  cached : [{"host":"a","usage":0.5},{"host":"b","usage":0.6}]
+  [PASS] last_cache equals the scan's latest-per-series ([{"host":"a","usage":0.5},{"host":"b","usage":0.6}])
+  [PASS] host a is 0.5 (the t=20 value), not 99 (the out-of-order t=15) (0.5)
+
+### 3. the cap holds (TIMELAKE_LAST_CACHE_MAX=50) ###
+  [PASS] wrote 500 more series (204)
+  [PASS] entry count pinned at the cap (50 hot series, not 500+) (50)
+  [PASS] timelake_last_value_entries agrees (50)
+
+=== ALL PASS ===
