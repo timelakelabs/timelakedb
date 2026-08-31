@@ -1044,7 +1044,8 @@ impl Engine {
             cfg.query_mem_bytes,
             cfg.max_concurrent_queries,
             cfg.query_timeout_secs,
-        );
+        )
+        .with_last_value(Arc::clone(&last_value));
         let query_env = match &selfmon {
             Some(m) => query_env.with_observer(m.clone()),
             None => query_env,
@@ -1879,6 +1880,12 @@ impl Engine {
     /// wiring is testable.
     pub fn last_value_snapshot(&self, db: &str, table: &str) -> Vec<timelake_lastvalue::LastValue> {
         self.last_value.snapshot(db, table)
+    }
+
+    /// Cumulative data files a scan has considered (#69). Exposed so a test can
+    /// prove `last_cache('table')` touches none of them.
+    pub fn scan_files_considered(&self) -> u64 {
+        self.scan_stats.files_considered.load(Ordering::Relaxed)
     }
 
     pub fn enable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {

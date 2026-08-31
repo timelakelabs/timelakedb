@@ -13,6 +13,23 @@ here.
 
 ## [Unreleased]
 
+### Added — Last-value cache, the query (#57 phase 2, #150) (2026-08-31)
+
+`last_cache('<table>')` is now a SQL table function that answers "current value
+per entity" from the in-memory cache (#149) with NO file scan — the latest
+`(time, tags, fields)` per series handed back as an in-memory table. It only
+ever returns cached rows, so there is no wrong-answer fallback: a historical
+point or a windowed aggregate queries the ordinary table and scans, as before.
+Registered per query in `run_sql_env` (the one production call site) and scoped
+to the session's database; it passes the read-only guard because it is a
+`SELECT`. Verified end to end (`deploy/compose/last_cache_drill.sh`,
+`docs/evidence/last-cache-drill.log`) against the SCAN COUNTERS, not wall-clock:
+a real latest-per-series scan moves `timelake_scan_files_considered_total`,
+`last_cache('cpu')` leaves it flat; its answer equals the scan's exactly (and an
+out-of-order older write never wins); and writing 500 series into a 50-entry cap
+keeps the count at 50 with only the hot series returned. Reference docs updated;
+this completes #57.
+
 ### Added — Last-value cache, the mechanism (#57 phase 1, #149) (2026-08-31)
 
 A new `timelake-lastvalue` crate holds an in-memory cache of the latest

@@ -103,3 +103,70 @@ fn the_opt_in_and_its_entries_are_dropped_on_disable() {
         "entries dropped with the opt-in"
     );
 }
+
+/// The phase-2 payoff (#150): last_cache('t') answers from the cache with NO
+/// file scan, and its answer equals a real scan's latest-per-series — even
+/// after the data has flushed to files, which is what makes "no file scan"
+/// meaningful (a scan WOULD read them).
+#[tokio::test]
+async fn last_cache_query_answers_from_cache_without_scanning_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    e.enable_last_cache("poc", "cpu").unwrap();
+
+    // Distinct timestamps per host; the last write per host is the "current"
+    // value. An out-of-order older write must not become the answer.
+    wr(
+        &e,
+        "poc",
+        b"cpu,host=a usage=0.1 10\ncpu,host=b usage=0.2 10",
+    );
+    wr(
+        &e,
+        "poc",
+        b"cpu,host=a usage=0.5 20\ncpu,host=b usage=0.6 20",
+    );
+    wr(&e, "poc", b"cpu,host=a usage=99 15"); // out-of-order, older than 20
+    // Flush to files, so a normal scan actually reads data files.
+    e.flush_all().unwrap();
+
+    let q = |sql: &'static str| {
+        let e = &e;
+        async move {
+            let b = e.sql_batches("poc", sql, vec![], None).await.unwrap();
+            timelake_query::batches_to_json(&b)
+        }
+    };
+
+    // A normal scan reads files — the counter moves. Latest-per-host via a
+    // window, which is exactly what the cache is supposed to shortcut.
+    let base = e.scan_files_considered();
+    let scanned = q("SELECT host, usage FROM (SELECT host, usage, \
+                     row_number() OVER (PARTITION BY host ORDER BY time DESC) rn \
+                     FROM cpu) WHERE rn = 1 ORDER BY host")
+    .await;
+    assert!(
+        e.scan_files_considered() > base,
+        "a real scan considered files"
+    );
+
+    // last_cache answers from memory — the counter does NOT move.
+    let before = e.scan_files_considered();
+    let cached = q("SELECT host, usage FROM last_cache('cpu') ORDER BY host").await;
+    assert_eq!(
+        e.scan_files_considered(),
+        before,
+        "last_cache('cpu') scanned NO data files"
+    );
+
+    // Exact: the cache's latest-per-host equals the scan's, and the
+    // out-of-order older write did not win.
+    assert_eq!(
+        cached, scanned,
+        "last_cache equals the scan's latest-per-series"
+    );
+    assert_eq!(cached[0]["host"], "a");
+    assert_eq!(cached[0]["usage"], 0.5);
+    assert_eq!(cached[1]["host"], "b");
+    assert_eq!(cached[1]["usage"], 0.6);
+}

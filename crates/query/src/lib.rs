@@ -42,6 +42,8 @@ pub use metrics::{QueryMetrics, QueryObserver, QueryOutcome, QueryStats};
 
 use datafusion::execution::runtime_env::RuntimeEnv;
 
+mod last_cache;
+
 /// Shared query environment (RR-1/RR-2 hardening, M4):
 /// ONE memory pool for every concurrent query (previously each query got
 /// its own full-size pool — concurrency multiplied memory, the exact
@@ -58,6 +60,10 @@ pub struct QueryEnv {
     /// here. `None` on a plain node and in tests, in which case the whole
     /// per-query path costs one `Option` check.
     observer: Option<Arc<dyn QueryObserver>>,
+    /// #57: the last-value cache, if this node has one. `Some` registers the
+    /// `last_cache('table')` function; `None` (tests, and a node before the
+    /// cache exists) leaves it unregistered, so nothing changes.
+    last_value: Option<Arc<timelake_lastvalue::LastValueCache>>,
 }
 
 impl QueryEnv {
@@ -87,6 +93,7 @@ impl QueryEnv {
             timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
             metrics: QueryMetrics::new(),
             observer: None,
+            last_value: None,
         }
     }
 
@@ -95,6 +102,14 @@ impl QueryEnv {
     /// node without self-monitoring stays exactly as it was.
     pub fn with_observer(mut self, observer: Arc<dyn QueryObserver>) -> QueryEnv {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Attach the last-value cache so `last_cache('table')` resolves (#57).
+    /// Builder-style for the same reason: every existing `new` caller is
+    /// untouched and a node without the cache stays exactly as it was.
+    pub fn with_last_value(mut self, cache: Arc<timelake_lastvalue::LastValueCache>) -> QueryEnv {
+        self.last_value = Some(cache);
         self
     }
 }
@@ -229,6 +244,18 @@ pub async fn run_sql_env(
             finish(0, QueryOutcome::Failed);
             return Err(opaque(&ref_id, "register", e));
         }
+    }
+
+    // #57: `last_cache('table')` answers from the in-memory cache, so a scan of
+    // it touches no data files. Registered per query, scoped to this db.
+    if let Some(cache) = &env.last_value {
+        ctx.register_udtf(
+            "last_cache",
+            Arc::new(last_cache::LastCacheFunc::new(
+                cache.clone(),
+                db.to_string(),
+            )),
+        );
     }
 
     let work = async {

@@ -234,6 +234,22 @@
         </table>
       </div>
 
+      <h3>Last-value cache (<code>last_cache</code>)</h3>
+      <p>
+        <code>last_cache('&lt;table&gt;')</code> is a table function that returns
+        the latest <code>(time, tags, fields)</code> per series from an in-memory
+        cache — answering "current value per entity" with <strong>no file
+        scan</strong>. Enable it per table first with
+        <code>PUT /admin/last_cache</code> (see the admin surface below); it is
+        off by default because it is <strong>bounded</strong>: it accelerates hot
+        (recently written) series, not all series, so a table with more series
+        than the cap holds keeps only its most-recently-written ones. It is exact
+        for the latest value — an out-of-order write with an older timestamp
+        never becomes the answer — but only for that: a historical point or a
+        windowed aggregate queries the ordinary table and scans, as always.
+      </p>
+      <pre>SELECT host, usage FROM last_cache('cpu') ORDER BY host</pre>
+
       <h3>JSON encoding of results</h3>
       <p><code>/api/sql</code> returns an array of row objects:</p>
       <div class="code">
@@ -444,6 +460,28 @@
           both on <code>/metrics</code>.
         </p>
       </div>
+
+      <h3>Last-value cache (R-4)</h3>
+      <p>
+        Turn the last-value cache on for a table so
+        <code>last_cache('&lt;table&gt;')</code> can answer from memory (see the
+        SQL dialect above). It is off by default and bounded; enabling it costs a
+        small per-write update on that table only.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Auth</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /admin/last_cache</code></td><td>viewer</td><td>200 + <code>{"tables":[{db, table}]}</code></td></tr>
+            <tr><td><code>PUT /admin/last_cache</code></td><td>operator; body <code>db</code>, <code>table</code></td><td>200; enables the cache for that table, persists durably</td></tr>
+            <tr><td><code>DELETE /admin/last_cache/{db}/{table}</code></td><td>operator</td><td>200; disables it and drops its cached rows</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <code>timelake_last_value_entries</code> on <code>/metrics</code> is the
+        live entry count across all cached tables — watch it approach the cap.
+      </p>
 
       <h3>Admin console (<code>/admin/ui</code>)</h3>
       <p>
