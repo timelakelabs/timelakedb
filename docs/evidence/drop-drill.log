@@ -1,0 +1,26 @@
+=== authorized DROP drill (2026-08-31T14:43:32Z) ===
+workdir=/tmp/tmp.KkBwnkDtAl  bin=target/debug/timelake-server
+
+### setup: a declared table with data, plus a second table so the db persists ###
+  [PASS] CREATE poc.sensors (201)
+  [PASS] wrote 2 rows (204)
+  [PASS] wrote poc.keep (keeps the db alive) (204)
+  [PASS] sensors has 2 rows before the drop (2)
+
+### 1. admin DROP removes the table ###
+  [PASS] DELETE /admin/tables/poc/sensors (200)
+  [PASS] SELECT on the dropped table errors (gone, not empty) (400)
+  [PASS] the other table is untouched (1)
+
+### 2. the data plane still refuses DDL ###
+  [PASS] DROP TABLE over /api/sql refused (read-only guard) (400)
+  [PASS] so keep is still there (1)
+
+### 3. DROP is not permanent (schema-on-write recreates) ###
+  [PASS] a write to the dropped name is accepted (204)
+  [PASS] the table is back, with just the new row (1)
+
+### 4. dropping a table that does not exist ###
+  [PASS] DELETE of a nonexistent table is a 400, not a silent success (400)
+
+=== ALL PASS ===

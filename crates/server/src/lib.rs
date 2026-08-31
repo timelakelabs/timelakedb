@@ -2041,6 +2041,83 @@ impl Engine {
         self.catalog.declared_schema(db, table)
     }
 
+    /// Authorized DROP (#80 phase 2): remove a table entirely — its files, its
+    /// declaration, any standing tombstones and its cached rows — cluster-wide
+    /// via a manifest-log drop marker. NOT data-plane DDL; `/api/sql` stays
+    /// read-only. Returns the seq the drop committed at.
+    ///
+    /// It flushes first, on purpose. Unflushed rows live in the WAL, and the WAL
+    /// is replayed into buffers on the next restart AFTER the catalog loads — so
+    /// a drop that skipped the flush would remove the table's files and then
+    /// watch the restart resurrect it from the log. `flush_all` seals and
+    /// reclaims the WAL, so once it returns there is nothing left to replay. A
+    /// write that races the flush can still leave a fresh row behind: dropping a
+    /// table that is being written to is the operator's call, not something the
+    /// engine can make safe short of stopping the world.
+    pub fn drop_table(&self, db: &str, table: &str) -> Result<u64, String> {
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(
+                "this node is a querier (TIMELAKE_ROLE=querier) and holds no drop path — \
+                 send the drop to the router or an ingester"
+                    .into(),
+            );
+        }
+        let exists = self.table_names(db).iter().any(|t| t == table)
+            || self.catalog.declared_schema(db, table).is_some();
+        if !exists {
+            return Err(format!("table '{table}' does not exist in database '{db}'"));
+        }
+
+        self.flush_all()
+            .map_err(|e| format!("flush before drop: {e}"))?;
+
+        // The objects to reclaim, read AFTER the flush so the just-flushed files
+        // are included.
+        let paths: Vec<String> = self
+            .catalog
+            .files_for(db, table)
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+
+        let seq = self
+            .catalog
+            .commit_drop(db, table)
+            .map_err(|e| format!("commit drop: {e}"))?;
+
+        // Purge the in-memory traces the catalog cannot reach. The file-derived
+        // schema registry only ever ADDS (refresh folds in new files, never
+        // removes), so a dropped table lingers there unless cleared here; the
+        // buffer and holding area should be empty after the flush but are
+        // cleared defensively against a racing write.
+        {
+            let key = (db.to_string(), table.to_string());
+            self.schemas.write().expect("schemas lock").remove(&key);
+            self.schema_source
+                .write()
+                .expect("schema source lock")
+                .remove(&key);
+            self.flushing.write().expect("flushing lock").remove(&key);
+        }
+        if let Some(tables) = self.dbs.write().expect("dbs lock").get_mut(db) {
+            tables.remove(table);
+        }
+        // A last-value cache the table had opted into goes with it; persist so a
+        // restart does not re-enable it for a table that no longer exists.
+        if self
+            .last_value
+            .enabled_tables()
+            .iter()
+            .any(|(d, t)| d == db && t == table)
+        {
+            self.last_value.disable(db, table);
+            let _ = self.persist_last_cache();
+        }
+
+        self.defer_gc(paths);
+        Ok(seq)
+    }
+
     pub fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
         self.last_value.disable(db, table);
         self.persist_last_cache()
@@ -2549,6 +2626,10 @@ impl timelake_api::Engine for Engine {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Engine::create_table(self, db, table, cols)
+    }
+
+    fn drop_table(&self, db: &str, table: &str) -> Result<(), String> {
+        Engine::drop_table(self, db, table).map(|_seq| ())
     }
 
     fn rollups(&self) -> Vec<RollupDef> {

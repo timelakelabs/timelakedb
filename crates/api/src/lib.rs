@@ -376,6 +376,12 @@ pub trait Engine: Send + Sync + 'static {
         columns: Vec<(String, String, bool)>,
     ) -> Result<(), String>;
 
+    /// Authorized DROP (#80 phase 2), backing `DELETE /admin/tables/{db}/{table}`:
+    /// remove a table entirely (files, declaration, tombstones, cached rows)
+    /// via a manifest-log drop marker. The data plane stays read-only, so a
+    /// `DROP TABLE` over `/api/sql` is still refused.
+    fn drop_table(&self, db: &str, table: &str) -> Result<(), String>;
+
     /// R-2 rollups (ARCHITECTURE §18): the runtime downsampling surface,
     /// backing `/admin/rollups`. `set_rollup` upserts by `(db, name)` and
     /// enforces the retention invariant (§18.4); materialisation runs on the
@@ -545,6 +551,10 @@ pub fn admin_app<E: Engine>(
             axum::routing::delete(last_cache_delete::<E>),
         )
         .route("/admin/tables", axum::routing::post(tables_create::<E>))
+        .route(
+            "/admin/tables/{db}/{table}",
+            axum::routing::delete(tables_drop::<E>),
+        )
         .route("/admin/config", get(config_list::<E>))
         .route(
             "/admin/config/{key}",
@@ -1612,6 +1622,56 @@ async fn tables_create<E: Engine>(
                 &session,
                 source,
                 "table.create",
+                Some(target),
+                None,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::BAD_REQUEST, &e)
+        }
+    }
+}
+
+async fn tables_drop<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path((db, table)): axum::extract::Path<(String, String)>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    // Removing a table, like introducing one, is an admin operation.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let target = format!("{db}.{table}");
+    match state.engine.drop_table(&db, &table) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "table.drop",
+                Some(target),
+                None,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "db": db, "table": table, "status": "dropped" })).into_response()
+        }
+        // A table that does not exist is the caller's mistake — 400, not a
+        // silent 200. (An infrastructure failure surfaces here too; the message
+        // says which.)
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "table.drop",
                 Some(target),
                 None,
                 None,

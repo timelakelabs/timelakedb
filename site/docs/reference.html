@@ -228,13 +228,13 @@
           <tbody>
             <tr><td><code>SHOW TABLES</code>, <code>information_schema</code></td><td><strong>Supported.</strong> The default catalog is named after the database, so <code>poc.public.events</code> resolves and matches what Flight SQL reports</td></tr>
             <tr><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code></td><td><strong>Refused</strong> — the surface is read-only. Write with line protocol; remove data with retention (FR-7) or a targeted delete (<code>POST /admin/delete</code>)</td></tr>
-            <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td><strong>Refused on this surface</strong> — the read-only guard rejects DDL before it plans, so a <code>DROP TABLE</code> no longer appears to succeed while doing nothing. Creating a table is an <em>authorized</em> operation instead: <code>POST /admin/tables</code> (see <a href="#authorized-ddl">Authorized table creation</a> below)</td></tr>
+            <tr><td><code>CREATE TABLE</code>, <code>DROP TABLE</code></td><td><strong>Refused on this surface</strong> — the read-only guard rejects DDL before it plans, so a <code>DROP TABLE</code> no longer appears to succeed while doing nothing. Creating and dropping tables are <em>authorized</em> operations instead: <code>POST</code> / <code>DELETE /admin/tables</code> (see <a href="#authorized-ddl">Authorized table creation and removal</a> below)</td></tr>
             <tr><td><code>COPY … TO '&lt;path&gt;'</code></td><td><strong>Refused</strong> — this once wrote a file as the server process; the surface is now read-only, enforced on the plan (even inside <code>EXPLAIN ANALYZE</code>). See <a href="index.html#security">Security</a></td></tr>
           </tbody>
         </table>
       </div>
 
-      <h3 id="authorized-ddl">Authorized table creation</h3>
+      <h3 id="authorized-ddl">Authorized table creation and removal</h3>
       <p>
         A table normally comes into being on its first write — schema-on-write
         infers columns and types from the line protocol. When you want a table's
@@ -263,6 +263,16 @@
         carries a value of the wrong type is a <strong>400 before the WAL</strong>
         — the write is refused, not durably accepted and coerced. Undeclared
         tables are unaffected: they still auto-create on first write.
+      </p>
+      <p>
+        Removing a table is the symmetric admin operation:
+        <code>DELETE /admin/tables/{db}/{table}</code>. It records a drop in the
+        same manifest log, so every node purges the table at one point — its
+        files, its declaration, any standing targeted-delete tombstones, and its
+        last-value cache. The physical objects are reclaimed on the usual GC
+        grace timer. A <code>DROP TABLE</code> over <code>/api/sql</code> stays
+        refused; and a drop is not permanent — writing to the name again
+        re-creates the table by schema-on-write, now with no declaration.
       </p>
 
       <h3>Last-value cache (<code>last_cache</code>)</h3>
@@ -356,6 +366,7 @@
             <tr><td><code>PUT /admin/retention</code></td><td>operator to grow, <strong>admin</strong> to shrink, introduce, or widen scope; body <code>db</code>, <code>table</code>, <code>duration</code></td><td>—</td><td>200; persists durably, applies ≤ 60 s</td></tr>
             <tr><td><code>DELETE /admin/retention/{db}/{table}</code></td><td>admin</td><td>—</td><td>200; that table keeps everything again</td></tr>
             <tr><td><code>POST /admin/tables</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>columns[]</code> (each <code>name</code>, <code>type</code> = float|integer|unsigned|boolean|string, optional <code>tag</code>)</td><td>—</td><td>201 + <code>{db, table, status:"created"}</code>. Authorized DDL: declares a table's schema in the catalog so it is queryable empty and a violating write is 400. 400 on a bad type, a duplicate or reserved (<code>time</code>) column, or a table that already exists</td></tr>
+            <tr><td><code>DELETE /admin/tables/{db}/{table}</code></td><td><strong>admin</strong></td><td>—</td><td>200 + <code>{db, table, status:"dropped"}</code>. Removes the table wholesale — files, declaration, tombstones and cached rows — cluster-wide; the bytes go on the GC grace timer. A later write re-creates it by schema-on-write. 400 if the table does not exist</td></tr>
             <tr><td><code>GET /admin/config</code></td><td>session (viewer)</td><td>—</td><td>200 + <code>{revision, settings[]}</code> — every setting with its effective value and where it came from (default &lt; property &lt; override), plus the applied config revision</td></tr>
             <tr><td><code>GET /admin/config/{key}</code></td><td>session (viewer)</td><td>—</td><td>200 + that one setting's layered provenance. 404 if unknown</td></tr>
             <tr><td><code>PUT /admin/config/{key}</code></td><td>the setting's own role (viewer/operator/<strong>admin</strong>); body <code>value</code> (a value, or <code>null</code> for explicit-off)</td><td><code>dry_run=1</code> previews without applying</td><td>200; persists durably and applies live. 409 if it breaks a cross-field invariant (the error names it), 404 if unknown</td></tr>
