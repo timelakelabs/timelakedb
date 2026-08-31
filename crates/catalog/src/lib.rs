@@ -99,6 +99,16 @@ pub struct TableSchema {
     pub columns: Vec<TableColumn>,
 }
 
+/// A table dropped by an authorized DROP (#80 phase 2), recorded in the manifest
+/// log so every node purges it — its files, its declaration and any standing
+/// tombstones — at the same seq. A later write re-creates the table by
+/// schema-on-write; the drop only removes what existed at or before its seq.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DroppedTable {
+    pub db: String,
+    pub table: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     seq: u64,
@@ -115,6 +125,10 @@ struct ManifestEntry {
     /// so every manifest written before this feature still deserializes.
     #[serde(default)]
     schema_decls: Vec<TableSchema>,
+    /// Tables removed by an authorized DROP (#80 phase 2). `default` so every
+    /// manifest written before this feature still deserializes.
+    #[serde(default)]
+    drop_tables: Vec<DroppedTable>,
 }
 
 /// Read and parse one manifest object, tagging the path on failure so a
@@ -185,6 +199,16 @@ fn apply_entry(
             tombstones.push(t);
         }
     }
+    // #80 phase 2: a DROP purges the table wholesale — every file, the
+    // declaration, and any standing tombstones — at this seq. Applied LAST so
+    // that if one entry ever both added to and dropped a table, the drop wins;
+    // in practice a DROP is its own commit. A later write re-creates the table
+    // with a fresh add at a higher seq, which this leaves untouched.
+    for d in &entry.drop_tables {
+        files.remove(&(d.db.clone(), d.table.clone()));
+        declared.remove(&(d.db.clone(), d.table.clone()));
+        tombstones.retain(|t| !(t.db == d.db && t.table == d.table));
+    }
 }
 
 pub struct Catalog<S: Store> {
@@ -253,7 +277,7 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), false)
+        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), Vec::new(), false)
     }
 
     /// Commit a replacement whose inputs must still exist (C2 phase 5).
@@ -289,14 +313,14 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), true)
+        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), Vec::new(), true)
     }
 
     /// Durably record a targeted-delete predicate (R-1) in the manifest log.
     /// The same CAS loop as any commit, so it composes with file adds/removes
     /// and replays/propagates identically. Returns the seq it landed at.
     pub fn commit_tombstone(&self, tombstone: Tombstone) -> std::io::Result<u64> {
-        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], Vec::new(), false)
+        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], Vec::new(), Vec::new(), false)
     }
 
     fn commit_guarded(
@@ -305,6 +329,7 @@ impl<S: Store> Catalog<S> {
         remove_paths: Vec<String>,
         tombstones: Vec<Tombstone>,
         schema_decls: Vec<TableSchema>,
+        drop_tables: Vec<DroppedTable>,
         require_removals_present: bool,
     ) -> std::io::Result<u64> {
         let _commit = self.commit_lock.lock().expect("commit lock");
@@ -342,6 +367,7 @@ impl<S: Store> Catalog<S> {
                 remove_paths: remove_paths.clone(),
                 tombstones: stamped,
                 schema_decls: schema_decls.clone(),
+                drop_tables: drop_tables.clone(),
             };
             let bytes = serde_json::to_vec(&entry).expect("manifest json");
             if self.store.put_if_absent(&manifest_path(seq), &bytes)? {
@@ -436,7 +462,27 @@ impl<S: Store> Catalog<S> {
     /// CAS loop as any commit, so it composes and replays/propagates like a file
     /// add. Returns the seq it landed at.
     pub fn commit_schema(&self, schema: TableSchema) -> std::io::Result<u64> {
-        self.commit_guarded(Vec::new(), Vec::new(), Vec::new(), vec![schema], false)
+        self.commit_guarded(Vec::new(), Vec::new(), Vec::new(), vec![schema], Vec::new(), false)
+    }
+
+    /// Durably record an authorized DROP (#80 phase 2): purge the table's files,
+    /// declaration and tombstones at one seq, cluster-wide. Not fenced — a drop
+    /// is forceful, so a file compacted away underneath it is fine (the drop
+    /// removes whatever the table still holds, by key, not by path). Returns the
+    /// seq it landed at. The caller reclaims the physical objects (GC).
+    pub fn commit_drop(&self, db: &str, table: &str) -> std::io::Result<u64> {
+        let dropped = DroppedTable {
+            db: db.to_string(),
+            table: table.to_string(),
+        };
+        self.commit_guarded(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![dropped],
+            false,
+        )
     }
 
     /// The declared schema for a table, if an authorized CREATE declared one.
@@ -1216,5 +1262,47 @@ mod tests {
         assert!(s.columns.iter().any(|c| c.name == "core"));
         assert!(fresh.declared_schema("poc", "absent").is_none());
         assert_eq!(fresh.declared_schemas().len(), 1, "one table declared");
+    }
+
+    #[test]
+    fn drop_purges_files_declaration_and_tombstones_for_peers_and_reload() {
+        // #80 phase 2: a DROP is a manifest entry, so the two things that matter
+        // are that a PEER on the same store learns of it (cluster-wide) and that
+        // a cold reload replays it — files, declaration and tombstones all gone,
+        // and only for the dropped table.
+        let dir = tempfile::tempdir().unwrap();
+        let store = || LocalStore::new(dir.path()).unwrap();
+
+        let a = Catalog::load(store()).unwrap();
+        a.commit_add(vec![meta("poc", "cpu", "2026080600", "cpu-1.parquet")])
+            .unwrap();
+        a.commit_schema(TableSchema {
+            db: "poc".into(),
+            table: "cpu".into(),
+            columns: vec![TableColumn { name: "host".into(), ty: ColumnType::String, tag: true }],
+        })
+        .unwrap();
+        a.commit_tombstone(tomb("d1", "poc", "cpu")).unwrap();
+        a.commit_add(vec![meta("poc", "mem", "2026080600", "mem-1.parquet")])
+            .unwrap();
+
+        // A peer catalog on the same store, currently caught up.
+        let b = Catalog::load(store()).unwrap();
+        assert_eq!(b.files_for("poc", "cpu").len(), 1);
+
+        a.commit_drop("poc", "cpu").unwrap();
+        assert!(a.files_for("poc", "cpu").is_empty(), "files gone");
+        assert!(a.declared_schema("poc", "cpu").is_none(), "declaration gone");
+        assert!(a.tombstones_for("poc", "cpu").is_empty(), "tombstones gone");
+        assert_eq!(a.files_for("poc", "mem").len(), 1, "other table untouched");
+
+        b.catch_up().unwrap();
+        assert!(b.files_for("poc", "cpu").is_empty(), "peer sees the drop");
+        assert!(b.declared_schema("poc", "cpu").is_none());
+
+        let fresh = Catalog::load(store()).unwrap();
+        assert!(fresh.files_for("poc", "cpu").is_empty(), "reload replays the drop");
+        assert!(fresh.declared_schema("poc", "cpu").is_none());
+        assert_eq!(fresh.files_for("poc", "mem").len(), 1);
     }
 }

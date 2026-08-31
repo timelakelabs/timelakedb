@@ -56,6 +56,14 @@ async fn count(e: &timelake_server::Engine, db: &str, table: &str) -> i64 {
         .expect("n is an integer")
 }
 
+/// True when a table no longer resolves — the query errors ("table not found",
+/// or "database does not exist" if it was the last table). A dropped table must
+/// answer this way, not with zero rows (which would mean it still exists, empty).
+async fn gone(e: &timelake_server::Engine, db: &str, table: &str) -> bool {
+    let sql = format!("SELECT COUNT(*) AS n FROM {table}");
+    e.sql_batches(db, &sql, Vec::new(), None).await.is_err()
+}
+
 #[tokio::test]
 async fn create_makes_an_empty_table_queryable_not_missing() {
     let dir = tempfile::tempdir().unwrap();
@@ -181,5 +189,75 @@ async fn declaration_and_refusal_survive_a_restart() {
         count(&e, "poc", "empty").await,
         0,
         "a declared-but-unwritten table is still queryable after a restart"
+    );
+}
+
+#[tokio::test]
+async fn drop_removes_the_table_including_unflushed_rows_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = engine(dir.path());
+        e.create_table("poc", "cpu", cpu_cols()).unwrap();
+        // Unflushed: the engine config never flushes on its own, so these rows
+        // live in the buffer + WAL. If drop_table did NOT flush first, the WAL
+        // would replay them after the restart below and resurrect the table.
+        wr_ok(&e, "poc", b"cpu,host=a usage=0.5 10");
+        wr_ok(&e, "poc", b"weather,city=x tempc=1.0 10"); // keeps the db alive
+        assert_eq!(count(&e, "poc", "cpu").await, 1);
+
+        e.drop_table("poc", "cpu").unwrap();
+        assert!(gone(&e, "poc", "cpu").await, "the table no longer resolves");
+        assert!(
+            e.declared_schema("poc", "cpu").is_none(),
+            "its declaration went too"
+        );
+        assert_eq!(count(&e, "poc", "weather").await, 1, "other tables untouched");
+    }
+
+    // Fresh engine, same dir: the WAL had unflushed cpu rows when the drop ran.
+    let e = engine(dir.path());
+    assert!(
+        gone(&e, "poc", "cpu").await,
+        "a dropped table must not come back from the WAL on restart"
+    );
+    assert_eq!(count(&e, "poc", "weather").await, 1);
+}
+
+#[tokio::test]
+async fn a_write_after_drop_recreates_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    e.create_table("poc", "cpu", cpu_cols()).unwrap();
+    wr_ok(&e, "poc", b"cpu,host=a usage=0.5 10");
+    e.drop_table("poc", "cpu").unwrap();
+    assert!(gone(&e, "poc", "cpu").await);
+
+    // DROP is not permanent: schema-on-write brings the table back, now with no
+    // declaration (the drop removed it), so any columns are accepted again.
+    wr_ok(&e, "poc", b"cpu,host=b usage=0.9,extra=1 20");
+    assert_eq!(count(&e, "poc", "cpu").await, 1, "the table is back");
+    assert!(e.declared_schema("poc", "cpu").is_none(), "but undeclared now");
+}
+
+#[tokio::test]
+async fn drop_a_declared_but_unwritten_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    e.create_table("poc", "empty", cpu_cols()).unwrap();
+    wr_ok(&e, "poc", b"keep,city=x tempc=1.0 10"); // keeps the db alive
+
+    e.drop_table("poc", "empty").unwrap();
+    assert!(e.declared_schema("poc", "empty").is_none());
+    assert!(gone(&e, "poc", "empty").await, "no longer resolves");
+}
+
+#[test]
+fn drop_a_table_that_does_not_exist_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    wr_ok(&e, "poc", b"keep,city=x tempc=1.0 10");
+    assert!(
+        e.drop_table("poc", "ghost").is_err(),
+        "dropping a table that was never created or written is an error"
     );
 }
