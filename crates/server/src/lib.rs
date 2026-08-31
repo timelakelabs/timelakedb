@@ -736,23 +736,49 @@ fn value_matches(v: &timelake_ingest::FieldValue, ty: ColumnType) -> bool {
 /// field the declaration doesn't name, a tag written as a field (or the
 /// reverse), or a field whose value type differs is a clean rejection — the
 /// "that's not the declared schema" the union-conflict path never gave.
-fn validate_declared(row: &timelake_ingest::ParsedLine, schema: &TableSchema) -> Result<(), String> {
-    let cols: std::collections::HashMap<&str, &TableColumn> =
-        schema.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+fn validate_declared(
+    row: &timelake_ingest::ParsedLine,
+    schema: &TableSchema,
+) -> Result<(), String> {
+    let cols: std::collections::HashMap<&str, &TableColumn> = schema
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let t = &row.table;
     for (name, _) in &row.tags {
         match cols.get(name.as_str()) {
             Some(c) if c.tag => {}
-            Some(_) => return Err(format!("column '{name}' is a field in the declared schema of '{t}', not a tag")),
-            None => return Err(format!("tag '{name}' is not in the declared schema of '{t}'")),
+            Some(_) => {
+                return Err(format!(
+                    "column '{name}' is a field in the declared schema of '{t}', not a tag"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "tag '{name}' is not in the declared schema of '{t}'"
+                ));
+            }
         }
     }
     for (name, val) in &row.fields {
         match cols.get(name.as_str()) {
-            Some(c) if c.tag => return Err(format!("column '{name}' is a tag in the declared schema of '{t}', not a field")),
-            Some(c) if !value_matches(val, c.ty) => return Err(format!("field '{name}' does not match the declared type in '{t}'")),
+            Some(c) if c.tag => {
+                return Err(format!(
+                    "column '{name}' is a tag in the declared schema of '{t}', not a field"
+                ));
+            }
+            Some(c) if !value_matches(val, c.ty) => {
+                return Err(format!(
+                    "field '{name}' does not match the declared type in '{t}'"
+                ));
+            }
             Some(_) => {}
-            None => return Err(format!("field '{name}' is not in the declared schema of '{t}'")),
+            None => {
+                return Err(format!(
+                    "field '{name}' is not in the declared schema of '{t}'"
+                ));
+            }
         }
     }
     Ok(())
@@ -1375,7 +1401,8 @@ impl Engine {
         let text = std::str::from_utf8(body)
             .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
         // validate before durability: a 400 must not land in the WAL
-        let parsed = parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
+        let parsed =
+            parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
         // #80: a table an authorized CREATE declared is validated against that
         // declaration here, BEFORE the WAL — a column it doesn't name or a value
         // whose type differs is rejected cleanly, not durably accepted and then
