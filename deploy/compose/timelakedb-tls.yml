@@ -11,11 +11,19 @@ services:
     build: ../..
     container_name: timelakedb-tls
     ports:
-      - "2963:1963"   # HTTPS: line-protocol writes + /api/sql + /admin/tls/reload
+      - "2963:1963"   # HTTPS: line-protocol writes + /api/sql
       - "2964:1964"   # Flight SQL over TLS
+      - "2966:1966"   # HTTPS: private admin listener (console + /admin/*)
     environment:
       TIMELAKE_TLS_CERT: /certs/server.crt
       TIMELAKE_TLS_KEY: /certs/server.key
+      # U0a moved /admin/* off the data port onto the private admin
+      # listener; 1963 answers them with 410 now. The listener defaults to
+      # 127.0.0.1:1966 — loopback INSIDE the container, which a published
+      # port cannot reach — so bind every interface to make 2966 above
+      # answer. AT-7's drill and Catchment's cert-rotation both drive
+      # /admin/tls/reload through it.
+      TIMELAKE_ADMIN_ADDR: 0.0.0.0:1966
       # SEC-3 want mode: a client MAY present a certificate and will be
       # identified if it does; one that does not is still served, which
       # is what keeps Grafana and Telegraf working unchanged.
