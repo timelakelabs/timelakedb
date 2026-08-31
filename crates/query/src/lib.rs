@@ -887,6 +887,41 @@ pub async fn run_sql(
 /// columns (FR-2). Used to resolve a rollup's `group_by` when it is left
 /// empty ("every source tag", ARCHITECTURE §18) — a string *field* is
 /// `Utf8`, a tag is a dictionary, so the two are distinguishable here.
+/// Build the query schema of a DECLARED table (#80): `time`, then each column,
+/// with tags as the same `Dictionary(Int32, Utf8)` a written tag becomes and
+/// fields as their own type — so a later flush's file schema matches, not
+/// conflicts. Each `(name, type, is_tag)`.
+pub fn declared_query_schema(columns: &[(String, QueryDataType, bool)]) -> QuerySchema {
+    use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
+    let mut fields = vec![Field::new(
+        "time",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        false,
+    )];
+    for (name, dt, is_tag) in columns {
+        let ty = if *is_tag {
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        } else {
+            dt.clone()
+        };
+        fields.push(Field::new(name, ty, true));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+/// A zero-row table provider for a declared table that has no data yet (#80), so
+/// `SELECT * FROM t` returns its declared columns rather than "table not found".
+pub fn empty_declared_provider(
+    columns: &[(String, QueryDataType, bool)],
+) -> Arc<dyn DfTableProvider> {
+    let schema = declared_query_schema(columns);
+    let empty = RecordBatch::new_empty(schema.clone());
+    Arc::new(
+        datafusion::datasource::MemTable::try_new(schema, vec![vec![empty]])
+            .expect("empty declared memtable"),
+    )
+}
+
 pub fn tag_columns(schema: &QuerySchema) -> Vec<String> {
     schema
         .fields()

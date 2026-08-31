@@ -46,6 +46,8 @@ flate2.workspace = true
 timelake-ingest = { path = "../ingest" }
 timelake-lastvalue = { path = "../lastvalue" }
 timelake-query = { path = "../query" }
+# #80: the DDL tests name ColumnType / TableColumn to build a declared schema.
+timelake-catalog = { path = "../catalog" }
 # CL-3 tests wire two engines to ONE store in a single process — the
 # cluster's read shape without a container.
 timelake-store = { path = "../store" }

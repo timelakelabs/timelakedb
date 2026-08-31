@@ -362,6 +362,20 @@ pub trait Engine: Send + Sync + 'static {
     fn enable_last_cache(&self, db: &str, table: &str) -> Result<(), String>;
     fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String>;
 
+    /// Authorized DDL (#80), backing `POST /admin/tables`: declare a table's
+    /// schema as a catalog manifest-log entry. `columns` are
+    /// `(name, type, is_tag)`; the type string is one of
+    /// float|integer|unsigned|boolean|string. The declaration makes the table
+    /// queryable with zero rows and makes a later conflicting write a clean
+    /// 400 — but the data plane's read-only SQL guard is unchanged, so DDL over
+    /// `/api/sql` stays refused. This is the authorized path, not that one.
+    fn create_table(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Vec<(String, String, bool)>,
+    ) -> Result<(), String>;
+
     /// R-2 rollups (ARCHITECTURE §18): the runtime downsampling surface,
     /// backing `/admin/rollups`. `set_rollup` upserts by `(db, name)` and
     /// enforces the retention invariant (§18.4); materialisation runs on the
@@ -530,6 +544,7 @@ pub fn admin_app<E: Engine>(
             "/admin/last_cache/{db}/{table}",
             axum::routing::delete(last_cache_delete::<E>),
         )
+        .route("/admin/tables", axum::routing::post(tables_create::<E>))
         .route("/admin/config", get(config_list::<E>))
         .route(
             "/admin/config/{key}",
@@ -1513,6 +1528,97 @@ async fn last_cache_delete<E: Engine>(
             );
             let _ = state.audit.record(ev);
             err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
+    }
+}
+
+/// `POST /admin/tables` body: an authorized CREATE TABLE (#80). One column per
+/// entry; `time` is implicit and must not be listed. `tag` defaults to false
+/// (a field), so a plain `{"name":"x","type":"float"}` declares a field.
+#[derive(serde::Deserialize)]
+struct TableColumnSpec {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+    #[serde(default)]
+    tag: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct TableCreate {
+    db: String,
+    table: String,
+    #[serde(default)]
+    columns: Vec<TableColumnSpec>,
+}
+
+async fn tables_create<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    let body = match axum::body::to_bytes(req.into_body(), 256 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let spec: TableCreate = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let (db, table) = (spec.db.trim().to_string(), spec.table.trim().to_string());
+    if db.is_empty() || table.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "db and table must not be empty");
+    }
+    // Introducing schema is an admin operation, like introducing a retention
+    // policy (shrink/introduce/remove = admin). The data plane can only ever
+    // narrow into a table this declares; it cannot declare one itself.
+    if let Some(deny) = require(&session, Role::Admin) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let columns: Vec<(String, String, bool)> = spec
+        .columns
+        .into_iter()
+        .map(|c| (c.name, c.ty, c.tag))
+        .collect();
+    let target = format!("{db}.{table}");
+    match state.engine.create_table(&db, &table, columns) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "table.create",
+                Some(target),
+                None,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            (
+                StatusCode::CREATED,
+                Json(json!({ "db": db, "table": table, "status": "created" })),
+            )
+                .into_response()
+        }
+        // A bad column type, a duplicate name, or a table that already exists
+        // are all the caller's error, not the server's — 400, not 500.
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "table.create",
+                Some(target),
+                None,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::BAD_REQUEST, &e)
         }
     }
 }

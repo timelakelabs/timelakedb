@@ -30,7 +30,7 @@ use timelake_api::WriteError;
 // engine they configure, without depending on the api crate directly.
 pub use timelake_api::{RETENTION_ANY_DB, RetentionPolicy, RollupAgg, RollupDef, RollupFn};
 use timelake_buffer::{TableBuffer, flush};
-use timelake_catalog::{Catalog, FileMeta};
+use timelake_catalog::{Catalog, ColumnType, FileMeta, TableColumn, TableSchema};
 use timelake_ingest::{parse_lines, precision_multiplier};
 use timelake_query::{QueryDataType, QuerySession, batches_to_json};
 use timelake_store::{CachingKms, EncryptingStore, Kms, KmsStats, LocalKek, LocalStore, Store};
@@ -699,6 +699,81 @@ impl WriteRejects {
     }
 }
 
+/// A declared column type to its Arrow/query type (#80).
+fn declared_datatype(ty: ColumnType) -> QueryDataType {
+    match ty {
+        ColumnType::Float => QueryDataType::Float64,
+        ColumnType::Integer => QueryDataType::Int64,
+        ColumnType::Unsigned => QueryDataType::UInt64,
+        ColumnType::Boolean => QueryDataType::Boolean,
+        ColumnType::String => QueryDataType::Utf8,
+    }
+}
+
+/// A declared schema as the `(name, type, is_tag)` list the query helpers take.
+fn declared_columns(schema: &TableSchema) -> Vec<(String, QueryDataType, bool)> {
+    schema
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), declared_datatype(c.ty), c.tag))
+        .collect()
+}
+
+/// Whether a parsed value's type matches a declared field type (#80).
+fn value_matches(v: &timelake_ingest::FieldValue, ty: ColumnType) -> bool {
+    use timelake_ingest::FieldValue as V;
+    matches!(
+        (v, ty),
+        (V::Float(_), ColumnType::Float)
+            | (V::Int(_), ColumnType::Integer)
+            | (V::UInt(_), ColumnType::Unsigned)
+            | (V::Bool(_), ColumnType::Boolean)
+            | (V::Str(_), ColumnType::String)
+    )
+}
+
+/// Validate one parsed line against a declared table schema (#80). A tag or
+/// field the declaration doesn't name, a tag written as a field (or the
+/// reverse), or a field whose value type differs is a clean rejection — the
+/// "that's not the declared schema" the union-conflict path never gave.
+fn validate_declared(row: &timelake_ingest::ParsedLine, schema: &TableSchema) -> Result<(), String> {
+    let cols: std::collections::HashMap<&str, &TableColumn> =
+        schema.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let t = &row.table;
+    for (name, _) in &row.tags {
+        match cols.get(name.as_str()) {
+            Some(c) if c.tag => {}
+            Some(_) => return Err(format!("column '{name}' is a field in the declared schema of '{t}', not a tag")),
+            None => return Err(format!("tag '{name}' is not in the declared schema of '{t}'")),
+        }
+    }
+    for (name, val) in &row.fields {
+        match cols.get(name.as_str()) {
+            Some(c) if c.tag => return Err(format!("column '{name}' is a tag in the declared schema of '{t}', not a field")),
+            Some(c) if !value_matches(val, c.ty) => return Err(format!("field '{name}' does not match the declared type in '{t}'")),
+            Some(_) => {}
+            None => return Err(format!("field '{name}' is not in the declared schema of '{t}'")),
+        }
+    }
+    Ok(())
+}
+
+/// Parse a wire column-type string into a [`ColumnType`] (#80). Liberal on
+/// spelling so `int`/`integer`/`int64` all land the same way; anything else is
+/// a named 400, not a silent default.
+fn parse_column_type(s: &str) -> Result<ColumnType, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "float" | "float64" | "double" => Ok(ColumnType::Float),
+        "integer" | "int" | "int64" => Ok(ColumnType::Integer),
+        "unsigned" | "uint" | "uint64" => Ok(ColumnType::Unsigned),
+        "boolean" | "bool" => Ok(ColumnType::Boolean),
+        "string" | "str" | "utf8" => Ok(ColumnType::String),
+        other => Err(format!(
+            "unknown column type '{other}' (use float|integer|unsigned|boolean|string)"
+        )),
+    }
+}
+
 pub struct Engine {
     dbs: RwLock<HashMap<String, HashMap<String, TableBuffer>>>,
     /// Writers hold this shared for append+apply; flush holds it
@@ -1300,7 +1375,25 @@ impl Engine {
         let text = std::str::from_utf8(body)
             .map_err(|_| WriteError::BadRequest("body is not utf-8".into()))?;
         // validate before durability: a 400 must not land in the WAL
-        parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
+        let parsed = parse_lines(text, mult, 0).map_err(|e| WriteError::BadRequest(e.to_string()))?;
+        // #80: a table an authorized CREATE declared is validated against that
+        // declaration here, BEFORE the WAL — a column it doesn't name or a value
+        // whose type differs is rejected cleanly, not durably accepted and then
+        // union-coerced. Cached per table so a 50k-row batch is one catalog read
+        // per distinct table, not per row; undeclared tables (the common case)
+        // cache a `None` and cost nothing more.
+        {
+            let mut declared: std::collections::HashMap<&str, Option<TableSchema>> =
+                std::collections::HashMap::new();
+            for row in &parsed {
+                let schema = declared
+                    .entry(row.table.as_str())
+                    .or_insert_with(|| self.catalog.declared_schema(db, &row.table));
+                if let Some(s) = schema {
+                    validate_declared(row, s).map_err(WriteError::BadRequest)?;
+                }
+            }
+        }
         // RR-5: the WAL cap is a named, visible limit
         if self.wal.lock().expect("wal lock").size() > self.cfg.load().wal_max_bytes {
             return Err(WriteError::Backpressure(format!(
@@ -1893,6 +1986,61 @@ impl Engine {
         self.persist_last_cache()
     }
 
+    /// Authorized DDL (#80): declare `db.table`'s schema in the catalog
+    /// manifest log. Strict — a table that already exists, by an earlier
+    /// declaration or by a schema-on-write, is an error, not a silent no-op;
+    /// removing one is DROP's job (#154). The declaration is a CAS commit, so
+    /// it is cluster-visible and replay-safe the moment it lands, and a
+    /// conflicting write is refused before the WAL (see `write_lp_internal`).
+    pub fn create_table(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Vec<TableColumn>,
+    ) -> Result<(), String> {
+        if db.is_empty() {
+            return Err("database name is required".into());
+        }
+        if table.is_empty() {
+            return Err("table name is required".into());
+        }
+        if self.catalog.declared_schema(db, table).is_some() {
+            return Err(format!("table '{table}' is already declared in '{db}'"));
+        }
+        if self.table_names(db).iter().any(|t| t == table) {
+            return Err(format!(
+                "table '{table}' already exists in '{db}' (a write created it first)"
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in &columns {
+            if c.name.is_empty() {
+                return Err("a column name is required".into());
+            }
+            if c.name == "time" {
+                return Err("column 'time' is implicit and cannot be declared".into());
+            }
+            if !seen.insert(c.name.as_str()) {
+                return Err(format!("column '{}' is declared twice", c.name));
+            }
+        }
+        let schema = TableSchema {
+            db: db.to_string(),
+            table: table.to_string(),
+            columns,
+        };
+        self.catalog
+            .commit_schema(schema)
+            .map_err(|e| format!("commit schema: {e}"))?;
+        Ok(())
+    }
+
+    /// The declared schema for a table, if an authorized CREATE (#80) named it.
+    /// `None` for a table that only exists by schema-on-write, or not at all.
+    pub fn declared_schema(&self, db: &str, table: &str) -> Option<TableSchema> {
+        self.catalog.declared_schema(db, table)
+    }
+
     pub fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
         self.last_value.disable(db, table);
         self.persist_last_cache()
@@ -2384,6 +2532,25 @@ impl timelake_api::Engine for Engine {
         Engine::disable_last_cache(self, db, table)
     }
 
+    fn create_table(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Vec<(String, String, bool)>,
+    ) -> Result<(), String> {
+        let cols = columns
+            .into_iter()
+            .map(|(name, ty, tag)| {
+                Ok(TableColumn {
+                    name,
+                    ty: parse_column_type(&ty)?,
+                    tag,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Engine::create_table(self, db, table, cols)
+    }
+
     fn rollups(&self) -> Vec<RollupDef> {
         Engine::rollups(self)
     }
@@ -2536,6 +2703,18 @@ impl Engine {
         for (name, buffer) in live {
             let files = self.catalog.files_for(db, &name);
             if buffer.is_empty() && files.is_empty() {
+                // #80: a table an authorized CREATE declared but nothing has
+                // yet been written to lives in the catalog with zero rows.
+                // Register an empty provider carrying its declared schema so a
+                // SELECT returns no rows instead of "table not found" — the
+                // CREATE is visible to the planner the moment it commits,
+                // before any write. Undeclared empty tables still fall through.
+                if let Some(decl) = self.catalog.declared_schema(db, &name) {
+                    tables.push((
+                        name,
+                        timelake_query::empty_declared_provider(&declared_columns(&decl)),
+                    ));
+                }
                 continue;
             }
             // merged schema: registry (covers files + past flushes) ∪ every
@@ -2617,6 +2796,14 @@ impl Engine {
                 names.push(db);
             }
         }
+        // #80: a database that so far holds only a declared (but unwritten)
+        // table exists nowhere else yet. Report it, or a query against the
+        // table it was created to hold answers "no such database".
+        for s in self.catalog.declared_schemas() {
+            if !names.contains(&s.db) {
+                names.push(s.db);
+            }
+        }
         // CL-3: a database whose first writes are still in an ingester's
         // memory exists nowhere local yet. Without this a querier answers
         // "no such database" for the first ten seconds of its life.
@@ -2644,6 +2831,15 @@ impl Engine {
         for t in self.catalog.tables_for(db) {
             if !names.contains(&t) {
                 names.push(t);
+            }
+        }
+        // #80: a table declared by an authorized CREATE but not yet written to
+        // exists only as a manifest-log schema entry — no buffer, no files.
+        // Name it so a SELECT resolves it (sql_batches gives it an empty
+        // provider) instead of "table not found".
+        for s in self.catalog.declared_schemas() {
+            if s.db == db && !names.contains(&s.table) {
+                names.push(s.table);
             }
         }
         // CL-3: tables that exist only in an ingester's buffer. The list is
