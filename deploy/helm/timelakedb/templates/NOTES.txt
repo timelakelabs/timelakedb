@@ -1,15 +1,26 @@
 TimeLakeDB ({{ .Values.mode }} mode) is installed as "{{ .Release.Name }}".
 
-Client Service (ClusterIP by default):
+{{- if eq .Values.mode "cluster" }}
+
+Topology: {{ .Values.cluster.ingester.replicas }} ingester(s) [StatefulSet],
+{{ .Values.cluster.querier.replicas }} querier(s), {{ .Values.cluster.router.replicas }} router(s)
+{{- if .Values.cluster.compactor.enabled }}, 1 compactor{{ end }}, discovered via Consul.
+{{- if .Values.cluster.minio.enabled }}
+Object store: a bundled dev MinIO (EPHEMERAL — not for production data).
+{{- end }}
+
+Clients talk ONLY to the router:
+{{- else }}
+
+Single {{ "role=all" }} node.
+{{- end }}
+
   {{ include "timelakedb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}   (HTTP: writes + /api/sql)
   {{ include "timelakedb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.flightPort }}   (Flight SQL)
 
 Smoke it from inside the cluster (or `kubectl port-forward` first):
 
-  # health
   curl -fs http://<svc>:{{ .Values.service.httpPort }}/health
-
-  # write a point, then read it back
   curl -fs -XPOST "http://<svc>:{{ .Values.service.httpPort }}/api/v3/write_lp?db=poc&precision=ns" \
     --data-binary 'demo,host=a value=1 1'
   curl -fs -XPOST "http://<svc>:{{ .Values.service.httpPort }}/api/sql" \
@@ -18,7 +29,7 @@ Smoke it from inside the cluster (or `kubectl port-forward` first):
 
 {{- if eq .Values.dataAuth "off" }}
 
-NOTE: data-plane auth is OFF. That is fine behind a ClusterIP Service, but set
+NOTE: data-plane auth is OFF. Fine behind a ClusterIP Service, but set
 `dataAuth: required` and issue a token before exposing the data plane.
 {{- end }}
 {{- if not .Values.adminBootstrapPassword }}
@@ -26,8 +37,8 @@ NOTE: data-plane auth is OFF. That is fine behind a ClusterIP Service, but set
 NOTE: no adminBootstrapPassword was set — the admin console seeds admin/admin,
 quarantined until you rotate it on first sign-in.
 {{- end }}
-{{- if not .Values.objectStore.enabled }}
+{{- if and (eq .Values.mode "single") (not .Values.objectStore.enabled) }}
 
 NOTE: objectStore is disabled — data lives on the node's local PVC. Enable an
-S3-compatible store for durability beyond the node and for the cluster topology.
+S3-compatible store for durability beyond the node.
 {{- end }}

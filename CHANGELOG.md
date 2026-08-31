@@ -13,6 +13,29 @@ here.
 
 ## [Unreleased]
 
+### Added — Helm chart, cluster mode (#81 phase 2, #146) (2026-08-30)
+
+`helm install --set mode=cluster` deploys the C2 split: ingesters as a
+**StatefulSet** (durable WAL + PVC, CL-2 paired), and the router, queriers and
+compactor as **Deployments** (they own no durable data). Clients talk only to
+the router's Service; the intra-cluster listener (1965) is confined to the
+headless ingester Service — never external, never a LoadBalancer.
+
+Discovery is **Consul, not static `TIMELAKE_PEERS`** — and the reason is worth
+recording, because the ticket assumed static peers via stable DNS. It can't
+work: an ingester replicates to its first ingester peer and does not filter
+itself out, so within a shared StatefulSet pod template (one env for every pod)
+there is no static list that excludes self. Consul has each node self-register
+(node id = pod name, advertised address = pod IP, exactly as the discovery drill
+wires it) and returns peers with self excluded, so `cluster.ingester.replicas` is
+genuinely a value you turn. A bundled dev Consul + MinIO make a cluster
+self-contained for a smoke; point `objectStore` at real S3 for production. A
+wait-consul init container removes a router CrashLoop race (it refuses to start
+with no ingesters, so it needs Consul up first). Verified end to end on a real
+(kind) cluster — 2 ingesters + 2 queriers + compactor + router self-register,
+a write through the router shards to the ingesters and reads back through a
+querier (`docs/evidence/helm-cluster-smoke.log`). Completes #81.
+
 ### Added — Helm chart, single-node (#81 phase 1, #145) (2026-08-30)
 
 `deploy/helm/timelakedb/` — the first supported way to deploy TimeLakeDB on

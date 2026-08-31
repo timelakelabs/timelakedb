@@ -1,0 +1,88 @@
+{{- if eq .Values.mode "cluster" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "timelakedb.fullname" . }}-querier
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: querier
+spec:
+  # Stateless read replicas — a Deployment. They own no durable data (the
+  # catalog is replayed from the object store), so an ephemeral data dir.
+  replicas: {{ .Values.cluster.querier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "timelakedb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: querier
+  template:
+    metadata:
+      labels:
+        {{- include "timelakedb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: querier
+    spec:
+      serviceAccountName: {{ include "timelakedb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "timelakedb.podSecurityContext" . | nindent 8 }}
+      initContainers:
+        {{- include "timelakedb.waitConsulInit" . | nindent 8 }}
+        {{- include "timelakedb.ensureBucketInit" . | nindent 8 }}
+      containers:
+        - name: timelakedb
+          image: {{ include "timelakedb.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            {{- include "timelakedb.clusterEnvFrom" . | nindent 12 }}
+          env:
+            {{- include "timelakedb.podIdentityEnv" . | nindent 12 }}
+            - name: TIMELAKE_ROLE
+              value: querier
+            {{- include "timelakedb.tlsEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+            - name: flight
+              containerPort: {{ .Values.service.flightPort }}
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- include "timelakedb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/timelake/data
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/timelake/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+{{- end }}

@@ -1,4 +1,5 @@
 {{- include "timelakedb.validate" . -}}
+{{- if eq .Values.mode "single" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -25,3 +26,4 @@ data:
   {{- with .Values.query.maxConcurrent }}
   TIMELAKE_MAX_CONCURRENT_QUERIES: {{ . | quote }}
   {{- end }}
+{{- end }}
