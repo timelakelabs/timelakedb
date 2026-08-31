@@ -350,6 +350,21 @@ impl WalCipher for WalKms {
 /// Where runtime retention config lives in the object store (FR-7).
 const RETENTION_CONFIG_PATH: &str = "catalog/config/retention.json";
 
+/// Which tables have the last-value cache on (#57), persisted so the opt-in
+/// survives a restart — mirrors the retention/rollup config objects.
+const LAST_CACHE_CONFIG_PATH: &str = "catalog/config/last_cache.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct LastCacheDoc {
+    tables: Vec<LastCacheTable>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct LastCacheTable {
+    db: String,
+    table: String,
+}
+
 /// v1 was a bare `{"table": seconds}` map with no database scope at all.
 const RETENTION_FORMAT_VERSION: u32 = 2;
 
@@ -812,6 +827,10 @@ pub struct Engine {
     /// #69: per-scan pruning telemetry (files/row-groups considered vs skipped
     /// by time/stats/bloom, meta-cache hits) — where a lookup's cost goes.
     scan_stats: Arc<timelake_query::provider::ScanStats>,
+    /// #57: the last-value cache — latest `(ts, fields)` per series for
+    /// opted-in tables, updated on the write path. Lock-free `is_active()` when
+    /// nothing opted in, so the default write path is untouched.
+    last_value: Arc<timelake_lastvalue::LastValueCache>,
     /// §12.2: KMS call/cache counters, when the key cache is active.
     kms_stats: Option<Arc<KmsStats>>,
     /// §12.1: S3 request counters, when the backend is S3.
@@ -928,6 +947,33 @@ impl Engine {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => cfg.retention.clone(),
             Err(e) => return Err(e),
+        };
+
+        // #57 last-value cache: the opted-in tables persist in the store, seeded
+        // here so the cache is on for the same tables after a restart. Cap from
+        // the environment, default 100k hot series.
+        let last_value = {
+            let cap = std::env::var("TIMELAKE_LAST_CACHE_MAX")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(timelake_lastvalue::DEFAULT_CAP);
+            let cache = Arc::new(timelake_lastvalue::LastValueCache::new(cap));
+            match store.get(LAST_CACHE_CONFIG_PATH) {
+                Ok(bytes) => {
+                    let doc: LastCacheDoc = serde_json::from_slice(&bytes).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("{LAST_CACHE_CONFIG_PATH}: {e}"),
+                        )
+                    })?;
+                    for t in doc.tables {
+                        cache.enable(&t.db, &t.table);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            cache
         };
 
         // R-2 rollups: same seed rule as retention — stored copy outranks
@@ -1083,6 +1129,7 @@ impl Engine {
             meta_cache: Arc::new(Default::default()),
             visibility_filtered: Arc::new(AtomicU64::new(0)),
             scan_stats: Arc::new(timelake_query::provider::ScanStats::default()),
+            last_value,
             kms_stats,
             s3_stats,
             tls: RwLock::new(None),
@@ -1170,6 +1217,17 @@ impl Engine {
                 })
                 .collect()
         };
+        // #57: update the last-value cache. Gated on a lock-free `is_active` so a
+        // deployment with no opted-in table does no per-row work; done after the
+        // dbs lock is released, so the cache's lock never nests under it. Every
+        // row here appended successfully (a bad row would have returned above),
+        // so the cache never reflects a write the buffer rejected.
+        if self.last_value.is_active() {
+            for row in &rows {
+                self.last_value
+                    .observe(db, &row.table, &row.tags, row.timestamp_ns, &row.fields);
+            }
+        }
         // registry upkeep only when a table's column set could have grown
         for (table, cols) in touched {
             let key = (db.to_string(), table.clone());
@@ -1810,6 +1868,46 @@ impl Engine {
         Self::persist_retention(&self.store, &r)
     }
 
+    /// Last-value cache opt-in surface (#57), the retention pattern reused: the
+    /// enabled set lives in the cache, this persists it so it survives a restart.
+    pub fn last_cache_tables(&self) -> Vec<(String, String)> {
+        self.last_value.enabled_tables()
+    }
+
+    /// The cached latest rows for a table (the hot series only). Phase 2's
+    /// `last_cache()` query function reads this; exposed now so the write-path
+    /// wiring is testable.
+    pub fn last_value_snapshot(&self, db: &str, table: &str) -> Vec<timelake_lastvalue::LastValue> {
+        self.last_value.snapshot(db, table)
+    }
+
+    pub fn enable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
+        self.last_value.enable(db, table);
+        self.persist_last_cache()
+    }
+
+    pub fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
+        self.last_value.disable(db, table);
+        self.persist_last_cache()
+    }
+
+    fn persist_last_cache(&self) -> Result<(), String> {
+        let doc = LastCacheDoc {
+            tables: self
+                .last_value
+                .enabled_tables()
+                .into_iter()
+                .map(|(db, table)| LastCacheTable { db, table })
+                .collect(),
+        };
+        self.store
+            .put(
+                LAST_CACHE_CONFIG_PATH,
+                &serde_json::to_vec_pretty(&doc).expect("last_cache json"),
+            )
+            .map_err(|e| format!("persist last_cache config: {e}"))
+    }
+
     /// R-2 rollup surface (ARCHITECTURE §18), the retention pattern reused.
     pub fn rollups(&self) -> Vec<RollupDef> {
         self.rollups.read().expect("rollups lock").clone()
@@ -2265,6 +2363,18 @@ impl timelake_api::Engine for Engine {
 
     fn remove_retention(&self, db: &str, table: &str) -> Result<(), String> {
         Engine::remove_retention(self, db, table)
+    }
+
+    fn last_cache_tables(&self) -> Vec<(String, String)> {
+        Engine::last_cache_tables(self)
+    }
+
+    fn enable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
+        Engine::enable_last_cache(self, db, table)
+    }
+
+    fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String> {
+        Engine::disable_last_cache(self, db, table)
     }
 
     fn rollups(&self) -> Vec<RollupDef> {
@@ -3258,6 +3368,12 @@ impl Engine {
             self.config_revision(),
             self.catalog.head(),
         );
+        // #57: how many hot series the last-value cache holds — the FR-2 bound
+        // made visible, so an operator sees it approach the cap.
+        let last_value_line = format!(
+            "# TYPE timelake_last_value_entries gauge\ntimelake_last_value_entries {}\n",
+            self.last_value.len(),
+        );
         format!(
             "# TYPE timelake_lines_written_total counter\n\
              timelake_lines_written_total {}\n\
@@ -3306,7 +3422,7 @@ impl Engine {
              # TYPE timelake_audit_records_total counter\n\
              timelake_audit_records_total {}\n\
              # TYPE timelake_audit_sink_healthy gauge\n\
-             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}{}",
+             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -3368,6 +3484,7 @@ impl Engine {
             self.query_env.metrics.render(),
             self.lifecycle_lines(),
             config_line,
+            last_value_line,
         )
     }
 }

@@ -355,6 +355,13 @@ pub trait Engine: Send + Sync + 'static {
     /// Remove one policy (that table keeps everything again).
     fn remove_retention(&self, db: &str, table: &str) -> Result<(), String>;
 
+    /// Last-value cache opt-in (#57), backing `/admin/last_cache`. A table is
+    /// cached only after `enable_last_cache`; nothing is stamped by default,
+    /// because the cache is bounded and accelerates hot series, not all series.
+    fn last_cache_tables(&self) -> Vec<(String, String)>;
+    fn enable_last_cache(&self, db: &str, table: &str) -> Result<(), String>;
+    fn disable_last_cache(&self, db: &str, table: &str) -> Result<(), String>;
+
     /// R-2 rollups (ARCHITECTURE §18): the runtime downsampling surface,
     /// backing `/admin/rollups`. `set_rollup` upserts by `(db, name)` and
     /// enforces the retention invariant (§18.4); materialisation runs on the
@@ -514,6 +521,14 @@ pub fn admin_app<E: Engine>(
         .route(
             "/admin/retention/{db}/{table}",
             axum::routing::delete(retention_delete::<E>),
+        )
+        .route(
+            "/admin/last_cache",
+            get(last_cache_list::<E>).put(last_cache_set::<E>),
+        )
+        .route(
+            "/admin/last_cache/{db}/{table}",
+            axum::routing::delete(last_cache_delete::<E>),
         )
         .route("/admin/config", get(config_list::<E>))
         .route(
@@ -1365,6 +1380,134 @@ async fn retention_delete<E: Engine>(
                 "retention.remove",
                 Some(target),
                 before,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
+    }
+}
+
+/// `PUT /admin/last_cache` body: which table to cache (#57).
+#[derive(serde::Deserialize)]
+struct LastCacheSet {
+    db: String,
+    table: String,
+}
+
+async fn last_cache_list<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Viewer) {
+        return deny;
+    }
+    let tables: Vec<Value> = state
+        .engine
+        .last_cache_tables()
+        .into_iter()
+        .map(|(db, table)| json!({ "db": db, "table": table }))
+        .collect();
+    Json(json!({ "tables": tables })).into_response()
+}
+
+async fn last_cache_set<E: Engine>(
+    State(state): State<AdminState<E>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let set: LastCacheSet = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let (db, table) = (set.db.trim(), set.table.trim());
+    if db.is_empty() || table.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "db and table must not be empty");
+    }
+    // A config change, not a data change — operator, like enabling a rollup.
+    if let Some(deny) = require(&session, Role::Operator) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let target = format!("{db}.{table}");
+    match state.engine.enable_last_cache(db, table) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "last_cache.enable",
+                Some(target),
+                None,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "db": db, "table": table, "status": "enabled" })).into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "last_cache.enable",
+                Some(target),
+                None,
+                None,
+                "error",
+            );
+            let _ = state.audit.record(ev);
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
+        }
+    }
+}
+
+async fn last_cache_delete<E: Engine>(
+    State(state): State<AdminState<E>>,
+    axum::extract::Path((db, table)): axum::extract::Path<(String, String)>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let session = session_of(req.extensions());
+    let source = source_of(req.extensions());
+    if let Some(deny) = require(&session, Role::Operator) {
+        return deny;
+    }
+    if let Some(resp) = audit_gate(&state.audit) {
+        return resp;
+    }
+    let target = format!("{db}.{table}");
+    match state.engine.disable_last_cache(&db, &table) {
+        Ok(()) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "last_cache.disable",
+                Some(target),
+                None,
+                None,
+                "ok",
+            );
+            if let Some(resp) = audit_record(&state.audit, ev) {
+                return resp;
+            }
+            Json(json!({ "db": db, "table": table, "status": "disabled" })).into_response()
+        }
+        Err(e) => {
+            let ev = audit_event(
+                &session,
+                source,
+                "last_cache.disable",
+                Some(target),
+                None,
                 None,
                 "error",
             );

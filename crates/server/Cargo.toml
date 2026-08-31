@@ -16,6 +16,7 @@ timelake-auth = { path = "../auth" }
 timelake-audit = { path = "../audit" }
 timelake-cluster = { path = "../cluster" }
 timelake-ingest = { path = "../ingest" }
+timelake-lastvalue = { path = "../lastvalue" }
 timelake-wal = { path = "../wal" }
 timelake-buffer = { path = "../buffer" }
 timelake-query = { path = "../query" }
@@ -39,6 +40,10 @@ reqwest.workspace = true
 flate2.workspace = true
 
 [dev-dependencies]
+# #57: the last-value tests name FieldValue / LastValue directly, which an
+# integration-test crate can only do if they are dev-deps too.
+timelake-ingest = { path = "../ingest" }
+timelake-lastvalue = { path = "../lastvalue" }
 # CL-3 tests wire two engines to ONE store in a single process — the
 # cluster's read shape without a container.
 timelake-store = { path = "../store" }

@@ -4596,6 +4596,14 @@ name = "timelake-ingest"
 version = "0.3.0"
 
 [[package]]
+name = "timelake-lastvalue"
+version = "0.3.0"
+dependencies = [
+ "lru",
+ "timelake-ingest",
+]
+
+[[package]]
 name = "timelake-prometheus"
 version = "0.3.0"
 dependencies = [
@@ -4651,6 +4659,7 @@ dependencies = [
  "timelake-discovery",
  "timelake-flight",
  "timelake-ingest",
+ "timelake-lastvalue",
  "timelake-prometheus",
  "timelake-query",
  "timelake-store",
