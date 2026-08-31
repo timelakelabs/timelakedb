@@ -27,6 +27,9 @@ CERTS = HERE / "certs"
 RUN_TAG = f"r{int(time.time())}"  # rerun-safe: this run's writes are countable in isolation
 CA = str(CERTS / "ca.crt")
 BASE = "https://localhost:2963"
+# U0a moved /admin/* off the data port onto the private admin listener;
+# 2963 answers them with 410 now. Same cert, so verify=CA still holds.
+ADMIN = "https://localhost:2966"
 FLIGHT = "grpc+tls://localhost:2964"
 CONTAINER = "timelakedb-tls"
 TELEGRAF = "timelake-telegraf-tls"
@@ -52,18 +55,18 @@ def admin_login():
     if ADMIN_SESSION:
         return ADMIN_SESSION
     s = requests.Session()
-    r = s.post(f"{BASE}/admin/session", json={"username": "admin", "password": "admin"},
+    r = s.post(f"{ADMIN}/admin/session", json={"username": "admin", "password": "admin"},
                verify=CA, timeout=10)
     if r.status_code == 200 and r.json().get("must_change_password"):
         csrf = r.json()["csrf"]
-        s.post(f"{BASE}/admin/password",
+        s.post(f"{ADMIN}/admin/password",
                json={"current_password": "admin", "new_password": "at7 drill password"},
                headers={"x-timelake-csrf": csrf}, verify=CA, timeout=10)
-        r = s.post(f"{BASE}/admin/session",
+        r = s.post(f"{ADMIN}/admin/session",
                    json={"username": "admin", "password": "at7 drill password"},
                    verify=CA, timeout=10)
     elif r.status_code != 200:
-        r = s.post(f"{BASE}/admin/session",
+        r = s.post(f"{ADMIN}/admin/session",
                    json={"username": "admin", "password": "at7 drill password"},
                    verify=CA, timeout=10)
     r.raise_for_status()
@@ -74,7 +77,7 @@ def admin_login():
 
 def admin_post(path):
     a = admin_login()
-    return a["session"].post(f"{BASE}{path}", headers=a["headers"], verify=CA, timeout=10)
+    return a["session"].post(f"{ADMIN}{path}", headers=a["headers"], verify=CA, timeout=10)
 
 
 def serving_serial(port: int) -> str:
@@ -354,7 +357,7 @@ def main():
             ok = True
             break
     if not ok:
-        requests.post(f"{BASE}/admin/tls/reload", verify=CA, timeout=10)
+        admin_post("/admin/tls/reload")
         ok = metrics().get("timelake_tls_last_reload_ok") == 1.0
     check(ok, "good renewal after the bad one restores health")
 
