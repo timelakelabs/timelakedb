@@ -67,6 +67,38 @@ pub struct Tombstone {
     pub created_seq: u64,
 }
 
+/// A declared column of a table (#80). `tag` distinguishes a primary-key tag
+/// (always a string) from a field. Types are the line-protocol field types.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnType {
+    Float,
+    Integer,
+    Unsigned,
+    Boolean,
+    String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TableColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: ColumnType,
+    #[serde(default)]
+    pub tag: bool,
+}
+
+/// An explicitly declared table schema (#80), recorded in the manifest log by an
+/// authorized CREATE so it is CAS-committed, replays on restart, and reaches
+/// every node exactly as a file add does. A write is then validated against it
+/// rather than the first writer winning the schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TableSchema {
+    pub db: String,
+    pub table: String,
+    pub columns: Vec<TableColumn>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     seq: u64,
@@ -79,6 +111,10 @@ struct ManifestEntry {
     /// so every manifest written before R-1 still deserializes.
     #[serde(default)]
     tombstones: Vec<Tombstone>,
+    /// Declared table schemas (#80) recorded by an authorized CREATE. `default`
+    /// so every manifest written before this feature still deserializes.
+    #[serde(default)]
+    schema_decls: Vec<TableSchema>,
 }
 
 /// Read and parse one manifest object, tagging the path on failure so a
@@ -118,8 +154,15 @@ fn first_absent(
 fn apply_entry(
     files: &mut HashMap<(String, String), Vec<FileMeta>>,
     tombstones: &mut Vec<Tombstone>,
+    declared: &mut HashMap<(String, String), TableSchema>,
     entry: ManifestEntry,
 ) {
+    // A re-declared schema replaces the prior one (last-wins), so a CREATE that
+    // corrects a typo'd type is not stuck behind the first. Idempotent on replay
+    // because the same entry yields the same map.
+    for s in entry.schema_decls {
+        declared.insert((s.db.clone(), s.table.clone()), s);
+    }
     if !entry.remove_paths.is_empty() {
         for list in files.values_mut() {
             list.retain(|f| !entry.remove_paths.contains(&f.path));
@@ -151,6 +194,9 @@ pub struct Catalog<S: Store> {
     /// Active targeted-delete predicates (R-1), folded from the manifest log.
     /// Locked AFTER `files` wherever both are held, so the two never deadlock.
     tombstones: Mutex<Vec<Tombstone>>,
+    /// Explicitly declared table schemas (#80), folded from the manifest log.
+    /// Locked AFTER `tombstones` wherever more than one is held.
+    declared_schemas: Mutex<HashMap<(String, String), TableSchema>>,
     /// Serializes this process's own commits so seq allocation, CAS, and the
     /// in-memory apply are one critical section. The CAS handles the
     /// *inter*-process race; this handles the intra-process one, and keeps
@@ -171,17 +217,19 @@ impl<S: Store> Catalog<S> {
     pub fn load(store: S) -> std::io::Result<Catalog<S>> {
         let mut files: HashMap<(String, String), Vec<FileMeta>> = HashMap::new();
         let mut tombstones: Vec<Tombstone> = Vec::new();
+        let mut declared: HashMap<(String, String), TableSchema> = HashMap::new();
         let mut seq = 0u64;
         for path in store.list("catalog/manifest")? {
             let entry = read_entry(&store, &path)?;
             seq = seq.max(entry.seq);
-            apply_entry(&mut files, &mut tombstones, entry);
+            apply_entry(&mut files, &mut tombstones, &mut declared, entry);
         }
         Ok(Catalog {
             store,
             seq: AtomicU64::new(seq),
             files: Mutex::new(files),
             tombstones: Mutex::new(tombstones),
+            declared_schemas: Mutex::new(declared),
             commit_lock: Mutex::new(()),
             commit_conflicts: AtomicU64::new(0),
         })
@@ -205,7 +253,7 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), false)
+        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), false)
     }
 
     /// Commit a replacement whose inputs must still exist (C2 phase 5).
@@ -241,14 +289,14 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), true)
+        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), true)
     }
 
     /// Durably record a targeted-delete predicate (R-1) in the manifest log.
     /// The same CAS loop as any commit, so it composes with file adds/removes
     /// and replays/propagates identically. Returns the seq it landed at.
     pub fn commit_tombstone(&self, tombstone: Tombstone) -> std::io::Result<u64> {
-        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], false)
+        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], Vec::new(), false)
     }
 
     fn commit_guarded(
@@ -256,6 +304,7 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
         tombstones: Vec<Tombstone>,
+        schema_decls: Vec<TableSchema>,
         require_removals_present: bool,
     ) -> std::io::Result<u64> {
         let _commit = self.commit_lock.lock().expect("commit lock");
@@ -292,6 +341,7 @@ impl<S: Store> Catalog<S> {
                 add_files: add_files.clone(),
                 remove_paths: remove_paths.clone(),
                 tombstones: stamped,
+                schema_decls: schema_decls.clone(),
             };
             let bytes = serde_json::to_vec(&entry).expect("manifest json");
             if self.store.put_if_absent(&manifest_path(seq), &bytes)? {
@@ -299,7 +349,8 @@ impl<S: Store> Catalog<S> {
                 self.seq.store(seq, Ordering::SeqCst);
                 let mut files = self.files.lock().expect("catalog lock");
                 let mut tombs = self.tombstones.lock().expect("tombstone lock");
-                apply_entry(&mut files, &mut tombs, entry);
+                let mut declared = self.declared_schemas.lock().expect("schema lock");
+                apply_entry(&mut files, &mut tombs, &mut declared, entry);
                 return Ok(seq);
             }
             // Lost the race: someone else holds `seq`. Learn what they wrote,
@@ -368,15 +419,44 @@ impl<S: Store> Catalog<S> {
         newer.sort_by_key(|(seq, _)| *seq);
         let mut files = self.files.lock().expect("catalog lock");
         let mut tombs = self.tombstones.lock().expect("tombstone lock");
+        let mut declared = self.declared_schemas.lock().expect("schema lock");
         let mut new_head = head;
         for (seq, entry) in newer {
-            apply_entry(&mut files, &mut tombs, entry);
+            apply_entry(&mut files, &mut tombs, &mut declared, entry);
             new_head = new_head.max(seq);
         }
         drop(files);
         drop(tombs);
+        drop(declared);
         self.seq.store(new_head, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Durably record a declared table schema (#80) in the manifest log. Same
+    /// CAS loop as any commit, so it composes and replays/propagates like a file
+    /// add. Returns the seq it landed at.
+    pub fn commit_schema(&self, schema: TableSchema) -> std::io::Result<u64> {
+        self.commit_guarded(Vec::new(), Vec::new(), Vec::new(), vec![schema], false)
+    }
+
+    /// The declared schema for a table, if an authorized CREATE declared one.
+    pub fn declared_schema(&self, db: &str, table: &str) -> Option<TableSchema> {
+        self.declared_schemas
+            .lock()
+            .expect("schema lock")
+            .get(&(db.to_string(), table.to_string()))
+            .cloned()
+    }
+
+    /// Every declared schema — the engine seeds its schema registry from these
+    /// on boot so a declared table is queryable before any write lands.
+    pub fn declared_schemas(&self) -> Vec<TableSchema> {
+        self.declared_schemas
+            .lock()
+            .expect("schema lock")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// CAS collisions since load — 0 without a second writer (SR-4 metric).
@@ -1099,5 +1179,42 @@ mod tests {
         let _ = b.commit_replace(vec![meta("poc", "cpu", "p", "m2")], vec!["f1".into()]);
         a.catch_up().unwrap();
         assert_eq!(a.head(), head_before, "a refusal must not advance the log");
+    }
+
+    #[test]
+    fn declared_schema_survives_reload_and_last_wins() {
+        // #80: a CREATE TABLE is a manifest-log entry like a tombstone, so the
+        // two things that matter are that a cold reload replays it and that a
+        // re-declaration of the same (db, table) is the one that survives.
+        let dir = tempfile::tempdir().unwrap();
+        let store = || LocalStore::new(dir.path()).unwrap();
+
+        let a = Catalog::load(store()).unwrap();
+        a.commit_schema(TableSchema {
+            db: "poc".into(),
+            table: "cpu".into(),
+            columns: vec![
+                TableColumn { name: "host".into(), ty: ColumnType::String, tag: true },
+                TableColumn { name: "usage".into(), ty: ColumnType::Float, tag: false },
+            ],
+        })
+        .unwrap();
+        a.commit_schema(TableSchema {
+            db: "poc".into(),
+            table: "cpu".into(),
+            columns: vec![
+                TableColumn { name: "host".into(), ty: ColumnType::String, tag: true },
+                TableColumn { name: "usage".into(), ty: ColumnType::Float, tag: false },
+                TableColumn { name: "core".into(), ty: ColumnType::Integer, tag: true },
+            ],
+        })
+        .unwrap();
+
+        let fresh = Catalog::load(store()).unwrap();
+        let s = fresh.declared_schema("poc", "cpu").expect("declaration replayed");
+        assert_eq!(s.columns.len(), 3, "the later declaration wins on replay");
+        assert!(s.columns.iter().any(|c| c.name == "core"));
+        assert!(fresh.declared_schema("poc", "absent").is_none());
+        assert_eq!(fresh.declared_schemas().len(), 1, "one table declared");
     }
 }

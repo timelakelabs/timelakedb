@@ -1,0 +1,24 @@
+=== authorized DDL drill (2026-08-31T12:25:49Z) ===
+workdir=/tmp/tmp.QepbOaDLpo  bin=target/debug/timelake-server
+
+### 1. admin CREATE, then zero-row visibility ###
+  [PASS] POST /admin/tables created poc.sensors (201)
+  [PASS] SELECT on the empty declared table is 200, not an error (200)
+  [PASS] declared table answers COUNT(*) = 0 (not "table not found") (0)
+
+### 2. the write path is held to the declaration ###
+  [PASS] conforming write accepted (204)
+  [PASS] undeclared field 'humidity' rejected (400)
+  [PASS] wrong type (string for a float) rejected (400)
+  [PASS] undeclared tag 'rack' rejected (400)
+  [PASS] only the conforming write landed a row (1)
+
+### 3. the data plane still refuses DDL ###
+  [PASS] CREATE TABLE over /api/sql refused (read-only guard) (400)
+  [PASS] the table it named was never created (query errors) (400)
+
+### 4. schema-on-write is untouched ###
+  [PASS] an undeclared table still auto-creates on first write (204)
+  [PASS] and reads back (1)
+
+=== ALL PASS ===
