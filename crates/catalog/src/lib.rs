@@ -277,7 +277,14 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), Vec::new(), false)
+        self.commit_guarded(
+            add_files,
+            remove_paths,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
     }
 
     /// Commit a replacement whose inputs must still exist (C2 phase 5).
@@ -313,14 +320,28 @@ impl<S: Store> Catalog<S> {
         add_files: Vec<FileMeta>,
         remove_paths: Vec<String>,
     ) -> std::io::Result<u64> {
-        self.commit_guarded(add_files, remove_paths, Vec::new(), Vec::new(), Vec::new(), true)
+        self.commit_guarded(
+            add_files,
+            remove_paths,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
     }
 
     /// Durably record a targeted-delete predicate (R-1) in the manifest log.
     /// The same CAS loop as any commit, so it composes with file adds/removes
     /// and replays/propagates identically. Returns the seq it landed at.
     pub fn commit_tombstone(&self, tombstone: Tombstone) -> std::io::Result<u64> {
-        self.commit_guarded(Vec::new(), Vec::new(), vec![tombstone], Vec::new(), Vec::new(), false)
+        self.commit_guarded(
+            Vec::new(),
+            Vec::new(),
+            vec![tombstone],
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
     }
 
     fn commit_guarded(
@@ -462,7 +483,14 @@ impl<S: Store> Catalog<S> {
     /// CAS loop as any commit, so it composes and replays/propagates like a file
     /// add. Returns the seq it landed at.
     pub fn commit_schema(&self, schema: TableSchema) -> std::io::Result<u64> {
-        self.commit_guarded(Vec::new(), Vec::new(), Vec::new(), vec![schema], Vec::new(), false)
+        self.commit_guarded(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![schema],
+            Vec::new(),
+            false,
+        )
     }
 
     /// Durably record an authorized DROP (#80 phase 2): purge the table's files,
@@ -1240,8 +1268,16 @@ mod tests {
             db: "poc".into(),
             table: "cpu".into(),
             columns: vec![
-                TableColumn { name: "host".into(), ty: ColumnType::String, tag: true },
-                TableColumn { name: "usage".into(), ty: ColumnType::Float, tag: false },
+                TableColumn {
+                    name: "host".into(),
+                    ty: ColumnType::String,
+                    tag: true,
+                },
+                TableColumn {
+                    name: "usage".into(),
+                    ty: ColumnType::Float,
+                    tag: false,
+                },
             ],
         })
         .unwrap();
@@ -1249,15 +1285,29 @@ mod tests {
             db: "poc".into(),
             table: "cpu".into(),
             columns: vec![
-                TableColumn { name: "host".into(), ty: ColumnType::String, tag: true },
-                TableColumn { name: "usage".into(), ty: ColumnType::Float, tag: false },
-                TableColumn { name: "core".into(), ty: ColumnType::Integer, tag: true },
+                TableColumn {
+                    name: "host".into(),
+                    ty: ColumnType::String,
+                    tag: true,
+                },
+                TableColumn {
+                    name: "usage".into(),
+                    ty: ColumnType::Float,
+                    tag: false,
+                },
+                TableColumn {
+                    name: "core".into(),
+                    ty: ColumnType::Integer,
+                    tag: true,
+                },
             ],
         })
         .unwrap();
 
         let fresh = Catalog::load(store()).unwrap();
-        let s = fresh.declared_schema("poc", "cpu").expect("declaration replayed");
+        let s = fresh
+            .declared_schema("poc", "cpu")
+            .expect("declaration replayed");
         assert_eq!(s.columns.len(), 3, "the later declaration wins on replay");
         assert!(s.columns.iter().any(|c| c.name == "core"));
         assert!(fresh.declared_schema("poc", "absent").is_none());
@@ -1279,7 +1329,11 @@ mod tests {
         a.commit_schema(TableSchema {
             db: "poc".into(),
             table: "cpu".into(),
-            columns: vec![TableColumn { name: "host".into(), ty: ColumnType::String, tag: true }],
+            columns: vec![TableColumn {
+                name: "host".into(),
+                ty: ColumnType::String,
+                tag: true,
+            }],
         })
         .unwrap();
         a.commit_tombstone(tomb("d1", "poc", "cpu")).unwrap();
@@ -1292,7 +1346,10 @@ mod tests {
 
         a.commit_drop("poc", "cpu").unwrap();
         assert!(a.files_for("poc", "cpu").is_empty(), "files gone");
-        assert!(a.declared_schema("poc", "cpu").is_none(), "declaration gone");
+        assert!(
+            a.declared_schema("poc", "cpu").is_none(),
+            "declaration gone"
+        );
         assert!(a.tombstones_for("poc", "cpu").is_empty(), "tombstones gone");
         assert_eq!(a.files_for("poc", "mem").len(), 1, "other table untouched");
 
@@ -1301,7 +1358,10 @@ mod tests {
         assert!(b.declared_schema("poc", "cpu").is_none());
 
         let fresh = Catalog::load(store()).unwrap();
-        assert!(fresh.files_for("poc", "cpu").is_empty(), "reload replays the drop");
+        assert!(
+            fresh.files_for("poc", "cpu").is_empty(),
+            "reload replays the drop"
+        );
         assert!(fresh.declared_schema("poc", "cpu").is_none());
         assert_eq!(fresh.files_for("poc", "mem").len(), 1);
     }

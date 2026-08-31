@@ -27,8 +27,16 @@ fn engine(dir: &std::path::Path) -> Arc<timelake_server::Engine> {
 /// host tag + usage float — the schema every case here starts from.
 fn cpu_cols() -> Vec<TableColumn> {
     vec![
-        TableColumn { name: "host".into(), ty: ColumnType::String, tag: true },
-        TableColumn { name: "usage".into(), ty: ColumnType::Float, tag: false },
+        TableColumn {
+            name: "host".into(),
+            ty: ColumnType::String,
+            tag: true,
+        },
+        TableColumn {
+            name: "usage".into(),
+            ty: ColumnType::Float,
+            tag: false,
+        },
     ]
 }
 
@@ -76,7 +84,11 @@ async fn create_makes_an_empty_table_queryable_not_missing() {
 
     // A brand-new db that holds only a declared table still resolves — a query
     // against it answers with rows, not "database does not exist".
-    assert_eq!(count(&e, "poc", "cpu").await, 0, "declared, empty, queryable");
+    assert_eq!(
+        count(&e, "poc", "cpu").await,
+        0,
+        "declared, empty, queryable"
+    );
 
     // And SELECT * resolves the columns rather than erroring "table not found".
     let batches = e
@@ -84,7 +96,10 @@ async fn create_makes_an_empty_table_queryable_not_missing() {
         .await
         .expect("select on a zero-row declared table must succeed");
     assert!(
-        timelake_query::batches_to_json(&batches).as_array().unwrap().is_empty(),
+        timelake_query::batches_to_json(&batches)
+            .as_array()
+            .unwrap()
+            .is_empty(),
         "no rows yet"
     );
 }
@@ -102,11 +117,23 @@ async fn write_is_held_to_the_declaration() {
     // Every shape of "not the declared schema" is refused, and none of them
     // moves the count — the rejection is before durability.
     let bad: [(&str, &[u8]); 5] = [
-        ("an undeclared field", &b"cpu,host=a usage=0.5,extra=1 20"[..]),
+        (
+            "an undeclared field",
+            &b"cpu,host=a usage=0.5,extra=1 20"[..],
+        ),
         ("an undeclared tag", &b"cpu,host=a,rack=r1 usage=0.5 20"[..]),
-        ("a type mismatch (string for a float)", &b"cpu,host=a usage=\"hot\" 20"[..]),
-        ("a declared tag written as a field", &b"cpu usage=0.5,host=\"x\" 20"[..]),
-        ("a declared field written as a tag", &b"cpu,usage=0.5,host=a other=1 20"[..]),
+        (
+            "a type mismatch (string for a float)",
+            &b"cpu,host=a usage=\"hot\" 20"[..],
+        ),
+        (
+            "a declared tag written as a field",
+            &b"cpu usage=0.5,host=\"x\" 20"[..],
+        ),
+        (
+            "a declared field written as a tag",
+            &b"cpu,usage=0.5,host=a other=1 20"[..],
+        ),
     ];
     for (what, body) in bad {
         assert!(wr_refused(&e, "poc", body), "must refuse {what}");
@@ -141,23 +168,37 @@ fn create_refuses_bad_declarations() {
     );
 
     // time is implicit; a duplicate column is a typo; an empty name is nonsense.
-    assert!(e
-        .create_table(
+    assert!(
+        e.create_table(
             "poc",
             "t1",
-            vec![TableColumn { name: "time".into(), ty: ColumnType::Integer, tag: false }]
+            vec![TableColumn {
+                name: "time".into(),
+                ty: ColumnType::Integer,
+                tag: false
+            }]
         )
-        .is_err());
-    assert!(e
-        .create_table(
+        .is_err()
+    );
+    assert!(
+        e.create_table(
             "poc",
             "t2",
             vec![
-                TableColumn { name: "x".into(), ty: ColumnType::Float, tag: false },
-                TableColumn { name: "x".into(), ty: ColumnType::Integer, tag: true },
+                TableColumn {
+                    name: "x".into(),
+                    ty: ColumnType::Float,
+                    tag: false
+                },
+                TableColumn {
+                    name: "x".into(),
+                    ty: ColumnType::Integer,
+                    tag: true
+                },
             ]
         )
-        .is_err());
+        .is_err()
+    );
     assert!(e.create_table("poc", "", cpu_cols()).is_err());
 }
 
@@ -178,8 +219,14 @@ async fn declaration_and_refusal_survive_a_restart() {
 
     // Fresh engine, same dir: catalog + WAL replay from disk.
     let e = engine(dir.path());
-    assert!(e.declared_schema("poc", "cpu").is_some(), "declaration replayed");
-    assert!(e.declared_schema("poc", "empty").is_some(), "the unwritten one too");
+    assert!(
+        e.declared_schema("poc", "cpu").is_some(),
+        "declaration replayed"
+    );
+    assert!(
+        e.declared_schema("poc", "empty").is_some(),
+        "the unwritten one too"
+    );
     assert_eq!(
         count(&e, "poc", "cpu").await,
         1,
@@ -211,7 +258,11 @@ async fn drop_removes_the_table_including_unflushed_rows_across_restart() {
             e.declared_schema("poc", "cpu").is_none(),
             "its declaration went too"
         );
-        assert_eq!(count(&e, "poc", "weather").await, 1, "other tables untouched");
+        assert_eq!(
+            count(&e, "poc", "weather").await,
+            1,
+            "other tables untouched"
+        );
     }
 
     // Fresh engine, same dir: the WAL had unflushed cpu rows when the drop ran.
@@ -236,7 +287,10 @@ async fn a_write_after_drop_recreates_the_table() {
     // declaration (the drop removed it), so any columns are accepted again.
     wr_ok(&e, "poc", b"cpu,host=b usage=0.9,extra=1 20");
     assert_eq!(count(&e, "poc", "cpu").await, 1, "the table is back");
-    assert!(e.declared_schema("poc", "cpu").is_none(), "but undeclared now");
+    assert!(
+        e.declared_schema("poc", "cpu").is_none(),
+        "but undeclared now"
+    );
 }
 
 #[tokio::test]
