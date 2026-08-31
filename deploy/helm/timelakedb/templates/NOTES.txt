@@ -1,0 +1,33 @@
+TimeLakeDB ({{ .Values.mode }} mode) is installed as "{{ .Release.Name }}".
+
+Client Service (ClusterIP by default):
+  {{ include "timelakedb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}   (HTTP: writes + /api/sql)
+  {{ include "timelakedb.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.flightPort }}   (Flight SQL)
+
+Smoke it from inside the cluster (or `kubectl port-forward` first):
+
+  # health
+  curl -fs http://<svc>:{{ .Values.service.httpPort }}/health
+
+  # write a point, then read it back
+  curl -fs -XPOST "http://<svc>:{{ .Values.service.httpPort }}/api/v3/write_lp?db=poc&precision=ns" \
+    --data-binary 'demo,host=a value=1 1'
+  curl -fs -XPOST "http://<svc>:{{ .Values.service.httpPort }}/api/sql" \
+    -H 'content-type: application/json' \
+    -d '{"db":"poc","sql":"SELECT COUNT(*) AS n FROM demo"}'
+
+{{- if eq .Values.dataAuth "off" }}
+
+NOTE: data-plane auth is OFF. That is fine behind a ClusterIP Service, but set
+`dataAuth: required` and issue a token before exposing the data plane.
+{{- end }}
+{{- if not .Values.adminBootstrapPassword }}
+
+NOTE: no adminBootstrapPassword was set — the admin console seeds admin/admin,
+quarantined until you rotate it on first sign-in.
+{{- end }}
+{{- if not .Values.objectStore.enabled }}
+
+NOTE: objectStore is disabled — data lives on the node's local PVC. Enable an
+S3-compatible store for durability beyond the node and for the cluster topology.
+{{- end }}

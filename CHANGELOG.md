@@ -13,6 +13,23 @@ here.
 
 ## [Unreleased]
 
+### Added — Helm chart, single-node (#81 phase 1, #145) (2026-08-30)
+
+`deploy/helm/timelakedb/` — the first supported way to deploy TimeLakeDB on
+Kubernetes. `helm install` brings up a single `role=all` node as a **StatefulSet**
+(not a Deployment: the node owns a durable WAL and data dir and must reschedule
+onto the same volume) with a PVC for `/var/lib/timelake/data`, a client ClusterIP
+Service plus a headless Service for stable identity, config via ConfigMap, and
+object-store creds / encryption key / TLS via a chart Secret or an
+`existingSecret`. Safe by default: uid 1000 (P0-2), read-only rootfs with a
+tmpfs `/tmp`, dropped capabilities, `fsGroup` so the PVC is writable, and a
+template-time refusal to render `dataAuth: off` behind an externally-exposed
+Service. Installed on a real (kind) cluster and smoked green — `/health` reports
+`role=all`, a line-protocol write returns 204 and `/api/sql` reads the rows back,
+with the data on the PVC and the rootfs read-only
+(`docs/evidence/helm-single-node-smoke.log`). The cluster topology (router /
+ingester / querier split) is phase 2 (#146).
+
 ### Added — Live Consul discovery (C3, #71) (2026-08-30)
 
 Discovery gained a second backend. Set `TIMELAKE_DISCOVERY=consul://host:port`

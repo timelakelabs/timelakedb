@@ -1,0 +1,143 @@
+{{- if eq .Values.mode "single" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "timelakedb.fullname" . }}
+  labels:
+    {{- include "timelakedb.labels" . | nindent 4 }}
+spec:
+  # A StatefulSet, not a Deployment: a role=all node owns a durable WAL and data
+  # dir, and must reschedule onto the SAME volume, not a fresh empty one.
+  serviceName: {{ include "timelakedb.fullname" . }}-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "timelakedb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "timelakedb.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "timelakedb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # uid 1000 (P0-2), and fsGroup so the mounted PVC is writable by it.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: timelakedb
+          image: {{ include "timelakedb.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "timelakedb.fullname" . }}
+            {{- if include "timelakedb.hasChartSecret" . }}
+            - secretRef:
+                name: {{ include "timelakedb.fullname" . }}
+            {{- end }}
+            {{- with .Values.objectStore.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+            {{- with .Values.encryption.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+          {{- if or .Values.tls.enabled .Values.extraEnv }}
+          env:
+            {{- if .Values.tls.enabled }}
+            - name: TIMELAKE_TLS_CERT
+              value: /etc/timelake/tls/tls.crt
+            - name: TIMELAKE_TLS_KEY
+              value: /etc/timelake/tls/tls.key
+            {{- if .Values.tls.clientCa }}
+            - name: TIMELAKE_TLS_CLIENT_CA
+              value: /etc/timelake/tls/ca.crt
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+            - name: flight
+              containerPort: {{ .Values.service.flightPort }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            # The rootfs is read-only; the only writable paths are the data PVC
+            # and a tmpfs /tmp, matching the compose rig's read_only: true.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/timelake/data
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/timelake/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+{{- end }}
