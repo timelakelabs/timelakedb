@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "timelake-compact"
 version.workspace = true
 edition.workspace = true
