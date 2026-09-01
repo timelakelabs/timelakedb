@@ -302,7 +302,7 @@ no file pruning yet; fresh-vs-settled work is M3/M4.
 Each release attaches a `.deb` and an `.rpm` built from that tag.
 
 ```bash
-VER=0.3.0
+VER=0.4.0
 
 # Debian / Ubuntu
 curl -LO https://github.com/timelakelabs/timelakedb/releases/latest/download/timelakedb_${VER}_amd64.deb

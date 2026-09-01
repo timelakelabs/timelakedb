@@ -369,7 +369,7 @@
             <tr><td><code>DELETE /admin/tables/{db}/{table}</code></td><td><strong>admin</strong></td><td>—</td><td>200 + <code>{db, table, status:"dropped"}</code>. Removes the table wholesale — files, declaration, tombstones and cached rows — cluster-wide; the bytes go on the GC grace timer. A later write re-creates it by schema-on-write. 400 if the table does not exist</td></tr>
             <tr><td><code>GET /admin/config</code></td><td>session (viewer)</td><td>—</td><td>200 + <code>{revision, settings[]}</code> — every setting with its effective value and where it came from (default &lt; property &lt; override), plus the applied config revision</td></tr>
             <tr><td><code>GET /admin/config/{key}</code></td><td>session (viewer)</td><td>—</td><td>200 + that one setting's layered provenance. 404 if unknown</td></tr>
-            <tr><td><code>PUT /admin/config/{key}</code></td><td>the setting's own role (viewer/operator/<strong>admin</strong>); body <code>value</code> (a value, or <code>null</code> for explicit-off)</td><td><code>dry_run=1</code> previews without applying</td><td>200; persists durably and applies live. 409 if it breaks a cross-field invariant (the error names it), 404 if unknown</td></tr>
+            <tr><td><code>PUT /admin/config/{key}</code></td><td>the setting's own role (viewer/operator/<strong>admin</strong>); body <code>value</code> (a value, or <code>null</code> for explicit-off)</td><td><code>dry_run=1</code> previews without applying</td><td>200; persists durably and applies live. 409 if it breaks a cross-field invariant (the error names it) or if the key is pinned to the property layer by <code>TIMELAKE_CONFIG_PINNED</code>, 404 if unknown</td></tr>
             <tr><td><code>DELETE /admin/config/{key}</code></td><td>the setting's own role</td><td>—</td><td>200; drops the override back to the property/default beneath it</td></tr>
             <tr><td><code>POST /admin/delete</code></td><td><strong>admin</strong>; body <code>db</code>, <code>table</code>, <code>tags{}</code>, optional <code>start_ns</code>, <code>end_ns</code></td><td>—</td><td>200 + <code>{tombstone_id, seq, status}</code>. Records a tombstone that hides every matching row at once — buffer, files and aggregates alike — before a background pass rewrites the files. A predicate with neither a tag match nor a time bound is refused with 400</td></tr>
             <tr><td><code>GET /admin/rollups</code></td><td>viewer</td><td>—</td><td>200 + <code>{"rollups":[{db, name, source, target, interval, lookback, group_by, aggregations[]}]}</code></td></tr>
@@ -523,7 +523,8 @@
       </div>
       <p>
         <code>timelake_last_value_entries</code> on <code>/metrics</code> is the
-        live entry count across all cached tables — watch it approach the cap.
+        live entry count across all cached tables — watch it approach the cap,
+        which <code>TIMELAKE_LAST_CACHE_MAX</code> sets (default 100000).
       </p>
 
       <h3>Admin console (<code>/admin/ui</code>)</h3>

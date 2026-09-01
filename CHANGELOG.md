@@ -5,13 +5,41 @@ All notable changes to TimeLakeDB are recorded here. The format follows
 will follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from
 its first release.
 
-Nothing has been released yet. Everything below is pre-v1 work on `main`,
-organised by the milestone that gated it. Every performance or robustness
-entry traces to a recorded run in `docs/evidence/` — the harness is the
-specification, so an entry without a measurement behind it does not belong
-here.
+These are pre-v1 milestone releases on `main`, each tagged `v0.x` and packaged
+as it landed; the public v1 line has not opened yet. Everything below is
+organised by the milestone that gated it. Every performance or robustness entry
+traces to a recorded run in `docs/evidence/` — the harness is the specification,
+so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-09-01
+
+### Added — Authorized DDL: CREATE and DROP TABLE (#80, #153, #154) (2026-08-31)
+
+A table can be declared before any data lands, and removed wholesale, as
+authorized admin operations — without loosening the data plane, which stays
+read-only: a `CREATE`/`DROP TABLE` over `/api/sql` is still refused. Both are
+manifest-log entries committed by CAS like a tombstone, so they are
+cluster-visible and replay on restart.
+
+`POST /admin/tables` (admin) declares a table's schema, and the write path is
+then held to it — a column the declaration doesn't name, a tag written as a
+field or the reverse, or a value of the wrong type is a `400` *before* the WAL,
+not durably accepted and coerced. A declared table is queryable with zero rows
+immediately (an empty provider carrying the declared schema), so a `SELECT`
+answers `[]`, not "table not found". Undeclared tables are unaffected:
+schema-on-write still auto-creates them.
+
+`DELETE /admin/tables/{db}/{table}` (admin) removes a table — its files,
+declaration, standing tombstones and cached rows — cluster-wide, then reclaims
+the objects on the GC grace timer. It flushes first, on purpose, and the reason
+is the whole design: unflushed rows live in the WAL, which is replayed into
+buffers on the next restart *after* the catalog loads, so a drop that skipped
+the flush would watch the table come back from the log. A later write re-creates
+the table by schema-on-write. Drilled end to end
+(`deploy/compose/ddl_drill.sh` 12/12, `drop_drill.sh` 13/13;
+`docs/evidence/ddl-drill.log`, `docs/evidence/drop-drill.log`).
 
 ### Added — Last-value cache, the query (#57 phase 2, #150) (2026-08-31)
 
@@ -146,6 +174,50 @@ behind required mTLS — replication with zero acked loss across a node death, a
 hot cert rotation under continuous writes that the established replication link
 rides out (zero write errors, zero loss), and a certless / wrong-CA peer refused
 at the handshake.
+
+### Added — The cluster view: `/admin/cluster` and a cluster-wide dashboard (#111, #117, U3) (2026-08-29)
+
+`GET /admin/cluster` (viewer) aggregates every discovery peer's public `/health`
+into one view — per node its role, health, applied `config_revision` and
+`catalog_head` — with a 3 s per-peer timeout so a wedged peer reads
+`reachable:false` rather than hanging the whole view. Advisory only (CL-5:
+discovery carries no correctness). `/health` was enriched to carry the fields the
+view aggregates, and `catalog_head` is now exposed on every node, not just
+followers, so "has this node caught up" is answerable without a query. The
+console gained a Cluster screen over it, and a cluster-wide Grafana dashboard
+(`deploy/grafana/`) reads the same shape over Flight SQL. Drilled on a real
+ingester pair (`docs/evidence/u3-cluster-drill.log`,
+`docs/evidence/cluster-dashboard-drill.log`).
+
+### Added — The operator console: audit, logs and configuration screens (#110, U2) (2026-08-28)
+
+The admin console gained read views for the three things an operator reaches for
+during an incident, each answered from the node itself so they work when the
+query path is what is broken. The **audit** screen renders the hash-chained
+trail (`GET /admin/audit`, with `?verify=1` to check the chain); the **logs**
+screen reads a bounded in-process log ring (`GET /admin/logs`, filterable by
+level, target and substring, and reporting how many entries it overwrote before
+you read); the **configuration** screen renders the layered view below. All
+viewer-role. Verified in `docs/evidence/u2-console-drill.log`.
+
+### Added — Layered configuration, live and provenanced (#108, #109, U0/U1) (2026-08-27)
+
+Configuration is no longer read once from the environment at boot. A new
+`timelake-config` crate resolves every setting through three layers —
+`EngineConfig::default()` < a `TIMELAKE_*` system property < a stored override —
+each visible, with divergence from the property reported rather than hidden.
+`GET /admin/config` lists every setting with its provenance; `PUT`/`DELETE
+/admin/config/{key}` set or revert an override at that setting's own role
+(viewer/operator/admin), apply it live with no restart, check cross-field
+invariants (`409`), and preview with `dry_run=1`. `TIMELAKE_CONFIG_PINNED` locks
+named keys to the property layer, so a `PUT` to a pinned key is refused — the
+escape hatch for a value the console must not be able to change.
+
+The admin plane moved onto its own private listener in the same work (U0a):
+`/admin/*` and the console answer on `TIMELAKE_ADMIN_ADDR` (default
+`127.0.0.1:1966`, loopback), off the exposed data port — which now returns
+`410 Gone` for those paths and names the new listener. 1965 is the intra-cluster
+replication port, so admin took 1966.
 
 ## [0.3.0] - 2026-08-26
 
