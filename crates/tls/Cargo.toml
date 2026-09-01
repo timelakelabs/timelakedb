@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "timelake-tls"
 version.workspace = true
 edition.workspace = true

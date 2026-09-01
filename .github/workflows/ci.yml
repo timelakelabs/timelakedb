@@ -1,12 +1,18 @@
 name: ci
 
-# Markdown does not gate this workflow. Every job here is expensive — clippy,
-# 173 tests, an instrumented coverage rebuild, a Docker image and tier-1
-# conformance, ~30 minutes of billed private-repo minutes (Catchment/CI.md
-# treats that budget as a real constraint) — and none of it can be affected
-# by a prose change: no Rust source pulls a .md in via include_str!, and no
-# test opens one. The .md references in crates/ are doc comments and error
+# Markdown does not gate this workflow. The work here is expensive — clippy, the
+# workspace tests, a Docker image and tier-1 conformance, plus an instrumented
+# coverage rebuild on a push to main — billed private-repo minutes
+# (Catchment/CI.md treats that budget as a real constraint) — and none of it can
+# be affected by a prose change: no Rust source pulls a .md in via include_str!,
+# and no test opens one. The .md references in crates/ are doc comments and error
 # strings citing SECURITY.md, not reads.
+#
+# Shape: a cheap `lint` job (fmt + clippy) gates the expensive ones, so a
+# formatting or clippy slip does not also pay for conformance and coverage on a
+# commit that cannot merge. Coverage runs only on main; a pull request runs a
+# plain `cargo test`. Both keep the billed minutes off doomed and off routine
+# pull-request runs.
 #
 # The cost is that a docs-only commit gets no run, so its sha has no green
 # result of its own. That is the intended trade: the last green run still
@@ -35,25 +41,46 @@ permissions:
   packages: write
 
 jobs:
-  rust:
-    name: fmt · clippy · tests · coverage
+  # The cheap gate: fmt + clippy, ~3 min. Everything expensive below
+  # `needs: [lint]`, so a formatting or clippy slip fails here instead of ALSO
+  # burning a ~22 min conformance run and an instrumented coverage rebuild on a
+  # commit that was never going to merge. Not hypothetical: the #80 DDL PRs went
+  # red on `cargo fmt --check` while conformance ran green in parallel, three
+  # times, each ~22 wasted minutes on a private-repo bill.
+  lint:
+    name: fmt · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Tests always; coverage only on a push to main. The instrumented
+  # `cargo llvm-cov` rebuild is both the expensive half and the only part that
+  # needs the disk-reclaim dance, and it does not need to gate every pull
+  # request: a PR runs a plain `cargo test`, main measures coverage. Each event
+  # therefore runs the workspace suite exactly once — plain on a PR (`on.push`
+  # is main/master only), instrumented on main.
+  test:
+    name: tests · coverage
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # A 16-crate workspace built --all-targets, then rebuilt instrumented
-      # for coverage, does not fit on a hosted runner beside its preinstalled
-      # images: run 31561992129 reached 87 MB free and `ld` died with SIGBUS
-      # mid-link. That reads as a test failure in the log and is not one —
-      # the same sha passes in a stock rust:1-slim container. None of what is
-      # removed below is used by this job.
-      #
-      # The original list (dotnet/ghc/android/CodeQL) left the margin thin
-      # enough that a lockfile refresh alone re-crossed it (run 31901364946:
-      # "No space left on device" in the same llvm-cov link). Freeing the
-      # rest of the language runtimes this job never touches, plus the
-      # preloaded Docker images, restores real headroom (~10+ GB).
+      # A 16-crate workspace rebuilt instrumented for coverage does not fit on a
+      # hosted runner beside its preinstalled images: run 31561992129 reached
+      # 87 MB free and `ld` died with SIGBUS mid-link. That reads as a test
+      # failure in the log and is not one — the same sha passes in a stock
+      # rust:1-slim container. None of what is removed is used here, and the
+      # plain `cargo test` on a PR fits without it, so this runs only for the
+      # coverage build on main.
       - name: Reclaim runner disk
+        if: github.event_name == 'push'
         run: |
           echo "before: $(df -h --output=avail / | tail -1) available"
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
@@ -66,12 +93,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, llvm-tools-preview
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+      # Pull request: a plain test run, no instrumentation, no disk dance.
+      - name: Tests
+        if: github.event_name == 'pull_request'
+        run: cargo test --workspace
+
+      # main: the same suite, instrumented, with the 80% line gate.
       - uses: taiki-e/install-action@cargo-llvm-cov
+        if: github.event_name == 'push'
       # Two exclusions, both because the code is exercised somewhere this
       # job is not, rather than because it is untested:
       #   main.rs   — socket bind/serve, covered by the container healthcheck.
@@ -86,21 +118,24 @@ jobs:
       #               whose tests all pass elsewhere.
       #
       # Strip full DWARF from the instrumented rebuild. The plain `cargo test`
-      # above fits; this coverage build does not, and freeing more runner disk
-      # (dotnet/ghc/android above) was a losing race against a workspace that
-      # only grows — datafusion + arrow + aws-sdk instrumented AND carrying
-      # `-C debuginfo=2` produced object files that OOM'd `ld` mid-link
-      # (SIGBUS, "ld terminated with signal 7", on whichever test binary drew
-      # the short straw). llvm-cov's line counts come from the embedded
-      # coverage map, not from DWARF, so line-tables-only is all it needs and
-      # cuts the link 3–5×. `--fail-under-lines` is unaffected.
-      - run: cargo llvm-cov --workspace --ignore-filename-regex 'main\.rs|store-s3/src/lib\.rs' --fail-under-lines 80
+      # fits; this coverage build does not, and freeing more runner disk
+      # (above) was a losing race against a workspace that only grows —
+      # datafusion + arrow + aws-sdk instrumented AND carrying `-C debuginfo=2`
+      # produced object files that OOM'd `ld` mid-link (SIGBUS, "ld terminated
+      # with signal 7", on whichever test binary drew the short straw).
+      # llvm-cov's line counts come from the embedded coverage map, not from
+      # DWARF, so line-tables-only is all it needs and cuts the link 3–5×.
+      # `--fail-under-lines` is unaffected.
+      - name: Coverage
+        if: github.event_name == 'push'
+        run: cargo llvm-cov --workspace --ignore-filename-regex 'main\.rs|store-s3/src/lib\.rs' --fail-under-lines 80
         env:
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
           CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
   store-s3:
     name: store-s3 · S3 + KMS against LocalStack
+    needs: [lint]
     runs-on: ubuntu-latest
     # The three #[ignore]d tests in timelake-store-s3 are the only ones that
     # touch a real object store: the Store contract over S3 (including range
@@ -152,6 +187,7 @@ jobs:
 
   conformance:
     name: catchment · conformance (tier 1)
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -248,7 +284,7 @@ jobs:
     # compiling the database on every one of its pull requests — the one
     # deliberate exception to "test the working tree, never a published
     # tag", justified because there the tree under test is Tributary's.
-    needs: [rust, store-s3, conformance]
+    needs: [test, store-s3, conformance]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
       - uses: actions/checkout@v4
