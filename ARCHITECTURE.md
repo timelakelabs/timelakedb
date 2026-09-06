@@ -446,6 +446,23 @@ commits are small and rare, contention negligible at this fleet size;
 both the local hard-link and the real S3 `If-None-Match`
 (`docs/evidence/catalog-cas-drill.log`).
 
+**Entries state their format, and a newer one is refused (#160).** Every
+entry carries `format`; a binary that meets a number above its own stops
+loading the catalog instead of reading the fields it recognises and
+dropping the rest. That direction is the one nobody tests. Every field
+added since M2 is `#[serde(default)]`, which is right going forward and
+silent going backward: an older reader has no member for a key it does
+not know, serde discards it, and a `DROP TABLE` or a targeted delete
+arrives as an empty no-op commit while the files it retired stay listed
+and the GC grace runs down. The number moves only when an entry gains
+something an older reader would **mis-apply**, never merely miss —
+`tombstones` and `drop_tables` were that; a new per-file statistic is
+not. `deny_unknown_fields` is the wrong tool and is deliberately absent:
+it would break the forward path every `default` above depends on. Scope,
+stated because a version number invites unearned confidence: 0.2 through
+0.4 carry no check, so a rollback *to* them is unguarded and always will
+be.
+
 One refinement is deferred to C2 with the role split: **re-validating
 the commit against the new state on conflict** — a compaction whose
 inputs were concurrently retention-dropped should abort rather than
