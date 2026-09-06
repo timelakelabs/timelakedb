@@ -13,6 +13,43 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Fixed — The manifest log states its format, and a newer one is refused (#160)
+
+Every manifest entry now carries a `format` number, and a binary that meets
+a higher one **refuses to load the catalog** rather than reading what it
+recognises and dropping the rest.
+
+The rollback policy, which is the point of the number: **a binary reads
+manifests at its own format or lower, and refuses anything above it.** The
+current format is **1**, and it covers every manifest written by 0.2
+through 0.4 as well — those carry no `format` key and are treated as 1,
+so upgrading changes nothing and needs no migration.
+
+What this fixes is the direction nobody checks. Each field added since M2 —
+`remove_paths`, `tombstones` (R-1), `schema_decls` and `drop_tables`
+(#80) — is `#[serde(default)]`, which is right going forward: a new binary
+reads an old manifest and fills in the blanks. Going backward it was
+silent and wrong. An older binary has no struct member for a field it does
+not know, serde drops the key, and the entry reads as an empty no-op
+commit — a `DROP TABLE` or a targeted delete quietly undone, with the files
+it retired still listed in the catalog and the GC grace already counting
+down toward collecting them. Nothing anywhere said a word.
+
+Be clear about the scope, because a version number invites more confidence
+than this one has earned: **0.2 through 0.4 carry no check at all, so
+nothing here can make a rollback to them safe.** The number protects every
+rollback after this one, which is the only kind still available to protect.
+
+The version is bumped only when an entry gains something an older reader
+would *mis-apply*, never merely miss. A new optional per-file statistic
+does not move it. A version that changes every release is one nobody reads.
+
+Deliberately NOT `#[serde(deny_unknown_fields)]`, which looks like the
+one-line version of this and breaks the forward path instead: every
+`default` field above depends on a reader ignoring keys it does not know.
+The number is what separates a field you may ignore from one you must not,
+and `crates/catalog` has a test for each.
+
 ## [0.4.0] - 2026-09-01
 
 ### Added — Authorized DDL: CREATE and DROP TABLE (#80, #153, #154) (2026-08-31)

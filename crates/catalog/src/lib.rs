@@ -109,8 +109,36 @@ pub struct DroppedTable {
     pub table: String,
 }
 
+/// The manifest log's on-disk format.
+///
+/// Bumped ONLY when an entry gains something an older reader would
+/// **mis-apply**, not merely miss. `tombstones` (R-1) and `drop_tables`
+/// (#80 phase 2) were both that: an older binary deserialises the entry
+/// into a struct without those fields, serde drops the unknown keys, and
+/// the commit reads as a no-op — a delete or a drop silently undone, with
+/// the files it retired still listed and the GC grace already counting
+/// down. A new optional per-file statistic is not that, and must not move
+/// this number. A version that changes every release is one nobody reads.
+///
+/// Still 1: this commit adds the *mechanism*, not a new incompatibility.
+/// Which means the honest scope is forward-looking — 0.2 through 0.4
+/// binaries carry no check at all, so nothing here can protect a rollback
+/// to them. It protects every rollback after this one, which is the only
+/// kind still available to protect.
+const MANIFEST_FORMAT_VERSION: u32 = 1;
+
+/// Entries written before the field existed (0.2 through 0.4) carry no
+/// `format` key, and are format 1 by definition.
+fn unversioned_manifest_format() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
+    /// First, so the format of a manifest is the first thing a person
+    /// reading one sees.
+    #[serde(default = "unversioned_manifest_format")]
+    format: u32,
     seq: u64,
     add_files: Vec<FileMeta>,
     /// Object paths superseded by this commit (compaction merges,
@@ -135,12 +163,36 @@ struct ManifestEntry {
 /// corrupt entry is diagnosable.
 fn read_entry<S: Store>(store: &S, path: &str) -> std::io::Result<ManifestEntry> {
     let bytes = store.get(path)?;
-    serde_json::from_slice(&bytes).map_err(|e| {
+    let entry: ManifestEntry = serde_json::from_slice(&bytes).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("manifest {path}: {e}"),
         )
-    })
+    })?;
+    // Refuse forward, never guess. An entry from a newer writer may carry a
+    // field this binary has no struct member for, and serde will drop it
+    // without a word — which is precisely how a DROP or a targeted delete
+    // comes back as an empty no-op commit while the files it retired stay
+    // listed and the GC grace runs out underneath them.
+    //
+    // Failing here stops the node booting. That is the point: a catalog
+    // this binary cannot read correctly is not one it should serve from,
+    // and a loud refusal at start-up is cheaper than a silent resurrection
+    // discovered when a scan hits an object the GC already collected.
+    if entry.format > MANIFEST_FORMAT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "manifest {path} is format {} and this binary reads at most \
+                 format {} — it was written by a newer TimeLakeDB. Refusing \
+                 to load rather than silently ignore entries this version \
+                 does not understand; run a build that reads format {} or \
+                 later.",
+                entry.format, MANIFEST_FORMAT_VERSION, entry.format,
+            ),
+        ));
+    }
+    Ok(entry)
 }
 
 /// Fold one entry into the in-memory file index: removals first (so a
@@ -383,6 +435,7 @@ impl<S: Store> Catalog<S> {
                 })
                 .collect();
             let entry = ManifestEntry {
+                format: MANIFEST_FORMAT_VERSION,
                 seq,
                 add_files: add_files.clone(),
                 remove_paths: remove_paths.clone(),
@@ -1364,5 +1417,121 @@ mod tests {
         );
         assert!(fresh.declared_schema("poc", "cpu").is_none());
         assert_eq!(fresh.files_for("poc", "mem").len(), 1);
+    }
+
+    // ---- manifest format version (#160) --------------------------------
+    //
+    // The failure this guards: a binary reads a manifest written by a newer
+    // one, has no struct member for a field it does not know, and serde
+    // drops it silently. A DROP or a targeted delete then reads as an empty
+    // no-op commit, the files it retired stay listed, and the GC grace runs
+    // out underneath them. There is no error anywhere in that sequence.
+
+    /// What a manifest this binary wrote must say about itself.
+    #[test]
+    fn every_commit_stamps_the_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        cat.commit_add(vec![meta("poc", "cpu", "2026090600", "a.parquet")])
+            .unwrap();
+
+        let raw = std::fs::read(dir.path().join(manifest_path(1))).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            doc.get("format").and_then(|v| v.as_u64()),
+            Some(MANIFEST_FORMAT_VERSION as u64),
+            "a manifest that does not state its format cannot be refused by a              future reader — that is the whole mechanism"
+        );
+    }
+
+    /// The 0.2-through-0.4 manifests already on disk have no `format` key.
+    /// Refusing those would turn an upgrade into an outage.
+    #[test]
+    fn a_manifest_without_a_format_key_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("catalog/manifest")).unwrap();
+        std::fs::write(
+            dir.path().join(manifest_path(1)),
+            br#"{"seq":1,"add_files":[{"db":"poc","table":"cpu","partition":"2026090600","path":"a.parquet","rows":1,"size_bytes":1,"min_ts_ns":0,"max_ts_ns":0}]}"#,
+        )
+        .unwrap();
+
+        let cat =
+            Catalog::load(LocalStore::new(dir.path()).unwrap()).expect("pre-format manifest loads");
+        assert_eq!(cat.head(), 1);
+        assert_eq!(cat.files_for("poc", "cpu").len(), 1);
+    }
+
+    /// The point of the number. A newer writer's entry is refused, loudly,
+    /// naming both versions — rather than being half-read into a commit
+    /// that looks empty.
+    #[test]
+    fn a_manifest_from_a_newer_writer_is_refused_not_half_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("catalog/manifest")).unwrap();
+        // Shaped like a real future entry: a field this binary has no member
+        // for, carrying the kind of instruction it would otherwise drop.
+        let future = format!(
+            r#"{{"format":{},"seq":1,"add_files":[],"unmap_partitions":[{{"db":"poc","table":"cpu"}}]}}"#,
+            MANIFEST_FORMAT_VERSION + 1
+        );
+        std::fs::write(dir.path().join(manifest_path(1)), future).unwrap();
+
+        // `expect_err` would need Catalog: Debug, which it is not.
+        let err = match Catalog::load(LocalStore::new(dir.path()).unwrap()) {
+            Ok(_) => panic!("loaded a manifest written by a newer format"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&(MANIFEST_FORMAT_VERSION + 1).to_string())
+                && msg.contains(&MANIFEST_FORMAT_VERSION.to_string()),
+            "the error must name what it found and what it reads: {msg}"
+        );
+    }
+
+    /// The trap `deny_unknown_fields` would have walked into. An entry at a
+    /// format this binary DOES read may still carry a field it has never
+    /// heard of — a later optional statistic, say — and that must load. The
+    /// version number is what separates "a field you may ignore" from "a
+    /// field you must not".
+    #[test]
+    fn an_unknown_field_at_a_readable_format_is_still_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("catalog/manifest")).unwrap();
+        let entry = format!(
+            r#"{{"format":{},"seq":1,"add_files":[],"some_later_statistic":42}}"#,
+            MANIFEST_FORMAT_VERSION
+        );
+        std::fs::write(dir.path().join(manifest_path(1)), entry).unwrap();
+
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap())
+            .expect("an unknown field at a readable format is not a reason to refuse");
+        assert_eq!(cat.head(), 1);
+    }
+
+    /// A newer entry appended while this node is running hits the CAS
+    /// catch-up path, not `load`. Both go through `read_entry`; this pins
+    /// that they do, because a check on only the boot path would leave the
+    /// running node applying entries it cannot read.
+    #[test]
+    fn the_catch_up_path_refuses_a_newer_entry_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::load(LocalStore::new(dir.path()).unwrap()).unwrap();
+        cat.commit_add(vec![meta("poc", "cpu", "2026090600", "a.parquet")])
+            .unwrap();
+
+        // A peer at a newer format lands the next slot underneath us.
+        let future = format!(
+            r#"{{"format":{},"seq":2,"add_files":[]}}"#,
+            MANIFEST_FORMAT_VERSION + 1
+        );
+        std::fs::write(dir.path().join(manifest_path(2)), future).unwrap();
+
+        let err = cat
+            .commit_add(vec![meta("poc", "cpu", "2026090600", "b.parquet")])
+            .expect_err("the CAS retry must refuse the newer entry it replays");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
