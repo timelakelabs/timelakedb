@@ -186,8 +186,18 @@ fn read_entry<S: Store>(store: &S, path: &str) -> std::io::Result<ManifestEntry>
                 "manifest {path} is format {} and this binary reads at most \
                  format {} — it was written by a newer TimeLakeDB. Refusing \
                  to load rather than silently ignore entries this version \
-                 does not understand; run a build that reads format {} or \
-                 later.",
+                 does not understand: they can include a table drop or a \
+                 targeted delete, and applying a manifest without them \
+                 serves data that was removed on request.\n\
+                 \n\
+                 Two ways forward. Run a build that reads format {} or later \
+                 — the data is intact and nothing here has been modified. Or \
+                 restore the backup taken before the upgrade \
+                 (docs/BACKUP_RESTORE.md), which brings back a catalog this \
+                 binary can read.\n\
+                 \n\
+                 There is deliberately no flag to load it anyway. The entries \
+                 this binary cannot see are the ones that delete things.",
                 entry.format, MANIFEST_FORMAT_VERSION, entry.format,
             ),
         ));
