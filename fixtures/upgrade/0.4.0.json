@@ -1,0 +1,28 @@
+{
+  "db": "poc",
+  "expect": {
+    "admin_password": "fixture rotated pw",
+    "declared_columns": [
+      "site",
+      "celsius"
+    ],
+    "declared_table": "sensors",
+    "deleted_tag": {
+      "host": "web-1",
+      "table": "metrics"
+    },
+    "dropped_table": "scratch",
+    "metrics_rows": 90,
+    "retention": {
+      "db": "poc",
+      "duration": "365d",
+      "table": "metrics"
+    },
+    "sensors_rows": 325,
+    "sensors_settled_rows": 300,
+    "tokens": 2
+  },
+  "generated_at": "2026-09-08T01:54:48Z",
+  "note": "Written by the release named above. Never regenerate with a newer binary \u2014 that turns the test into a version reading its own output.",
+  "version": "0.4.0"
+}
