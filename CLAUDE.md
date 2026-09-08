@@ -361,11 +361,18 @@ This project is inspired by the following projects.
   compactors racing every partition do double the IO to land half the
   merges. Flipping it is a decision with its own issue.
   Design: ARCHITECTURE §12.4.
-  PRE-EXISTING FLAKE, not from this work: `health.rs`
-  `rows_stay_visible_while_a_slow_flush_uploads` fails when run ALONE via
-  a test filter (passes in the full binary and the full workspace, and
-  fails the same way on the previous commit) — it can catch the
-  documented sub-millisecond swap→`flushing` gap in `flush_all`.
+  FLAKE FIXED 2026-09-08 (#176), and the note that stood here was wrong:
+  `health.rs` `rows_stay_visible_while_a_slow_flush_uploads` was recorded
+  as failing only when run ALONE via a test filter and passing in the full
+  workspace. It was the other way round. It slowed every `put` by 150 ms
+  and then asserted it had got three probes into the resulting ~300 ms
+  window, so it failed when the machine was BUSY — two of three
+  `cargo test --workspace` runs on 2026-09-07. The store now blocks in
+  `put` until the test releases it, so the window is as long as the
+  probing takes and no wall clock is involved. Ten runs alone, three full
+  binaries, two full workspaces, all green. Red-proofed by removing the
+  `flushing` holding-area read, which puts it back to the C0 symptom
+  ("table not found" mid-flush).
 - Previous: **C2 phase 3 SHIPPED — the router (write sharding)** (2026-08-10,
   drill `docs/evidence/router-sharding-drill.log`). `TIMELAKE_ROLE=router`:
   stateless, holds NO data, opens NO engine (main.rs branches before engine
