@@ -13,6 +13,49 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Fixed — `/api/sql` and Flight bound the result, and refuse rather than truncate (#161)
+
+The memory pool bounds what a query *plan* costs. Nothing bounded the
+*answer*. `run_sql_env` called `df.collect()`, which assembles every batch
+into one `Vec<RecordBatch>` before anything gets to look at how big it is,
+so `SELECT * FROM sensors` over a large table was a `Vec` the size of the
+table. The RR-2 deadline does not save you here either — it fires on a query
+that is taking too long, and `collect()` was succeeding the whole time,
+right up until the allocator was not.
+
+So RR-1 — "no query can kill the server", promise 2 in the README — was true
+of the plan and false of the result.
+
+`max_result_rows` (default **1,000,000**, `TIMELAKE_MAX_RESULT_ROWS`,
+operator-settable live) now caps it. Execution streams, counts rows as
+batches arrive, and stops at the first batch that crosses the line.
+
+**It refuses. It does not truncate**, and that is the whole design argument.
+Truncating answers a different question than the one asked and returns it
+with a `200`, and a Flight client paginating on its own cannot tell the
+difference between "that is all the rows" and "that is all the rows you are
+getting". A refusal is loud, names the cap, and names the config key so an
+operator knows which knob to turn without reading the source.
+
+The obvious-looking fix that is wrong: injecting `LIMIT n+1` into the plan.
+It is cheaper and it is incorrect — `SELECT COUNT(*) FROM metrics` returns
+one row after reading a billion, and a `LIMIT` on the output of that changes
+nothing while a `LIMIT` pushed anywhere useful changes the answer. The cap
+is about the size of the result, not the size of the scan, and there is a
+test named after exactly that case.
+
+Refusals get their own counter, `timelake_query_result_rows_refused_total`,
+rather than a new label on `timelake_query_refused_total` — adding a label
+to a counter that is already being scraped breaks the existing series. Both
+move: the aggregate one keeps meaning "refused", and the new one separates
+a client asking for something never permitted (a `COPY`) from a legitimate
+query whose answer is too big (a dashboard panel over too wide a range).
+Those want different responses from whoever is on call.
+
+Not fixed here: Flight still buffers the batches it is about to send, so
+this bounds the memory but does not make Flight streaming end to end. The
+cap applies to both surfaces because both go through `run_sql_env`.
+
 ### Fixed — The manifest log states its format, and a newer one is refused (#160)
 
 Every manifest entry now carries a `format` number, and a binary that meets

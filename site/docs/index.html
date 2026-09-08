@@ -987,6 +987,7 @@ TIMELAKE_PEERS=ingester-a=ingester@ingester-a:1965|ingester-a:1963,ingester-b=in
             <tr><td><code>TIMELAKE_QUERY_MEM_BYTES</code></td><td>1 GiB</td><td>Shared query memory pool</td></tr>
             <tr><td><code>TIMELAKE_MAX_CONCURRENT_QUERIES</code></td><td>6</td><td>Admission limit; the rest queue</td></tr>
             <tr><td><code>TIMELAKE_QUERY_TIMEOUT_SECS</code></td><td>600</td><td>Server-side query deadline</td></tr>
+            <tr><td><code>TIMELAKE_MAX_RESULT_ROWS</code></td><td>1000000</td><td>Largest result a single statement may return. A query that goes past it is <strong>refused</strong>, not truncated — a short answer returned with a 200 is a wrong answer the client cannot detect. The cap counts the ANSWER, not the scan, so an aggregate over far more rows than this is unaffected. Settable live at <code>/admin/config/max_result_rows</code> (operator, 1–1,000,000,000)</td></tr>
             <tr><td><code>TIMELAKE_FLUSH_ROWS</code></td><td>50000</td><td>Rows in a table buffer before flushing</td></tr>
             <tr><td><code>TIMELAKE_FLUSH_AGE_SECS</code></td><td>60</td><td>Age-based flush trigger</td></tr>
             <tr><td><code>TIMELAKE_WAL_MAX_BYTES</code></td><td>2 GiB</td><td>Backpressure threshold (429)</td></tr>

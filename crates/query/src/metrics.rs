@@ -212,6 +212,13 @@ pub struct QueryMetrics {
     completed: AtomicU64,
     timeouts: AtomicU64,
     refused: AtomicU64,
+    /// #161: refusals for an oversized RESULT, counted apart from the
+    /// read-only guard's. Both are refusals and both move `refused`, but
+    /// they mean opposite things operationally — one is a client asking for
+    /// something never permitted, the other a legitimate query whose answer
+    /// is too big, which is a signal to look at the cap or the dashboard
+    /// behind it.
+    result_rows_refused: AtomicU64,
     failed: AtomicU64,
 }
 
@@ -231,6 +238,7 @@ impl QueryMetrics {
             completed: AtomicU64::new(0),
             timeouts: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            result_rows_refused: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         }
     }
@@ -277,6 +285,17 @@ impl QueryMetrics {
         }
     }
 
+    /// A result refused for its size (#161). It also moves `refused` via the
+    /// ordinary outcome path, so an existing alert on
+    /// `timelake_query_refused_total` keeps working — but the two mean
+    /// opposite things and are worth telling apart. The guard refusing a
+    /// COPY is a client asking for something never permitted; this is a
+    /// legitimate query whose answer is too big, which points at the cap or
+    /// at the dashboard behind it.
+    pub fn result_rows_refused(&self) {
+        self.result_rows_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render(&self) -> String {
         let mut out = self.duration.render(
             "timelake_query_duration_seconds",
@@ -304,13 +323,17 @@ impl QueryMetrics {
              timelake_query_refused_total {}\n\
              # HELP timelake_query_failed_total Queries that failed to plan or execute.\n\
              # TYPE timelake_query_failed_total counter\n\
-             timelake_query_failed_total {}\n",
+             timelake_query_failed_total {}\n\
+             # HELP timelake_query_result_rows_refused_total Queries refused for exceeding max_result_rows.\n\
+             # TYPE timelake_query_result_rows_refused_total counter\n\
+             timelake_query_result_rows_refused_total {}\n",
             self.in_flight(),
             self.queued(),
             self.completed.load(Ordering::Relaxed),
             self.timeouts.load(Ordering::Relaxed),
             self.refused.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
+            self.result_rows_refused.load(Ordering::Relaxed),
         ));
         out
     }

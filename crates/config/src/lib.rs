@@ -205,6 +205,22 @@ pub static INVENTORY: &[Spec] = &[
         default: "600",
     },
     Spec {
+        key: "max_result_rows",
+        env: "TIMELAKE_MAX_RESULT_ROWS",
+        scope: Scope::Node,
+        apply: Apply::Hot,
+        min_role: Role::Operator,
+        kind: Kind::Uint {
+            // Not zero. A cap of zero refuses every result including
+            // `SELECT 1`, and a config typo must not be able to take the
+            // read path down. The ceiling is high enough to be an escape
+            // hatch for a genuine export rather than a second footgun.
+            min: 1,
+            max: 1_000_000_000,
+        },
+        default: "1000000",
+    },
+    Spec {
         key: "gc_grace_secs",
         env: "TIMELAKE_GC_GRACE_SECS",
         scope: Scope::Cluster,
