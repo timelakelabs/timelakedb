@@ -20,6 +20,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::StreamExt;
 use serde_json::{Map, Number, Value, json};
 
 /// The registry stores column types as Arrow `DataType`s; re-exported
@@ -64,7 +65,22 @@ pub struct QueryEnv {
     /// `last_cache('table')` function; `None` (tests, and a node before the
     /// cache exists) leaves it unregistered, so nothing changes.
     last_value: Option<Arc<timelake_lastvalue::LastValueCache>>,
+    /// #161: the largest result the server will assemble, in rows.
+    ///
+    /// An atomic rather than a plain field, and re-read per query, so the
+    /// hot config key reaches a running node the way `query_timeout_secs`
+    /// reaches the scan deadline — without threading another argument
+    /// through eleven call sites, most of them tests.
+    max_result_rows: std::sync::atomic::AtomicU64,
 }
+
+/// Rows, not bytes, and the distinction matters: a wide schema at the cap
+/// is still a large answer. It bounds the failure (40M rows will not be
+/// assembled) rather than promising a memory ceiling, and it is high enough
+/// that no dashboard panel or benchmark query in this repository reaches
+/// it — the queries that do are exports, and an export wants a different
+/// door (see the ROADMAP's authorized-COPY note).
+pub const DEFAULT_MAX_RESULT_ROWS: u64 = 1_000_000;
 
 impl QueryEnv {
     pub fn new(total_mem_bytes: usize, max_concurrent: usize, timeout_secs: u64) -> Self {
@@ -94,12 +110,31 @@ impl QueryEnv {
             metrics: QueryMetrics::new(),
             observer: None,
             last_value: None,
+            max_result_rows: std::sync::atomic::AtomicU64::new(DEFAULT_MAX_RESULT_ROWS),
         }
     }
 
     /// Attach the per-query sink. Builder-style so `new` keeps its
     /// signature — every existing caller and test is unaffected, and a
     /// node without self-monitoring stays exactly as it was.
+    /// The current cap. Read once per query so a hot config change lands
+    /// on the next statement rather than the next restart.
+    pub fn max_result_rows(&self) -> u64 {
+        self.max_result_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Applied by the engine from the layered config on every query. Zero
+    /// is rejected here rather than treated as "unlimited": a cap of zero
+    /// refuses every result including `SELECT 1`, and a config typo should
+    /// not be able to take the read path down.
+    pub fn set_max_result_rows(&self, rows: u64) {
+        if rows > 0 {
+            self.max_result_rows
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub fn with_observer(mut self, observer: Arc<dyn QueryObserver>) -> QueryEnv {
         self.observer = Some(observer);
         self
@@ -278,9 +313,46 @@ pub async fn run_sql_env(
             .execute_logical_plan(plan)
             .await
             .map_err(|e| (opaque(&ref_id, "execute", e), QueryOutcome::Failed))?;
-        df.collect()
+
+        // Streamed, not collected, and the difference is the whole point of
+        // #161. `collect()` materialises every batch before anything can
+        // look at the total, so a `SELECT *` over a 40M-row table builds the
+        // lot in memory and the node dies — and the RR-2 deadline never
+        // fires, because collect() was succeeding the entire time. Nothing
+        // was watching the size; the memory pool governs the plan's own
+        // operators, not the answer it produces.
+        //
+        // Refuse, never truncate. Silently returning the first N rows of a
+        // result the caller asked for in full is a wrong answer wearing a
+        // 200, and a Flight client paginating for itself would never know.
+        // Injecting `LIMIT` is the same mistake earlier: wrong for
+        // aggregates, which scan everything to produce ten rows.
+        let cap = env.max_result_rows();
+        let mut stream = df
+            .execute_stream()
             .await
-            .map_err(|e| (opaque(&ref_id, "collect", e), QueryOutcome::Failed))
+            .map_err(|e| (opaque(&ref_id, "execute", e), QueryOutcome::Failed))?;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut rows: u64 = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| (opaque(&ref_id, "collect", e), QueryOutcome::Failed))?;
+            rows += batch.num_rows() as u64;
+            if rows > cap {
+                env.metrics.result_rows_refused();
+                return Err((
+                    format!(
+                        "result is larger than max_result_rows ({cap}): stopped after \
+                         {rows} rows. The server refuses rather than truncating, because \
+                         a partial answer returned as a whole one is worse than an \
+                         error. Narrow the time range or the projection, aggregate, or \
+                         raise max_result_rows if this result is genuinely wanted."
+                    ),
+                    QueryOutcome::Refused,
+                ));
+            }
+            batches.push(batch);
+        }
+        Ok(batches)
     };
     match tokio::time::timeout(env.timeout, work).await {
         Ok(Ok(batches)) => {

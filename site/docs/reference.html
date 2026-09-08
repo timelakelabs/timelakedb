@@ -1028,6 +1028,7 @@
             <tr><td><code>timelake_queries_total</code></td><td>counter</td><td>Queries finished, all outcomes</td></tr>
             <tr><td><code>timelake_query_timeouts_total</code></td><td>counter</td><td>Queries stopped by the server-side cap (RR-2)</td></tr>
             <tr><td><code>timelake_query_refused_total</code></td><td>counter</td><td>Statements the read-only guard refused (COPY, DDL, DML). <strong>Not an error</strong> — this is the guard working, so it is counted apart from failures</td></tr>
+            <tr><td><code>timelake_query_result_rows_refused_total</code></td><td>counter</td><td>Queries refused for producing more rows than <code>max_result_rows</code>. Also counted in <code>timelake_query_refused_total</code>, but worth watching on its own: the guard refusing a <code>COPY</code> is a client asking for something never permitted, while this is a legitimate query whose answer is too large — usually a dashboard panel over too wide a range</td></tr>
             <tr><td><code>timelake_query_failed_total</code></td><td>counter</td><td>Queries that failed to plan or execute</td></tr>
             <tr><td><code>timelake_uptime_seconds</code></td><td>gauge</td><td>Seconds since this process started</td></tr>
             <tr><td><code>timelake_build_info{version}</code></td><td>gauge</td><td>Always 1; the running version is the label</td></tr>

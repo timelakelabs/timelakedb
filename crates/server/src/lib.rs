@@ -84,6 +84,11 @@ pub struct EngineConfig {
     pub max_concurrent_queries_per_client: usize,
     /// Server-side query cap (RR-2): abandoned work stops burning pool.
     pub query_timeout_secs: u64,
+    /// #161: the largest result the server will assemble, in rows. The
+    /// memory pool bounds what the PLAN costs; nothing bounded the answer,
+    /// so a `SELECT *` over a large table was assembled in full and the
+    /// node died with the deadline never firing.
+    pub max_result_rows: u64,
     /// Files superseded by compaction/retention are physically deleted
     /// only after this grace (must exceed query_timeout so an in-flight
     /// query's catalog snapshot never dangles — the AT-3 race).
@@ -164,6 +169,7 @@ impl Default for EngineConfig {
             // budget", without refusing a modest single-client burst.
             max_concurrent_queries_per_client: 4,
             query_timeout_secs: 600,
+            max_result_rows: timelake_query::DEFAULT_MAX_RESULT_ROWS,
             gc_grace_secs: 900,
             data_auth: timelake_auth::DataAuthMode::Off,
             repl_timeout_ms: 250,
@@ -2889,6 +2895,11 @@ impl Engine {
             tables.push((name, Arc::new(provider)));
         }
 
+        // Re-applied per query so the hot key lands on the next statement
+        // rather than the next restart — the same reason the scan deadline
+        // above reads `cfg.load()` instead of a value captured at boot.
+        self.query_env
+            .set_max_result_rows(self.cfg.load().max_result_rows);
         timelake_query::run_sql_env(&self.query_env, &session, db, tables, query).await
     }
 
@@ -4379,6 +4390,7 @@ fn config_property(cfg: &EngineConfig) -> std::collections::BTreeMap<String, Str
         "query_timeout_secs".into(),
         cfg.query_timeout_secs.to_string(),
     );
+    m.insert("max_result_rows".into(), cfg.max_result_rows.to_string());
     m.insert("gc_grace_secs".into(), cfg.gc_grace_secs.to_string());
     m.insert("query_mem_bytes".into(), cfg.query_mem_bytes.to_string());
     m.insert("repl_timeout_ms".into(), cfg.repl_timeout_ms.to_string());
@@ -4457,6 +4469,7 @@ fn materialize(
         query_timeout_secs: g("query_timeout_secs")
             .parse()
             .unwrap_or(d.query_timeout_secs),
+        max_result_rows: g("max_result_rows").parse().unwrap_or(d.max_result_rows),
         gc_grace_secs: g("gc_grace_secs").parse().unwrap_or(d.gc_grace_secs),
         query_mem_bytes: g("query_mem_bytes").parse().unwrap_or(d.query_mem_bytes),
         data_auth: parse_data_auth(&g("data_auth")),
@@ -4618,6 +4631,7 @@ pub fn config_from_env() -> EngineConfig {
     let d = EngineConfig::default();
     EngineConfig {
         query_mem_bytes: env("TIMELAKE_QUERY_MEM_BYTES", d.query_mem_bytes),
+        max_result_rows: env("TIMELAKE_MAX_RESULT_ROWS", d.max_result_rows),
         flush_rows: env("TIMELAKE_FLUSH_ROWS", d.flush_rows),
         flush_age_secs: env("TIMELAKE_FLUSH_AGE_SECS", d.flush_age_secs),
         wal_max_bytes: env("TIMELAKE_WAL_MAX_BYTES", d.wal_max_bytes),
