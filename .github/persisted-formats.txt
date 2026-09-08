@@ -1,0 +1,21 @@
+# Files that own a format written to disk and read back by a LATER binary.
+#
+# Touching one of these makes a pull request answer a compatibility
+# question before it can merge (.github/scripts/compat_gate.py). The list is
+# deliberately explicit rather than a pattern: "anything with a serde derive"
+# would catch every HTTP request struct in the API and the gate would be
+# noise inside a week.
+#
+# This file is itself on the list, by the entry below. Adding a new
+# persisted format therefore trips the gate on the commit that adds it,
+# which is the one commit where somebody still remembers how it is meant to
+# be read by the next version.
+#
+# Format = one line, a path, then optional whitespace and a comment.
+
+crates/catalog/src/lib.rs       # the manifest log; MANIFEST_FORMAT_VERSION
+crates/wal/src/lib.rs           # WAL frames, "TLDB" and the "TLDW" encrypted header; WAL_VERSION
+crates/store/src/encrypt.rs     # per-object envelope header, magic "TLDE1"
+crates/server/src/lib.rs        # catalog/config/{retention,rollups,settings}.json; RETENTION_FORMAT_VERSION, ROLLUPS_FORMAT_VERSION
+crates/auth/src/lib.rs          # catalog/config/{tokens,principals,cert-grants}.json
+.github/persisted-formats.txt   # this list — see above

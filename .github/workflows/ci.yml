@@ -47,6 +47,36 @@ jobs:
   # commit that was never going to merge. Not hypothetical: the #80 DDL PRs went
   # red on `cargo fmt --check` while conformance ran green in parallel, three
   # times, each ~22 wasted minutes on a private-repo bill.
+  # Cheap, and first, because it is the one gate that catches a class of bug
+  # the test suite structurally cannot: a persisted format that an OLDER
+  # binary will read wrongly. Every manifest field for three releases was
+  # added with `#[serde(default)]` — correct forward, silently wrong
+  # backward — and nothing asked about it once (#160). No Rust build here,
+  # so it answers in seconds and does not gate on `lint`.
+  compat:
+    name: compat · persisted formats
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate diffs this branch against the base commit, so it needs
+          # more than the default shallow clone.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compatibility declaration
+        env:
+          # Through the environment, never interpolated into the shell: a
+          # pull request body is arbitrary prose and will eventually contain
+          # a backtick.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python .github/scripts/test_compat_gate.py
+          python .github/scripts/compat_gate.py \
+            --base "${{ github.event.pull_request.base.sha }}" --head HEAD
+
   lint:
     name: fmt · clippy
     runs-on: ubuntu-latest
