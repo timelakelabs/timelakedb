@@ -270,6 +270,65 @@ feed. This is what this document is about.
 Alerting on TimeLakeDB's health *through* TimeLakeDB's query path is a
 loop with an obvious failure mode. Keep it on `/metrics`.
 
+### The data volume filling up (#165)
+
+This one belongs on `/metrics`, and it is worth spelling out because the
+obvious rule is subtly wrong.
+
+```yaml
+# The disk is nearly full. Fires while there is still time to act.
+- alert: TimeLakeDataVolumeLow
+  expr: timelake_data_dir_free_bytes < 5e9
+  for: 10m
+  annotations:
+    summary: "{{ $labels.instance }}: under 5 GB free on the data volume"
+
+# The gauge itself went away. WITHOUT THIS the rule above is decorative.
+- alert: TimeLakeDataVolumeUnmeasured
+  expr: absent(timelake_data_dir_free_bytes)
+  for: 30m
+  annotations:
+    summary: "{{ $labels.instance }}: free space is not being reported"
+
+# Writes are already being refused. This is the condition, not a warning
+# about it, so it pages immediately.
+- alert: TimeLakeWritesRefusedDiskFull
+  expr: increase(timelake_write_rejected_total{reason="disk_full"}[5m]) > 0
+  annotations:
+    summary: "{{ $labels.instance }}: refusing writes, data volume is full"
+
+# Rows cannot reach object storage. They stay in the buffer and the WAL, so
+# this ends as backpressure or as a full disk if nobody looks.
+- alert: TimeLakeFlushFailing
+  expr: increase(timelake_flush_failures_total[15m]) > 0
+  annotations:
+    summary: "{{ $labels.instance }}: table flushes are failing"
+```
+
+**Why `absent()` is not optional here.** The free-space gauge is emitted
+only when the node can actually measure it — on a platform without
+`statvfs`, or if the syscall fails, the series is simply not there. That is
+deliberate: a `0` would mean "full" and page someone over a measurement
+that never happened. But it means a threshold rule on a missing series sits
+in Normal forever, which is the same silent-green failure as the `ORDER BY
+time DESC` trap in §3, arrived at from the other direction. The pair covers
+both: one fires when the number is bad, the other when there is no number.
+
+**Why a separate rule for the refusal.** `timelake_write_rejected_total`
+also carries `reason="backpressure"`, and those two look alike on a graph
+and are not alike at all. Backpressure is the WAL cap doing its job and
+resolves itself when flush catches up. `disk_full` does not resolve itself.
+Alerting on the unlabelled total gets you paged for the healthy one.
+
+**The threshold is yours to set.** 5 GB is a starting point, not a
+recommendation — it should be larger than the working set between two
+flushes on your ingest rate, and the WAL cap (`wal_max_bytes`, 2 GiB by
+default) is a floor to start from. The cap is deliberately NOT derived from
+free space: a moving cap makes the RR-3 replay bound a function of how full
+the disk happened to be, so a crash on a nearly-full volume would take
+longer to recover than one on an empty volume. Fixed cap, visible gauge,
+and the operator decides.
+
 ---
 
 ## 7. Known limits

@@ -239,6 +239,14 @@ pub enum WriteError {
     /// 429 + Retry-After — a named, visible limit (RR-5): the WAL is at
     /// its cap and flush needs to catch up before more writes land.
     Backpressure(String),
+    /// 507 + Retry-After — the data volume is full (timelakedb#165). Nothing
+    /// about the request is wrong and the engine is not broken, so it is
+    /// neither a 400 nor a 500: the node cannot make this write durable
+    /// right now and a client should spool rather than drop. It may clear on
+    /// its own, because a flush moves rows to object storage and truncates
+    /// the WAL, so Retry-After is honest rather than decorative — but the
+    /// operator's cue is `timelake_data_dir_free_bytes`, not this response.
+    DiskFull(String),
     /// 500 — the engine failed to make the write durable.
     Internal(String),
     /// 501 — this node does not take writes at all (CL-3: a querier is a
@@ -2162,6 +2170,12 @@ fn write_result_response(
         Ok(Err(WriteError::Backpressure(msg))) => (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "1")],
+            Json(json!({ "error": msg })),
+        )
+            .into_response(),
+        Ok(Err(WriteError::DiskFull(msg))) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            [("retry-after", "5")],
             Json(json!({ "error": msg })),
         )
             .into_response(),

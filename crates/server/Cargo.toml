@@ -66,3 +66,9 @@ reqwest = { workspace = true }
 
 
 
+
+# #165: statvfs for the free-space gauge. Unix only, and the gauge simply
+# does not exist elsewhere — this crate is built for Linux containers and
+# the packages, and a wrong number would be worse than no number.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

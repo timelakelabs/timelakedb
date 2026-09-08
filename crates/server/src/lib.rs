@@ -684,6 +684,10 @@ pub struct WriteRejects {
     pub bad_request: AtomicU64,
     /// CL-3: a querier holds no write path.
     pub not_here: AtomicU64,
+    /// The data volume is full (#165). Counted apart from `internal`
+    /// because it is the one write fault an operator can fix directly, and
+    /// because it says the node is healthy and the disk is not.
+    pub disk_full: AtomicU64,
     /// WAL append or apply failed — a real fault.
     pub internal: AtomicU64,
 }
@@ -696,12 +700,70 @@ impl WriteRejects {
              timelake_write_rejected_total{{reason=\"backpressure\"}} {}\n\
              timelake_write_rejected_total{{reason=\"bad_request\"}} {}\n\
              timelake_write_rejected_total{{reason=\"not_here\"}} {}\n\
-             timelake_write_rejected_total{{reason=\"internal\"}} {}\n",
+             timelake_write_rejected_total{{reason=\"internal\"}} {}\n\
+             timelake_write_rejected_total{{reason=\"disk_full\"}} {}\n",
             self.backpressure.load(Ordering::Relaxed),
             self.bad_request.load(Ordering::Relaxed),
             self.not_here.load(Ordering::Relaxed),
             self.internal.load(Ordering::Relaxed),
+            self.disk_full.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// ENOSPC, however it arrives (#165).
+///
+/// `StorageFull` is the portable spelling and is what the WAL's own fault
+/// injection raises, but a real full volume reaches us as whatever the
+/// platform's errno maps to, and that mapping has moved between Rust
+/// releases. So the raw errno is checked too: 28 is ENOSPC on Linux and on
+/// macOS. `EDQUOT` (a quota, not a full disk) is deliberately NOT included —
+/// it looks identical to a client and needs a different fix, and lumping it
+/// in here would send an operator to look at free space that is fine.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28)
+    }
+    #[cfg(not(unix))]
+    {
+        e.kind() == std::io::ErrorKind::StorageFull
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, or `None` if it cannot be
+/// determined (#165).
+///
+/// `None` renders as no series at all rather than as a zero. A zero here
+/// would read as "the disk is full" and page whoever is on call, which is
+/// the exact opposite of what "I could not measure it" means. The cost of
+/// that choice is that an alert on this gauge goes quiet instead of firing
+/// if the probe ever breaks, so the rule in `docs/ALERTING.md` pairs the
+/// threshold with an `absent()` companion.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c` is a valid NUL-terminated path for the duration of the
+        // call and `stat` is written only by statvfs, which fills it before
+        // returning 0.
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c.as_ptr(), &mut stat) != 0 {
+                return None;
+            }
+            // f_bavail, not f_bfree: blocks available to an UNPRIVILEGED
+            // process. The difference is the root reserve, typically 5%, and
+            // the server does not run as root (P0-2), so f_bfree would
+            // promise space this process cannot actually have.
+            Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -889,7 +951,22 @@ pub struct Engine {
     /// the M2-documented tolerance, never a vanish.
     flushing: RwLock<HashMap<(String, String), timelake_query::QueryBatch>>,
     lines_total: AtomicU64,
+    /// The data volume, kept only so the free-space gauge can be sampled
+    /// without threading the path through every caller (#165).
+    data_dir: PathBuf,
     flushes_total: AtomicU64,
+    /// Tables whose flush failed (#165). `flushes_total` counts successes
+    /// only, so before this a node that could no longer write Parquet looked
+    /// identical on /metrics to one that had nothing to flush — the rows
+    /// stayed in the buffer and the WAL, the error went to the log, and the
+    /// first symptom anyone saw was the WAL cap refusing writes much later.
+    /// Counted per table, matching the loop: one pass failing four tables
+    /// moves this by four.
+    flush_failures: AtomicU64,
+    /// Free bytes on the data volume, sampled on the maintenance tick
+    /// (#165). `u64::MAX` means "never measured or not measurable", and
+    /// renders as no series rather than as a zero — see `free_bytes`.
+    data_dir_free: AtomicU64,
     compactions_total: AtomicU64,
     /// Merges discarded because another writer replaced the inputs first.
     /// Expected once more than one node compacts; a steadily climbing
@@ -1219,7 +1296,10 @@ impl Engine {
             cfg: ArcSwap::from_pointee(cfg),
             config: RwLock::new(layered),
             lines_total: AtomicU64::new(0),
+            data_dir: data_dir.to_path_buf(),
             flushes_total: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+            data_dir_free: AtomicU64::new(u64::MAX),
             compactions_total: AtomicU64::new(0),
             stale_merges: AtomicU64::new(0),
             started: std::time::Instant::now(),
@@ -1268,6 +1348,9 @@ impl Engine {
                 tracing::warn!(db, error = %e, "skipping unreplayable WAL frame");
             }
         }
+        // #165: one sample before the first scrape, so a node that boots on a
+        // full volume says so immediately instead of a minute later.
+        engine.sample_data_dir_free();
         engine.refresh_schema_registry();
         tracing::info!(
             frames = n,
@@ -1439,7 +1522,17 @@ impl Engine {
             .lock()
             .expect("wal lock")
             .append(db, mult, body)
-            .map_err(|e| WriteError::Internal(format!("wal append: {e}")))?;
+            .map_err(|e| {
+                if is_disk_full(&e) {
+                    WriteError::DiskFull(format!(
+                        "no space left on the data volume; the write was not \
+                         made durable and was NOT applied — retry after \
+                         freeing space or extending the volume ({e})"
+                    ))
+                } else {
+                    WriteError::Internal(format!("wal append: {e}"))
+                }
+            })?;
         if let Some(r) = self.replicator.read().expect("replicator lock").as_ref() {
             r.replicate(db, mult, body);
         }
@@ -1503,6 +1596,7 @@ impl Engine {
                     }
                     Err(err) => {
                         tracing::error!(%db, %table, %err, "flush snapshot failed; others continue");
+                        self.flush_failures.fetch_add(1, Ordering::Relaxed);
                         failed.push(format!("{db}.{table}"));
                     }
                 }
@@ -1524,6 +1618,7 @@ impl Engine {
                 }
                 Err(err) => {
                     tracing::error!(%db, %table, %err, "flush failed for this table; others continue");
+                    self.flush_failures.fetch_add(1, Ordering::Relaxed);
                     failed.push(format!("{db}.{table}"));
                 }
             }
@@ -2372,6 +2467,7 @@ impl Engine {
             .map_err(|e| match e {
                 WriteError::BadRequest(s)
                 | WriteError::Backpressure(s)
+                | WriteError::DiskFull(s)
                 | WriteError::Internal(s)
                 | WriteError::NotHere(s) => format!("rollup write to {}: {s}", def.target),
             })?;
@@ -2537,6 +2633,7 @@ impl timelake_api::Engine for Engine {
                 WriteError::Backpressure(_) => &self.write_rejects.backpressure,
                 WriteError::BadRequest(_) => &self.write_rejects.bad_request,
                 WriteError::NotHere(_) => &self.write_rejects.not_here,
+                WriteError::DiskFull(_) => &self.write_rejects.disk_full,
                 WriteError::Internal(_) => &self.write_rejects.internal,
             };
             counter.fetch_add(1, Ordering::Relaxed);
@@ -3365,6 +3462,7 @@ impl Engine {
                 let reason = match &e {
                     WriteError::BadRequest(m)
                     | WriteError::Backpressure(m)
+                    | WriteError::DiskFull(m)
                     | WriteError::Internal(m)
                     | WriteError::NotHere(m) => m.as_str(),
                 };
@@ -3474,6 +3572,24 @@ impl Engine {
             ));
         }
         out.push_str(&self.write_rejects.render());
+        // #165. Free space and flush failures are the two things that were
+        // invisible when a data volume filled up: the write path answered
+        // 500 "internal" and the flush path answered the log file.
+        out.push_str(&format!(
+            "# HELP timelake_flush_failures_total Table flushes that failed.\n\
+             # TYPE timelake_flush_failures_total counter\n\
+             timelake_flush_failures_total {}\n",
+            self.flush_failures.load(Ordering::Relaxed),
+        ));
+        let free = self.data_dir_free.load(Ordering::Relaxed);
+        if free != u64::MAX {
+            out.push_str(&format!(
+                "# HELP timelake_data_dir_free_bytes Bytes available to this \
+                 process on the data volume.\n\
+                 # TYPE timelake_data_dir_free_bytes gauge\n\
+                 timelake_data_dir_free_bytes {free}\n",
+            ));
+        }
         // The self-monitoring counters belong on `/metrics` specifically:
         // if the sampler is dropping rows then the STORED history is the
         // thing that is incomplete, so it cannot be the surface that
@@ -3482,6 +3598,27 @@ impl Engine {
             out.push_str(&monitor.render());
         }
         out
+    }
+
+    /// Re-read free space on the data volume (#165). Called on the
+    /// maintenance tick and once at open, so a node reports a real number
+    /// from its first scrape rather than after its first minute.
+    ///
+    /// Sampled rather than measured inside `/metrics` on purpose: that
+    /// endpoint answers from atomics precisely so it still works when the
+    /// rest of the node does not, and a `statvfs` on a wedged network mount
+    /// blocks. A tick-old number is the right trade for a gauge whose alert
+    /// threshold is measured in minutes.
+    pub fn sample_data_dir_free(&self) {
+        let v = free_bytes(&self.data_dir).unwrap_or(u64::MAX);
+        self.data_dir_free.store(v, Ordering::Relaxed);
+    }
+
+    /// Make the next WAL append fail with this error (#165). A test
+    /// seam — see `timelake_wal::Wal::fail_next_append` for why ENOSPC
+    /// cannot be provoked any other way.
+    pub fn fail_next_wal_append(&self, e: std::io::Error) {
+        self.wal.lock().expect("wal lock").fail_next_append(e);
     }
 
     pub fn metrics_text_impl(&self) -> String {
@@ -3920,6 +4057,12 @@ impl timelake_flight::SqlBackend for Engine {
                 WE::BadRequest(m) => PE::BadRequest(m),
                 WE::Backpressure(m) => PE::Backpressure(m),
                 WE::NotHere(m) => PE::Internal(m),
+                // RESOURCE_EXHAUSTED, not INTERNAL (#165). A full volume is
+                // a retryable condition and clients treat those two very
+                // differently: exhausted means back off and try again,
+                // internal means the server is broken and many shippers
+                // drop the batch on it.
+                WE::DiskFull(m) => PE::Backpressure(m),
                 WE::Internal(m) => PE::Internal(m),
             })
     }

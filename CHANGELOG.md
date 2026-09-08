@@ -13,6 +13,51 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Fixed — A full data volume says so, instead of answering 500 (#165)
+
+A full disk used to surface as `500` with `reason="internal"` and a line in
+the log. Nothing on `/metrics` named the disk, so `docs/ALERTING.md` had no
+rule to write against it, and the operator found out from the client's
+errors.
+
+On a small PVC it was the only signal at all. The WAL cap is a fixed 2 GiB
+and Helm gives each ingester its own volume, so on a 1 GiB PVC the disk
+fills long before the cap trips — the backpressure path built to say "slow
+down" never engages, and the first symptom is writes failing for a reason
+that means nothing.
+
+Three things now exist:
+
+- **`timelake_data_dir_free_bytes`**, sampled on the maintenance tick and
+  once at open, so a node that boots on a full volume says so on its first
+  scrape.
+- **`timelake_flush_failures_total`**. `timelake_flushes_total` counts
+  successes, so a node that could no longer write Parquet was
+  indistinguishable on `/metrics` from an idle one.
+- **`reason="disk_full"`** on `timelake_write_rejected_total`, and a **507**
+  with a `Retry-After` on the write path rather than a 500. Over Flight it
+  is `RESOURCE_EXHAUSTED`, not `INTERNAL`, because shippers retry the first
+  and drop the batch on the second.
+
+The gauge is **absent rather than zero** when free space cannot be
+measured. A zero would read as "full" and page someone over a measurement
+that never happened. The cost is that a threshold rule on a missing series
+sits in Normal forever — the same silent-green failure as the `ORDER BY
+time DESC` trap, from the other direction — so the rules in ALERTING.md §6
+pair the threshold with an `absent()` companion.
+
+The obvious-looking fix that is wrong: deriving the WAL cap from free
+space. It makes the RR-3 replay bound a function of how full the disk
+happened to be, so a crash on a nearly-full volume takes longer to recover
+than one on an empty volume. The cap stays fixed; the gauge is what moves.
+
+`Wal::fail_next_append` is a new test seam, and it is there because ENOSPC
+is the one write-path failure that cannot otherwise be provoked: filling a
+real filesystem needs a mount and therefore root, a symlink to `/dev/full`
+gives a real kernel ENOSPC on write but hangs replay because `/dev/full`
+reads as endless zeroes, and `RLIMIT_FSIZE` raises `EFBIG`, a different
+errno on a different branch.
+
 ### Fixed — `/api/sql` and Flight bound the result, and refuse rather than truncate (#161)
 
 The memory pool bounds what a query *plan* costs. Nothing bounded the
