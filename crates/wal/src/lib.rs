@@ -70,6 +70,9 @@ pub struct Wal {
     generation: u64,
     cipher: Option<Arc<dyn WalCipher>>,
     enc: Option<FileEnc>,
+    /// Fault injection for the next `append` (timelakedb#165). See
+    /// `fail_next_append`.
+    fail_next: Option<std::io::Error>,
 }
 
 fn gen_path(dir: &Path, generation: u64) -> PathBuf {
@@ -230,6 +233,7 @@ impl Wal {
                     generation,
                     cipher: cipher.clone(),
                     enc: Some(FileEnc { dek, seq: 0 }),
+                    fail_next: None,
                 },
                 frames,
             ))
@@ -246,14 +250,38 @@ impl Wal {
                     generation,
                     cipher: None,
                     enc: None,
+                    fail_next: None,
                 },
                 frames,
             ))
         }
     }
 
+    /// Make the next `append` fail with this error instead of touching the
+    /// file (timelakedb#165). Takes a whole `io::Error`, not a kind, so a
+    /// test can inject one carrying a real errno — the classifier upstream
+    /// looks at both and a synthetic error has no `raw_os_error`.
+    ///
+    /// This exists because ENOSPC is the one write-path failure that cannot
+    /// be provoked from a test. Filling a real filesystem needs a mount, and
+    /// so needs root, which `cargo test` does not have on a runner. The
+    /// alternatives were worse: pointing the WAL at a symlink to `/dev/full`
+    /// gives a genuine kernel ENOSPC on write, but replay reads that path
+    /// first and `/dev/full` reads as an endless stream of zero bytes, so
+    /// opening the WAL never returns. `RLIMIT_FSIZE` raises `EFBIG`, which is
+    /// a different errno taking a different branch.
+    ///
+    /// One-shot on purpose. A latched fault would leave a test that forgot to
+    /// clear it passing for the wrong reason.
+    pub fn fail_next_append(&mut self, e: std::io::Error) {
+        self.fail_next = Some(e);
+    }
+
     /// Durably append one write. 204 must not be sent before this returns.
     pub fn append(&mut self, db: &str, mult: i64, body: &[u8]) -> std::io::Result<()> {
+        if let Some(e) = self.fail_next.take() {
+            return Err(e);
+        }
         if let Some(enc) = &mut self.enc {
             let ct = seal(&enc.dek, enc.seq, &encode_frame_body(db, mult, body))?;
             let mut buf = Vec::with_capacity(4 + ct.len());

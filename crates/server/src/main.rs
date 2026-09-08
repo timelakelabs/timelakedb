@@ -475,6 +475,8 @@ async fn main() {
                     // same way, so every node's /admin/rollups agrees and the
                     // compactor materialising it stays current (§18.6).
                     e.reload_rollups();
+                    // #165: cheap, and the only place the gauge moves.
+                    e.sample_data_dir_free();
                     if let Err(err) = e.flush_if_needed() {
                         tracing::error!(%err, stage = "flush", "maintenance stage failed");
                     }
