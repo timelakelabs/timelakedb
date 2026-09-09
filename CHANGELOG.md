@@ -13,6 +13,37 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Fixed — A tag is refused until its ci run has finished green (#168)
+
+`release.yml` never ran the test suite, by design: `ci.yml` proves the
+tree, and the tag was "expected to point at a commit whose ci run was
+green". Expected, not checked. 0.4.0 was published six minutes before its
+own ci run finished, and its parent commit, the CI restructure, had been
+cancelled mid-run by `cancel-in-progress` and never got a verdict at all.
+Had that restructure broken anything, the `.deb` and the `.rpm` would
+already have been on a public Release under a green badge.
+
+The first job in `release.yml` now looks up the tagged commit's newest
+`ci.yml` run and refuses the release unless it is `completed` and
+`success`, printing the run URL either way. Every publishing job depends on
+it. A refused tag does not need to move: once ci is green, re-run the
+workflow from the Actions page, and the re-run still publishes because the
+event is kept.
+
+A docs-only commit has no ci run, on purpose, since `ci.yml` does not run
+for a change to markdown or LICENSE. The gate follows the same rule the
+workflow's header states rather than contradicting it: such a commit takes
+its first parent's verdict. A commit that touches code and has no run was
+never tested, and is refused as such. The gate's idea of what ci ignores is
+checked against `ci.yml`'s own `paths-ignore` by a test, so the two cannot
+drift apart quietly.
+
+The other half: `ci.yml` no longer cancels an in-progress run on `main`
+when the next commit lands. That is right for a pull request, where only
+the newest head can merge, and was wrong on `main`, where it is how a
+commit ends up with no verdict. A pull request still replaces its older
+run.
+
 ### Added — A release publishes a versioned, multi-arch image and the chart (#167)
 
 There was no container image for any release. The only image was

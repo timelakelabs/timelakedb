@@ -32,9 +32,18 @@ on:
 # Without this, a second push during a 20-minute Rust build queues a
 # whole second build rather than replacing the first. On a private repo
 # that is billed minutes spent on a commit nobody is waiting for.
+#
+# Replacing is right for a pull request, where only the newest head can
+# merge. It is wrong for main, and this used to do it there too: the
+# 0.4.0 release commit landed nineteen minutes into its parent's run and
+# killed it, so 77bce9a — the CI restructure — never got a verdict, and
+# release.yml's gate (#168) would have had nothing to read for the commit
+# that actually changed the pipeline. A commit on main gets its run to the
+# end. The cost is one queued build per push during a build, and a third
+# push in that window still replaces the queued (not the running) one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
