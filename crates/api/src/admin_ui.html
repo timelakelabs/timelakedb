@@ -421,7 +421,7 @@ async function loadTokens() {
   const tb = $('#tokens tbody');
   tb.innerHTML = '';
   if (!body.tokens.length) {
-    tb.innerHTML = '<tr><td colspan="6" class="empty">No tokens — the data plane answers per TIMELAKE_DATA_AUTH (anonymous in off/optional).</td></tr>';
+    tb.innerHTML = '<tr><td colspan="6" class="empty">No tokens — the data plane answers per TIMELAKE_DATA_AUTH (tokenless callers served under the default optional, and under off).</td></tr>';
     return;
   }
   for (const k of body.tokens) {

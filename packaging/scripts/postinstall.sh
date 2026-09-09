@@ -37,9 +37,10 @@ if command -v systemctl >/dev/null 2>&1; then
 TimeLakeDB is installed but NOT started.
 
   1. Review  /etc/timelakedb/timelakedb.env
-     It binds 127.0.0.1 only. The data plane is unauthenticated by default —
-     set TIMELAKE_DATA_AUTH=required (and issue tokens) or front it with an
-     authenticating proxy before exposing it beyond loopback.
+     It binds 127.0.0.1 only. The data plane serves tokenless clients by
+     default (TIMELAKE_DATA_AUTH=optional) — issue tokens, configure your
+     clients, then set TIMELAKE_DATA_AUTH=required, or front it with an
+     authenticating proxy, before exposing it beyond loopback.
 
   2. Start it:
        systemctl enable --now timelakedb

@@ -73,9 +73,11 @@ impl Scope {
 }
 
 /// How strictly the data plane treats credentials. The three states are
-/// a migration, not a preference: `Off` is today's behaviour, `Optional`
-/// is the window in which operators roll credentials out while watching
-/// the authenticated/anonymous split, and `Required` is the end state.
+/// a migration, not a preference: `Optional` is the default since 0.5
+/// (#162) and the window in which operators roll credentials out while
+/// watching the authenticated/anonymous split, `Required` is the end
+/// state, and `Off` is the pre-0.5 behaviour, kept for anyone who needs
+/// the header ignored entirely.
 /// Jumping straight to `Required` is what breaks a fleet, so the middle
 /// state exists to make that avoidable — the same discipline want-mode
 /// mTLS uses.
@@ -249,6 +251,36 @@ pub fn token_from_authorization(header: &str) -> Option<String> {
     None
 }
 
+/// True for an `Authorization` value in a scheme we speak whose credential
+/// is empty: `Bearer`, `Token ` or `Basic` with an empty password.
+///
+/// That is a client whose token field is blank, not a credential that
+/// failed to verify, and [`Auth::decide_data`](crate::Auth::decide_data)
+/// treats it as absent. The distinction only exists because the default
+/// mode is `optional` (#162): a tokenless Telegraf still sends the header,
+/// and refusing it would turn the migration window into a flag day.
+/// Unknown schemes are not blank; they are presented and unusable.
+pub fn credential_is_blank(header: &str) -> bool {
+    let (scheme, rest) = header.split_once(' ').unwrap_or((header, ""));
+    let rest = rest.trim();
+    let bearer_or_token =
+        scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("token");
+    let basic = scheme.eq_ignore_ascii_case("basic");
+    if !bearer_or_token && !basic {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    if basic {
+        return base64_decode(rest)
+            .and_then(|d| String::from_utf8(d).ok())
+            .and_then(|t| t.split_once(':').map(|(_, password)| password.is_empty()))
+            .unwrap_or(false);
+    }
+    false
+}
+
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -385,6 +417,37 @@ mod tests {
         );
         assert_eq!(token_from_authorization("Digest xyz"), None);
         assert_eq!(token_from_authorization("Bearer   ").as_deref(), None);
+    }
+
+    #[test]
+    fn a_blank_credential_is_absent_and_a_strange_one_is_not() {
+        // A stock Telegraf influxdb_v2 output with `token = ""` still sends
+        // the header. Under `optional` by default (#162) that has to read
+        // as "no token", or every tokenless Telegraf is 401 on day one.
+        for blank in ["Token ", "Token", "Bearer ", "bearer   ", "Basic dXNlcjo="] {
+            assert!(
+                credential_is_blank(blank),
+                "{blank:?} is a blank credential"
+            );
+            assert_eq!(
+                token_from_authorization(blank),
+                None,
+                "{blank:?} must not authenticate as the empty token"
+            );
+        }
+        // Real credentials, wrong credentials and foreign schemes are not
+        // blank: they are presented, and the guard decides what they mean.
+        for present in [
+            "Token tldb_x",
+            "Bearer tldb_wrong",
+            "Digest xyz",
+            "Negotiate",
+            "Basic ????",
+        ] {
+            assert!(!credential_is_blank(present), "{present:?} is presented");
+        }
+        // base64("user") — Basic with no colon at all is malformed, not blank.
+        assert!(!credential_is_blank("Basic dXNlcg=="));
     }
 
     #[test]

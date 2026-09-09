@@ -46,9 +46,10 @@ database, and not a description of one workload's tables.
 | `../Catchment/` | Conformance and fault-injection testing across this and Tributary |
 | `site/` | Project website: landing, docs, and `docs/reference.html` — line protocol, SQL dialect, API surface, InfluxDB compatibility, metrics, glossary |
 
-> **Security:** the data plane **can** authenticate but ships `off`.
-> `TIMELAKE_DATA_AUTH=optional|required` turns on token authentication for
-> writes, `/api/sql` and Flight SQL; until you set it, any client that can
+> **Security:** the data plane authenticates by token and ships
+> `TIMELAKE_DATA_AUTH=optional`: a client with no token is still served, a
+> client with a wrong token gets 401, and the anonymous/authenticated split
+> is measured on `/metrics`. Until you set `required`, any client that can
 > reach port 1963 or 1964 reads and writes everything, and network
 > isolation is your only access control. The *administrative* surface
 > always authenticates (SEC-4), and TLS 1.3 with hot rotation, client
@@ -157,11 +158,12 @@ latency is Docker Desktop port forwarding
   well-known default ever exists; alert on
   `timelake_admin_default_credential_active`.
 - **The data plane authenticates by token, in three stages.**
-  `TIMELAKE_DATA_AUTH=off|optional|required` — `off` is the default and
-  the compatibility contract, `optional` is the migration state (anonymous
-  still served, bad tokens refused, and the
-  `timelake_data_requests_*` split measures what a flip would break), and
-  `required` closes both ports. One token, three spellings, because the
+  `TIMELAKE_DATA_AUTH=off|optional|required` — `optional` is the default
+  since 0.5 (#162): anonymous still served, a wrong token refused, a blank
+  one treated as none, and the `timelake_data_requests_*` split measures
+  what the flip would break; `off` is the pre-0.5 contract where the header
+  is not read at all; `required` closes both ports. One token, three
+  spellings, because the
   clients differ: `Bearer` for Grafana's Flight SQL and Tributary, `Token`
   for Telegraf v2, `Basic` for Telegraf v1 — a mechanism chosen from a
   recorded client probe rather than from the specifications.

@@ -336,8 +336,9 @@
         and <code>/metrics</code> take no authentication; writes and
         <code>/api/sql</code> authenticate by token when
         <code>TIMELAKE_DATA_AUTH</code> is <code>optional</code> or
-        <code>required</code> (default <code>off</code>, see Data-plane tokens
-        below). The admin plane — every <code>/admin/*</code> route — answers on
+        <code>required</code> (default <code>optional</code>: tokenless callers
+        served, wrong tokens refused; see Data-plane tokens below). The admin
+        plane — every <code>/admin/*</code> route — answers on
         a dedicated private listener, <strong>1966</strong>
         (<code>TIMELAKE_ADMIN_ADDR</code>, <code>127.0.0.1</code> by default),
         each route requiring a session (SEC-4); on 1963 those paths now return
@@ -684,14 +685,17 @@
       <h3>Data-plane tokens (SEC-4 phased)</h3>
       <p>
         <code>TIMELAKE_DATA_AUTH</code> controls whether the data plane
-        authenticates: <code>off</code> (default — the
-        <code>Authorization</code> header is not examined, so existing
-        clients are untouched), <code>optional</code> (anonymous callers
-        still served, but a presented token that does not verify is
-        refused), and <code>required</code> (no valid token, no access, on
-        both <code>:1963</code> and <code>:1964</code>). The three states
-        are a migration: stage from <code>off</code> to <code>required</code>
-        while watching the request split, rather than flipping blind.
+        authenticates: <code>optional</code> (the default since 0.5 —
+        anonymous callers still served, a blank token treated as none, but a
+        presented token that does not verify is refused with 401),
+        <code>off</code> (the pre-0.5 contract — the
+        <code>Authorization</code> header is not examined, so a wrong token
+        is served like no token), and <code>required</code> (no valid token,
+        no access, on both <code>:1963</code> and <code>:1964</code>). The
+        three states are a migration: issue tokens under
+        <code>optional</code>, watch
+        <code>timelake_data_requests_anonymous_total</code> reach zero, then
+        set <code>required</code>, rather than flipping blind.
       </p>
       <p>
         Tokens are issued from the console (<code>POST /admin/tokens</code>,
@@ -853,7 +857,7 @@
             <tr><td><code>POST /write</code> (v1)</td><td><strong>Implemented</strong></td></tr>
             <tr><td><code>POST /api/v2/write</code> (v2)</td><td><strong>Implemented</strong>; <code>org</code> accepted and ignored, single tenant</td></tr>
             <tr><td><code>POST /api/v3/write_lp</code> (v3)</td><td><strong>Implemented</strong></td></tr>
-            <tr><td>Authorization tokens</td><td>Under the default <code>TIMELAKE_DATA_AUTH=off</code>: accepted and ignored — any value works, including none. Under <code>optional</code>/<code>required</code>: verified, as <code>Bearer</code>, <code>Token</code> or <code>Basic</code> (token as the password), so Telegraf v1, v2 and Grafana all work unmodified once issued a token from the console</td></tr>
+            <tr><td>Authorization tokens</td><td>Under the default <code>TIMELAKE_DATA_AUTH=optional</code>: none or an empty value is served anonymously, a wrong value is 401. Under <code>off</code>: accepted and ignored — any value works. Under <code>optional</code>/<code>required</code>: verified, as <code>Bearer</code>, <code>Token</code> or <code>Basic</code> (token as the password), so Telegraf v1, v2 and Grafana all work unmodified once issued a token from the console</td></tr>
             <tr><td>Buckets / databases</td><td>Created implicitly on first write; no management API</td></tr>
             <tr><td><code>GET /ping</code></td><td>204, but the version header is <code>x-timelakedb-version</code>, <em>not</em> <code>X-Influxdb-Version</code> — clients that gate on that header will not recognise the server</td></tr>
             <tr><td><code>GET /query</code> (InfluxQL)</td><td>404 — not implemented</td></tr>

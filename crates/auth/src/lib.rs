@@ -41,7 +41,7 @@ pub mod token;
 pub use guard::{Action, Decision, decide};
 pub use token::{
     DataAuthCounts, DataAuthMode, Scope, TokenError, TokenIdentity, TokenIndex, TokenRecord,
-    generate_secret, hash_token, token_from_authorization,
+    credential_is_blank, generate_secret, hash_token, token_from_authorization,
 };
 
 /// Where the principal store lives in the object store.
@@ -559,12 +559,20 @@ impl Auth {
         let presented = if mode == DataAuthMode::Off {
             None
         } else {
-            authorization.map(|h| match token_from_authorization(h) {
-                Some(secret) => self.verify_token(&secret),
+            authorization.and_then(|h| match token_from_authorization(h) {
+                Some(secret) => Some(self.verify_token(&secret)),
+                // `Token ` with nothing after it, or `Basic` with an empty
+                // password, is a client whose token field is blank, not a
+                // credential that failed. A stock Telegraf influxdb_v2
+                // output sends the header either way. Blank is absent:
+                // anonymous under `optional`, `Missing` under `required`.
+                // Without this, `optional` by default (#162) would 401
+                // every tokenless Telegraf on day one.
+                None if credential_is_blank(h) => None,
                 // An Authorization header in a scheme we don't speak
                 // (Digest, Negotiate…) is a presented-but-unusable
                 // credential, not an anonymous request.
-                None => Err(TokenError::Invalid),
+                None => Some(Err(TokenError::Invalid)),
             })
         };
         guard::decide(mode, presented, action, db)

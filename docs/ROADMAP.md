@@ -175,7 +175,8 @@ outranks "do not deploy this yet":
 > `docs/evidence/P0-1-ci.md`; the public flip and `v0.1.0-alpha` tag are
 > Phase 2 in `../PROJECT_PLAN.md`, paywalled) · **P0-2** `/api/sql`
 > sandbox + non-root container ✓ (done 2026-08-10) · **P0-3** data-plane
-> tokens ✓ built 2026-08-10, **still defaults `off`** · **P0-4** catalog
+> tokens ✓ built 2026-08-10, **defaults `optional` since 2026-09-09
+> (#162)**; `required` waits on a measured split · **P0-4** catalog
 > CAS ✓ (done 2026-08-10) · **P0-5** Tributary presents the token ✓ (done
 > 2026-08-10)
 

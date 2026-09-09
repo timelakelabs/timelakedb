@@ -171,7 +171,15 @@ impl Default for EngineConfig {
             query_timeout_secs: 600,
             max_result_rows: timelake_query::DEFAULT_MAX_RESULT_ROWS,
             gc_grace_secs: 900,
-            data_auth: timelake_auth::DataAuthMode::Off,
+            // `optional` since #162: anonymous is still served, a bad token
+            // is refused, and `timelake_data_requests_{authenticated,
+            // anonymous}_total` measures the split that decides `required`.
+            // It was `Off` for three releases, so a stock node served anyone
+            // who could reach the port. The same default is spelled in
+            // crates/config (the layered-config inventory),
+            // packaging/timelakedb.env and deploy/helm values.yaml; flip all
+            // four or the packaged installs disagree with the container.
+            data_auth: timelake_auth::DataAuthMode::Optional,
             repl_timeout_ms: 250,
             max_body_bytes: 32 << 20, // 32 MiB: FR-1 asks for >=10 MB, with headroom
             // Above one querier's max_concurrent_queries (6), so a single
