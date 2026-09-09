@@ -319,9 +319,10 @@ fn the_default_mode_is_optional_in_both_places_that_spell_it() {
 }
 
 /// A tokenless stock client is not "a client with a bad token". Telegraf's
-/// influxdb_v2 output sends `Authorization: Token ` with nothing after it
-/// when no token is configured, and its v1 output sends `Basic user:` when
-/// only a username is. Under the `optional` default those must be served
+/// influxdb_v2 output sends `Authorization: Token` with nothing after it
+/// when no token is configured (Go trims the trailing space; recorded in
+/// `docs/evidence/data-auth-default-optional-drill.log`), and its v1 output
+/// sends `Basic user:` when only a username is. Under the `optional` default those must be served
 /// as anonymous, or the migration window is a flag day; under `required`
 /// they are refused as missing, not as invalid.
 #[tokio::test]

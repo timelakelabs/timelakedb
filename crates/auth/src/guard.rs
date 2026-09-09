@@ -64,7 +64,7 @@ impl Decision {
 ///    once.
 /// 3. In `Optional`, a request with no credential proceeds anonymously —
 ///    that is the migration window. "No credential" includes a blank one
-///    (`Token ` with nothing after it, `Basic` with an empty password):
+///    (`Token` with nothing after it, `Basic` with an empty password):
 ///    a tokenless stock Telegraf still sends the header, and since
 ///    `Optional` is the default (#162), refusing that would make day one
 ///    the flag day. `Auth::decide_data` folds blank into `None` before

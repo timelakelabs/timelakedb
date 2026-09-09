@@ -33,8 +33,9 @@ inventory in `crates/config` (a test now pins the two to each other),
 still available and means what it did: the header is not read at all.
 
 **A blank token is not a wrong token.** Telegraf's `influxdb_v2` output
-sends `Authorization: Token ` with nothing after it when no token is
-configured, and its v1 output sends `Basic user:` when only a username is.
+sends `Authorization: Token` with nothing after it when no token is
+configured (Go trims the trailing space; recorded in the drill), and its
+v1 output sends `Basic user:` when only a username is.
 Before this change both parsed as a presented credential that failed, so
 `optional` by default would have answered 401 to every tokenless Telegraf
 on day one and turned the migration window into a flag day. A credential

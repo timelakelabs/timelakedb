@@ -22,6 +22,10 @@
 #
 # Run from the HOST. T=node HTTP, G=Grafana.
 set -e
+# Git Bash rewrites `/probe.py` in a docker argument into
+# `C:/Program Files/Git/probe.py` and the recorder dies on the spot (see
+# packaging/README.md, same trap). Harmless everywhere else.
+export MSYS_NO_PATHCONV=1
 T=${T:-http://localhost:1963}
 G=${G:-http://localhost:3003}
 GUSER=${GUSER:-admin}; GPASS=${GPASS:-admin}
@@ -58,11 +62,19 @@ chk "$(metric timelake_data_auth_mode)" "1" "timelake_data_auth_mode reads 1 (op
 
 echo "-- B. what a tokenless stock Telegraf sends (recorder on $NET) --"
 cleanup
-docker create --name tldb-162-recorder --network "$NET" python:3-slim python /probe.py >/dev/null
-docker cp "$HERE/tls-drill/http_probe.py" tldb-162-recorder:/probe.py
-docker start tldb-162-recorder >/dev/null
-PROBE_CONF=$(mktemp)
-cat >"$PROBE_CONF" <<'EOF'
+# Files go in over stdin, never as a docker argument: a host path in a
+# docker argument is exactly what Git Bash mangles, and `docker cp` needs one.
+# The recorder is the container's MAIN process (it waits for its script to
+# land), because `docker logs` shows only that process — a `docker exec -d`
+# python prints into the void, and that is how the first cut of this step
+# recorded nothing while everything else passed.
+docker run -d --name tldb-162-recorder --network "$NET" python:3-slim \
+  sh -c 'while [ ! -f /probe.py ]; do sleep 0.2; done; exec python /probe.py' >/dev/null
+docker exec -i tldb-162-recorder sh -c 'cat > /probe.py.part && mv /probe.py.part /probe.py' \
+  < "$HERE/tls-drill/http_probe.py"
+docker run -d --name tldb-162-probe-telegraf --network "$NET" --entrypoint sh telegraf:latest \
+  -c 'while [ ! -f /tmp/probe.ready ]; do sleep 0.2; done; exec telegraf --config /tmp/probe.conf' >/dev/null
+docker exec -i tldb-162-probe-telegraf sh -c 'cat > /tmp/probe.conf && touch /tmp/probe.ready' <<'EOF'
 [agent]
   interval = "2s"
   flush_interval = "2s"
@@ -78,17 +90,19 @@ cat >"$PROBE_CONF" <<'EOF'
   username = "telegraf"
   password = ""
 EOF
-docker create --name tldb-162-probe-telegraf --network "$NET" telegraf:latest >/dev/null
-docker cp "$PROBE_CONF" tldb-162-probe-telegraf:/etc/telegraf/telegraf.conf
-rm -f "$PROBE_CONF"
-docker start tldb-162-probe-telegraf >/dev/null
 for i in $(seq 1 30); do
   [ "$(docker logs tldb-162-recorder 2>&1 | grep -c PROBE)" -ge 2 ] && break; sleep 1
 done
 docker logs tldb-162-recorder 2>&1 | grep PROBE | sort -u | sed 's/^/  recorded: /'
+if [ "$(docker logs tldb-162-recorder 2>&1 | grep -c PROBE)" -lt 2 ]; then
+  echo "  (recorder saw fewer than two probes; the probe Telegraf said:)"
+  docker logs tldb-162-probe-telegraf 2>&1 | tail -6 | sed 's/^/    /'
+fi
 V2=$(docker logs tldb-162-recorder 2>&1 | grep "path=/api/v2/write" | head -1 | sed -n "s/.*authorization=\(.*\)$/\1/p")
 V1=$(docker logs tldb-162-recorder 2>&1 | grep "path=/write" | head -1 | sed -n "s/.*authorization=\(.*\)$/\1/p")
-chk "$V2" "'Token '" "influxdb_v2 output with token=\"\" sends 'Token ' with nothing after it"
+# Go's HTTP client trims the trailing space, so the wire value is `Token`,
+# scheme only. The node treats scheme-only and scheme-plus-space the same.
+chk "$V2" "'Token'" "influxdb_v2 output with token=\"\" sends 'Token' with nothing after it"
 chk "$V1" "'Basic dGVsZWdyYWY6'" "influxdb (v1) output with a username and no password sends Basic telegraf:"
 cleanup
 
@@ -128,8 +142,8 @@ chk "$(metric timelake_data_requests_rejected_total)" "2" "both counted as rejec
 
 echo "-- F. a BLANK credential in each spelling is served as anonymous --"
 ANON0=$(metric timelake_data_requests_anonymous_total)
-chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Token ' --data-binary "drill,run=$RUN v=2i")" \
-    "204" "'Token ' (what a tokenless influxdb_v2 output sends) -> 204"
+chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Token' --data-binary "drill,run=$RUN v=2i")" \
+    "204" "'Token' (what a tokenless influxdb_v2 output sends, as recorded above) -> 204"
 chk "$(code -X POST "$T/write?db=poc&precision=ns" -H 'authorization: Basic dGVsZWdyYWY6' --data-binary "drill,run=$RUN v=3i")" \
     "204" "'Basic telegraf:' (what a passwordless v1 output sends) -> 204"
 chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Bearer' --data-binary "drill,run=$RUN v=4i")" \

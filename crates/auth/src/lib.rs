@@ -561,10 +561,12 @@ impl Auth {
         } else {
             authorization.and_then(|h| match token_from_authorization(h) {
                 Some(secret) => Some(self.verify_token(&secret)),
-                // `Token ` with nothing after it, or `Basic` with an empty
+                // `Token` with nothing after it, or `Basic` with an empty
                 // password, is a client whose token field is blank, not a
                 // credential that failed. A stock Telegraf influxdb_v2
-                // output sends the header either way. Blank is absent:
+                // output sends the header either way (recorded in
+                // docs/evidence/data-auth-default-optional-drill.log). Blank
+                // is absent:
                 // anonymous under `optional`, `Missing` under `required`.
                 // Without this, `optional` by default (#162) would 401
                 // every tokenless Telegraf on day one.

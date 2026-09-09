@@ -252,7 +252,8 @@ pub fn token_from_authorization(header: &str) -> Option<String> {
 }
 
 /// True for an `Authorization` value in a scheme we speak whose credential
-/// is empty: `Bearer`, `Token ` or `Basic` with an empty password.
+/// is empty: `Bearer` or `Token` alone (with or without a trailing space;
+/// Go's HTTP client trims it), or `Basic` with an empty password.
 ///
 /// That is a client whose token field is blank, not a credential that
 /// failed to verify, and [`Auth::decide_data`](crate::Auth::decide_data)
