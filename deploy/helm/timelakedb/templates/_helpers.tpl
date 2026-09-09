@@ -203,6 +203,9 @@ http://{{ include "timelakedb.fullname" . }}-consul:8500
 {{/* Refuse configurations that would silently expose an unauthenticated write
      endpoint. Rendered once from NOTES/validation include. */}}
 {{- define "timelakedb.validate" -}}
+{{- if not (has .Values.mode (list "single" "cluster")) -}}
+{{- fail (printf "mode is %q — it must be \"single\" or \"cluster\". Every workload template is gated on one of those two, so a typo here does not fail, it renders a release containing nothing but a ServiceAccount and reports success." .Values.mode) -}}
+{{- end -}}
 {{- if and (eq .Values.dataAuth "off") (or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort")) -}}
 {{- fail "dataAuth is \"off\" but service.type exposes the data plane externally (LoadBalancer/NodePort). Set dataAuth to \"optional\" or \"required\", or keep service.type ClusterIP. An open write endpoint is never a silent default." -}}
 {{- end -}}

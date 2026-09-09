@@ -89,6 +89,70 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The chart had never been checked by anything. It was linted by hand twice,
+  # in August, and the templates are gated on `mode`, which nothing verified
+  # either — `--set mode=cluser` rendered a release containing one
+  # ServiceAccount and reported success.
+  #
+  # Deliberately NOT filtered to `deploy/helm/**` changes. The templates
+  # render the server's environment, so a new required setting in the engine
+  # can invalidate the chart without touching a file under it, and that is
+  # exactly the change nobody would think to look. It costs about twenty
+  # seconds.
+  helm:
+    name: helm · lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, not `latest`. This is the version the chart is verified
+      # against, the way ALERTING.md pins the Grafana it was drilled on: a
+      # silent helm upgrade changing render or lint behaviour should be a
+      # deliberate bump with a re-check, not a Tuesday morning surprise.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+
+      - name: Lint
+        run: helm lint deploy/helm/timelakedb
+
+      # Both modes, because they share no templates: `single` renders the
+      # StatefulSet and `cluster` renders the five role workloads, and a
+      # break in one is invisible from the other.
+      - name: Render single-node
+        run: |
+          helm template rel deploy/helm/timelakedb > /tmp/single.yaml
+          test -s /tmp/single.yaml
+          grep -q 'kind: StatefulSet' /tmp/single.yaml
+
+      - name: Render cluster
+        run: |
+          helm template rel deploy/helm/timelakedb \
+            --set mode=cluster --set cluster.minio.enabled=true > /tmp/cluster.yaml
+          for role in ingester querier router; do
+            grep -q "timelakedb-$role" /tmp/cluster.yaml \
+              || { echo "cluster render is missing the $role workload" >&2; exit 1; }
+          done
+
+      # The guards are the chart's only defence against a values file that is
+      # wrong rather than malformed, so a guard that has stopped firing has to
+      # fail the build. Each of these MUST be rejected.
+      - name: The guards still refuse what they are there to refuse
+        run: |
+          set -u
+          refuses() {
+            desc=$1; shift
+            if helm template rel deploy/helm/timelakedb "$@" >/dev/null 2>&1; then
+              echo "NOT REFUSED: $desc" >&2
+              exit 1
+            fi
+            echo "  refused: $desc"
+          }
+          refuses "an unknown mode"            --set mode=cluser
+          refuses "cluster with no object store" --set mode=cluster
+          refuses "an externally exposed open data plane" \
+            --set dataAuth=off --set service.type=LoadBalancer
+          refuses "tls on with no secret named" --set tls.enabled=true
+
   # Tests always; coverage only on a push to main. The instrumented
   # `cargo llvm-cov` rebuild is both the expensive half and the only part that
   # needs the disk-reclaim dance, and it does not need to gate every pull

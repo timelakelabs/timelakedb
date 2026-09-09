@@ -7,6 +7,30 @@ plumbing and get the cluster-role split subtly wrong.
 Two modes: `mode: single` (one `role=all` node) and `mode: cluster` (the
 router / ingester / querier / compactor split).
 
+## Install from the registry
+
+Released charts and images are published on tag (#167). This is the
+reproducible install: the chart's `appVersion` is stamped at the tag, so the
+chart and the image it deploys move together.
+
+```sh
+helm install tldb oci://ghcr.io/timelakelabs/charts/timelakedb \
+  --version 0.5.0 -n timelakedb --create-namespace
+```
+
+Image tags carry **no `v`**: the tag `v0.5.0` publishes
+`ghcr.io/timelakelabs/timelakedb:0.5.0`, matching the `.deb`/`.rpm` version
+and the chart version, so one string names all four artifacts. `:latest`
+follows the newest non-prerelease. Images are `linux/amd64` and
+`linux/arm64`.
+
+`ghcr.io/timelakelabs/timelakedb:main` also exists. It is **not** a release
+— it is what the last push to `main` built, for Tributary's conformance job
+to consume, and it moves under you. Never pin production to it.
+
+Installing from a checkout, as below, gives you the chart as it is in the
+tree, whose `appVersion` tracks `main` for the same reason.
+
 ## Install — single node
 
 ```sh
@@ -29,7 +53,7 @@ helm install tldb deploy/helm/timelakedb -n timelakedb --create-namespace \
   --set mode=cluster \
   --set objectStore.enabled=true --set objectStore.url=s3://my-bucket/timelake \
   --set objectStore.existingSecret=my-s3-creds \
-  --set image.tag=v0.1.0
+  --set image.tag=0.5.0
 ```
 
 Cluster mode brings up **ingesters as a StatefulSet** (durable WAL + PVC, CL-2

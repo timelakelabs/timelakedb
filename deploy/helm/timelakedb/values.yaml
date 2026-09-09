@@ -58,7 +58,11 @@ cluster:
 
 image:
   repository: ghcr.io/timelakelabs/timelakedb
-  # Empty = the chart's appVersion. Pin to a released tag in production.
+  # Empty = the chart's appVersion, which the release workflow stamps at the
+  # tag. So a chart installed from oci://ghcr.io/timelakelabs/charts pulls a
+  # matching released image with nothing set here, and a chart installed from
+  # a checkout pulls `main`. Set this only to deploy an image OTHER than the
+  # one the chart was released against. Tags carry no `v`: 0.5.0, not v0.5.0.
   tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
