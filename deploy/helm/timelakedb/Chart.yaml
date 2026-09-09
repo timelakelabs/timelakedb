@@ -3,10 +3,15 @@ name: timelakedb
 description: TimeLakeDB — a high-cardinality time-series database, deployed on Kubernetes
 type: application
 # Chart version. Bump on any chart change.
+#
+# Both of these are STAMPED AT THE TAG by .github/workflows/release.yml, so
+# the published artifact names a real release. What is committed here is
+# what a developer installing from a checkout gets, which is why appVersion
+# tracks `main`: the chart in the tree deploys the image the tree builds.
+# Don't hand-edit these to a release number — the workflow overwrites them,
+# and a version somebody remembers to bump by hand is one that eventually
+# does not get bumped.
 version: 0.1.0
-# The TimeLakeDB image this chart is written against. There is no released
-# semver image yet, so this tracks the published `main` tag; pin `image.tag` to
-# a release tag once one ships.
 appVersion: "main"
 home: https://github.com/timelakelabs/timelakedb
 sources:

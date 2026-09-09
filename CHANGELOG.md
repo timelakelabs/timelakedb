@@ -13,6 +13,60 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Added — A release publishes a versioned, multi-arch image and the chart (#167)
+
+There was no container image for any release. The only image was
+`ghcr.io/timelakelabs/timelakedb:main`, which is whatever the last push to
+`main` built, amd64 only, and it moves. `:<sha>` existed too, but nobody
+writes a sha down. So "roll back to what we ran last week" had no answer,
+and Graviton nodes and Apple-silicon kind clusters could not run it at all.
+
+A `v*` tag now also publishes:
+
+- **`ghcr.io/timelakelabs/timelakedb:<version>`** for `linux/amd64` and
+  `linux/arm64`, plus `:latest` for a non-prerelease tag. The workflow then
+  inspects the manifest and fails if either platform is missing, because a
+  single-arch push succeeds and tags exactly the same way.
+- **`oci://ghcr.io/timelakelabs/charts/timelakedb`**, with `version` and
+  `appVersion` stamped at the tag, and the packaged chart attached to the
+  Release for anyone who cannot reach a registry.
+
+Image tags carry no `v`, matching the packages, so one string names the
+`.deb`, the `.rpm`, the image and the chart.
+
+arm64 is built only on tag. Under QEMU it roughly triples the pipeline, and
+paying that once per release is reasonable where paying it on every push is
+how a build gate ends up switched off.
+
+The chart is published only after the image it names, since a chart whose
+`appVersion` points at a tag nobody pushed installs cleanly and then sits in
+`ImagePullBackOff`.
+
+### Fixed — The image is built from `Cargo.lock` (#167)
+
+The Dockerfile copied `Cargo.toml` and the sources but not `Cargo.lock`, so
+`cargo build` re-resolved dependencies at image build time. An image tagged
+`0.5.0` could therefore contain versions of dependencies that nothing had
+tested. `.dockerignore` had always un-ignored the lock file; the `COPY` just
+never listed it. Now copied, and built `--locked`.
+
+### Fixed — The Helm chart is checked by CI, and a typo in `mode` is refused (#167)
+
+The chart had never been linted or rendered by anything automatic. It was
+checked by hand twice, in August.
+
+`helm lint` plus a render of both modes now runs on every push, along with a
+check that each of the chart's four value guards still refuses what it
+exists to refuse. Deliberately not filtered to `deploy/helm/**`: the
+templates render the server's environment, so a new required setting in the
+engine can invalidate the chart without touching a file underneath it, and
+that is precisely the change nobody would think to look at.
+
+Writing that job turned up a fifth guard that was missing. Every workload
+template is gated on `mode` being `single` or `cluster`, and nothing checked
+the value, so `--set mode=cluser` rendered a release containing one
+ServiceAccount and reported success.
+
 ### Fixed — A full data volume says so, instead of answering 500 (#165)
 
 A full disk used to surface as `500` with `reason="internal"` and a line in

@@ -1,9 +1,14 @@
 # TimeLakeDB server image (M0 stub).
 FROM rust:1-slim AS build
 WORKDIR /src
-COPY Cargo.toml rust-toolchain.toml ./
+# Cargo.lock is copied and the build is --locked: a RELEASE image has to be
+# the tree that CI proved, and without the lock file cargo re-resolves at
+# build time, so an image tagged 0.5.0 could contain dependency versions
+# nothing ever tested. .dockerignore has always un-ignored the lock; the
+# COPY simply never listed it.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --release -p timelake-server
+RUN cargo build --release --locked -p timelake-server
 
 # trixie matches the glibc of the rust:1-slim builder (a bookworm runtime
 # broke with `GLIBC_2.38 not found` when the builder image moved forward)
