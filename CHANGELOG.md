@@ -13,6 +13,35 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Fixed — `main` requires its checks, and a docs-only pull request still merges (#169)
+
+Two pull requests merged on 2026-08-31 with every check red, and `main`
+stayed red for nine hours. Nothing stopped them because nothing was set to.
+The excuse in the docs, that branch protection is paywalled for private
+repositories, expired when the repository went public.
+
+A ruleset on `main` now requires `changes`, `compat`, `fmt · clippy`,
+`helm`, `tests · coverage`, `store-s3` and `catchment · conformance` to
+pass before a pull request merges or a commit lands, with no bypass and no
+review requirement (one maintainer; a review rule would be bypassed on day
+one). Force pushes and deletion of `main` are refused too. A commit pushed
+straight to `main` is refused unless its sha already has passing checks, so
+the release commit goes through a pull request like everything else.
+
+The trap this had to avoid: required checks and `paths-ignore` do not mix.
+A workflow skipped by path filtering never reports, its checks sit
+"expected" forever, and the pull request never merges. Five docs-only pull
+requests merged since `paths-ignore` arrived on 2026-08-13 with no ci run
+at all; every one would have been stuck. So a pull request always gets a
+run now: a `changes` job decides in seconds whether anything the expensive
+jobs run for was touched, judged by the same list the release gate uses,
+and those jobs condition on it. A job skipped by an `if` reports success,
+so a docs-only pull request is a green run in which nothing ran. `changes`
+is itself required, because a job whose dependency failed is skipped and
+reports success; unrequired, a broken gate would wave everything through.
+A push to `main` keeps `paths-ignore`, so the release gate's docs-only rule
+is unchanged.
+
 ### Fixed — A tag is refused until its ci run has finished green (#168)
 
 `release.yml` never ran the test suite, by design: `ci.yml` proves the

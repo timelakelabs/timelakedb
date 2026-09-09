@@ -93,6 +93,22 @@ a second enforcement point.
 
 ## What CI enforces
 
+`main` is protected by a ruleset (#169): the checks below must pass before
+a pull request merges or a commit lands, nobody can bypass it, and there
+is no review requirement. That applies to a direct push too, so the
+release commit goes through a pull request like everything else; a commit
+pushed straight to `main` is refused unless its sha already has passing
+checks.
+
+A docs-only pull request still merges. `ci.yml` runs on every pull
+request, and a first job, `changes`, decides in seconds whether anything
+the expensive jobs run for was touched (the list is `paths-ignore` in the
+workflow, mirrored by `release_gate.CI_IGNORED`). If not, the rest is
+skipped, and a skipped job counts as passing. Do not "fix" that by adding
+`paths-ignore` to the `pull_request` trigger: a path-filtered workflow
+never reports, and a required check that never reports blocks the pull
+request forever.
+
 `.github/workflows/ci.yml` runs, and a pull request must pass:
 
 ```bash
