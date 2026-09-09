@@ -1279,21 +1279,58 @@ async fn console_page_is_public_and_the_default_credential_is_alarmable() {
 /// first flush: buffer swapped out, catalog commit still seconds away
 /// behind slow object writes → "table not found" mid-benchmark. Rows
 /// must stay visible across the whole upload window.
+///
+/// The window is held open by a gate, not by a sleep (#176). This test used
+/// to slow every `put` by 150 ms and then assert it had managed three probes
+/// inside the resulting ~300 ms, which is a claim about how busy the machine
+/// is rather than about the engine — under `cargo test --workspace` it went
+/// red on two of three runs, always on that assertion and never on the one
+/// that matters. The store now stops dead inside `put` until this test
+/// releases it, so the window lasts exactly as long as the probing takes and
+/// there is no race left to lose. It is also faster, because nothing sleeps.
 #[tokio::test]
 async fn rows_stay_visible_while_a_slow_flush_uploads() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use timelake_store::{LocalStore, Store};
 
-    struct SlowStore {
+    /// A store that stops in `put` once armed and stays stopped until
+    /// released.
+    ///
+    /// Arming is separate from construction on purpose: the engine writes
+    /// objects while it opens, and a gate that was live from the start would
+    /// block there and hang the test before it had done anything.
+    struct GatedStore {
         inner: LocalStore,
-        delay: std::time::Duration,
+        armed: AtomicBool,
+        held: AtomicUsize,
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, Condvar)>,
     }
-    impl Store for SlowStore {
+    impl GatedStore {
+        fn hold(&self) {
+            if !self.armed.load(Ordering::SeqCst) {
+                return;
+            }
+            self.held.fetch_add(1, Ordering::SeqCst);
+            // Before blocking, not after: the notify has to be visible to the
+            // test whether or not it is already waiting, and `Notify` holds a
+            // permit for exactly that case.
+            self.arrived.notify_one();
+            let (lock, cv) = &*self.release;
+            let mut open = lock.lock().expect("release lock");
+            while !*open {
+                open = cv.wait(open).expect("release wait");
+            }
+        }
+    }
+    impl Store for GatedStore {
         fn put(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
-            std::thread::sleep(self.delay); // an object-store-shaped put
+            self.hold();
             self.inner.put(path, bytes)
         }
         fn put_if_absent(&self, path: &str, bytes: &[u8]) -> std::io::Result<bool> {
-            std::thread::sleep(self.delay);
+            self.hold();
             self.inner.put_if_absent(path, bytes)
         }
         fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
@@ -1314,10 +1351,16 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn timelake_store::Store> = Arc::new(SlowStore {
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate = Arc::new(GatedStore {
         inner: LocalStore::new(&dir.path().join("objects")).unwrap(),
-        delay: std::time::Duration::from_millis(150),
+        armed: AtomicBool::new(false),
+        held: AtomicUsize::new(0),
+        arrived: Arc::clone(&arrived),
+        release: Arc::clone(&release),
     });
+    let store: Arc<dyn Store> = gate.clone();
     let eng =
         timelake_server::Engine::open_with_store(dir.path(), engine_cfg(Vec::new()), store, false)
             .unwrap();
@@ -1334,15 +1377,28 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
         "write must land"
     );
 
-    // first flush of this table: file put + manifest put ≈ 300 ms of
-    // window that used to serve "table not found"
+    // Everything the engine needed to write for itself is done; from here a
+    // put is the flush.
+    gate.armed.store(true, Ordering::SeqCst);
     let flusher = {
         let eng = Arc::clone(&eng);
         std::thread::spawn(move || eng.flush_all())
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut probes = 0;
-    while !flusher.is_finished() && std::time::Instant::now() < deadline {
+
+    // Wait for the flush to reach the store. It is now stopped inside the
+    // upload with the buffer already swapped into the holding area and the
+    // manifest not yet committed — the exact window the C0 drill found rows
+    // missing in. The generous timeout is not a race: it fails only if the
+    // flush never put anything at all, which is a different bug worth
+    // hearing about.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        std::pin::pin!(arrived.notified()),
+    )
+    .await
+    .expect("the flush never reached the store, so nothing was probed in the window");
+
+    for probe in 1..=3 {
         let batches = eng
             .sql_batches(
                 "poc",
@@ -1353,11 +1409,27 @@ async fn rows_stay_visible_while_a_slow_flush_uploads() {
             .await
             .expect("mid-flush query must not fail");
         let n = timelake_query::batches_to_json(&batches)[0]["n"].as_i64();
-        assert_eq!(n, Some(3), "acked rows vanished mid-flush");
-        probes += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(n, Some(3), "acked rows vanished mid-flush, probe {probe}");
     }
-    assert!(probes >= 3, "the flush window was never actually probed");
+
+    // The whole point of the gate: the flush is demonstrably still in
+    // progress, so those three answers came from inside the window and not
+    // from after it.
+    assert!(
+        !flusher.is_finished(),
+        "the flush finished while the gate was holding it — the probes above \
+         proved nothing"
+    );
+    assert!(
+        gate.held.load(Ordering::SeqCst) >= 1,
+        "the gate never held a put"
+    );
+
+    {
+        let (lock, cv) = &*release;
+        *lock.lock().expect("release lock") = true;
+        cv.notify_all();
+    }
     flusher.join().unwrap().unwrap();
 
     // and after the flush the answer is identical, from files
