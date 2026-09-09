@@ -93,17 +93,26 @@ EOF
 for i in $(seq 1 30); do
   [ "$(docker logs tldb-162-recorder 2>&1 | grep -c PROBE)" -ge 2 ] && break; sleep 1
 done
-docker logs tldb-162-recorder 2>&1 | grep PROBE | sort -u | sed 's/^/  recorded: /'
+# The recorded lines are printed with any `Basic` value DECODED. The raw
+# base64 of "telegraf:" is not a secret (the password is empty), but
+# GitHub's secret scanning flags `Basic <base64>` wherever it appears, and
+# an alert per drill run is noise nobody will keep reading (alert #3).
+# Same reason the expected value below is computed rather than written.
+decode_basic() { python -c "import sys,re,base64
+for line in sys.stdin:
+    print(re.sub(r\"Basic ([A-Za-z0-9+/=]+)\", lambda m: 'Basic base64(%r)' % base64.b64decode(m.group(1)).decode(), line), end='')"; }
+docker logs tldb-162-recorder 2>&1 | grep PROBE | sort -u | decode_basic | sed 's/^/  recorded: /'
 if [ "$(docker logs tldb-162-recorder 2>&1 | grep -c PROBE)" -lt 2 ]; then
   echo "  (recorder saw fewer than two probes; the probe Telegraf said:)"
   docker logs tldb-162-probe-telegraf 2>&1 | tail -6 | sed 's/^/    /'
 fi
 V2=$(docker logs tldb-162-recorder 2>&1 | grep "path=/api/v2/write" | head -1 | sed -n "s/.*authorization=\(.*\)$/\1/p")
 V1=$(docker logs tldb-162-recorder 2>&1 | grep "path=/write" | head -1 | sed -n "s/.*authorization=\(.*\)$/\1/p")
+BASIC_TELEGRAF=$(python -c "import base64; print(base64.b64encode(b'telegraf:').decode())")
 # Go's HTTP client trims the trailing space, so the wire value is `Token`,
 # scheme only. The node treats scheme-only and scheme-plus-space the same.
 chk "$V2" "'Token'" "influxdb_v2 output with token=\"\" sends 'Token' with nothing after it"
-chk "$V1" "'Basic dGVsZWdyYWY6'" "influxdb (v1) output with a username and no password sends Basic telegraf:"
+chk "$V1" "'Basic $BASIC_TELEGRAF'" "influxdb (v1) output with a username and no password sends Basic base64('telegraf:')"
 cleanup
 
 echo "-- C. the fixture Telegraf (token = \"\") writes, and is counted as anonymous --"
@@ -144,8 +153,8 @@ echo "-- F. a BLANK credential in each spelling is served as anonymous --"
 ANON0=$(metric timelake_data_requests_anonymous_total)
 chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Token' --data-binary "drill,run=$RUN v=2i")" \
     "204" "'Token' (what a tokenless influxdb_v2 output sends, as recorded above) -> 204"
-chk "$(code -X POST "$T/write?db=poc&precision=ns" -H 'authorization: Basic dGVsZWdyYWY6' --data-binary "drill,run=$RUN v=3i")" \
-    "204" "'Basic telegraf:' (what a passwordless v1 output sends) -> 204"
+chk "$(code -X POST "$T/write?db=poc&precision=ns" -H "authorization: Basic $BASIC_TELEGRAF" --data-binary "drill,run=$RUN v=3i")" \
+    "204" "'Basic base64(telegraf:)' (what a passwordless v1 output sends) -> 204"
 chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Bearer' --data-binary "drill,run=$RUN v=4i")" \
     "204" "'Bearer' with no value -> 204"
 chk "$(code -X POST "$T/api/v2/write?org=poc&bucket=poc&precision=ns" -H 'authorization: Digest abc' --data-binary "drill,run=$RUN v=5i")" \

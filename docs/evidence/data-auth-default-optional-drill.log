@@ -9,10 +9,10 @@ drill: deploy/compose/data_auth_default_drill.sh
   PASS  timelake_data_auth_mode reads 1 (optional) from the compiled-in default
 -- B. what a tokenless stock Telegraf sends (recorder on bench-timelakedb_default) --
   recorded: PROBE path=/api/v2/write ua=Telegraf/1.39.2 Go/1.26.5 authorization='Token'
-  recorded: PROBE path=/query ua=Telegraf/1.39.2 Go/1.26.5 authorization='Basic dGVsZWdyYWY6'
-  recorded: PROBE path=/write ua=Telegraf/1.39.2 Go/1.26.5 authorization='Basic dGVsZWdyYWY6'
+  recorded: PROBE path=/query ua=Telegraf/1.39.2 Go/1.26.5 authorization='Basic base64('telegraf:')'
+  recorded: PROBE path=/write ua=Telegraf/1.39.2 Go/1.26.5 authorization='Basic base64('telegraf:')'
   PASS  influxdb_v2 output with token="" sends 'Token' with nothing after it
-  PASS  influxdb (v1) output with a username and no password sends Basic telegraf:
+  PASS  influxdb (v1) output with a username and no password sends Basic base64('telegraf:')
 -- C. the fixture Telegraf (token = "") writes, and is counted as anonymous --
   PASS  cpu rows from the tokenless fixture Telegraf are readable (1 >= 1)
   PASS  nothing has been rejected
@@ -29,7 +29,7 @@ drill: deploy/compose/data_auth_default_drill.sh
   PASS  both counted as rejected
 -- F. a BLANK credential in each spelling is served as anonymous --
   PASS  'Token' (what a tokenless influxdb_v2 output sends, as recorded above) -> 204
-  PASS  'Basic telegraf:' (what a passwordless v1 output sends) -> 204
+  PASS  'Basic base64(telegraf:)' (what a passwordless v1 output sends) -> 204
   PASS  'Bearer' with no value -> 204
   PASS  a scheme the node does not speak is still presented-and-unusable -> 401
   PASS  the three blank writes were counted as anonymous (3 >= 3)
