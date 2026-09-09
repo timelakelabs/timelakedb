@@ -300,6 +300,79 @@ async fn off_mode_does_not_read_credentials_the_compat_contract() {
     assert_eq!(rows[0]["n"], 1);
 }
 
+/// #162: `optional` is the default, and it is spelled in two places that do
+/// not know about each other — the engine's compiled-in config and the
+/// layered-config inventory. If they disagree, a node started with no
+/// `TIMELAKE_DATA_AUTH` runs one mode and reports the other.
+#[test]
+fn the_default_mode_is_optional_in_both_places_that_spell_it() {
+    assert_eq!(
+        timelake_server::EngineConfig::default().data_auth,
+        timelake_auth::DataAuthMode::Optional,
+        "EngineConfig::default() is the mode a stock node runs"
+    );
+    assert_eq!(
+        timelake_config::spec("data_auth").unwrap().default,
+        "optional",
+        "the config inventory is the default the console reports"
+    );
+}
+
+/// A tokenless stock client is not "a client with a bad token". Telegraf's
+/// influxdb_v2 output sends `Authorization: Token` with nothing after it
+/// when no token is configured (Go trims the trailing space; recorded in
+/// `docs/evidence/data-auth-default-optional-drill.log`), and its v1 output
+/// sends `Basic user:` when only a username is. Under the `optional` default those must be served
+/// as anonymous, or the migration window is a flag day; under `required`
+/// they are refused as missing, not as invalid.
+#[tokio::test]
+async fn a_blank_token_is_anonymous_under_optional_and_missing_under_required() {
+    let t = now_ns();
+    let blanks = [
+        "Token ".to_string(),
+        "Bearer".to_string(),
+        format!("Basic {}", b64("telegraf:")),
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine_with_mode(dir.path(), timelake_auth::DataAuthMode::Optional);
+    let app = timelake_server::app(eng);
+    for (i, h) in blanks.iter().enumerate() {
+        assert_eq!(
+            write_auth(&app, Some(h), &format!("blank v={i}i {}", t + i as i64)).await,
+            StatusCode::NO_CONTENT,
+            "{h:?} under optional is a tokenless client, served anonymously"
+        );
+    }
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let metrics = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        metrics.contains("timelake_data_requests_anonymous_total 3\n"),
+        "blank credentials count as anonymous, so the split that gates \
+         `required` sees them:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("timelake_data_requests_rejected_total 0\n"),
+        "nothing was rejected:\n{metrics}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine_with_mode(dir.path(), timelake_auth::DataAuthMode::Required);
+    let app = timelake_server::app(eng);
+    for h in &blanks {
+        assert_eq!(
+            write_auth(&app, Some(h), &format!("blank v=1i {t}")).await,
+            StatusCode::UNAUTHORIZED,
+            "{h:?} under required is still no token"
+        );
+    }
+}
+
 #[tokio::test]
 async fn optional_mode_serves_anonymous_refuses_bad_and_accepts_all_three_spellings() {
     let dir = tempfile::tempdir().unwrap();

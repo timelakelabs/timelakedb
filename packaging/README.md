@@ -117,9 +117,10 @@ it. The unit is hardened the way the container is (SECURITY.md exposure 4):
 `ProtectSystem=strict` with `/var/lib/timelake` as the only writable path, no
 new privileges, a `@system-service` syscall filter.
 
-**It does not start the service, and that is deliberate.** With
-`TIMELAKE_DATA_AUTH` unset, any client that can reach the port has full read
-and write access to every database (SECURITY.md exposure 1). A package that
+**It does not start the service, and that is deliberate.** Under the
+default `TIMELAKE_DATA_AUTH=optional`, a client with no token is still
+served, so anyone who can reach the port has full read and write access to
+every database until you flip to `required` (SECURITY.md exposure 1). A package that
 begins listening because somebody ran `apt install` would hand that to
 whatever the machine is attached to. So the shipped config binds `127.0.0.1`
 only, the unit is installed but not enabled, and the postinstall prints the

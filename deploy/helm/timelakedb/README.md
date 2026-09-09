@@ -109,14 +109,16 @@ PVC. The querier and router own no data and will be Deployments in phase 2.
   unreachable behind a Service).
 - The chart **refuses to render `dataAuth: off` behind a LoadBalancer/NodePort**
   Service — an unauthenticated write endpoint on the internet is never silent.
-  Set `dataAuth: required` (and issue a token) before exposing the data plane.
+  The default `optional` (#162) still serves tokenless clients, so it is an
+  open endpoint too; set `dataAuth: required` (and issue a token) before
+  exposing the data plane.
 
 ## Key values
 
 | Value | Default | Notes |
 |---|---|---|
 | `image.repository` / `image.tag` | `ghcr.io/timelakelabs/timelakedb` / appVersion | Pin `tag` to a release. |
-| `dataAuth` | `off` | `off`\|`optional`\|`required` (SEC-4). |
+| `dataAuth` | `optional` | `off`\|`optional`\|`required` (SEC-4). `optional` serves tokenless clients and refuses wrong tokens. |
 | `adminBootstrapPassword` | `""` | Empty ⇒ seeds admin/admin, quarantined until rotated. |
 | `persistence.size` / `.storageClass` | `10Gi` / cluster default | The data-dir PVC. |
 | `objectStore.enabled` + `.url` | `false` | S3-compatible store (SEC-1/C0). Inline creds or `existingSecret`. |

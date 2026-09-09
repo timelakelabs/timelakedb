@@ -67,10 +67,14 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# Data-plane auth (SEC-4): "off" | "optional" | "required". The chart REFUSES to
-# render with "off" behind an externally-reachable Service (LoadBalancer /
-# NodePort) — an open write endpoint on the internet is never a silent default.
-dataAuth: "off"
+# Data-plane auth (SEC-4): "off" | "optional" | "required". "optional" is the
+# product default (#162): tokenless clients are served, a wrong token is 401,
+# and timelake_data_requests_{authenticated,anonymous}_total measures the
+# split that decides "required". The chart REFUSES to render with "off"
+# behind an externally-reachable Service (LoadBalancer / NodePort) — an open
+# write endpoint on the internet is never a silent default. "optional" is
+# still an open endpoint; set "required" before exposing it.
+dataAuth: "optional"
 
 # SEC-4 admin bootstrap password. Empty = the server seeds admin/admin,
 # quarantined until rotated on first sign-in. Set this for anything real; it

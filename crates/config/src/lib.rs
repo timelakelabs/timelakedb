@@ -284,7 +284,8 @@ pub static INVENTORY: &[Spec] = &[
         apply: Apply::Staged,
         min_role: Role::Admin,
         kind: Kind::Enum(&["off", "optional", "required"]),
-        default: "off",
+        // Must agree with EngineConfig::default() in crates/server (#162).
+        default: "optional",
     },
 ];
 

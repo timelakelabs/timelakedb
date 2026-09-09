@@ -35,8 +35,9 @@ writes, stateless queriers read with exact freshness — each drilled), so
 rather than the only shape; the compactor role is built but gated behind
 its work-avoidance layer (C2 phase 5b), so a cluster today still runs
 compaction on an `all`-role node; C3 (Consul discovery, required
-intra-cluster mTLS) is unstarted; and the data plane's default is open
-until an operator sets `TIMELAKE_DATA_AUTH`. Read the per-item sections
+intra-cluster mTLS) is unstarted; and the data plane's default,
+`optional` since 0.5, still serves a tokenless caller until an operator
+sets `TIMELAKE_DATA_AUTH=required`. Read the per-item sections
 below rather than this paragraph — each says what shipped and what is
 still owed.
 
@@ -58,7 +59,7 @@ Five axes. An item earns priority by which axis it unblocks.
 | # | Axis | Today |
 |---|---|---|
 | 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). No Helm chart; no public release cut yet |
-| 2 | **Access controlled and attributable** | Partly — the mechanisms exist but the defaults do not enforce them. Admin routes require a session (SEC-4); the data plane takes tokens but `TIMELAKE_DATA_AUTH` **defaults to `off`**, so a stock node still serves anyone who can reach it. Attribution is real: a hash-chained audit trail for every admin mutation (P1-2), client-certificate identity on both query surfaces (SEC-3 v2), and one row per query in `_system.queries` (U2). Not yet: data-plane auth on by default, and auditing of the data plane itself |
+| 2 | **Access controlled and attributable** | Partly — the mechanisms exist but the defaults do not enforce them. Admin routes require a session (SEC-4); the data plane takes tokens and `TIMELAKE_DATA_AUTH` **defaults to `optional` since 0.5 (#162)** — a wrong token is refused, but a stock node still serves anyone who reaches it with no token, and it counts them so the flip to `required` is made on a number. Attribution is real: a hash-chained audit trail for every admin mutation (P1-2), client-certificate identity on both query surfaces (SEC-3 v2), and one row per query in `_system.queries` (U2). Not yet: `required` by default (needs a measured split from a real deployment first), and auditing of the data plane itself |
 | 3 | **Survives node loss** | With the role split, yes for acknowledged writes — an ingester replicates every frame to its pair before the 204 and a SIGKILL'd ingester recovers on the peer with zero acked loss (`docs/evidence/cl2-replication-drill.log`, 12/12); a querier is stateless and rebuilds from the bucket. Not yet: automatic failover (recovery is an explicit `/recover`), and a compactor that can run on its own node. A default `TIMELAKE_ROLE=all` deployment is still single node, single volume, RPO = last backup |
 | 4 | **Failures visible before outages** | Yes — query latency/admission/outcome histograms, per-table storage, lifecycle lag and write-refusal causes on `/metrics` (U2, 2026-08-18); the hash-chained audit trail (P1-2); a documented alert list in `site/docs/reference.html`; and a self-monitoring Grafana console reading the node's own `_system` database. No alert *rules* are shipped — the list is prose, not a rules file |
 | 5 | **Safe to upgrade** | Partly. Forward is fine and always was: every manifest field added since M2 is `#[serde(default)]`, so a new binary reads an old catalog. **Backward is what was silently broken, and is now refused rather than guessed** (#160) — the manifest log states its format, a binary meeting a higher one stops instead of dropping the entries it does not understand, and the rule is written down in the CHANGELOG: read your own format or lower. The honest limit: 0.2 through 0.4 carry no such check, so rolling back *to* them is still unguarded and always will be — a `DROP TABLE` replayed by one of those reads as an empty commit while the files it retired stay listed. The WAL (`WAL_VERSION`) and the retention and rollup sidecars carry their own versions. Not yet: a released version to upgrade *from*, and any tested upgrade path across two releases |
@@ -178,7 +179,7 @@ registered and `CREATE EXTERNAL TABLE` does not survive the per-request
 session. Both are accidents of current configuration, not boundaries.
 The allowlist makes it a boundary.
 
-### P0-3 · Data-plane authentication  ⟂ **BUILT, NOT DEFAULTED ON (2026-08-13)**
+### P0-3 · Data-plane authentication  ✓ **DEFAULT `optional` (2026-09-09, #162); `required` waits on a measured split**
 
 **Every item this entry listed as remaining has shipped.** The Flight SQL
 side, the engine implementation, the `/admin/tokens` management surface and
@@ -189,18 +190,27 @@ routes at `crates/api/src/lib.rs:171`, integration tests in
 `docs/evidence/data-auth-drill.log` and `sec4-auth-drill.log`. Riverkeeper
 R0 independently verified the data-auth truth table on 23 assertions.
 
-**It is still not closed, and the reason is the last line of this entry.**
-The mechanism ships `off`: `crates/server/src/lib.rs:76` compiles in
-`DataAuthMode::Off`, and only an explicit `TIMELAKE_DATA_AUTH` changes it.
-So the sentence this entry opens with — anyone who can reach `:1963` or
-`:1964` has full read and write access to every database — remains true of
-a default install, which is the condition P0-3 exists to describe. Building
-the lock is not the same as fitting it.
+**The default moved to `optional` on 2026-09-09 (#162).** For three
+releases the mechanism shipped `off`: `EngineConfig::default()` compiled
+in `DataAuthMode::Off`, and only an explicit `TIMELAKE_DATA_AUTH` changed
+it, so the sentence this entry opens with — anyone who can reach `:1963`
+or `:1964` has full read and write access to every database — stayed true
+of a default install. Building the lock is not the same as fitting it.
 
-Closing this means defaulting to `optional`, taking the measured
-authenticated/anonymous split from a real deployment, and only then
-considering `required`. Until that first flip, treat the data plane as open
-and rely on network isolation, exactly as `SECURITY.md` and the README say.
+Now a stock node (the container, the `.deb`/`.rpm` via
+`packaging/timelakedb.env`, and the chart via `values.yaml`, all four
+spellings flipped together) verifies any token it is shown, refuses a wrong
+one with 401, and serves a request with no token — or an empty one, which
+is what a tokenless stock Telegraf sends — anonymously, counting it in
+`timelake_data_requests_anonymous_total`. Drilled against the unchanged
+AT-6 fixtures: `docs/evidence/data-auth-default-optional-drill.log`.
+
+What is still owed is `required` by default, and that is deliberately not
+a date: it needs the measured authenticated/anonymous split from a real
+deployment, because it breaks every client not yet holding a token at
+once. Until then the data plane is still open to a tokenless caller, and
+network isolation is still the control, exactly as `SECURITY.md` and the
+README say.
 
 The original text follows unchanged, for the record.
 

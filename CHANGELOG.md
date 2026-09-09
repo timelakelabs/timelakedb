@@ -13,6 +13,41 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Changed — `TIMELAKE_DATA_AUTH` defaults to `optional` (#162)
+
+For three releases a stock node served anyone who could reach `:1963` or
+`:1964`. The token mechanism shipped in 0.2 (P0-3) and the docs said the
+closing step was to default it to `optional`; nothing scheduled that step,
+so `DataAuthMode::Off` stayed compiled in. Meanwhile the query that can
+exhaust a node needed no credential.
+
+A stock node now verifies any token it is shown and refuses a wrong one
+with 401. A request with no token is still served, anonymously, and
+counted in `timelake_data_requests_anonymous_total`; that counter reaching
+zero is the evidence for flipping to `required`, which is not the default
+and will not be until a real deployment has produced that number. The
+default lives in four places that do not know about each other, and all
+four moved together: `EngineConfig::default()`, the layered-config
+inventory in `crates/config` (a test now pins the two to each other),
+`packaging/timelakedb.env`, and the Helm chart's `values.yaml`. `off` is
+still available and means what it did: the header is not read at all.
+
+**A blank token is not a wrong token.** Telegraf's `influxdb_v2` output
+sends `Authorization: Token` with nothing after it when no token is
+configured (Go trims the trailing space; recorded in the drill), and its
+v1 output sends `Basic user:` when only a username is.
+Before this change both parsed as a presented credential that failed, so
+`optional` by default would have answered 401 to every tokenless Telegraf
+on day one and turned the migration window into a flag day. A credential
+in a scheme we speak whose value is empty is now treated as absent:
+anonymous under `optional`, `Missing` under `required`. Unknown schemes
+(`Digest`, `Negotiate`) are still presented-and-unusable, still refused.
+
+The AT-6 Telegraf fixture carried `token = "anything-auth-is-off"`, which
+under the new default is a wrong token. It is empty now. Drilled against
+the unchanged fixtures, tokenless Telegraf and tokenless Grafana over
+Flight SQL, in `docs/evidence/data-auth-default-optional-drill.log`.
+
 ### Fixed — `main` requires its checks, and a docs-only pull request still merges (#169)
 
 Two pull requests merged on 2026-08-31 with every check red, and `main`

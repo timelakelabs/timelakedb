@@ -92,12 +92,13 @@
       </div>
       <div class="note warn">
         <p>
-          <strong>The data plane can authenticate, but ships off.</strong>
-          Set <code>TIMELAKE_DATA_AUTH</code> to <code>optional</code> or
-          <code>required</code> and writes, <code>/api/sql</code> and Flight SQL
-          all authenticate by token. Until you do, the default is
-          <code>off</code>: any client that can reach port 1963 or 1964 reads
-          and writes everything, and network reachability is your only access
+          <strong>The data plane authenticates by token, and ships
+          <code>optional</code>.</strong> A client with no token is still
+          served, a client with a wrong token gets 401, and
+          <code>/metrics</code> counts the split. Until you set
+          <code>TIMELAKE_DATA_AUTH=required</code>, any client that can reach
+          port 1963 or 1964 reads and writes everything, and network
+          reachability is your only access
           control. The <a href="#console">admin surface</a> always requires a
           session. Read <a href="#security">Security</a> before exposing this
           anywhere.
@@ -488,25 +489,26 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         want-mode client certificates, encryption at rest including the WAL,
         row visibility labels, a hash-chained audit trail, and authentication
         on both the <a href="#console">admin surface</a> and the data plane are
-        finished and drilled — but the <strong>data plane ships with
-        authentication off</strong>. Until you set
-        <code>TIMELAKE_DATA_AUTH</code>, access control for writes and queries
-        is network isolation, and visibility authorizations are claims any
-        client can assert. Plan the deployment around the default you actually
-        run, not the one the mechanism allows.
+        finished and drilled — but the <strong>data plane ships
+        <code>optional</code>, which still serves a tokenless client</strong>.
+        Until you set <code>TIMELAKE_DATA_AUTH=required</code>, access control
+        for writes and queries is network isolation, and visibility
+        authorizations are claims any client can assert. Plan the deployment
+        around the default you actually run, not the one the mechanism allows.
       </p>
 
       <div class="note warn">
         <p>
-          <strong>Authentication covers administration always, and data only
-          when you turn it on.</strong> Every <code>/admin/*</code> route
-          requires a session with a role (<code>viewer</code>,
-          <code>operator</code>, <code>admin</code>). The data plane — writes,
-          <code>/api/sql</code>, Flight SQL — authenticates by token when
-          <code>TIMELAKE_DATA_AUTH</code> is <code>optional</code> or
-          <code>required</code>; under the default <code>off</code> the
-          <code>Authorization</code> header is not examined, so any token works
-          and so does none, and the Flight SQL handshake accepts anything. There
+          <strong>Authentication covers administration always, and data by
+          token — with anonymous still served until you require it.</strong>
+          Every <code>/admin/*</code> route requires a session with a role
+          (<code>viewer</code>, <code>operator</code>, <code>admin</code>). The
+          data plane — writes, <code>/api/sql</code>, Flight SQL —
+          authenticates by token; under the default <code>optional</code> a
+          request with no token (or an empty one) is served anonymously and a
+          wrong token is refused, under <code>required</code> every request
+          needs a valid token, and under <code>off</code> the
+          <code>Authorization</code> header is not examined at all. There
           are no per-table permissions; databases are namespaces, not security
           boundaries. On a default install treat an open 1963 or 1964 as
           equivalent to an unauthenticated shell into the data. The default is
@@ -546,14 +548,15 @@ curl -s -X POST http://localhost:<span class="n">1963</span>/api/sql \
         What remains open:
       </p>
       <ul>
-        <li><strong>The data plane is unauthenticated by default.</strong> With
-            <code>TIMELAKE_DATA_AUTH</code> unset, anyone who can reach 1963 or
-            1964 can write arbitrary data, read all data and enumerate the
-            schema. Setting <code>required</code> closes it, but that breaks
-            every client not yet holding a token — which is why <code>off</code>
-            is still the default and <code>optional</code> exists as the
-            migration state between them. Until you set it, treat the port as
-            an unauthenticated shell into the data.</li>
+        <li><strong>The data plane serves anonymous callers by default.</strong>
+            Under the shipped <code>TIMELAKE_DATA_AUTH=optional</code>, anyone
+            who can reach 1963 or 1964 without a token can write arbitrary
+            data, read all data and enumerate the schema; only a wrong token is
+            refused. Setting <code>required</code> closes it, but that breaks
+            every client not yet holding a token — which is why
+            <code>optional</code> is the default: it measures the split so you
+            flip on evidence. Until you set <code>required</code>, treat the
+            port as an unauthenticated shell into the data.</li>
         <li>The administrative surface answers on the <strong>same port as the
             data plane</strong> (1963), and a deployment that never rotates the
             seeded <code>admin</code>/<code>admin</code> credential is one guess
@@ -1004,7 +1007,7 @@ TIMELAKE_PEERS=ingester-a=ingester@ingester-a:1965|ingester-a:1963,ingester-b=in
             <tr><td><code>TIMELAKE_TLS_CERT</code> / <code>_KEY</code></td><td>unset</td><td>Enable TLS on both listeners (PEM paths). Both or neither</td></tr>
             <tr><td><code>TIMELAKE_TLS_CLIENT_CA</code></td><td>unset</td><td>PEM bundle of trust anchors. Setting it turns on want-mode client certificates: one is requested, verified if presented, and the connection is served either way</td></tr>
             <tr><td><code>TIMELAKE_TLS_MIN</code></td><td><code>1.3</code></td><td>Set to <code>1.2</code> to lower the protocol floor</td></tr>
-            <tr><td><code>TIMELAKE_DATA_AUTH</code></td><td><code>off</code></td><td><code>off</code> | <code>optional</code> | <code>required</code>. Turns on data-plane token authentication. An unparseable value is refused at startup rather than silently downgraded</td></tr>
+            <tr><td><code>TIMELAKE_DATA_AUTH</code></td><td><code>optional</code></td><td><code>off</code> | <code>optional</code> | <code>required</code>. Data-plane token authentication: <code>optional</code> serves tokenless callers and refuses wrong tokens, <code>required</code> refuses both, <code>off</code> reads no header. An unparseable value is refused at startup rather than silently downgraded</td></tr>
             <tr><td><code>TIMELAKE_CONFIG_PINNED</code></td><td>empty</td><td>Comma-separated config keys locked to the system-property layer: a pinned key refuses <code>PUT /admin/config</code>, so an operator cannot override what deployment policy has fixed</td></tr>
             <tr><td><code>TIMELAKE_ENCRYPTION_KEY</code> / <code>_KEY_FILE</code></td><td>unset</td><td>64 hex characters. Envelope-encrypts every stored object <em>and</em> the WAL. Mutually exclusive with <code>TIMELAKE_KMS_KEY_ID</code></td></tr>
             <tr><td><code>TIMELAKE_KMS_KEY_ID</code></td><td>unset</td><td>AWS KMS key for the envelope, instead of a local key</td></tr>
@@ -1127,9 +1130,10 @@ TIMELAKE_PEERS=ingester-a=ingester@ingester-a:1965|ingester-a:1963,ingester-b=in
 
       <h3>Assume the port is the perimeter until you turn auth on</h3>
       <p>
-        Administration is always authenticated; the data plane is only when
-        <code>TIMELAKE_DATA_AUTH</code> says so, and it ships <code>off</code>.
-        Until you set it, whoever can reach 1963 or 1964 owns the data. The
+        Administration is always authenticated; the data plane ships
+        <code>TIMELAKE_DATA_AUTH=optional</code>, which still serves whoever
+        sends no token. Until you set <code>required</code>, whoever can reach
+        1963 or 1964 owns the data. The
         console answers on its own private listener (1966, loopback by default),
         so it is not on those ports — but its exposure is still yours to decide
         the moment you bind it wider. Bind to a private interface, keep

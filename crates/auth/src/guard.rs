@@ -63,7 +63,12 @@ impl Decision {
 ///    the day the mode flips to `Required` and the whole fleet fails at
 ///    once.
 /// 3. In `Optional`, a request with no credential proceeds anonymously —
-///    that is the migration window.
+///    that is the migration window. "No credential" includes a blank one
+///    (`Token` with nothing after it, `Basic` with an empty password):
+///    a tokenless stock Telegraf still sends the header, and since
+///    `Optional` is the default (#162), refusing that would make day one
+///    the flag day. `Auth::decide_data` folds blank into `None` before
+///    this function sees it.
 /// 4. In `Required`, no credential is a refusal.
 /// 5. A verified credential must cover the action and the database.
 pub fn decide(

@@ -199,10 +199,11 @@ Functional bugs: open an issue with the version or commit, the configuration,
 what you observed, and — ideally — a harness scenario that reproduces it.
 
 Security issues: **do not open a public issue.** Follow `SECURITY.md`. Note
-that the data plane ships with `TIMELAKE_DATA_AUTH=off` by design — the
-mechanism exists and is drilled, the default is the compatibility
-contract — so "the data plane is open on a default install" is the
-documented posture, not a vulnerability report.
+that the data plane ships with `TIMELAKE_DATA_AUTH=optional` by design — a
+tokenless client is served, a wrong token is refused, and the split is
+measured so an operator can flip to `required` on evidence — so "an
+anonymous client can write on a default install" is the documented posture
+(SECURITY.md exposure 1), not a vulnerability report.
 
 ## Code of conduct
 
