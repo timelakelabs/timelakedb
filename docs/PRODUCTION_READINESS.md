@@ -32,10 +32,13 @@ What remains is genuinely operational. The cluster role split is four
 phases in (ingester pairs replicate before the ack, a router shards
 writes, stateless queriers read with exact freshness — each drilled), so
 "one node, one copy" is now a *deployment choice* (`TIMELAKE_ROLE=all`)
-rather than the only shape; the compactor role is built but gated behind
-its work-avoidance layer (C2 phase 5b), so a cluster today still runs
-compaction on an `all`-role node; C3 (Consul discovery, required
-intra-cluster mTLS) is unstarted; and the data plane's default,
+rather than the only shape; the compactor role's gate opened with C2
+phase 5b on 2026-08-24 (#18: partition ownership above the commit fence),
+so a dedicated compactor is a deployment choice too; C3 shipped on
+2026-08-30 — live Consul discovery (#71) and a required client
+certificate on the intra-cluster listener (#72), which this paragraph
+called unstarted for eleven days after it landed; and the data plane's
+default,
 `optional` since 0.5, still serves a tokenless caller until an operator
 sets `TIMELAKE_DATA_AUTH=required`. Read the per-item sections
 below rather than this paragraph — each says what shipped and what is
@@ -58,7 +61,7 @@ Five axes. An item earns priority by which axis it unblocks.
 
 | # | Axis | Today |
 |---|---|---|
-| 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). No Helm chart; no public release cut yet |
+| 1 | **Deployable by someone else** | Partly — pushed, CI recorded green, and `.deb`/`.rpm` now ship with each tagged release (verified installing and serving on Debian 12, Ubuntu 22.04, Rocky 9, AL2023). A Helm chart ships too (`deploy/helm/timelakedb`, single and cluster modes, linted and rendered in CI), and v0.2.0/v0.3.0/v0.4.0 are public releases with a versioned multi-arch image since #167. This cell said "no Helm chart; no public release cut yet" through three of them |
 | 2 | **Access controlled and attributable** | Partly — the mechanisms exist but the defaults do not enforce them. Admin routes require a session (SEC-4); the data plane takes tokens and `TIMELAKE_DATA_AUTH` **defaults to `optional` since 0.5 (#162)** — a wrong token is refused, but a stock node still serves anyone who reaches it with no token, and it counts them so the flip to `required` is made on a number. Attribution is real: a hash-chained audit trail for every admin mutation (P1-2), client-certificate identity on both query surfaces (SEC-3 v2), and one row per query in `_system.queries` (U2). Not yet: `required` by default (needs a measured split from a real deployment first), and auditing of the data plane itself |
 | 3 | **Survives node loss** | With the role split, yes for acknowledged writes — an ingester replicates every frame to its pair before the 204 and a SIGKILL'd ingester recovers on the peer with zero acked loss (`docs/evidence/cl2-replication-drill.log`, 12/12); a querier is stateless and rebuilds from the bucket. Not yet: automatic failover (recovery is an explicit `/recover`), and a compactor that can run on its own node. A default `TIMELAKE_ROLE=all` deployment is still single node, single volume, RPO = last backup |
 | 4 | **Failures visible before outages** | Yes — query latency/admission/outcome histograms, per-table storage, lifecycle lag and write-refusal causes on `/metrics` (U2, 2026-08-18); the hash-chained audit trail (P1-2); a documented alert list in `site/docs/reference.html`; and a self-monitoring Grafana console reading the node's own `_system` database. No alert *rules* are shipped — the list is prose, not a rules file |
