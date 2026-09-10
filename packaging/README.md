@@ -132,6 +132,10 @@ plainly that the data is still there.
 
 ## Releasing
 
+**The checklist is `../RELEASING.md`** — what to change, in what order,
+and which steps are automated so nobody does them by hand. What follows
+here is only the packaging half of it.
+
 `.github/workflows/release.yml` runs on a `v*` tag: it calls `build.sh`,
 installs the `.deb` on Debian 12 and the `.rpm` on Rocky 9 as a smoke test,
 and attaches both plus `SHA256SUMS` to the Release. A tag containing `-`

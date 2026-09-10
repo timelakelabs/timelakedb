@@ -38,6 +38,7 @@ database, and not a description of one workload's tables.
 | `ARCHITECTURE.md` | Components, seams, milestones M0–M5 |
 | `SECURITY.md` | Security posture, exposures, and how to report a vulnerability |
 | `CONTRIBUTING.md` | Development environment, the crate map, what CI enforces |
+| `RELEASING.md` | Cutting a release: what a tag does by itself, and the four files that are yours |
 | `CHANGELOG.md` | What landed, milestone by milestone |
 | `docs/BACKUP_RESTORE.md` | The AT-5 procedure, runnable (`ops/tldb-backup.sh`) |
 | `deploy/compose/` | Compose topologies for every deployment shape, and the correctness drills that launch them |
