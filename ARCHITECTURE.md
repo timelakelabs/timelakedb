@@ -774,7 +774,7 @@ M0–M5 are complete. The cluster phases (§12 design):
 |---|---|---|
 | C0 | `S3Store` + `put_if_absent`, SSE-KMS + Bucket Keys, `AwsKms` + `CachingKms`; single node on LocalStack | smoke exact on S3; KMS calls measured cache-on vs cache-off; at-rest + SSE verified |
 | C1 | Catalog CAS + checkpoints, commit re-validation | two-writer race drill: one winner per seq, loser converges, no lost/dup files |
-| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Arrow IPC), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild. Phases 1–4 shipped (roles, CL-2, router, CL-3 querier); 5a shipped 2026-08-21 (compactor role built behind the commit fence, `Role::implemented` still false); 5b open (work-avoidance above the fence, which is what flips the gate) |
+| C2 | Role split: router, ingester pair (WAL replication + buffer-snapshot Arrow IPC), stateless queriers, compactor role | cluster smoke through the router; ingester SIGKILL = zero acked loss; querier kill = reads continue; empty-disk rebuild. Phases 1–4 shipped (roles, CL-2, router, CL-3 querier); 5a shipped 2026-08-21 (compactor role built behind the commit fence) and 5b on 2026-08-24 (partition ownership above the fence), which flipped the gate — `Role::implemented` accepts `Compactor`, as §12.4 above says. This cell claimed the opposite for two weeks while the paragraph on line 598 of this same file recorded it opening |
 | C3 | Consul discovery, intra-cluster mTLS, full scale | AT-3-style gate against the cluster; latency re-baselined off LocalStack |
 
 The console phases (§17 design, `docs/CONSOLE.md`). U0–U2 are independent

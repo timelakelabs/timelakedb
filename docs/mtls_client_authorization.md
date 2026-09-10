@@ -1,4 +1,4 @@
-# mTLS client-authorization: not wired end to end (an operational gap)
+# mTLS client-authorization was not wired end to end — CLOSED 2026-08-18
 
 **Noted 2026-08-14** by Riverkeeper, building R3's client-certificate
 narrowing control; **wired the same day**. This is deliberately NOT filed
