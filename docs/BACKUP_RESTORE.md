@@ -130,6 +130,15 @@ want when you are repairing a partial loss. Docker refuses to delete a volume
 that a stopped container still references, so `down` (not just `stop`) is the
 reliable sequence.
 
+**Ownership.** A tar carries whatever ownership it was written with, and the
+server runs as uid 1000 (`USER timelake` in the Dockerfile, P0-2's non-root
+container). An archive written by a root process therefore restores as root
+and the server dies on it with `open engine (recovery): Permission denied`,
+which names neither the file nor the reason. `restore` chowns the volume to
+that uid for you; `--uid N` if your deployment runs the server as someone
+else. An archive this script cut from a live volume already carries 1000,
+so for the ordinary backup-and-restore path this changes nothing.
+
 ### 4. Validate the restore
 
 Health first, then row counts. Use a **fixed upper time bound** on both sides

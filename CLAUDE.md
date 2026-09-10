@@ -483,9 +483,14 @@ This project is inspired by the following projects.
   (one parse). (2) Dockerfile `USER timelake` uid 1000 + compose
   `read_only: true` + `tmpfs /tmp` + data volume the only writable mount.
   Incidental: CREATE/DROP TABLE now REFUSED explicitly (were silent `[]`).
-  **UPGRADE GOTCHA**: non-root uid can't open a root-owned data volume from
-  the old image → panic "open engine (recovery): Permission denied"; chown
-  volume to 1000:1000 or use fresh. 121 tests (+4 sql_guard), clippy/fmt
+  ~~**UPGRADE GOTCHA**: non-root uid can't open a root-owned data volume
+  from the old image → panic "open engine (recovery): Permission denied";
+  chown volume to 1000:1000 or use fresh.~~ **FIXED 2026-09-10**:
+  `ops/tldb-backup.sh restore` chowns the volume to the service uid
+  (`--uid`, default 1000) and `ops/make-upgrade-fixture.sh` tars with that
+  ownership. Recorded as a gotcha here for three weeks instead, which is
+  how the 0.4.0 upgrade fixture shipped root-owned and failed every
+  nightly for three days (catchment#13). 121 tests (+4 sql_guard), clippy/fmt
   clean. NEXT P0: P0-4 catalog CAS (put_if_absent exists, catalog still
   plain put), P0-5 Tributary presents token. Roadmap `docs/ROADMAP.md`.
 - Previous: **SEC-4 phased data-plane auth SHIPPED** (2026-08-10, drill
