@@ -232,6 +232,47 @@ jobs:
           { echo '### image'; echo '```'; cat /tmp/manifest.txt; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # ...and somebody who is NOT us can fetch it. The step above runs as
+      # the pushing identity, so it proves the image is multi-arch and says
+      # nothing about whether it is reachable — a package stays private
+      # until someone makes it public, and a repository going public does
+      # not take its packages with it. This one did not: the repo was
+      # public for weeks while `docker pull ghcr.io/…/timelakedb:0.4.0`
+      # answered 403 to everyone outside the org, so the chart's own
+      # default `image.repository` gave every operator an ImagePullBackOff
+      # and Riverkeeper's nightly could not pull the thing it audits (#187).
+      #
+      # Anonymous means anonymous: a fresh registry token with no
+      # credentials, rather than `docker logout`, which would wreck the
+      # daemon's auth for anything later in the job.
+      - name: Anyone can pull it
+        if: github.event_name == 'push' && !github.event.repository.private
+        run: |
+          set -euo pipefail
+          repo=${{ github.repository_owner }}/timelakedb
+          ver=${{ steps.v.outputs.version }}
+          # No `-f`, and a parse that cannot throw: for a PRIVATE package the
+          # token endpoint itself answers 401 with a non-JSON body, so a
+          # strict fetch dies here with a curl error and the step never
+          # reaches the message that explains what to do. No match means an
+          # empty token, which is a fine answer — the manifest request below
+          # then returns the 403 that says it plainly.
+          tok=$(curl -s "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
+                | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+                   -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                   -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                   "https://ghcr.io/v2/$repo/manifests/$ver")
+          echo "anonymous GET manifests/$ver -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::$repo:$ver was published but is not publicly pullable \
+          (HTTP $code). This repository is public, so its package should be too: \
+          Packages -> timelakedb -> Package settings -> Change visibility -> Public. \
+          Granting individual repositories read access instead fixes CI and leaves \
+          every user of the Helm chart in ImagePullBackOff (#187)."
+            exit 1
+          fi
+
   # The chart is published only after the image it names exists. A chart whose
   # appVersion points at a tag nobody pushed installs cleanly and then sits in
   # ImagePullBackOff, which costs an afternoon to diagnose the first time.
