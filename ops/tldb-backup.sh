@@ -20,6 +20,13 @@ export MSYS2_ARG_CONV_EXCL='*'
 
 VOLUME="${TLDB_VOLUME:-bench-timelakedb_timelake-data}"
 HELPER="${TLDB_HELPER_IMAGE:-alpine:3}"
+# The uid the server runs as, and therefore the uid a restored volume has to
+# belong to. The image pins it: `useradd --system --uid 1000 timelake` plus
+# `USER timelake:timelake` in the Dockerfile, which is P0-2's non-root
+# container. A tar carries whatever ownership it was written with, so an
+# archive cut by a root process restores as root and the server dies on it
+# with `open engine (recovery): Permission denied` — see the restore step.
+SERVICE_UID="${TLDB_UID:-1000}"
 COMPRESS=1
 RECREATE=0
 ASSUME_YES=0
@@ -51,12 +58,17 @@ options:
                     required for correctness)
   --recreate        restore only: delete and recreate the target volume
                     first, so the restore lands on empty storage
+  --uid N           restore only: uid:gid to give the restored files
+                    (default 1000, the uid the image's `timelake` user has).
+                    A restore that leaves them owned by anyone else produces
+                    a volume the server cannot open.
   -y                do not prompt before destructive steps
   -h, --help        this text
 
 environment:
   TLDB_VOLUME         default volume name
   TLDB_HELPER_IMAGE   helper image for tar (default alpine:3)
+  TLDB_UID            default restore uid (see --uid)
 EOF
 }
 
@@ -104,6 +116,7 @@ while [ $# -gt 0 ]; do
     --no-compress) COMPRESS=0; shift ;;
     --stop) STOP_CONTAINER="${2:?--stop needs a container name}"; shift 2 ;;
     --recreate) RECREATE=1; shift ;;
+    --uid) SERVICE_UID="${2:?--uid needs a number}"; shift 2 ;;
     -y) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option '$1' (try --help)" ;;
@@ -227,8 +240,25 @@ stop them first — restoring under a live server corrupts the catalog"
     note "dropped $dropped in-flight .tmp-write file(s)"
   fi
 
+  # Hand the volume to the uid the server runs as. A tar carries the
+  # ownership it was written with: an archive this script cut from a live
+  # volume is already 1000, because the non-root server wrote those files,
+  # and restoring it was fine. An archive cut by a ROOT process is not, and
+  # the server dies on it at boot with
+  #
+  #     open engine (recovery): Permission denied
+  #
+  # which names neither the file nor the reason. That is how the 0.4.0
+  # upgrade fixture — tarred inside a `rust:1-slim` container, so root/root
+  # — failed every nightly for three days (catchment#13), and it was written
+  # down as a known gotcha in CLAUDE.md weeks before that rather than fixed.
+  # A restore whose output the server cannot open has not restored anything.
+  docker run --rm -v "$VOLUME":/data "$HELPER" \
+    chown -R "$SERVICE_UID:$SERVICE_UID" /data
+  note "owned by uid $SERVICE_UID (the image's timelake user; --uid to change)"
+
   docker run --rm -v "$VOLUME":/data:ro "$HELPER" \
-    sh -c 'echo "restored:"; ls /data; echo "manifests: $(ls /data/objects/catalog/manifest 2>/dev/null | wc -l)"' >&2
+    sh -c 'echo "restored:"; ls -n /data; echo "manifests: $(ls /data/objects/catalog/manifest 2>/dev/null | wc -l)"' >&2
 
   note "done — start the server and check /health, then count rows"
   ;;

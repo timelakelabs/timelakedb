@@ -176,7 +176,18 @@ sleep 1
 [ -d "$WORK/data/wal" ] && say "wal dir present: $(ls "$WORK/data/wal" | wc -l) file(s)"
 
 # --- the artifact, in the layout ops/tldb-backup.sh restores -----------------
-tar czf "$OUT/$VERSION.tgz" -C "$WORK/data" .
+# --owner/--group, because this script is documented to run inside a
+# `rust:1-slim` container and therefore as ROOT. Without them the archive
+# records root/root, and restoring it produces a volume the non-root server
+# (uid 1000, Dockerfile `USER timelake`) cannot open: `open engine
+# (recovery): Permission denied`, which names neither the file nor the
+# reason. 0.4.0's fixture was cut that way and failed every nightly for
+# three days (catchment#13). `ops/tldb-backup.sh restore` now also chowns,
+# so a fixture is usable either way; both, because an artifact that is only
+# correct after the right tool touches it is an artifact waiting to be
+# extracted by hand.
+tar --owner=1000 --group=1000 --numeric-owner \
+  -czf "$OUT/$VERSION.tgz" -C "$WORK/data" .
 python3 - "$OUT/$VERSION.json" "$VERSION" "$SETTLED" "$METRICS" "$TOTAL_SENSORS" <<'PY'
 import json, sys, time
 path, version, settled, metrics, total = sys.argv[1:6]
