@@ -6,6 +6,10 @@
 //! log is itself audited; and `/metrics` exposes the record count. Tamper
 //! detection over a corrupted file is a crate-level unit test — it cannot be
 //! reached through the HTTP surface, which is the point.
+//!
+//! Since #163 it also pins the session half: login, logout and refused login
+//! are recorded, every record a session causes carries that session's id, and
+//! a bearer logout really ends the session it says it ended.
 
 use std::sync::Arc;
 
@@ -124,6 +128,33 @@ fn metric(text: &str, name: &str) -> Option<f64> {
         .find(|l| l.starts_with(&format!("{name} ")))
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|v| v.parse().ok())
+}
+
+/// The raw session token out of the Set-Cookie, for the bearer path.
+fn bearer_of(session: &AdminSession) -> String {
+    session
+        .cookie
+        .split_once('=')
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default()
+}
+
+/// Every audit record, read with a live session.
+async fn audit_records(app: &axum::Router, session: &AdminSession) -> Vec<serde_json::Value> {
+    let (code, v) = admin_json(app, "GET", "/admin/audit?limit=1000", None, session).await;
+    assert_eq!(code, StatusCode::OK, "reading the audit log failed: {v}");
+    v["records"].as_array().cloned().unwrap_or_default()
+}
+
+fn only<'a>(
+    records: &'a [serde_json::Value],
+    action: &str,
+    principal: &str,
+) -> Vec<&'a serde_json::Value> {
+    records
+        .iter()
+        .filter(|r| r["action"] == action && r["principal"] == principal)
+        .collect()
 }
 
 #[tokio::test]
@@ -264,5 +295,235 @@ async fn a_viewer_can_read_the_audit_log() {
     assert!(
         code.is_client_error(),
         "an unauthenticated audit read must be refused, got {code}"
+    );
+}
+/// #163: the whole point of a session id. Log in, change something, log out —
+/// and the three records say so as one story rather than as three unrelated
+/// lines that happen to name the same username.
+#[tokio::test]
+async fn a_session_brackets_the_mutations_it_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelake_server::app(engine(dir.path()));
+    let working = admin_ready(&app).await;
+
+    let (code, _) = admin_json(
+        &app,
+        "PUT",
+        "/admin/retention",
+        Some(serde_json::json!({"db": "poc", "table": "pipeline_events", "duration": "30d"})),
+        &working,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+
+    let (code, _) = admin_json(&app, "DELETE", "/admin/session", None, &working).await;
+    assert_eq!(code, StatusCode::OK);
+
+    // That session is gone, so read the trail from a fresh one. Its records
+    // get their own id, which is also what makes the assertion below mean
+    // something: "same id" has to be able to be false.
+    let reader = login(&app, "admin", "test console password").await.1;
+    let records = audit_records(&app, &reader).await;
+
+    let logouts = only(&records, "session.logout", "admin");
+    assert_eq!(logouts.len(), 1, "exactly one logout: {records:#?}");
+    let sid = logouts[0]["session"].as_str().unwrap().to_string();
+    assert!(!sid.is_empty(), "the logout record must carry a session id");
+
+    let with_sid: Vec<&str> = records
+        .iter()
+        .filter(|r| r["session"] == serde_json::json!(sid))
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert!(
+        with_sid.contains(&"session.login")
+            && with_sid.contains(&"retention.set")
+            && with_sid.contains(&"session.logout"),
+        "login, the mutation and logout must share one session id; got {with_sid:?}"
+    );
+
+    // And the filter that makes the id worth carrying: one request, one
+    // session, the whole story in order.
+    let (code, v) = admin_json(
+        &app,
+        "GET",
+        &format!("/admin/audit?session={sid}"),
+        None,
+        &reader,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let story: Vec<&str> = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        story,
+        vec!["session.login", "retention.set", "session.logout"],
+        "?session= must return that session and nothing else, in order"
+    );
+
+    // And the reader is a different session, so the id actually discriminates.
+    let reads = only(&records, "session.login", "admin");
+    let ids: std::collections::HashSet<&str> =
+        reads.iter().filter_map(|r| r["session"].as_str()).collect();
+    assert!(
+        ids.len() >= 2,
+        "separate logins must get separate ids, got {ids:?}"
+    );
+
+    // The session id is NOT the session token. A trail any viewer can read
+    // must not hand out a live credential.
+    let token = bearer_of(&reader);
+    assert!(!token.is_empty());
+    let dump = serde_json::to_string(&records).unwrap();
+    assert!(
+        !dump.contains(&token),
+        "a session token leaked into the audit trail"
+    );
+}
+
+/// #163: a password-guessing run used to leave one counter and no record. The
+/// record has to say what was tried and from where, or the chain is an
+/// activity counter rather than an audit trail.
+#[tokio::test]
+async fn refused_logins_are_recorded_with_what_was_attempted() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelake_server::app(engine(dir.path()));
+    let reader = admin_ready(&app).await;
+
+    // Four wrong passwords are refused one at a time; the fifth trips the
+    // backoff. Both refusals are audited, and they are audited differently:
+    // "still guessing" and "guessed wrong once" are not the same fact.
+    for _ in 0..4 {
+        let (code, _) = login(&app, "mallory", "hunter2").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+    let (code, _) = login(&app, "mallory", "hunter2").await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "backoff must engage");
+
+    let (code, v) = admin_json(
+        &app,
+        "GET",
+        "/admin/audit?action=session.login&principal=mallory",
+        None,
+        &reader,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let records = v["records"].as_array().unwrap();
+    assert_eq!(records.len(), 5, "every attempt recorded: {records:#?}");
+    for r in records {
+        assert_eq!(r["outcome"], "denied");
+        assert_eq!(r["role"], "-", "a refused login never got a role");
+        assert_eq!(
+            r["session"],
+            serde_json::Value::Null,
+            "a refused login opened no session"
+        );
+    }
+    assert_eq!(records[0]["after"]["reason"], "invalid_credentials");
+    assert_eq!(records[4]["after"]["reason"], "rate_limited");
+
+    // A successful login is in there too, and it is distinguishable.
+    let (code, v) = admin_json(
+        &app,
+        "GET",
+        "/admin/audit?action=session.login&principal=admin",
+        None,
+        &reader,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let ok: Vec<&serde_json::Value> = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["outcome"] == "ok")
+        .collect();
+    assert!(!ok.is_empty(), "the admin logins must be recorded as ok");
+    assert_eq!(ok[0]["role"], "admin");
+
+    // The sink is healthy, so nothing was dropped on the best-effort path.
+    let m = metrics(&app).await;
+    assert_eq!(
+        metric(&m, "timelake_audit_unrecorded_total"),
+        Some(0.0),
+        "no holes in the trail on a healthy node"
+    );
+}
+
+/// A username is whatever an unauthenticated caller typed, and it lands in the
+/// trail verbatim. Cap it, or a guessing run gets to choose how big the audit
+/// log grows.
+#[tokio::test]
+async fn an_enormous_username_is_truncated_in_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelake_server::app(engine(dir.path()));
+    let reader = admin_ready(&app).await;
+
+    let huge = "z".repeat(50_000);
+    let (code, _) = login(&app, &huge, "nope").await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+    let records = audit_records(&app, &reader).await;
+    let denied: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "session.login" && r["outcome"] == "denied")
+        .collect();
+    assert_eq!(denied.len(), 1);
+    // 128 kept, then an ellipsis saying it was cut. Exact, not "roughly":
+    // a cap that drifts is a cap nobody can reason about from the record.
+    let p = denied[0]["principal"].as_str().unwrap();
+    assert_eq!(
+        p,
+        format!("{}...", "z".repeat(128)),
+        "principal must be capped"
+    );
+}
+
+/// Found while auditing logout: `DELETE /admin/session` read the cookie only,
+/// so a bearer client — which is the automation path `admin_guard` documents —
+/// got `200 logged out` and kept a live session until it expired on its own.
+#[tokio::test]
+async fn a_bearer_logout_actually_ends_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = timelake_server::app(engine(dir.path()));
+    let session = admin_ready(&app).await;
+    let token = bearer_of(&session);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/session")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The claim the 200 made, checked.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/session")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "the token still works after logging out"
     );
 }

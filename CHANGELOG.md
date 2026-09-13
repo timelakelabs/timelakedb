@@ -13,6 +13,66 @@ so an entry without a measurement behind it does not belong here.
 
 ## [Unreleased]
 
+### Added — Sessions are in the audit chain, and their id threads through it (#163)
+
+The chain could say a token was issued at 03:12. It could not say which
+session issued it or from where, because `session.login` and `session.logout`
+were not audited at all and `NewRecord.session` was hard-wired to `None` —
+the admin `SessionInfo` carried no id to put there. A password-guessing run
+against `/admin/session` left `timelake_admin_login_failures_total` one higher
+and no record of what was tried, which is an activity counter, not an audit
+trail. The admin listener is the surface that can change retention and drop
+tables, so it is the one the chain most needs to remember afterwards.
+
+Now: `session.login` records every outcome, and records the two refusals
+*differently* — a wrong credential and a tripped backoff look identical in
+the failure counter and mean completely different things during an incident,
+one of them being "the guessing is still going on". `session.logout` closes
+the pair. Every record a session causes, mutations included, carries that
+session's id, so a login, what was done inside it and the logout read as one
+story instead of three lines that happen to share a username.
+
+The id is a separate random value minted at login, **not** the session token
+and not derived from it. Any `viewer` can read this log and it is designed to
+be exported; a token in it is a credential handed to whoever reads it. A test
+asserts the live token does not appear anywhere in the trail.
+
+Session events are **best-effort**, and that asymmetry is deliberate.
+Mutations stay fail-closed — no record, no mutation — which works because the
+mutation has not happened yet. A login has: the credential is already
+verified. Refusing it would lock the operator out of the console at the exact
+moment they need it to repair a broken audit sink, turning a full disk into an
+outage with no way in. So a login, a logout and a read of the log are written
+best-effort, and a failure increments the new
+`timelake_audit_unrecorded_total` and logs at error. Any non-zero value means
+the trail has a hole; alert on it.
+
+The refused-login `principal` is whatever an unauthenticated caller typed, so
+it is capped at 128 characters. Without that, a guessing run chooses how fast
+the audit log grows.
+
+Not included: data-plane auditing. The sink fsyncs per record, so auditing
+every write and every `/api/sql` would roughly double the fsync cost of
+ingest. Data-plane attribution is token last-used plus the auth-default flip,
+not the chain. Also still missing is a request-correlation id — records carry
+a session id but cannot be tied to the exact application log line, which needs
+middleware that does not exist yet.
+
+### Fixed — A bearer logout really ends the session (#163)
+
+Found while auditing logout, which is the argument for auditing it.
+`DELETE /admin/session` read the session cookie and only the cookie, but
+`admin_guard` authenticates with **bearer or cookie** and documents bearer as
+the automation path. So an automation client calling logout got `200 logged
+out` and a `Set-Cookie` clearing a cookie it never had, while its session
+stayed live until it aged out on its own — up to the idle timeout of extra
+validity on a credential its owner believed was revoked. Nothing noticed,
+because the response is identical either way.
+
+It reads the same bearer-or-cookie pair the guard does. The regression test
+fails against the old handler with the token still answering `200` on
+`GET /admin/session` after the logout returned `200`.
+
 ### Changed — `TIMELAKE_DATA_AUTH` defaults to `optional` (#162)
 
 For three releases a stock node served anyone who could reach `:1963` or

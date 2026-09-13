@@ -814,12 +814,43 @@ struct LoginRequest {
     password: String,
 }
 
+/// POST /admin/session: open a session.
+///
+/// Takes the whole `Request` rather than `Json<LoginRequest>` so it can reach
+/// `ConnectInfo` for the source address. "Which session issued the token at
+/// 03:12, and from where" is the question an incident asks, and a record with
+/// no address answers half of it.
+///
+/// Every outcome is recorded, both refusals included — a password-guessing run
+/// used to leave one counter and nothing else. BEST-EFFORT, never gated: see
+/// `AuditLog::record_best_effort` for why login must not fail closed.
 async fn session_login<E: Engine>(
     State(state): State<AdminState<E>>,
-    Json(req): Json<LoginRequest>,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    let source = source_of(req.extensions());
+    // 64 KiB, the same cap the other JSON admin handlers use. A login body is
+    // two short strings; anything larger is not a login.
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let req: LoginRequest = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
     match state.auth.login(&req.username, &req.password) {
         Ok((token, info)) => {
+            state.audit.record_best_effort(session_event(
+                info.username.clone(),
+                info.role.as_str(),
+                Some(info.id.clone()),
+                source,
+                "session.login",
+                "ok",
+                None,
+            ));
             let secure = if state.secure_cookies { "; Secure" } else { "" };
             let cookie =
                 format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/admin{secure}");
@@ -835,16 +866,42 @@ async fn session_login<E: Engine>(
             )
                 .into_response()
         }
-        Err(e @ timelake_auth::LoginError::RateLimited(_)) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": e.to_string(), "code": "rate_limited" })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": e.to_string(), "code": "invalid_credentials" })),
-        )
-            .into_response(),
+        // Recorded distinctly from a wrong password on purpose. A run that
+        // has tripped the backoff looks identical in the failure counter and
+        // completely different in an incident: it means the guessing is still
+        // going on, not that somebody fat-fingered a password once.
+        Err(e @ timelake_auth::LoginError::RateLimited(_)) => {
+            state.audit.record_best_effort(session_event(
+                attempted_principal(&req.username),
+                "-",
+                None,
+                source,
+                "session.login",
+                "denied",
+                Some(json!({ "reason": "rate_limited" })),
+            ));
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": e.to_string(), "code": "rate_limited" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            state.audit.record_best_effort(session_event(
+                attempted_principal(&req.username),
+                "-",
+                None,
+                source,
+                "session.login",
+                "denied",
+                Some(json!({ "reason": "invalid_credentials" })),
+            ));
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": e.to_string(), "code": "invalid_credentials" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -863,12 +920,44 @@ async fn session_show<E: Engine>(
     .into_response()
 }
 
+/// DELETE /admin/session: end a session.
+///
+/// `logout` hands back what the session was, so the record carries the same
+/// principal and session id the login did and the pair brackets everything
+/// that happened in between. A cookie naming no live session (expired, or a
+/// second logout) audits nothing — there is no session to close, and inventing
+/// a record for one would be a lie.
 async fn session_logout<E: Engine>(
     State(state): State<AdminState<E>>,
-    headers: HeaderMap,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
-    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
-        state.auth.logout(&t);
+    let source = source_of(req.extensions());
+    let headers = req.headers().clone();
+    // Bearer OR cookie, the same pair `admin_guard` authenticates with. This
+    // used to read the cookie alone, which meant a bearer client (the whole
+    // automation path) got 200 and a cleared cookie it never had, while its
+    // session stayed live until it expired on its own. Nothing noticed,
+    // because the response says "logged out" either way. Auditing it is what
+    // surfaced it: a logout record for a session that is still open is worse
+    // than no record at all.
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or_else(|| cookie_value(&headers, SESSION_COOKIE));
+    if let Some(info) = token.and_then(|t| state.auth.logout(&t)) {
+        {
+            state.audit.record_best_effort(session_event(
+                info.username.clone(),
+                info.role.as_str(),
+                Some(info.id.clone()),
+                source,
+                "session.logout",
+                "ok",
+                None,
+            ));
+        }
     }
     let secure = if state.secure_cookies { "; Secure" } else { "" };
     (
@@ -2735,6 +2824,10 @@ async fn cert_grants_remove<E: Engine>(
 struct AuditQuery {
     action: Option<String>,
     principal: Option<String>,
+    /// One session's whole story: the login, everything done inside it, the
+    /// logout. An id nobody can filter on is an id that may as well not be
+    /// in the record (#163).
+    session: Option<String>,
     target: Option<String>,
     since: Option<String>,
     limit: Option<usize>,
@@ -2770,6 +2863,9 @@ async fn audit_list<E: Engine>(
     let matches = |r: &AuditRecord| {
         q.action.as_ref().is_none_or(|a| &r.action == a)
             && q.principal.as_ref().is_none_or(|p| &r.principal == p)
+            && q.session
+                .as_ref()
+                .is_none_or(|s| r.session.as_deref() == Some(s.as_str()))
             && q.target
                 .as_ref()
                 .is_none_or(|t| r.target.as_deref() == Some(t.as_str()))
@@ -2792,7 +2888,7 @@ async fn audit_list<E: Engine>(
 
     // §5.1: reading the audit log is itself audited. Best-effort — the read is
     // served regardless, so no gate and no 503.
-    let _ = state.audit.record(audit_event(
+    state.audit.record_best_effort(audit_event(
         &session,
         source,
         "audit.read",
@@ -2863,9 +2959,56 @@ fn audit_record(audit: &AuditLog, nr: NewRecord) -> Option<axum::response::Respo
     }
 }
 
-/// Build a `NewRecord` for a mutation, filling the common fields. Session id
-/// is not yet threaded from `SessionInfo` (it carries none), so it stays
-/// `None`; request-id likewise until correlation middleware exists.
+/// Build a `NewRecord` for a mutation, filling the common fields. The session
+/// id comes from `SessionInfo` (#163), so a mutation and the login that opened
+/// the session for it share one value and the chain reads as a story rather
+/// than a list. Request-id stays `None` until correlation middleware exists.
+/// How much of a submitted username survives into a denied login record.
+/// Long enough to recognise an account, short enough that a guessing run
+/// cannot use the audit log as free storage: this field is whatever the
+/// unauthenticated caller typed.
+const AUDIT_PRINCIPAL_MAX: usize = 128;
+
+/// The `principal` for a login that was refused. There is no authenticated
+/// identity to attribute it to, so the record carries what was attempted —
+/// which is the whole point of auditing a failure, and also why it is capped.
+fn attempted_principal(name: &str) -> String {
+    let kept: String = name.chars().take(AUDIT_PRINCIPAL_MAX).collect();
+    if kept.chars().count() < name.chars().count() {
+        format!("{kept}...")
+    } else {
+        kept
+    }
+}
+
+/// Build a `session.*` record. Separate from `audit_event` because half of
+/// these have no `SessionInfo` to build from: a refused login has a typed
+/// username, an address, and nothing else. `role` is `-` in that case, since
+/// the caller never got one.
+#[allow(clippy::too_many_arguments)]
+fn session_event(
+    principal: String,
+    role: &str,
+    session: Option<String>,
+    source: Option<String>,
+    action: &str,
+    outcome: &str,
+    after: Option<Value>,
+) -> NewRecord {
+    NewRecord {
+        principal,
+        role: role.to_string(),
+        session,
+        source,
+        request_id: None,
+        action: action.to_string(),
+        target: None,
+        before: None,
+        after,
+        outcome: outcome.to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_event(
     session: &SessionInfo,
@@ -2879,7 +3022,7 @@ fn audit_event(
     NewRecord {
         principal: session.username.clone(),
         role: session.role.as_str().to_string(),
-        session: None,
+        session: Some(session.id.clone()),
         source,
         request_id: None,
         action: action.to_string(),
