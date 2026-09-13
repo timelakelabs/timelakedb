@@ -3889,7 +3889,10 @@ impl Engine {
              # TYPE timelake_audit_records_total counter\n\
              timelake_audit_records_total {}\n\
              # TYPE timelake_audit_sink_healthy gauge\n\
-             timelake_audit_sink_healthy {}\n{}{}{}{}{}{}{}{}{}{}{}{}{}",
+             timelake_audit_sink_healthy {}\n\
+             # HELP timelake_audit_unrecorded_total Events that happened but could not be written, because the caller may not fail closed (login, logout, reading the log). Non-zero means the trail has a hole.\n\
+             # TYPE timelake_audit_unrecorded_total counter\n\
+             timelake_audit_unrecorded_total {}\n{}{}{}{}{}{}{}{}{}{}{}{}{}",
             self.lines_total.load(Ordering::Relaxed),
             self.flushes_total.load(Ordering::Relaxed),
             self.catalog.file_count(),
@@ -3935,6 +3938,7 @@ impl Engine {
             self.client_limiter.rejected(),
             self.audit.records_total(),
             if self.audit.healthy() { 1 } else { 0 },
+            self.audit.unrecorded_total(),
             client_ca_lines,
             data_auth_lines,
             auth_split_lines,

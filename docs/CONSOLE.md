@@ -766,7 +766,7 @@ that owns HTML.
 | `GET` | `/admin/retention` | viewer | Sugar over `config?prefix=retention.` — the shipped shape, kept |
 | `PUT`/`DELETE` | `/admin/retention[/{table}]` | operator/admin | Same semantics as config, with the impact preview |
 | `GET` | `/admin/logs`, `/admin/logs/stream` | viewer | Snapshot, SSE tail |
-| `GET` | `/admin/audit` | viewer | Filter by actor/action/target/time; `?verify=1` checks the chain |
+| `GET` | `/admin/audit` | viewer | Filter by actor/action/session/target/time; `?verify=1` checks the chain |
 | `GET` | `/admin/metrics/series` | viewer | The sample ring, JSON |
 | `GET` | `/admin/queries` | viewer | Recent + in-flight, with plans |
 | `POST` | `/admin/maintenance/{flush,compact,gc}` | operator | Trigger a tick now |

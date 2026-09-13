@@ -467,6 +467,7 @@ pub struct AuditLog {
     fail_open: bool,
     healthy: AtomicBool,
     records_total: AtomicU64,
+    unrecorded_total: AtomicU64,
     sink: Mutex<AuditSink>,
 }
 
@@ -496,6 +497,7 @@ impl AuditLog {
             fail_open,
             healthy: AtomicBool::new(true),
             records_total: AtomicU64::new(count),
+            unrecorded_total: AtomicU64::new(0),
             sink: Mutex::new(sink),
         })
     }
@@ -514,6 +516,14 @@ impl AuditLog {
 
     pub fn records_total(&self) -> u64 {
         self.records_total.load(Ordering::Relaxed)
+    }
+
+    /// Events that happened but were NOT written, because the caller was one
+    /// of the few that may not fail closed. Zero on a healthy node; any
+    /// non-zero value means the trail has a hole in it and the only record of
+    /// what went missing is this number and a log line. Alert on it.
+    pub fn unrecorded_total(&self) -> u64 {
+        self.unrecorded_total.load(Ordering::Relaxed)
     }
 
     /// Fail-closed admission, called BEFORE a mutation runs: `Ok` if it may
@@ -546,6 +556,32 @@ impl AuditLog {
                 self.healthy.store(false, Ordering::Relaxed);
                 Err(AuditUnavailable(e.to_string()))
             }
+        }
+    }
+
+    /// Append a record for something that has already happened and cannot be
+    /// undone by refusing — a login, a logout, a read of the log itself.
+    ///
+    /// These are the events that must NOT inherit the fail-closed rule. That
+    /// rule exists so a mutation with no record is refused rather than
+    /// performed silently, which works because the mutation has not happened
+    /// yet. A login has: the credential was already verified. Refusing it
+    /// would lock the operator out of the console at the exact moment they
+    /// need it to repair the audit sink, which turns a broken disk into an
+    /// outage with no way in. So it is written best-effort, and the failure
+    /// is counted and shouted about instead of being swallowed.
+    pub fn record_best_effort(&self, nr: NewRecord) {
+        let action = nr.action.clone();
+        let principal = nr.principal.clone();
+        if let Err(e) = self.record(nr) {
+            self.unrecorded_total.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                error = %e.0,
+                action = %action,
+                principal = %principal,
+                "audit append failed for an event that cannot be refused; \
+                 the trail now has a hole (timelake_audit_unrecorded_total)"
+            );
         }
     }
 
