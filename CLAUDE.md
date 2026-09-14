@@ -157,8 +157,11 @@ This project is inspired by the following projects.
   SHA-256-chained, tamper-evident); every admin mutation writes one
   attributable record with resolved before/after; **fail-closed** (503 while
   the sink is broken, `TIMELAKE_AUDIT_FAIL_OPEN` escape); `GET /admin/audit`
-  (viewer) with `?verify=1`; `timelake_audit_*` metrics (SR-6; data-plane +
-  login/logout auditing deferred);
+  (viewer) with `?verify=1`; `timelake_audit_*` metrics (SR-6; data-plane
+  auditing deferred). **Sessions chained** (#163): `session.login` with both
+  refusals, `session.logout`, and a session id on every record the session
+  caused, so `?session=` returns one story; session events are best-effort,
+  counted by `timelake_audit_unrecorded_total`;
   intra-cluster port de-published (exposure 10);
   **release packaging** shipped — `packaging/` builds a `.deb` + `.rpm` from
   one nfpm spec, attached to `v*` tags by `.github/workflows/release.yml`;

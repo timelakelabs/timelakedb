@@ -131,6 +131,15 @@ pub struct SessionInfo {
     pub must_change_password: bool,
     /// Double-submit CSRF token for cookie-authenticated mutations.
     pub csrf: String,
+    /// Opaque identifier for this session, stamped on every audit record it
+    /// causes so login, the mutations, and logout read as one story (#163).
+    ///
+    /// Deliberately NOT the session token and not derived from it. The token
+    /// is a bearer credential; the audit log is readable by any `viewer` and
+    /// is designed to be exported, so a token in it is a token handed to
+    /// whoever reads the log. This is its own random value, generated at
+    /// login, and knowing it gets you nothing.
+    pub id: String,
 }
 
 struct Session {
@@ -138,6 +147,8 @@ struct Session {
     role: Role,
     must_change_password: bool,
     csrf: String,
+    /// See `SessionInfo::id`.
+    id: String,
     created: Instant,
     last_seen: Instant,
 }
@@ -218,6 +229,17 @@ fn hash_password(password: &str) -> Result<String> {
 
 fn random_token() -> String {
     let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An audit-facing session id: 64 bits, hex, generated independently of the
+/// session token. Short because a human reads it out of a record and pastes
+/// it into `?session=`; 64 bits because it only has to not collide among the
+/// sessions one node holds at once, not to resist guessing — nothing is
+/// authorised by it.
+fn session_id() -> String {
+    let mut raw = [0u8; 8];
     OsRng.fill_bytes(&mut raw);
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -678,6 +700,7 @@ impl Auth {
             role: principal.role,
             must_change_password: principal.must_change_password,
             csrf: random_token(),
+            id: session_id(),
         };
         let now = Instant::now();
         self.sessions.write().expect("sessions lock").insert(
@@ -687,6 +710,7 @@ impl Auth {
                 role: info.role,
                 must_change_password: info.must_change_password,
                 csrf: info.csrf.clone(),
+                id: info.id.clone(),
                 created: now,
                 last_seen: now,
             },
@@ -724,11 +748,27 @@ impl Auth {
             role: s.role,
             must_change_password: s.must_change_password,
             csrf: s.csrf.clone(),
+            id: s.id.clone(),
         })
     }
 
-    pub fn logout(&self, token: &str) {
-        self.sessions.write().expect("sessions lock").remove(token);
+    /// End a session. Returns what it was, so the caller can attribute the
+    /// logout record to the same principal and session id the login record
+    /// carried. `None` means the token named no live session — an expired
+    /// cookie, or a second logout — and there is nothing to audit.
+    pub fn logout(&self, token: &str) -> Option<SessionInfo> {
+        let s = self
+            .sessions
+            .write()
+            .expect("sessions lock")
+            .remove(token)?;
+        Some(SessionInfo {
+            username: s.username,
+            role: s.role,
+            must_change_password: s.must_change_password,
+            csrf: s.csrf,
+            id: s.id,
+        })
     }
 
     /// Change a principal's password, clearing the rotation flag. The

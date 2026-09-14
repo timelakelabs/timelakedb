@@ -79,7 +79,7 @@ above starts applying to you. Uninstalling never deletes `/var/lib/timelake`.
 | Encryption at rest | **Implemented, opt-in.** Set `TIMELAKE_ENCRYPTION_KEY` (64 hex chars) or `TIMELAKE_ENCRYPTION_KEY_FILE` and every object written to the store — Parquet, manifests, checkpoints — is envelope-encrypted (per-object AES-256-GCM data key, wrapped by the configured key). Objects written before the key was set stay readable (plaintext passthrough). Since **SEC-8** the local WAL (and the replica WAL) is encrypted with the same envelope key — see exposure 8. |
 | Row visibility labels | **Implemented.** A `_visibility` tag holding an Accumulo-style expression (`(ops&audit)\|admin`) restricts rows to sessions presenting satisfying authorizations (`X-TimeLake-Authorizations` header / Flight SQL metadata). Enforced inside the scan, so aggregates cannot leak. **Authorizations are unauthenticated claims** — see exposure 7. |
 | Targeted delete / erasure | **Implemented (R-1), `admin` only.** `POST /admin/delete` records a durable tombstone — a `(tag equalities AND time window)` predicate — that hides every matching row from every query at once, in the live buffer and in settled files, and from `COUNT(*)` as much as from `SELECT`, because it is enforced at the same in-scan point as visibility. A background pass then physically rewrites the files so the bytes are gone from the settled store (deferred GC covers in-flight readers). An empty predicate is refused; deletes are irreversible and go to the write path, not a querier. See [Targeted delete (R-1)](#targeted-delete-r-1). |
-| Audit logging | **Admin mutations (P1-2 / SR-6).** Every administrative mutation — retention set/remove, targeted delete, token and cert-grant lifecycle, password change — writes one fsync'd, hash-chained record attributing it to its authenticated principal, with the resolved before/after state. **Fail-closed**: while the sink cannot append, mutations are refused with `503 audit sink unavailable` (`TIMELAKE_AUDIT_FAIL_OPEN=1` overrides). Read via `GET /admin/audit` (viewer role) with filters and `?verify=1` for a whole-chain check; `timelake_audit_records_total` / `timelake_audit_sink_healthy` on `/metrics`. Tamper-*evident* (a per-node SHA-256 chain), not tamper-proof — an external anchor is future work. **Still not covered:** data-plane reads/writes are unattributed (no data-plane principal by default, exposure 1/7), and session login/logout auditing is a documented follow-on. See [Audit trail (P1-2)](#audit-trail-p1-2). |
+| Audit logging | **Admin mutations and sessions (P1-2 / SR-6).** Every administrative mutation — retention set/remove, targeted delete, token and cert-grant lifecycle, password change — writes one fsync'd, hash-chained record attributing it to its authenticated principal, with the resolved before/after state. **Fail-closed**: while the sink cannot append, mutations are refused with `503 audit sink unavailable` (`TIMELAKE_AUDIT_FAIL_OPEN=1` overrides). **Sessions too (#163):** `session.login` (`ok` and both refusals, with the address and the username that was tried) and `session.logout`, and every record a session causes carries that session's id, so the chain reads as a story rather than a list. Session events are best-effort, never fail-closed — an operator locked out of the console cannot repair the sink — and `timelake_audit_unrecorded_total` counts what that costs. Read via `GET /admin/audit` (viewer role) with filters and `?verify=1` for a whole-chain check; `timelake_audit_records_total` / `timelake_audit_sink_healthy` / `timelake_audit_unrecorded_total` on `/metrics`. Tamper-*evident* (a per-node SHA-256 chain), not tamper-proof — an external anchor is future work. **Still not covered:** data-plane reads/writes are unattributed (no data-plane principal by default, exposure 1/7), and a role-based `403` refused by the admin guard before the handler runs. See [Audit trail (P1-2)](#audit-trail-p1-2). |
 | Availability guardrails | **Implemented.** Shared query memory pool, admission semaphore, server-side query deadline (RR-1), and WAL backpressure as an explicit 429 (RR-5). These bound resource exhaustion; they are not access control. |
 
 ## Known exposures
@@ -338,6 +338,16 @@ record names **who** (the authenticated principal and role), **from where**
 asks. A denial is recorded too (`outcome: "denied"`), and reading the log
 is itself audited (`audit.read`).
 
+Sessions are in the chain as well (#163). `session.login` records both
+outcomes — including which refusal it was, a wrong password or a tripped
+backoff, because "still guessing" and "guessed wrong once" are different
+facts — and `session.logout` closes the pair. Every record carries the
+**session id** of the session that caused it, so login, the mutations made
+inside it, and logout read as one story. That id is a value of its own,
+generated at login: it is deliberately **not** the session token and not
+derived from it, because any `viewer` can read this log and a token in it is
+a credential handed to whoever does.
+
 - **Tamper evidence, not tamper proofing.** `hash =
   SHA-256(record-without-hash || prev_hash)`, a per-node chain from a fixed
   genesis. `GET /admin/audit?verify=1` walks the chain and reports the first
@@ -353,8 +363,10 @@ is itself audited (`audit.read`).
   itself a deployment-time decision, not a console one.
 - **Read surface.** `GET /admin/audit` (viewer) filters by
   `action`/`principal`/`target`/`since` and returns the most-recent page
-  (`limit`, default 1000). `timelake_audit_records_total` and
-  `timelake_audit_sink_healthy` are on `/metrics`.
+  (`limit`, default 1000) — `?action=session.login` is the brute-force
+  question and `?principal=` narrows it to one account.
+  `timelake_audit_records_total`, `timelake_audit_sink_healthy` and
+  `timelake_audit_unrecorded_total` are on `/metrics`.
 
 Scope and residuals, all deliberate for this slice:
 
@@ -362,15 +374,23 @@ Scope and residuals, all deliberate for this slice:
   default (exposure 1), so a write or query may have no principal to
   attribute — data-plane auditing arrives with `TIMELAKE_DATA_AUTH=required`
   and a token identity.
-- **Session login/logout are not yet chained.** Login already emits metrics
-  and structured logs (`timelake_admin_logins_total` /
-  `_login_failures_total`); folding those events into the audit chain is a
-  follow-on, as is threading a session id (the admin `SessionInfo` carries
-  none today) and a request-correlation id.
-- **The recorded denials are engine/policy denials** (`outcome: "denied"` —
-  an empty-predicate delete, a rejected password). A role-based `403` refused
-  by the admin guard *before* the handler runs is not yet chained; folding
-  guard denials into the trail is part of the same login/logout follow-on.
+- **Session events are best-effort, and that is the one asymmetry here.**
+  Mutations fail closed: no record, no mutation. Login cannot, because the
+  credential has already been verified by the time there is anything to
+  record, and refusing it would lock the operator out of the console at the
+  moment they need it to repair the audit sink. So a login, a logout and a
+  read of the log are written best-effort, and a failure increments
+  `timelake_audit_unrecorded_total` and logs at error. Any non-zero value
+  means the trail has a hole; alert on it.
+- **A request-correlation id is still missing.** Records carry a session id
+  but no per-request id, so an audit record cannot be tied to the exact
+  application log line that describes it. That needs correlation middleware
+  and is a follow-on.
+- **The recorded denials are engine/policy denials and refused logins**
+  (`outcome: "denied"` — an empty-predicate delete, a rejected password, a
+  wrong credential). A role-based `403` refused by the admin guard *before*
+  the handler runs is still not chained: the guard is middleware and has no
+  audit handle today.
 - **Local segments, rotated but not uploaded.** The trail rotates into
   ordered segments (`TIMELAKE_AUDIT_ROTATE_SIZE`, default 64 MiB, and
   `TIMELAKE_AUDIT_ROTATE_EVERY`), and **the chain verifies straight through

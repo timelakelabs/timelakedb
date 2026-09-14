@@ -335,14 +335,20 @@ are recorded too, and reading the log is itself audited. **Fail-closed** —
 a mutation is refused with `503 audit sink unavailable` while the sink
 cannot append (`TIMELAKE_AUDIT_FAIL_OPEN=1` overrides). Read via
 `GET /admin/audit` (viewer) with filters and `?verify=1` (chain check);
-`timelake_audit_records_total` / `timelake_audit_sink_healthy` on
-`/metrics`. Tamper-*evident*, not tamper-proof (external anchoring is
+`timelake_audit_records_total` / `timelake_audit_sink_healthy` /
+`timelake_audit_unrecorded_total` on `/metrics`. **Sessions are chained too**
+(#163): `session.login` (both refusals distinguished), `session.logout`, and
+a session id on every record a session caused, so `?session=` returns the
+login, what was done inside it, and the logout as one story. Session events
+are best-effort rather than fail-closed, because refusing a login when the
+sink is down locks the operator out of the console they would repair it
+from; `timelake_audit_unrecorded_total` counts what that costs. Tamper-*evident*, not tamper-proof (external anchoring is
 future work — see SECURITY.md "Audit trail (P1-2)").
 
 **Still open (the follow-on):** the data plane is unauthenticated by
 default, so its reads/writes have no principal to attribute — data-plane
-auditing arrives with `TIMELAKE_DATA_AUTH=required`. Session login/logout
-chaining, a `system.audit` SQL exposure, object-store upload on rotation,
+auditing arrives with `TIMELAKE_DATA_AUTH=required`. A request-correlation
+id, a `system.audit` SQL exposure, object-store upload on rotation,
 and the retention floor are the remaining `docs/CONSOLE.md` §5 items.
 
 ### P1-3 · Per-client rate limiting — DONE (SEC-6, 2026-08-15)
